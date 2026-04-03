@@ -155,23 +155,19 @@ impl<'a> Lifter<'a> {
         // Load initial state from context
         for (&reg, &var) in &self.state.gprs {
             let offset = RegisterState::get_gpr_offset(reg);
-            let val = self.builder.ins().load(
-                types::I64,
-                MemFlags::trusted(),
-                ctx_ptr_val,
-                offset,
-            );
+            let val = self
+                .builder
+                .ins()
+                .load(types::I64, MemFlags::trusted(), ctx_ptr_val, offset);
             self.builder.def_var(var, val);
         }
 
         for (&flag, &var) in &self.state.flags {
             let offset = RegisterState::get_flag_offset(flag);
-            let val = self.builder.ins().load(
-                types::I8,
-                MemFlags::trusted(),
-                ctx_ptr_val,
-                offset,
-            );
+            let val = self
+                .builder
+                .ins()
+                .load(types::I8, MemFlags::trusted(), ctx_ptr_val, offset);
             self.builder.def_var(var, val);
         }
 
@@ -179,17 +175,25 @@ impl<'a> Lifter<'a> {
             let current_ip = decoder.ip();
 
             // Check if this IP is a jump target
-            if current_ip != ip {
-                if let Some(&block) = self.blocks.get(&current_ip) {
+            if let Some(&block) = self.blocks.get(&current_ip) {
+                if Some(block) != self.builder.current_block() {
                     if !self.builder.is_unreachable() {
                         self.builder.ins().jump(block, &[]);
                     }
                     self.builder.switch_to_block(block);
-                    if !self.sealed_blocks.contains(&block) {
-                        self.builder.seal_block(block);
-                        self.sealed_blocks.insert(block);
-                    }
                 }
+                if !self.sealed_blocks.contains(&block) {
+                    self.builder.seal_block(block);
+                    self.sealed_blocks.insert(block);
+                }
+            }
+
+            if self.builder.is_unreachable() {
+                // If we are in an unreachable state, and the start of the loop didn't switch us to a new block,
+                // then the following instructions are dead code. We skip them.
+                let mut instruction = Instruction::default();
+                decoder.decode_out(&mut instruction);
+                continue;
             }
 
             let mut instruction = Instruction::default();
@@ -203,9 +207,6 @@ impl<'a> Lifter<'a> {
             }
 
             self.lift_instruction(&instruction)?;
-
-            // If instructions were flow-altering (ret, jmp, etc),
-            // the builder state might be finished for this block.
         }
 
         Ok(())

@@ -11,8 +11,16 @@ impl<'a> Lifter<'a> {
             Mnemonic::Add => self.handle_add(instruction),
             Mnemonic::Sub => self.handle_sub(instruction),
             Mnemonic::Xor => self.handle_xor(instruction),
+            Mnemonic::And => self.handle_and(instruction),
+            Mnemonic::Or => self.handle_or(instruction),
+            Mnemonic::Test => self.handle_test(instruction),
+            Mnemonic::Cmp => self.handle_cmp(instruction),
+            Mnemonic::Inc => self.handle_inc(instruction),
+            Mnemonic::Dec => self.handle_dec(instruction),
+            Mnemonic::Lea => self.handle_lea(instruction),
             Mnemonic::Jmp => self.handle_jmp(instruction),
             Mnemonic::Je => self.handle_jz(instruction),
+            Mnemonic::Jne => self.handle_jnz(instruction),
             _ => Err(MicroliftError::UnsupportedInstruction {
                 mnemonic: format!("{:?}", instruction.mnemonic()),
             }),
@@ -28,10 +36,10 @@ impl<'a> Lifter<'a> {
                 let reg = instruction.op1_register();
                 self.get_reg_val(reg)?
             }
-            OpKind::Immediate32
-            | OpKind::Immediate64
-            | OpKind::Immediate8
+            OpKind::Immediate8
             | OpKind::Immediate16
+            | OpKind::Immediate32
+            | OpKind::Immediate64
             | OpKind::Immediate8to16
             | OpKind::Immediate8to32
             | OpKind::Immediate8to64
@@ -45,7 +53,7 @@ impl<'a> Lifter<'a> {
             }
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
-                    mnemonic: "mov-src-unknown".into(),
+                    mnemonic: format!("mov-src-{:?}", op1),
                 });
             }
         };
@@ -82,13 +90,20 @@ impl<'a> Lifter<'a> {
 
         let src_val = match op1 {
             OpKind::Register => self.get_reg_val(instruction.op1_register())?,
-            OpKind::Immediate32 | OpKind::Immediate64 => self
+            OpKind::Immediate8
+            | OpKind::Immediate16
+            | OpKind::Immediate32
+            | OpKind::Immediate64
+            | OpKind::Immediate8to16
+            | OpKind::Immediate8to32
+            | OpKind::Immediate8to64
+            | OpKind::Immediate32to64 => self
                 .builder
                 .ins()
                 .iconst(types::I64, instruction.immediate64() as i64),
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
-                    mnemonic: "xor-src".into(),
+                    mnemonic: format!("xor-src-{:?}", op1),
                 });
             }
         };
@@ -110,19 +125,150 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
+    fn handle_and(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let op0 = instruction.op0_kind();
+        let op1 = instruction.op1_kind();
+
+        let src_val = match op1 {
+            OpKind::Register => self.get_reg_val(instruction.op1_register())?,
+            OpKind::Immediate8
+            | OpKind::Immediate16
+            | OpKind::Immediate32
+            | OpKind::Immediate64
+            | OpKind::Immediate8to16
+            | OpKind::Immediate8to32
+            | OpKind::Immediate8to64
+            | OpKind::Immediate32to64 => self
+                .builder
+                .ins()
+                .iconst(types::I64, instruction.immediate64() as i64),
+            _ => {
+                return Err(MicroliftError::UnsupportedInstruction {
+                    mnemonic: format!("and-src-{:?}", op1),
+                });
+            }
+        };
+
+        match op0 {
+            OpKind::Register => {
+                let reg = instruction.op0_register();
+                let dst_val = self.get_reg_val(reg)?;
+                let result = self.builder.ins().band(dst_val, src_val);
+                self.set_reg_val(reg, result)?;
+                self.update_flags_logical(result)?;
+            }
+            _ => {
+                return Err(MicroliftError::UnsupportedInstruction {
+                    mnemonic: "and-dst".into(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_or(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let op0 = instruction.op0_kind();
+        let op1 = instruction.op1_kind();
+
+        let src_val = match op1 {
+            OpKind::Register => self.get_reg_val(instruction.op1_register())?,
+            OpKind::Immediate8
+            | OpKind::Immediate16
+            | OpKind::Immediate32
+            | OpKind::Immediate64
+            | OpKind::Immediate8to16
+            | OpKind::Immediate8to32
+            | OpKind::Immediate8to64
+            | OpKind::Immediate32to64 => self
+                .builder
+                .ins()
+                .iconst(types::I64, instruction.immediate64() as i64),
+            _ => {
+                return Err(MicroliftError::UnsupportedInstruction {
+                    mnemonic: format!("or-src-{:?}", op1),
+                });
+            }
+        };
+
+        match op0 {
+            OpKind::Register => {
+                let reg = instruction.op0_register();
+                let dst_val = self.get_reg_val(reg)?;
+                let result = self.builder.ins().bor(dst_val, src_val);
+                self.set_reg_val(reg, result)?;
+                self.update_flags_logical(result)?;
+            }
+            _ => {
+                return Err(MicroliftError::UnsupportedInstruction {
+                    mnemonic: "or-dst".into(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_test(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let op0 = instruction.op0_kind();
+        let op1 = instruction.op1_kind();
+
+        let src_val = match op1 {
+            OpKind::Register => self.get_reg_val(instruction.op1_register())?,
+            OpKind::Immediate8
+            | OpKind::Immediate16
+            | OpKind::Immediate32
+            | OpKind::Immediate64
+            | OpKind::Immediate8to16
+            | OpKind::Immediate8to32
+            | OpKind::Immediate8to64
+            | OpKind::Immediate32to64 => self
+                .builder
+                .ins()
+                .iconst(types::I64, instruction.immediate64() as i64),
+            _ => {
+                return Err(MicroliftError::UnsupportedInstruction {
+                    mnemonic: format!("test-src-{:?}", op1),
+                });
+            }
+        };
+
+        let dst_val = match op0 {
+            OpKind::Register => self.get_reg_val(instruction.op0_register())?,
+            OpKind::Immediate32 | OpKind::Immediate64 => self
+                .builder
+                .ins()
+                .iconst(types::I64, instruction.immediate64() as i64),
+            _ => {
+                return Err(MicroliftError::UnsupportedInstruction {
+                    mnemonic: format!("test-dst-{:?}", op0),
+                });
+            }
+        };
+
+        let result = self.builder.ins().band(dst_val, src_val);
+        self.update_flags_logical(result)?;
+        Ok(())
+    }
+
     fn handle_add(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let op0 = instruction.op0_kind();
         let op1 = instruction.op1_kind();
 
         let src_val = match op1 {
             OpKind::Register => self.get_reg_val(instruction.op1_register())?,
-            OpKind::Immediate32 => self
+            OpKind::Immediate8
+            | OpKind::Immediate16
+            | OpKind::Immediate32
+            | OpKind::Immediate64
+            | OpKind::Immediate8to16
+            | OpKind::Immediate8to32
+            | OpKind::Immediate8to64
+            | OpKind::Immediate32to64 => self
                 .builder
                 .ins()
-                .iconst(types::I64, instruction.immediate32() as i64),
+                .iconst(types::I64, instruction.immediate64() as i64),
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
-                    mnemonic: "add-src".into(),
+                    mnemonic: format!("add-src-{:?}", op1),
                 });
             }
         };
@@ -144,19 +290,66 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
+    fn handle_inc(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let op0 = instruction.op0_kind();
+        match op0 {
+            OpKind::Register => {
+                let reg = instruction.op0_register();
+                let dst_val = self.get_reg_val(reg)?;
+                let one = self.builder.ins().iconst(types::I64, 1);
+                let result = self.builder.ins().iadd(dst_val, one);
+                self.set_reg_val(reg, result)?;
+                self.update_flags_inc_dec(dst_val, one, result, true)?;
+            }
+            _ => {
+                return Err(MicroliftError::UnsupportedInstruction {
+                    mnemonic: "inc-dst".into(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_dec(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let op0 = instruction.op0_kind();
+        match op0 {
+            OpKind::Register => {
+                let reg = instruction.op0_register();
+                let dst_val = self.get_reg_val(reg)?;
+                let one = self.builder.ins().iconst(types::I64, 1);
+                let result = self.builder.ins().isub(dst_val, one);
+                self.set_reg_val(reg, result)?;
+                self.update_flags_inc_dec(dst_val, one, result, false)?;
+            }
+            _ => {
+                return Err(MicroliftError::UnsupportedInstruction {
+                    mnemonic: "dec-dst".into(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn handle_sub(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let op0 = instruction.op0_kind();
         let op1 = instruction.op1_kind();
 
         let src_val = match op1 {
             OpKind::Register => self.get_reg_val(instruction.op1_register())?,
-            OpKind::Immediate32 => self
+            OpKind::Immediate8
+            | OpKind::Immediate16
+            | OpKind::Immediate32
+            | OpKind::Immediate64
+            | OpKind::Immediate8to16
+            | OpKind::Immediate8to32
+            | OpKind::Immediate8to64
+            | OpKind::Immediate32to64 => self
                 .builder
                 .ins()
-                .iconst(types::I64, instruction.immediate32() as i64),
+                .iconst(types::I64, instruction.immediate64() as i64),
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
-                    mnemonic: "sub-src".into(),
+                    mnemonic: format!("sub-src-{:?}", op1),
                 });
             }
         };
@@ -175,6 +368,55 @@ impl<'a> Lifter<'a> {
                 });
             }
         }
+        Ok(())
+    }
+
+    fn handle_cmp(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let op0 = instruction.op0_kind();
+        let op1 = instruction.op1_kind();
+
+        let src_val = match op1 {
+            OpKind::Register => self.get_reg_val(instruction.op1_register())?,
+            OpKind::Immediate8
+            | OpKind::Immediate16
+            | OpKind::Immediate32
+            | OpKind::Immediate64
+            | OpKind::Immediate8to16
+            | OpKind::Immediate8to32
+            | OpKind::Immediate8to64
+            | OpKind::Immediate32to64 => self
+                .builder
+                .ins()
+                .iconst(types::I64, instruction.immediate64() as i64),
+            _ => {
+                return Err(MicroliftError::UnsupportedInstruction {
+                    mnemonic: format!("cmp-src-{:?}", op1),
+                });
+            }
+        };
+
+        let dst_val = match op0 {
+            OpKind::Register => self.get_reg_val(instruction.op0_register())?,
+            OpKind::Immediate32 | OpKind::Immediate64 => self
+                .builder
+                .ins()
+                .iconst(types::I64, instruction.immediate64() as i64),
+            _ => {
+                return Err(MicroliftError::UnsupportedInstruction {
+                    mnemonic: format!("cmp-dst-{:?}", op0),
+                });
+            }
+        };
+
+        let result = self.builder.ins().isub(dst_val, src_val);
+        self.update_flags_sub(dst_val, src_val, result)?;
+        Ok(())
+    }
+
+    fn handle_lea(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let reg = instruction.op0_register();
+        let ptr = self.get_mem_ptr(instruction, 1)?;
+        self.set_reg_val(reg, ptr)?;
         Ok(())
     }
 
@@ -248,6 +490,45 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
+    fn update_flags_inc_dec(
+        &mut self,
+        lhs: Value,
+        rhs: Value,
+        res: Value,
+        is_add: bool,
+    ) -> crate::Result<()> {
+        // Zero Flag (ZF)
+        let zf = self.builder.ins().icmp_imm(IntCC::Equal, res, 0);
+        self.set_flag(crate::lifter::X86Flag::Zero, zf)?;
+
+        // Sign Flag (SF)
+        let sign_bit = self.builder.ins().ushr_imm(res, 63);
+        let sf = self.builder.ins().ireduce(types::I8, sign_bit);
+        self.set_flag(crate::lifter::X86Flag::Sign, sf)?;
+
+        // Overflow Flag (OF)
+        let of = if is_add {
+            // (lhs ^ res) & (rhs ^ res) & MSB. But for INC, rhs is 1.
+            // Actually the standard formula (lhs ^ res) & (rhs ^ res) & MSB works.
+            let xor1 = self.builder.ins().bxor(lhs, res);
+            let xor2 = self.builder.ins().bxor(rhs, res);
+            let and = self.builder.ins().band(xor1, xor2);
+            let of_bit = self.builder.ins().ushr_imm(and, 63);
+            self.builder.ins().ireduce(types::I8, of_bit)
+        } else {
+            // (lhs ^ rhs) & (lhs ^ res) & MSB.
+            let xor1 = self.builder.ins().bxor(lhs, rhs);
+            let xor2 = self.builder.ins().bxor(lhs, res);
+            let and = self.builder.ins().band(xor1, xor2);
+            let of_bit = self.builder.ins().ushr_imm(and, 63);
+            self.builder.ins().ireduce(types::I8, of_bit)
+        };
+        self.set_flag(crate::lifter::X86Flag::Overflow, of)?;
+
+        // Carry Flag (CF) is NOT affected by INC/DEC
+        Ok(())
+    }
+
     fn set_flag(&mut self, flag: crate::lifter::X86Flag, val: Value) -> crate::Result<()> {
         if let Some(&var) = self.state.flags.get(&flag) {
             // Ensure flag is I8
@@ -286,6 +567,42 @@ impl<'a> Lifter<'a> {
         self.builder
             .ins()
             .brif(zf, target_block, &[], next_block, &[]);
+
+        // Switch to the next block for fallthrough
+        self.builder.switch_to_block(next_block);
+
+        Ok(())
+    }
+
+    fn handle_jnz(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let target = instruction.near_branch_target();
+        let next_ip = instruction.next_ip();
+
+        let target_block = self.get_block(target);
+        let next_block = self.get_block(next_ip);
+
+        let zf = self
+            .builder
+            .use_var(self.state.flags[&crate::lifter::X86Flag::Zero]);
+        // Jump if ZF is 0
+        self.builder
+            .ins()
+            .brif(zf, next_block, &[], target_block, &[]);
+
+        // Switch to the target block for fallthrough (which is target_block? No, it should be the NEXT instruction's block)
+        // Wait, standard brif(c, t1, t2) -> t1 if c.
+        // My handle_jnz: brif(zf, next_block, target_block) -> if zf is 1 (zero), skip to next_block. If zf is 0 (not zero), jump to target_block.
+        // So target_block is WHERE we jump if NOT zero.
+        // The fallthrough after the branch instruction is next_ip.
+        // So next_block is ALWAYS where we continue if the branch isn't taken?
+        // Let's re-think JNZ (Jump Not Zero).
+        // if zero (ZF=1) -> fallthrough (next_ip)
+        // if not zero (ZF=0) -> jump (target)
+        // My brif(zf, next_block, target_block) does exactly that!
+
+        // After handle_jnz, the current block in lifter.rs will be finished.
+        // We should switch to the block that logically follows it in terms of instruction order.
+        self.builder.switch_to_block(next_block);
 
         Ok(())
     }
