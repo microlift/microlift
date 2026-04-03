@@ -1,0 +1,15 @@
+[package]
+name = "microlift"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cranelift = "0.130.0"
+cranelift-frontend = "0.130.0"
+cranelift-module = "0.130.0"
+cranelift-jit = "0.130.0"
+cranelift-native = "0.130.0"
+iced-x86 = "1.21.0"
+target-lexicon = "0.13.5"
+thiserror = "1.0"
+cranelift-codegen = "0.130.0"
