@@ -31,11 +31,15 @@ impl<'a> Lifter<'a> {
         let op0 = instruction.op0_kind();
         let op1 = instruction.op1_kind();
 
+        let size = if op0 == OpKind::Register {
+            instruction.op0_register().size()
+        } else {
+            instruction.memory_size().size()
+        };
+        let ty = size_to_type(size);
+
         let src_val = match op1 {
-            OpKind::Register => {
-                let reg = instruction.op1_register();
-                self.get_reg_val(reg)?
-            }
+            OpKind::Register => self.get_reg_val(instruction.op1_register())?,
             OpKind::Immediate8
             | OpKind::Immediate16
             | OpKind::Immediate32
@@ -45,11 +49,11 @@ impl<'a> Lifter<'a> {
             | OpKind::Immediate8to64
             | OpKind::Immediate32to64 => {
                 let imm = instruction.immediate64();
-                self.builder.ins().iconst(types::I64, imm as i64)
+                self.builder.ins().iconst(ty, imm as i64)
             }
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 1)?;
-                self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0)
+                self.builder.ins().load(ty, MemFlags::new(), ptr, 0)
             }
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -88,6 +92,13 @@ impl<'a> Lifter<'a> {
         let op0 = instruction.op0_kind();
         let op1 = instruction.op1_kind();
 
+        let size = if op0 == OpKind::Register {
+            instruction.op0_register().size()
+        } else {
+            instruction.memory_size().size()
+        };
+        let ty = size_to_type(size);
+
         let src_val = match op1 {
             OpKind::Register => self.get_reg_val(instruction.op1_register())?,
             OpKind::Immediate8
@@ -100,7 +111,7 @@ impl<'a> Lifter<'a> {
             | OpKind::Immediate32to64 => self
                 .builder
                 .ins()
-                .iconst(types::I64, instruction.immediate64() as i64),
+                .iconst(ty, instruction.immediate64() as i64),
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
                     mnemonic: format!("xor-src-{:?}", op1),
@@ -114,7 +125,7 @@ impl<'a> Lifter<'a> {
                 let dst_val = self.get_reg_val(reg)?;
                 let result = self.builder.ins().bxor(dst_val, src_val);
                 self.set_reg_val(reg, result)?;
-                self.update_flags_logical(result)?;
+                self.update_flags_logical(result, size)?;
             }
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -129,6 +140,13 @@ impl<'a> Lifter<'a> {
         let op0 = instruction.op0_kind();
         let op1 = instruction.op1_kind();
 
+        let size = if op0 == OpKind::Register {
+            instruction.op0_register().size()
+        } else {
+            instruction.memory_size().size()
+        };
+        let ty = size_to_type(size);
+
         let src_val = match op1 {
             OpKind::Register => self.get_reg_val(instruction.op1_register())?,
             OpKind::Immediate8
@@ -141,7 +159,7 @@ impl<'a> Lifter<'a> {
             | OpKind::Immediate32to64 => self
                 .builder
                 .ins()
-                .iconst(types::I64, instruction.immediate64() as i64),
+                .iconst(ty, instruction.immediate64() as i64),
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
                     mnemonic: format!("and-src-{:?}", op1),
@@ -155,7 +173,7 @@ impl<'a> Lifter<'a> {
                 let dst_val = self.get_reg_val(reg)?;
                 let result = self.builder.ins().band(dst_val, src_val);
                 self.set_reg_val(reg, result)?;
-                self.update_flags_logical(result)?;
+                self.update_flags_logical(result, size)?;
             }
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -170,6 +188,13 @@ impl<'a> Lifter<'a> {
         let op0 = instruction.op0_kind();
         let op1 = instruction.op1_kind();
 
+        let size = if op0 == OpKind::Register {
+            instruction.op0_register().size()
+        } else {
+            instruction.memory_size().size()
+        };
+        let ty = size_to_type(size);
+
         let src_val = match op1 {
             OpKind::Register => self.get_reg_val(instruction.op1_register())?,
             OpKind::Immediate8
@@ -182,7 +207,7 @@ impl<'a> Lifter<'a> {
             | OpKind::Immediate32to64 => self
                 .builder
                 .ins()
-                .iconst(types::I64, instruction.immediate64() as i64),
+                .iconst(ty, instruction.immediate64() as i64),
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
                     mnemonic: format!("or-src-{:?}", op1),
@@ -196,7 +221,7 @@ impl<'a> Lifter<'a> {
                 let dst_val = self.get_reg_val(reg)?;
                 let result = self.builder.ins().bor(dst_val, src_val);
                 self.set_reg_val(reg, result)?;
-                self.update_flags_logical(result)?;
+                self.update_flags_logical(result, size)?;
             }
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -211,6 +236,13 @@ impl<'a> Lifter<'a> {
         let op0 = instruction.op0_kind();
         let op1 = instruction.op1_kind();
 
+        let size = if op0 == OpKind::Register {
+            instruction.op0_register().size()
+        } else {
+            instruction.memory_size().size()
+        };
+        let ty = size_to_type(size);
+
         let src_val = match op1 {
             OpKind::Register => self.get_reg_val(instruction.op1_register())?,
             OpKind::Immediate8
@@ -223,7 +255,7 @@ impl<'a> Lifter<'a> {
             | OpKind::Immediate32to64 => self
                 .builder
                 .ins()
-                .iconst(types::I64, instruction.immediate64() as i64),
+                .iconst(ty, instruction.immediate64() as i64),
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
                     mnemonic: format!("test-src-{:?}", op1),
@@ -233,10 +265,6 @@ impl<'a> Lifter<'a> {
 
         let dst_val = match op0 {
             OpKind::Register => self.get_reg_val(instruction.op0_register())?,
-            OpKind::Immediate32 | OpKind::Immediate64 => self
-                .builder
-                .ins()
-                .iconst(types::I64, instruction.immediate64() as i64),
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
                     mnemonic: format!("test-dst-{:?}", op0),
@@ -245,13 +273,20 @@ impl<'a> Lifter<'a> {
         };
 
         let result = self.builder.ins().band(dst_val, src_val);
-        self.update_flags_logical(result)?;
+        self.update_flags_logical(result, size)?;
         Ok(())
     }
 
     fn handle_add(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let op0 = instruction.op0_kind();
         let op1 = instruction.op1_kind();
+
+        let size = if op0 == OpKind::Register {
+            instruction.op0_register().size()
+        } else {
+            instruction.memory_size().size()
+        };
+        let ty = size_to_type(size);
 
         let src_val = match op1 {
             OpKind::Register => self.get_reg_val(instruction.op1_register())?,
@@ -265,7 +300,11 @@ impl<'a> Lifter<'a> {
             | OpKind::Immediate32to64 => self
                 .builder
                 .ins()
-                .iconst(types::I64, instruction.immediate64() as i64),
+                .iconst(ty, instruction.immediate64() as i64),
+            OpKind::Memory => {
+                let ptr = self.get_mem_ptr(instruction, 1)?;
+                self.builder.ins().load(ty, MemFlags::new(), ptr, 0)
+            }
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
                     mnemonic: format!("add-src-{:?}", op1),
@@ -279,7 +318,7 @@ impl<'a> Lifter<'a> {
                 let dst_val = self.get_reg_val(reg)?;
                 let result = self.builder.ins().iadd(dst_val, src_val);
                 self.set_reg_val(reg, result)?;
-                self.update_flags_add(dst_val, src_val, result)?;
+                self.update_flags_add(dst_val, src_val, result, size)?;
             }
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -292,14 +331,21 @@ impl<'a> Lifter<'a> {
 
     fn handle_inc(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let op0 = instruction.op0_kind();
+        let size = if op0 == OpKind::Register {
+            instruction.op0_register().size()
+        } else {
+            instruction.memory_size().size()
+        };
+        let ty = size_to_type(size);
+
         match op0 {
             OpKind::Register => {
                 let reg = instruction.op0_register();
                 let dst_val = self.get_reg_val(reg)?;
-                let one = self.builder.ins().iconst(types::I64, 1);
+                let one = self.builder.ins().iconst(ty, 1);
                 let result = self.builder.ins().iadd(dst_val, one);
                 self.set_reg_val(reg, result)?;
-                self.update_flags_inc_dec(dst_val, one, result, true)?;
+                self.update_flags_inc_dec(dst_val, one, result, true, size)?;
             }
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -312,14 +358,21 @@ impl<'a> Lifter<'a> {
 
     fn handle_dec(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let op0 = instruction.op0_kind();
+        let size = if op0 == OpKind::Register {
+            instruction.op0_register().size()
+        } else {
+            instruction.memory_size().size()
+        };
+        let ty = size_to_type(size);
+
         match op0 {
             OpKind::Register => {
                 let reg = instruction.op0_register();
                 let dst_val = self.get_reg_val(reg)?;
-                let one = self.builder.ins().iconst(types::I64, 1);
+                let one = self.builder.ins().iconst(ty, 1);
                 let result = self.builder.ins().isub(dst_val, one);
                 self.set_reg_val(reg, result)?;
-                self.update_flags_inc_dec(dst_val, one, result, false)?;
+                self.update_flags_inc_dec(dst_val, one, result, false, size)?;
             }
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -334,6 +387,13 @@ impl<'a> Lifter<'a> {
         let op0 = instruction.op0_kind();
         let op1 = instruction.op1_kind();
 
+        let size = if op0 == OpKind::Register {
+            instruction.op0_register().size()
+        } else {
+            instruction.memory_size().size()
+        };
+        let ty = size_to_type(size);
+
         let src_val = match op1 {
             OpKind::Register => self.get_reg_val(instruction.op1_register())?,
             OpKind::Immediate8
@@ -346,7 +406,11 @@ impl<'a> Lifter<'a> {
             | OpKind::Immediate32to64 => self
                 .builder
                 .ins()
-                .iconst(types::I64, instruction.immediate64() as i64),
+                .iconst(ty, instruction.immediate64() as i64),
+            OpKind::Memory => {
+                let ptr = self.get_mem_ptr(instruction, 1)?;
+                self.builder.ins().load(ty, MemFlags::new(), ptr, 0)
+            }
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
                     mnemonic: format!("sub-src-{:?}", op1),
@@ -360,7 +424,7 @@ impl<'a> Lifter<'a> {
                 let dst_val = self.get_reg_val(reg)?;
                 let result = self.builder.ins().isub(dst_val, src_val);
                 self.set_reg_val(reg, result)?;
-                self.update_flags_sub(dst_val, src_val, result)?;
+                self.update_flags_sub(dst_val, src_val, result, size)?;
             }
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -375,6 +439,13 @@ impl<'a> Lifter<'a> {
         let op0 = instruction.op0_kind();
         let op1 = instruction.op1_kind();
 
+        let size = if op0 == OpKind::Register {
+            instruction.op0_register().size()
+        } else {
+            instruction.memory_size().size()
+        };
+        let ty = size_to_type(size);
+
         let src_val = match op1 {
             OpKind::Register => self.get_reg_val(instruction.op1_register())?,
             OpKind::Immediate8
@@ -387,7 +458,11 @@ impl<'a> Lifter<'a> {
             | OpKind::Immediate32to64 => self
                 .builder
                 .ins()
-                .iconst(types::I64, instruction.immediate64() as i64),
+                .iconst(ty, instruction.immediate64() as i64),
+            OpKind::Memory => {
+                let ptr = self.get_mem_ptr(instruction, 1)?;
+                self.builder.ins().load(ty, MemFlags::new(), ptr, 0)
+            }
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
                     mnemonic: format!("cmp-src-{:?}", op1),
@@ -397,10 +472,10 @@ impl<'a> Lifter<'a> {
 
         let dst_val = match op0 {
             OpKind::Register => self.get_reg_val(instruction.op0_register())?,
-            OpKind::Immediate32 | OpKind::Immediate64 => self
-                .builder
-                .ins()
-                .iconst(types::I64, instruction.immediate64() as i64),
+            OpKind::Memory => {
+                let ptr = self.get_mem_ptr(instruction, 0)?;
+                self.builder.ins().load(ty, MemFlags::new(), ptr, 0)
+            }
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
                     mnemonic: format!("cmp-dst-{:?}", op0),
@@ -409,7 +484,7 @@ impl<'a> Lifter<'a> {
         };
 
         let result = self.builder.ins().isub(dst_val, src_val);
-        self.update_flags_sub(dst_val, src_val, result)?;
+        self.update_flags_sub(dst_val, src_val, result, size)?;
         Ok(())
     }
 
@@ -420,14 +495,21 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    fn update_flags_add(&mut self, lhs: Value, rhs: Value, res: Value) -> crate::Result<()> {
+    fn update_flags_add(
+        &mut self,
+        lhs: Value,
+        rhs: Value,
+        res: Value,
+        size: usize,
+    ) -> crate::Result<()> {
+        let bit_width = (size * 8) as i64;
+
         // Zero Flag (ZF)
         let zf = self.builder.ins().icmp_imm(IntCC::Equal, res, 0);
         self.set_flag(crate::lifter::X86Flag::Zero, zf)?;
 
         // Sign Flag (SF)
-        let sign_bit = self.builder.ins().ushr_imm(res, 63);
-        let sf = self.builder.ins().ireduce(types::I8, sign_bit);
+        let sf = self.builder.ins().ushr_imm(res, bit_width - 1);
         self.set_flag(crate::lifter::X86Flag::Sign, sf)?;
 
         // Carry Flag (CF)
@@ -440,21 +522,27 @@ impl<'a> Lifter<'a> {
         let xor1 = self.builder.ins().bxor(lhs, res);
         let xor2 = self.builder.ins().bxor(rhs, res);
         let and = self.builder.ins().band(xor1, xor2);
-        let of_bit = self.builder.ins().ushr_imm(and, 63);
-        let of = self.builder.ins().ireduce(types::I8, of_bit);
+        let of = self.builder.ins().ushr_imm(and, bit_width - 1);
         self.set_flag(crate::lifter::X86Flag::Overflow, of)?;
 
         Ok(())
     }
 
-    fn update_flags_sub(&mut self, lhs: Value, rhs: Value, res: Value) -> crate::Result<()> {
+    fn update_flags_sub(
+        &mut self,
+        lhs: Value,
+        rhs: Value,
+        res: Value,
+        size: usize,
+    ) -> crate::Result<()> {
+        let bit_width = (size * 8) as i64;
+
         // Zero Flag (ZF)
         let zf = self.builder.ins().icmp_imm(IntCC::Equal, res, 0);
         self.set_flag(crate::lifter::X86Flag::Zero, zf)?;
 
         // Sign Flag (SF)
-        let sign_bit = self.builder.ins().ushr_imm(res, 63);
-        let sf = self.builder.ins().ireduce(types::I8, sign_bit);
+        let sf = self.builder.ins().ushr_imm(res, bit_width - 1);
         self.set_flag(crate::lifter::X86Flag::Sign, sf)?;
 
         // Carry Flag (CF) - Borrow
@@ -465,21 +553,21 @@ impl<'a> Lifter<'a> {
         let xor1 = self.builder.ins().bxor(lhs, rhs);
         let xor2 = self.builder.ins().bxor(lhs, res);
         let and = self.builder.ins().band(xor1, xor2);
-        let of_bit = self.builder.ins().ushr_imm(and, 63);
-        let of = self.builder.ins().ireduce(types::I8, of_bit);
+        let of = self.builder.ins().ushr_imm(and, bit_width - 1);
         self.set_flag(crate::lifter::X86Flag::Overflow, of)?;
 
         Ok(())
     }
 
-    fn update_flags_logical(&mut self, res: Value) -> crate::Result<()> {
+    fn update_flags_logical(&mut self, res: Value, size: usize) -> crate::Result<()> {
+        let bit_width = (size * 8) as i64;
+
         // Zero Flag (ZF)
         let zf = self.builder.ins().icmp_imm(IntCC::Equal, res, 0);
         self.set_flag(crate::lifter::X86Flag::Zero, zf)?;
 
         // Sign Flag (SF)
-        let sign_bit = self.builder.ins().ushr_imm(res, 63);
-        let sf = self.builder.ins().ireduce(types::I8, sign_bit);
+        let sf = self.builder.ins().ushr_imm(res, bit_width - 1);
         self.set_flag(crate::lifter::X86Flag::Sign, sf)?;
 
         // Carry and Overflow are cleared for logical ops
@@ -496,32 +584,31 @@ impl<'a> Lifter<'a> {
         rhs: Value,
         res: Value,
         is_add: bool,
+        size: usize,
     ) -> crate::Result<()> {
+        let bit_width = (size * 8) as i64;
+
         // Zero Flag (ZF)
         let zf = self.builder.ins().icmp_imm(IntCC::Equal, res, 0);
         self.set_flag(crate::lifter::X86Flag::Zero, zf)?;
 
         // Sign Flag (SF)
-        let sign_bit = self.builder.ins().ushr_imm(res, 63);
-        let sf = self.builder.ins().ireduce(types::I8, sign_bit);
+        let sf = self.builder.ins().ushr_imm(res, bit_width - 1);
         self.set_flag(crate::lifter::X86Flag::Sign, sf)?;
 
         // Overflow Flag (OF)
         let of = if is_add {
             // (lhs ^ res) & (rhs ^ res) & MSB. But for INC, rhs is 1.
-            // Actually the standard formula (lhs ^ res) & (rhs ^ res) & MSB works.
             let xor1 = self.builder.ins().bxor(lhs, res);
             let xor2 = self.builder.ins().bxor(rhs, res);
             let and = self.builder.ins().band(xor1, xor2);
-            let of_bit = self.builder.ins().ushr_imm(and, 63);
-            self.builder.ins().ireduce(types::I8, of_bit)
+            self.builder.ins().ushr_imm(and, bit_width - 1)
         } else {
             // (lhs ^ rhs) & (lhs ^ res) & MSB.
             let xor1 = self.builder.ins().bxor(lhs, rhs);
             let xor2 = self.builder.ins().bxor(lhs, res);
             let and = self.builder.ins().band(xor1, xor2);
-            let of_bit = self.builder.ins().ushr_imm(and, 63);
-            self.builder.ins().ireduce(types::I8, of_bit)
+            self.builder.ins().ushr_imm(and, bit_width - 1)
         };
         self.set_flag(crate::lifter::X86Flag::Overflow, of)?;
 
@@ -638,8 +725,20 @@ impl<'a> Lifter<'a> {
 
     fn get_reg_val(&mut self, reg: Register) -> crate::Result<Value> {
         let base_reg = get_base_reg_64(reg);
+        let size = reg.size();
+        let is_high_8 = is_high_8_reg(reg);
+
         if let Some(&var) = self.state.gprs.get(&base_reg) {
-            Ok(self.builder.use_var(var))
+            let full_val = self.builder.use_var(var);
+            if size == 8 {
+                Ok(full_val)
+            } else if is_high_8 {
+                let shifted = self.builder.ins().ushr_imm(full_val, 8);
+                Ok(self.builder.ins().ireduce(types::I8, shifted))
+            } else {
+                let ty = size_to_type(size);
+                Ok(self.builder.ins().ireduce(ty, full_val))
+            }
         } else {
             Err(MicroliftError::UnsupportedInstruction {
                 mnemonic: format!("reg-{:?}", reg),
@@ -649,8 +748,36 @@ impl<'a> Lifter<'a> {
 
     fn set_reg_val(&mut self, reg: Register, val: Value) -> crate::Result<()> {
         let base_reg = get_base_reg_64(reg);
+        let size = reg.size();
+        let is_high_8 = is_high_8_reg(reg);
+
         if let Some(&var) = self.state.gprs.get(&base_reg) {
-            self.builder.def_var(var, val);
+            let old_val = self.builder.use_var(var);
+            let new_full_val = if size == 8 {
+                val
+            } else if size == 4 {
+                // 32-bit zero-extends to 64-bit
+                self.builder.ins().uextend(types::I64, val)
+            } else if is_high_8 {
+                // AH, BH, CH, DH: bits 8-15
+                let val_64 = self.builder.ins().uextend(types::I64, val);
+                let shifted_val = self.builder.ins().ishl_imm(val_64, 8);
+                let mask = self.builder.ins().iconst(types::I64, !0xFF00u64 as i64);
+                let cleared = self.builder.ins().band(old_val, mask);
+                self.builder.ins().bor(cleared, shifted_val)
+            } else {
+                // 8 or 16 bit: preserve upper bits
+                let mask_val = match size {
+                    1 => !0xFFu64,
+                    2 => !0xFFFFu64,
+                    _ => unreachable!(),
+                };
+                let mask = self.builder.ins().iconst(types::I64, mask_val as i64);
+                let cleared = self.builder.ins().band(old_val, mask);
+                let val_64 = self.builder.ins().uextend(types::I64, val);
+                self.builder.ins().bor(cleared, val_64)
+            };
+            self.builder.def_var(var, new_full_val);
             Ok(())
         } else {
             Err(MicroliftError::UnsupportedInstruction {
@@ -658,6 +785,23 @@ impl<'a> Lifter<'a> {
             })
         }
     }
+}
+
+fn size_to_type(size: usize) -> Type {
+    match size {
+        1 => types::I8,
+        2 => types::I16,
+        4 => types::I32,
+        8 => types::I64,
+        _ => panic!("Unsupported operand size: {}", size),
+    }
+}
+
+fn is_high_8_reg(reg: Register) -> bool {
+    matches!(
+        reg,
+        Register::AH | Register::BH | Register::CH | Register::DH
+    )
 }
 
 fn get_base_reg_64(reg: Register) -> Register {
