@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 pub struct RegisterState {
     pub gprs: HashMap<Register, Variable>,
     pub flags: HashMap<X86Flag, Variable>,
+    pub context_ptr: Variable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -64,7 +65,46 @@ impl RegisterState {
             flags.insert(flag, var);
         }
 
-        Self { gprs, flags }
+        let context_ptr = builder.declare_var(types::I64); // Assume 64-bit pointer
+
+        Self {
+            gprs,
+            flags,
+            context_ptr,
+        }
+    }
+
+    pub fn get_gpr_offset(reg: Register) -> i32 {
+        match reg {
+            Register::RAX => 0,
+            Register::RCX => 8,
+            Register::RDX => 16,
+            Register::RBX => 24,
+            Register::RSP => 32,
+            Register::RBP => 40,
+            Register::RSI => 48,
+            Register::RDI => 56,
+            Register::R8 => 64,
+            Register::R9 => 72,
+            Register::R10 => 80,
+            Register::R11 => 88,
+            Register::R12 => 96,
+            Register::R13 => 104,
+            Register::R14 => 112,
+            Register::R15 => 120,
+            _ => panic!("Unsupported register for offset: {:?}", reg),
+        }
+    }
+
+    pub fn get_flag_offset(flag: X86Flag) -> i32 {
+        match flag {
+            X86Flag::Carry => 136,
+            X86Flag::Parity => 137,
+            X86Flag::Auxiliary => 138,
+            X86Flag::Zero => 139,
+            X86Flag::Sign => 140,
+            X86Flag::Overflow => 141,
+        }
     }
 }
 
@@ -108,15 +148,31 @@ impl<'a> Lifter<'a> {
         self.builder.seal_block(initial_block);
         self.sealed_blocks.insert(initial_block);
 
-        // TODO initial values for registers (e.g. from function arguments)
-        let zero = self.builder.ins().iconst(types::I64, 0);
-        for &var in self.state.gprs.values() {
-            self.builder.def_var(var, zero);
+        // Use the first function parameter as the context pointer
+        let ctx_ptr_val = self.builder.block_params(initial_block)[0];
+        self.builder.def_var(self.state.context_ptr, ctx_ptr_val);
+
+        // Load initial state from context
+        for (&reg, &var) in &self.state.gprs {
+            let offset = RegisterState::get_gpr_offset(reg);
+            let val = self.builder.ins().load(
+                types::I64,
+                MemFlags::trusted(),
+                ctx_ptr_val,
+                offset,
+            );
+            self.builder.def_var(var, val);
         }
 
-        let zero_flag = self.builder.ins().iconst(types::I8, 0);
-        for &var in self.state.flags.values() {
-            self.builder.def_var(var, zero_flag);
+        for (&flag, &var) in &self.state.flags {
+            let offset = RegisterState::get_flag_offset(flag);
+            let val = self.builder.ins().load(
+                types::I8,
+                MemFlags::trusted(),
+                ctx_ptr_val,
+                offset,
+            );
+            self.builder.def_var(var, val);
         }
 
         while decoder.can_decode() {
@@ -157,5 +213,27 @@ impl<'a> Lifter<'a> {
 
     fn lift_instruction(&mut self, instruction: &Instruction) -> crate::Result<()> {
         self.handle_instruction(instruction)
+    }
+
+    pub fn sync_to_context(&mut self) -> crate::Result<()> {
+        let ctx_ptr = self.builder.use_var(self.state.context_ptr);
+
+        for (&reg, &var) in &self.state.gprs {
+            let val = self.builder.use_var(var);
+            let offset = RegisterState::get_gpr_offset(reg);
+            self.builder
+                .ins()
+                .store(MemFlags::trusted(), val, ctx_ptr, offset);
+        }
+
+        for (&flag, &var) in &self.state.flags {
+            let val = self.builder.use_var(var);
+            let offset = RegisterState::get_flag_offset(flag);
+            self.builder
+                .ins()
+                .store(MemFlags::trusted(), val, ctx_ptr, offset);
+        }
+
+        Ok(())
     }
 }

@@ -70,9 +70,9 @@ impl<'a> Lifter<'a> {
     }
 
     fn handle_ret(&mut self, _instruction: &Instruction) -> crate::Result<()> {
-        // Simple return for now, assume rax is the return value
-        let rax = self.get_reg_val(Register::RAX)?;
-        self.builder.ins().return_(&[rax]);
+        // Sync modified state back to context before returning
+        self.sync_to_context()?;
+        self.builder.ins().return_(&[]);
         Ok(())
     }
 
@@ -99,6 +99,7 @@ impl<'a> Lifter<'a> {
                 let dst_val = self.get_reg_val(reg)?;
                 let result = self.builder.ins().bxor(dst_val, src_val);
                 self.set_reg_val(reg, result)?;
+                self.update_flags_logical(result)?;
             }
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -225,6 +226,24 @@ impl<'a> Lifter<'a> {
         let of_bit = self.builder.ins().ushr_imm(and, 63);
         let of = self.builder.ins().ireduce(types::I8, of_bit);
         self.set_flag(crate::lifter::X86Flag::Overflow, of)?;
+
+        Ok(())
+    }
+
+    fn update_flags_logical(&mut self, res: Value) -> crate::Result<()> {
+        // Zero Flag (ZF)
+        let zf = self.builder.ins().icmp_imm(IntCC::Equal, res, 0);
+        self.set_flag(crate::lifter::X86Flag::Zero, zf)?;
+
+        // Sign Flag (SF)
+        let sign_bit = self.builder.ins().ushr_imm(res, 63);
+        let sf = self.builder.ins().ireduce(types::I8, sign_bit);
+        self.set_flag(crate::lifter::X86Flag::Sign, sf)?;
+
+        // Carry and Overflow are cleared for logical ops
+        let zero = self.builder.ins().iconst(types::I8, 0);
+        self.set_flag(crate::lifter::X86Flag::Carry, zero)?;
+        self.set_flag(crate::lifter::X86Flag::Overflow, zero)?;
 
         Ok(())
     }

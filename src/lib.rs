@@ -1,6 +1,7 @@
 use thiserror::Error;
 
 pub mod backend;
+pub mod context;
 pub mod lifter;
 pub mod semantics;
 

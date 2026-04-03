@@ -10,14 +10,16 @@ fn test_mov_rax_imm() {
     let mut flag_builder = settings::builder();
     flag_builder.set("use_colocated_libcalls", "false").unwrap();
     flag_builder.set("is_pic", "false").unwrap();
-    let isa = cranelift_native::builder()
+    let _isa = cranelift_native::builder()
         .unwrap()
         .finish(settings::Flags::new(flag_builder))
         .unwrap();
 
     let mut func =
         Function::with_name_signature(UserFuncName::user(0, 0), Signature::new(CallConv::Fast));
-    func.signature.returns.push(AbiParam::new(types::I64));
+    // Input: *mut RegisterContext (I64)
+    func.signature.params.push(AbiParam::new(types::I64));
+    // Output: void
 
     let mut func_ctx = cranelift_frontend::FunctionBuilderContext::new();
     let builder = cranelift_frontend::FunctionBuilder::new(&mut func, &mut func_ctx);
@@ -33,7 +35,9 @@ fn test_mov_rax_imm() {
     let mut backend = CraneliftBackend::new().expect("backend init failed");
     let code_ptr = backend.compile(func).expect("compilation failed");
 
-    let f: fn() -> i64 = unsafe { std::mem::transmute(code_ptr) };
-    let res = f();
-    assert_eq!(res, 42);
+    use microlift::context::RegisterContext;
+    let mut ctx = RegisterContext::default();
+    let f: fn(*mut RegisterContext) = unsafe { std::mem::transmute(code_ptr) };
+    f(&mut ctx);
+    assert_eq!(ctx.rax, 42);
 }
