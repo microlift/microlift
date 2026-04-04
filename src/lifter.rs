@@ -1,4 +1,4 @@
-use crate::MicroliftError;
+use crate::{MicroliftError, context::RegisterContext};
 use cranelift::prelude::*;
 use cranelift_frontend::{FunctionBuilder, Variable};
 use iced_x86::{Decoder, DecoderOptions, Instruction, Register};
@@ -74,36 +74,36 @@ impl RegisterState {
         }
     }
 
-    pub fn get_gpr_offset(reg: Register) -> i32 {
+    pub fn get_gpr_offset(reg: Register) -> crate::Result<i32> {
         match reg {
-            Register::RAX => 0,
-            Register::RCX => 8,
-            Register::RDX => 16,
-            Register::RBX => 24,
-            Register::RSP => 32,
-            Register::RBP => 40,
-            Register::RSI => 48,
-            Register::RDI => 56,
-            Register::R8 => 64,
-            Register::R9 => 72,
-            Register::R10 => 80,
-            Register::R11 => 88,
-            Register::R12 => 96,
-            Register::R13 => 104,
-            Register::R14 => 112,
-            Register::R15 => 120,
-            _ => panic!("Unsupported register for offset: {:?}", reg),
+            Register::RAX => Ok(std::mem::offset_of!(RegisterContext, rax) as i32),
+            Register::RCX => Ok(std::mem::offset_of!(RegisterContext, rcx) as i32),
+            Register::RDX => Ok(std::mem::offset_of!(RegisterContext, rdx) as i32),
+            Register::RBX => Ok(std::mem::offset_of!(RegisterContext, rbx) as i32),
+            Register::RSP => Ok(std::mem::offset_of!(RegisterContext, rsp) as i32),
+            Register::RBP => Ok(std::mem::offset_of!(RegisterContext, rbp) as i32),
+            Register::RSI => Ok(std::mem::offset_of!(RegisterContext, rsi) as i32),
+            Register::RDI => Ok(std::mem::offset_of!(RegisterContext, rdi) as i32),
+            Register::R8 => Ok(std::mem::offset_of!(RegisterContext, r8) as i32),
+            Register::R9 => Ok(std::mem::offset_of!(RegisterContext, r9) as i32),
+            Register::R10 => Ok(std::mem::offset_of!(RegisterContext, r10) as i32),
+            Register::R11 => Ok(std::mem::offset_of!(RegisterContext, r11) as i32),
+            Register::R12 => Ok(std::mem::offset_of!(RegisterContext, r12) as i32),
+            Register::R13 => Ok(std::mem::offset_of!(RegisterContext, r13) as i32),
+            Register::R14 => Ok(std::mem::offset_of!(RegisterContext, r14) as i32),
+            Register::R15 => Ok(std::mem::offset_of!(RegisterContext, r15) as i32),
+            _ => Err(MicroliftError::UnsupportedRegister(reg)),
         }
     }
 
-    pub fn get_flag_offset(flag: X86Flag) -> i32 {
+    pub fn get_flag_offset(flag: X86Flag) -> crate::Result<i32> {
         match flag {
-            X86Flag::Carry => 136,
-            X86Flag::Parity => 137,
-            X86Flag::Auxiliary => 138,
-            X86Flag::Zero => 139,
-            X86Flag::Sign => 140,
-            X86Flag::Overflow => 141,
+            X86Flag::Carry => Ok(std::mem::offset_of!(RegisterContext, cf) as i32),
+            X86Flag::Parity => Ok(std::mem::offset_of!(RegisterContext, pf) as i32),
+            X86Flag::Auxiliary => Ok(std::mem::offset_of!(RegisterContext, af) as i32),
+            X86Flag::Zero => Ok(std::mem::offset_of!(RegisterContext, zf) as i32),
+            X86Flag::Sign => Ok(std::mem::offset_of!(RegisterContext, sf) as i32),
+            X86Flag::Overflow => Ok(std::mem::offset_of!(RegisterContext, of) as i32),
         }
     }
 }
@@ -154,7 +154,7 @@ impl<'a> Lifter<'a> {
 
         // Load initial state from context
         for (&reg, &var) in &self.state.gprs {
-            let offset = RegisterState::get_gpr_offset(reg);
+            let offset = RegisterState::get_gpr_offset(reg)?;
             let val = self
                 .builder
                 .ins()
@@ -163,7 +163,7 @@ impl<'a> Lifter<'a> {
         }
 
         for (&flag, &var) in &self.state.flags {
-            let offset = RegisterState::get_flag_offset(flag);
+            let offset = RegisterState::get_flag_offset(flag)?;
             let val = self
                 .builder
                 .ins()
@@ -221,7 +221,7 @@ impl<'a> Lifter<'a> {
 
         for (&reg, &var) in &self.state.gprs {
             let val = self.builder.use_var(var);
-            let offset = RegisterState::get_gpr_offset(reg);
+            let offset = RegisterState::get_gpr_offset(reg)?;
             self.builder
                 .ins()
                 .store(MemFlags::trusted(), val, ctx_ptr, offset);
@@ -229,7 +229,7 @@ impl<'a> Lifter<'a> {
 
         for (&flag, &var) in &self.state.flags {
             let val = self.builder.use_var(var);
-            let offset = RegisterState::get_flag_offset(flag);
+            let offset = RegisterState::get_flag_offset(flag)?;
             self.builder
                 .ins()
                 .store(MemFlags::trusted(), val, ctx_ptr, offset);

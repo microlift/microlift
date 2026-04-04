@@ -1,3 +1,4 @@
+use iced_x86::Register;
 use thiserror::Error;
 
 pub mod backend;
@@ -15,6 +16,9 @@ pub enum MicroliftError {
 
     #[error("cranelift error: {0}")]
     CraneliftError(String),
+
+    #[error("unsupported register: {0:?}")]
+    UnsupportedRegister(Register),
 }
 
 pub type Result<T> = std::result::Result<T, MicroliftError>;
