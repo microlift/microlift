@@ -22,7 +22,9 @@ fn run_rip_test(
 
     let mut func_ctx = cranelift_frontend::FunctionBuilderContext::new();
     let builder = cranelift_frontend::FunctionBuilder::new(&mut func, &mut func_ctx);
-    let mut lifter = Lifter::new(builder, base_address);
+    let mut lifter = Lifter::new(builder);
+
+    ctx.image_base = base_address;
 
     lifter.lift(bytes, ip).expect("lifting failed");
 

@@ -18,6 +18,7 @@ pub struct RegisterContext {
     pub r14: u64,
     pub r15: u64,
     pub rip: u64,
+    pub image_base: u64,
     // Flags as individual bytes for simpler IR load/store
     pub cf: u8,
     pub pf: u8,

@@ -9,6 +9,7 @@ pub struct RegisterState {
     pub gprs: HashMap<Register, Variable>,
     pub flags: HashMap<X86Flag, Variable>,
     pub context_ptr: Variable,
+    pub image_base: Variable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -66,11 +67,13 @@ impl RegisterState {
         }
 
         let context_ptr = builder.declare_var(types::I64); // Assume 64-bit pointer
+        let image_base = builder.declare_var(types::I64);
 
         Self {
             gprs,
             flags,
             context_ptr,
+            image_base,
         }
     }
 
@@ -113,9 +116,6 @@ pub struct Lifter<'a> {
     pub state: RegisterState,
     pub blocks: HashMap<u64, Block>,
     pub sealed_blocks: HashSet<Block>,
-    /// The virtual address of the program image as seen by the guest.
-    /// Used to reconcile RIP without requiring the original bytes at runtime.
-    pub base_address: u64,
     /// The `ip` value passed to `lift()` — i.e. the original VA of the first
     /// instruction in the lifted region.  RIP offsets are relative to this.
     pub lift_base: u64,
@@ -129,11 +129,10 @@ pub struct Lifter<'a> {
 impl<'a> Lifter<'a> {
     /// Create a new `Lifter`.
     ///
-    /// `base_address` is the virtual address at which the guest program image
-    /// is loaded.  RIP is reconciled as `base_address + (current_ip - lift_base)`
-    /// so that the instruction pointer remains correct even when the original
-    /// x86-64 bytes are not present at runtime (AOT recompilation).
-    pub fn new(builder: FunctionBuilder<'a>, base_address: u64) -> Self {
+    /// RIP is reconciled dynamically at runtime as `image_base + (current_ip - lift_base)`,
+    /// where `image_base` is loaded from the `RegisterContext`. This allows the 
+    /// lifted code to remain correct even if the program image is relocated by ASLR.
+    pub fn new(builder: FunctionBuilder<'a>) -> Self {
         let mut builder = builder;
         let state = RegisterState::new(&mut builder);
         Self {
@@ -141,7 +140,6 @@ impl<'a> Lifter<'a> {
             state,
             blocks: HashMap::new(),
             sealed_blocks: HashSet::new(),
-            base_address,
             lift_base: 0,
             current_ip: 0,
         }
@@ -194,6 +192,16 @@ impl<'a> Lifter<'a> {
                 .load(types::I8, MemFlags::trusted(), ctx_ptr_val, offset);
             self.builder.def_var(var, val);
         }
+
+        // Load image_base from context for dynamic RIP reconciliation.
+        let image_base_offset = std::mem::offset_of!(RegisterContext, image_base) as i32;
+        let image_base_val = self.builder.ins().load(
+            types::I64,
+            MemFlags::trusted(),
+            ctx_ptr_val,
+            image_base_offset,
+        );
+        self.builder.def_var(self.state.image_base, image_base_val);
 
         while decoder.can_decode() {
             let current_ip = decoder.ip();
@@ -265,15 +273,12 @@ impl<'a> Lifter<'a> {
 
         // Flush RIP.  current_ip holds next_ip of the last lifted instruction,
         // which is what RIP would contain after that instruction retires.
-        // We express it as base_address + (current_ip - lift_base) so the
+        // We express it as image_base + (current_ip - lift_base) so the
         // value is correct even when the original bytes are not present
-        // (AOT half-virtualization scenario).
-        let reconciled_rip =
-            self.base_address.wrapping_add(self.current_ip.wrapping_sub(self.lift_base));
-        let rip_val = self
-            .builder
-            .ins()
-            .iconst(types::I64, reconciled_rip as i64);
+        // (AOT half-virtualization scenario) OR when relocated by ASLR.
+        let image_base = self.builder.use_var(self.state.image_base);
+        let offset = self.current_ip.wrapping_sub(self.lift_base);
+        let rip_val = self.builder.ins().iadd_imm(image_base, offset as i64);
         let rip_offset = std::mem::offset_of!(crate::context::RegisterContext, rip) as i32;
         self.builder
             .ins()

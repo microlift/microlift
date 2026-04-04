@@ -3,6 +3,7 @@ use cranelift_codegen::ir::{Function, UserFuncName};
 use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::settings;
 use microlift::backend::CraneliftBackend;
+use microlift::context::RegisterContext;
 use microlift::lifter::Lifter;
 
 #[test]
@@ -24,7 +25,10 @@ fn test_mov_rax_imm() {
     let mut func_ctx = cranelift_frontend::FunctionBuilderContext::new();
     let builder = cranelift_frontend::FunctionBuilder::new(&mut func, &mut func_ctx);
 
-    let mut lifter = Lifter::new(builder, 0x1000);
+    let mut lifter = Lifter::new(builder);
+
+    let mut ctx = RegisterContext::default();
+    ctx.image_base = 0x1000;
 
     // mov rax, 42; ret
     let bytes = [0x48, 0xC7, 0xC0, 0x2A, 0x00, 0x00, 0x00, 0xC3];
@@ -35,8 +39,6 @@ fn test_mov_rax_imm() {
     let mut backend = CraneliftBackend::new().expect("backend init failed");
     let code_ptr = backend.compile(func).expect("compilation failed");
 
-    use microlift::context::RegisterContext;
-    let mut ctx = RegisterContext::default();
     let f: fn(*mut RegisterContext) = unsafe { std::mem::transmute(code_ptr) };
     f(&mut ctx);
     assert_eq!(ctx.rax, 42);

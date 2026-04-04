@@ -17,7 +17,9 @@ fn run_test(bytes: &[u8], mut ctx: RegisterContext) -> RegisterContext {
 
     let mut func_ctx = cranelift_frontend::FunctionBuilderContext::new();
     let builder = cranelift_frontend::FunctionBuilder::new(&mut func, &mut func_ctx);
-    let mut lifter = Lifter::new(builder, 0x1000);
+    let mut lifter = Lifter::new(builder);
+
+    ctx.image_base = 0x1000;
 
     lifter.lift(bytes, 0x1000).expect("lifting failed");
 
