@@ -3,6 +3,9 @@ name = "microlift"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+disasm = ["dep:capstone"]
+
 [dependencies]
 cranelift = "0.130.0"
 cranelift-frontend = "0.130.0"
@@ -11,6 +14,7 @@ cranelift-jit = "0.130.0"
 cranelift-native = "0.130.0"
 cranelift-object = "0.130.0"
 object = "0.36"
+capstone = { version = "0.13.0", optional = true }
 iced-x86 = "1.21.0"
 target-lexicon = "0.13.5"
 thiserror = "1.0"

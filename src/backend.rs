@@ -1,13 +1,16 @@
 use crate::Result;
 use cranelift::prelude::*;
-use std::sync::Arc;
 use cranelift_codegen::ir::Function;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
 use cranelift_native::builder as native_builder;
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use object::{Object, ObjectSection};
+use std::sync::Arc;
 use target_lexicon::Triple;
+
+#[cfg(feature = "disasm")]
+use capstone::prelude::*;
 
 pub struct CraneliftBackend {
     module: JITModule,
@@ -56,8 +59,9 @@ pub struct ArtifactBackend;
 impl ArtifactBackend {
     fn get_isa(triple: Option<&str>) -> Result<Arc<dyn isa::TargetIsa>> {
         let triple_obj = if let Some(t) = triple {
-            t.parse::<Triple>()
-                .map_err(|_| crate::MicroliftError::CraneliftError("invalid target triple".into()))?
+            t.parse::<Triple>().map_err(|_| {
+                crate::MicroliftError::CraneliftError("invalid target triple".into())
+            })?
         } else {
             Triple::host()
         };
@@ -113,5 +117,65 @@ impl ArtifactBackend {
             .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
 
         Ok(bytes.to_vec())
+    }
+
+    #[cfg(feature = "disasm")]
+    pub fn disassemble(bytes: &[u8], triple: Option<&str>) -> Result<String> {
+        use target_lexicon::Architecture;
+
+        let triple_obj = if let Some(t) = triple {
+            t.parse::<Triple>().map_err(|_| {
+                crate::MicroliftError::CraneliftError("invalid target triple".into())
+            })?
+        } else {
+            Triple::host()
+        };
+
+        let (arch, mode) = match triple_obj.architecture {
+            Architecture::X86_64 => (capstone::Arch::X86, capstone::Mode::Mode64),
+            Architecture::Riscv64(_) => (capstone::Arch::RISCV, capstone::Mode::Mode64),
+            Architecture::Aarch64(_) => (capstone::Arch::ARM64, capstone::Mode::Arm),
+            _ => {
+                return Err(crate::MicroliftError::CraneliftError(format!(
+                    "unsupported architecture for disassembly: {:?}",
+                    triple_obj.architecture
+                )));
+            }
+        };
+
+        let cs = match triple_obj.architecture {
+            Architecture::X86_64 => Capstone::new()
+                .x86()
+                .mode(capstone::arch::x86::ArchMode::Mode64)
+                .build()
+                .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?,
+            Architecture::Riscv64(_) => Capstone::new()
+                .riscv()
+                .mode(capstone::arch::riscv::ArchMode::RiscV64)
+                .build()
+                .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?,
+            Architecture::Aarch64(_) => Capstone::new()
+                .arm64()
+                .mode(capstone::arch::arm64::ArchMode::Arm)
+                .build()
+                .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?,
+            _ => {
+                return Err(crate::MicroliftError::CraneliftError(format!(
+                    "unsupported architecture for disassembly: {:?}",
+                    triple_obj.architecture
+                )));
+            }
+        };
+
+        let insns = cs
+            .disasm_all(bytes, 0x0)
+            .map_err(|e: capstone::Error| crate::MicroliftError::CraneliftError(e.to_string()))?;
+
+        let mut output = String::new();
+        for i in insns.as_ref() {
+            output.push_str(&format!("{}\n", i));
+        }
+
+        Ok(output)
     }
 }
