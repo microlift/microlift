@@ -676,17 +676,6 @@ impl<'a> Lifter<'a> {
             .ins()
             .brif(zf, next_block, &[], target_block, &[]);
 
-        // Switch to the target block for fallthrough (which is target_block? No, it should be the NEXT instruction's block)
-        // Wait, standard brif(c, t1, t2) -> t1 if c.
-        // My handle_jnz: brif(zf, next_block, target_block) -> if zf is 1 (zero), skip to next_block. If zf is 0 (not zero), jump to target_block.
-        // So target_block is WHERE we jump if NOT zero.
-        // The fallthrough after the branch instruction is next_ip.
-        // So next_block is ALWAYS where we continue if the branch isn't taken?
-        // Let's re-think JNZ (Jump Not Zero).
-        // if zero (ZF=1) -> fallthrough (next_ip)
-        // if not zero (ZF=0) -> jump (target)
-        // My brif(zf, next_block, target_block) does exactly that!
-
         // After handle_jnz, the current block in lifter.rs will be finished.
         // We should switch to the block that logically follows it in terms of instruction order.
         self.builder.switch_to_block(next_block);
@@ -700,7 +689,14 @@ impl<'a> Lifter<'a> {
         let scale = instruction.memory_index_scale();
         let disp = instruction.memory_displacement64();
 
-        let mut ptr = if base_reg != Register::None {
+        let mut ptr = if base_reg == Register::RIP {
+            // RIP-relative: iced-x86 sets 'disp' to the absolute target address (as decoded).
+            // We reconcile this target address to our 'base_address'.
+            let target_rip = disp;
+            let offset = target_rip.wrapping_sub(self.lift_base);
+            let reconciled = self.base_address.wrapping_add(offset);
+            self.builder.ins().iconst(types::I64, reconciled as i64)
+        } else if base_reg != Register::None {
             self.get_reg_val(base_reg)?
         } else {
             self.builder.ins().iconst(types::I64, 0)
@@ -716,7 +712,9 @@ impl<'a> Lifter<'a> {
             ptr = self.builder.ins().iadd(ptr, scaled_index);
         }
 
-        if disp != 0 {
+        // Only add displacement if it was NOT RIP-relative.
+        // For RIP-relative, the target address is already our 'ptr'.
+        if base_reg != Register::RIP && disp != 0 {
             ptr = self.builder.ins().iadd_imm(ptr, disp as i64);
         }
 
@@ -724,6 +722,15 @@ impl<'a> Lifter<'a> {
     }
 
     fn get_reg_val(&mut self, reg: Register) -> crate::Result<Value> {
+        // RIP is handled specially: materialise it as a compile-time constant
+        // using the base_address + offset formula so that the original bytes
+        // are not required at runtime.
+        if reg == Register::RIP {
+            let reconciled =
+                self.base_address.wrapping_add(self.current_ip.wrapping_sub(self.lift_base));
+            return Ok(self.builder.ins().iconst(types::I64, reconciled as i64));
+        }
+
         let base_reg = get_base_reg_64(reg);
         let size = reg.size();
         let is_high_8 = is_high_8_reg(reg);
@@ -747,6 +754,14 @@ impl<'a> Lifter<'a> {
     }
 
     fn set_reg_val(&mut self, reg: Register, val: Value) -> crate::Result<()> {
+        // Writing RIP directly via a data instruction is illegal in x86-64.
+        // Branches/jumps set RIP implicitly through control-flow IR, not here.
+        if reg == Register::RIP {
+            return Err(MicroliftError::UnsupportedInstruction {
+                mnemonic: "set-RIP (direct write to RIP is illegal in x86-64)".into(),
+            });
+        }
+
         let base_reg = get_base_reg_64(reg);
         let size = reg.size();
         let is_high_8 = is_high_8_reg(reg);

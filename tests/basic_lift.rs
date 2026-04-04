@@ -24,7 +24,7 @@ fn test_mov_rax_imm() {
     let mut func_ctx = cranelift_frontend::FunctionBuilderContext::new();
     let builder = cranelift_frontend::FunctionBuilder::new(&mut func, &mut func_ctx);
 
-    let mut lifter = Lifter::new(builder);
+    let mut lifter = Lifter::new(builder, 0x1000);
 
     // mov rax, 42; ret
     let bytes = [0x48, 0xC7, 0xC0, 0x2A, 0x00, 0x00, 0x00, 0xC3];

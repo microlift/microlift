@@ -113,10 +113,27 @@ pub struct Lifter<'a> {
     pub state: RegisterState,
     pub blocks: HashMap<u64, Block>,
     pub sealed_blocks: HashSet<Block>,
+    /// The virtual address of the program image as seen by the guest.
+    /// Used to reconcile RIP without requiring the original bytes at runtime.
+    pub base_address: u64,
+    /// The `ip` value passed to `lift()` — i.e. the original VA of the first
+    /// instruction in the lifted region.  RIP offsets are relative to this.
+    pub lift_base: u64,
+    /// Tracks `instruction.next_ip()` for the instruction currently being
+    /// lifted.  This is the value RIP would hold after that instruction
+    /// retires, and is what we materialise on `Register::RIP` reads and store
+    /// into `RegisterContext::rip` on VM exit.
+    pub current_ip: u64,
 }
 
 impl<'a> Lifter<'a> {
-    pub fn new(builder: FunctionBuilder<'a>) -> Self {
+    /// Create a new `Lifter`.
+    ///
+    /// `base_address` is the virtual address at which the guest program image
+    /// is loaded.  RIP is reconciled as `base_address + (current_ip - lift_base)`
+    /// so that the instruction pointer remains correct even when the original
+    /// x86-64 bytes are not present at runtime (AOT recompilation).
+    pub fn new(builder: FunctionBuilder<'a>, base_address: u64) -> Self {
         let mut builder = builder;
         let state = RegisterState::new(&mut builder);
         Self {
@@ -124,6 +141,9 @@ impl<'a> Lifter<'a> {
             state,
             blocks: HashMap::new(),
             sealed_blocks: HashSet::new(),
+            base_address,
+            lift_base: 0,
+            current_ip: 0,
         }
     }
 
@@ -140,6 +160,9 @@ impl<'a> Lifter<'a> {
     pub fn lift(&mut self, bytes: &[u8], ip: u64) -> crate::Result<()> {
         let mut decoder = Decoder::with_ip(64, bytes, ip, DecoderOptions::NONE);
 
+        // Record the base IP for RIP-offset arithmetic.
+        self.lift_base = ip;
+
         // Start initial block
         let initial_block = self.get_block(ip);
         self.builder
@@ -152,7 +175,8 @@ impl<'a> Lifter<'a> {
         let ctx_ptr_val = self.builder.block_params(initial_block)[0];
         self.builder.def_var(self.state.context_ptr, ctx_ptr_val);
 
-        // Load initial state from context
+        // Load initial GPR state from context (RIP is NOT loaded into a
+        // Cranelift variable — it is reconciled lazily via current_ip).
         for (&reg, &var) in &self.state.gprs {
             let offset = RegisterState::get_gpr_offset(reg)?;
             let val = self
@@ -189,8 +213,7 @@ impl<'a> Lifter<'a> {
             }
 
             if self.builder.is_unreachable() {
-                // If we are in an unreachable state, and the start of the loop didn't switch us to a new block,
-                // then the following instructions are dead code. We skip them.
+                // Dead code after a terminator — decode and skip.
                 let mut instruction = Instruction::default();
                 decoder.decode_out(&mut instruction);
                 continue;
@@ -205,6 +228,11 @@ impl<'a> Lifter<'a> {
                     reason: "invalid instruction".to_string(),
                 });
             }
+
+            // Advance current_ip to next_ip *before* dispatching so that any
+            // read of Register::RIP inside the handler sees the correct value
+            // (RIP always points past the current instruction on real hardware).
+            self.current_ip = instruction.next_ip();
 
             self.lift_instruction(&instruction)?;
         }
@@ -234,6 +262,22 @@ impl<'a> Lifter<'a> {
                 .ins()
                 .store(MemFlags::trusted(), val, ctx_ptr, offset);
         }
+
+        // Flush RIP.  current_ip holds next_ip of the last lifted instruction,
+        // which is what RIP would contain after that instruction retires.
+        // We express it as base_address + (current_ip - lift_base) so the
+        // value is correct even when the original bytes are not present
+        // (AOT half-virtualization scenario).
+        let reconciled_rip =
+            self.base_address.wrapping_add(self.current_ip.wrapping_sub(self.lift_base));
+        let rip_val = self
+            .builder
+            .ins()
+            .iconst(types::I64, reconciled_rip as i64);
+        let rip_offset = std::mem::offset_of!(crate::context::RegisterContext, rip) as i32;
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), rip_val, ctx_ptr, rip_offset);
 
         Ok(())
     }

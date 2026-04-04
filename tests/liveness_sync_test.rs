@@ -20,7 +20,7 @@ fn test_liveness_sync_add() {
     let mut func_ctx = cranelift_frontend::FunctionBuilderContext::new();
     let builder = cranelift_frontend::FunctionBuilder::new(&mut func, &mut func_ctx);
 
-    let mut lifter = Lifter::new(builder);
+    let mut lifter = Lifter::new(builder, 0x1000);
 
     // add rax, rbx; ret
     // 48 01 D8 (add rax, rbx)
@@ -60,7 +60,7 @@ fn test_liveness_sync_flags() {
     let mut func_ctx = cranelift_frontend::FunctionBuilderContext::new();
     let builder = cranelift_frontend::FunctionBuilder::new(&mut func, &mut func_ctx);
 
-    let mut lifter = Lifter::new(builder);
+    let mut lifter = Lifter::new(builder, 0x2000);
 
     // xor rax, rax; ret (should set ZF=1)
     // 48 31 C0 (xor rax, rax)
