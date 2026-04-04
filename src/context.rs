@@ -26,6 +26,16 @@ pub struct RegisterContext {
     pub zf: u8,
     pub sf: u8,
     pub of: u8,
+    pub exit_reason: u32,
+}
+
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitReason {
+    None = 0,
+    Return = 1,
+    Syscall = 2,
+    UnknownJump = 3,
 }
 
 impl RegisterContext {

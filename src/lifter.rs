@@ -1,4 +1,4 @@
-use crate::{MicroliftError, context::RegisterContext};
+use crate::{MicroliftError, context::{RegisterContext, ExitReason}};
 use cranelift::prelude::*;
 use cranelift_frontend::{FunctionBuilder, Variable};
 use iced_x86::{Decoder, DecoderOptions, Instruction, Register};
@@ -128,6 +128,8 @@ pub struct Lifter<'a> {
     pub visited_blocks: HashSet<Block>,
     /// Tracks if the current block has been terminated (jmp, ret, etc.)
     pub block_terminated: bool,
+    /// Designated address for controlled VM exit via RET.
+    pub exit_trampoline_address: u64,
 }
 
 impl<'a> Lifter<'a> {
@@ -148,6 +150,7 @@ impl<'a> Lifter<'a> {
             current_ip: 0,
             visited_blocks: HashSet::new(),
             block_terminated: false,
+            exit_trampoline_address: 0xFFFF_FFFF_FFFF_FFFF, // Default to a safe high address
         }
     }
 
@@ -167,19 +170,26 @@ impl<'a> Lifter<'a> {
         // Record the base IP for RIP-offset arithmetic.
         self.lift_base = ip;
 
-        // Start initial block
-        let initial_block = self.get_block(ip);
+        // Create an entry block that receives function parameters
+        let entry_block = self.builder.create_block();
         self.builder
-            .append_block_params_for_function_params(initial_block);
-        self.builder.switch_to_block(initial_block);
-        self.visited_blocks.insert(initial_block);
-        self.block_terminated = false;
-        self.builder.seal_block(initial_block);
-        self.sealed_blocks.insert(initial_block);
+            .append_block_params_for_function_params(entry_block);
+        self.builder.switch_to_block(entry_block);
+
+        // Record the base IP for RIP-offset arithmetic.
+        self.lift_base = ip;
 
         // Use the first function parameter as the context pointer
-        let ctx_ptr_val = self.builder.block_params(initial_block)[0];
+        let ctx_ptr_val = self.builder.block_params(entry_block)[0];
         self.builder.def_var(self.state.context_ptr, ctx_ptr_val);
+
+        // Jump to the actual start block (this will be in the blocks map)
+        let start_block = self.get_block(ip);
+        self.builder.ins().jump(start_block, &[]);
+
+        self.builder.switch_to_block(start_block);
+        self.visited_blocks.insert(start_block);
+        self.block_terminated = false;
 
         // Load initial GPR state from context (RIP is NOT loaded into a
         // Cranelift variable — it is reconciled lazily via current_ip).
@@ -224,10 +234,6 @@ impl<'a> Lifter<'a> {
                     self.visited_blocks.insert(block);
                     self.block_terminated = false;
                 }
-                if !self.sealed_blocks.contains(&block) {
-                    self.builder.seal_block(block);
-                    self.sealed_blocks.insert(block);
-                }
             }
 
             if self.block_terminated {
@@ -257,7 +263,7 @@ impl<'a> Lifter<'a> {
 
         // Handle fallthrough at the end of the lifted region.
         if !self.block_terminated {
-            self.sync_to_context()?;
+            self.sync_to_context(None, ExitReason::None)?;
             self.builder.ins().return_(&[]);
             self.block_terminated = true;
         }
@@ -276,18 +282,17 @@ impl<'a> Lifter<'a> {
             let block = self.blocks[&offset];
             if !self.visited_blocks.contains(&block) && !processed_blocks.contains(&block) {
                 self.builder.switch_to_block(block);
-                // Note: we don't check is_unreachable here because unvisited blocks are pristine.
-                if !self.sealed_blocks.contains(&block) {
-                    self.builder.seal_block(block);
-                    self.sealed_blocks.insert(block);
-                }
                 // Sync to context at this target IP
                 self.current_ip = offset;
-                self.sync_to_context()?;
+                self.sync_to_context(None, ExitReason::None)?;
                 self.builder.ins().return_(&[]);
                 processed_blocks.insert(block);
             }
         }
+
+        // Final Sealing Pass: Seal all blocks currently known to the builder.
+        // This includes all internal targets, exit blocks, and fallthroughs.
+        self.builder.seal_all_blocks();
 
         Ok(())
     }
@@ -296,7 +301,11 @@ impl<'a> Lifter<'a> {
         self.handle_instruction(instruction)
     }
 
-    pub fn sync_to_context(&mut self) -> crate::Result<()> {
+    pub fn sync_to_context(
+        &mut self,
+        rip: Option<Value>,
+        reason: ExitReason,
+    ) -> crate::Result<()> {
         let ctx_ptr = self.builder.use_var(self.state.context_ptr);
 
         for (&reg, &var) in &self.state.gprs {
@@ -315,18 +324,27 @@ impl<'a> Lifter<'a> {
                 .store(MemFlags::trusted(), val, ctx_ptr, offset);
         }
 
-        // Flush RIP.  current_ip holds next_ip of the last lifted instruction,
-        // which is what RIP would contain after that instruction retires.
-        // We express it as image_base + (current_ip - lift_base) so the
-        // value is correct even when the original bytes are not present
-        // (AOT half-virtualization scenario) OR when relocated by ASLR.
-        let image_base = self.builder.use_var(self.state.image_base);
-        let offset = self.current_ip.wrapping_sub(self.lift_base);
-        let rip_val = self.builder.ins().iadd_imm(image_base, offset as i64);
+        // Flush RIP.
+        let rip_val = if let Some(r) = rip {
+            r
+        } else {
+            // Reconcile statically from current_ip
+            let image_base = self.builder.use_var(self.state.image_base);
+            let offset = self.current_ip.wrapping_sub(self.lift_base);
+            self.builder.ins().iadd_imm(image_base, offset as i64)
+        };
+
         let rip_offset = std::mem::offset_of!(crate::context::RegisterContext, rip) as i32;
         self.builder
             .ins()
             .store(MemFlags::trusted(), rip_val, ctx_ptr, rip_offset);
+
+        // Store exit reason
+        let reason_val = self.builder.ins().iconst(types::I32, reason as i64);
+        let reason_offset = std::mem::offset_of!(crate::context::RegisterContext, exit_reason) as i32;
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), reason_val, ctx_ptr, reason_offset);
 
         Ok(())
     }

@@ -19,13 +19,22 @@ fn run_test(bytes: &[u8], mut ctx: RegisterContext) -> RegisterContext {
     let builder = cranelift_frontend::FunctionBuilder::new(&mut func, &mut func_ctx);
     let mut lifter = Lifter::new(builder);
 
+    let mut stack = [0u64; 1024];
+    let stack_ptr = stack.as_mut_ptr() as u64;
+    let stack_top = stack_ptr + 8192;
+    ctx.rsp = stack_top - 8;
     ctx.image_base = 0x1000;
+
+    let exit_trampoline = lifter.exit_trampoline_address;
+    unsafe {
+        *(ctx.rsp as *mut u64) = exit_trampoline;
+    }
 
     lifter.lift(bytes, 0x1000).expect("lifting failed");
 
-    println!("IR: {}", func);
-
     let mut backend = CraneliftBackend::new().expect("backend init failed");
+    drop(lifter);
+    // println!("IR: {}", func); // Dropping lifter allows immutable borrow of func
     let code_ptr = backend.compile(func).expect("compilation failed");
 
     let f: fn(*mut RegisterContext) = unsafe { std::mem::transmute(code_ptr) };
@@ -81,11 +90,6 @@ fn test_inc_dec() {
 #[test]
 fn test_cmp_jnz() {
     // mov rax, 10; cmp rax, 10; jne target; mov rax, 20; target: ret
-    // 0: 48 c7 c0 0a 00 00 00    mov rax, 10
-    // 7: 48 83 f8 0a             cmp rax, 10
-    // b: 75 07                   jne +7 (to ret)
-    // d: 48 c7 c0 14 00 00 00    mov rax, 20
-    // 14: c3                     ret
     let bytes = [
         0x48, 0xC7, 0xC0, 0x0A, 0x00, 0x00, 0x00, 0x48, 0x83, 0xF8, 0x0A, 0x75, 0x07, 0x48, 0xC7,
         0xC0, 0x14, 0x00, 0x00, 0x00, 0xC3,

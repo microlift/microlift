@@ -19,13 +19,21 @@ fn run_test(bytes: &[u8], mut ctx: RegisterContext) -> RegisterContext {
     let builder = cranelift_frontend::FunctionBuilder::new(&mut func, &mut func_ctx);
     let mut lifter = Lifter::new(builder);
 
+    let mut stack = [0u64; 1024];
+    let stack_ptr = stack.as_mut_ptr() as u64;
+    let stack_top = stack_ptr + 8192;
+    ctx.rsp = stack_top - 8;
     ctx.image_base = 0x1000;
+
+    let exit_trampoline = lifter.exit_trampoline_address;
+    unsafe {
+        *(ctx.rsp as *mut u64) = exit_trampoline;
+    }
 
     lifter.lift(bytes, 0x1000).expect("lifting failed");
 
-    println!("IR: {}", func);
-
     let mut backend = CraneliftBackend::new().expect("backend init failed");
+    drop(lifter);
     let code_ptr = backend.compile(func).expect("compilation failed");
 
     let f: fn(*mut RegisterContext) = unsafe { std::mem::transmute(code_ptr) };
@@ -35,7 +43,6 @@ fn run_test(bytes: &[u8], mut ctx: RegisterContext) -> RegisterContext {
 
 #[test]
 fn test_mov_32_zero_extend() {
-    // mov rax, 0xFFFFFFFFFFFFFFFF; mov eax, 0x12345678; ret
     let bytes = [
         0x48, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF, // mov rax, -1
         0xB8, 0x78, 0x56, 0x34, 0x12, // mov eax, 0x12345678
@@ -47,10 +54,8 @@ fn test_mov_32_zero_extend() {
 
 #[test]
 fn test_mov_16_partial() {
-    // mov rax, 0x1122334455667788; mov ax, 0xAAAA; ret
     let bytes = [
-        0x48, 0xB8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22,
-        0x11, // mov rax, 0x1122334455667788
+        0x48, 0xB8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // mov rax, ...
         0x66, 0xB8, 0xAA, 0xAA, // mov ax, 0xAAAA
         0xC3, // ret
     ];
@@ -60,9 +65,8 @@ fn test_mov_16_partial() {
 
 #[test]
 fn test_mov_8_partial() {
-    // mov rax, 0x1122334455667788; mov al, 0xBB; ret
     let bytes = [
-        0x48, 0xB8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // mov rax, 11...
+        0x48, 0xB8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
         0xB0, 0xBB, // mov al, 0xBB
         0xC3, // ret
     ];
@@ -72,9 +76,8 @@ fn test_mov_8_partial() {
 
 #[test]
 fn test_mov_8_high_partial() {
-    // mov rax, 0x1122334455667788; mov ah, 0xCC; ret
     let bytes = [
-        0x48, 0xB8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // mov rax, 11...
+        0x48, 0xB8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
         0xB4, 0xCC, // mov ah, 0xCC
         0xC3, // ret
     ];
@@ -84,7 +87,6 @@ fn test_mov_8_high_partial() {
 
 #[test]
 fn test_add_32_flags() {
-    // mov eax, 0x7FFFFFFF; add eax, 1; ret
     let bytes = [
         0xB8, 0xFF, 0xFF, 0xFF, 0x7F, // mov eax, 0x7FFFFFFF
         0x83, 0xC0, 0x01, // add eax, 1
@@ -100,7 +102,6 @@ fn test_add_32_flags() {
 
 #[test]
 fn test_sub_8_carry() {
-    // mov al, 0; sub al, 1; ret
     let bytes = [
         0xB0, 0x00, // mov al, 0
         0x2C, 0x01, // sub al, 1
@@ -115,7 +116,6 @@ fn test_sub_8_carry() {
 
 #[test]
 fn test_inc_8_overflow() {
-    // mov al, 0x7F; inc al; ret
     let bytes = [
         0xB0, 0x7F, // mov al, 0x7F
         0xFE, 0xC0, // inc al

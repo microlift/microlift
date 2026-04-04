@@ -21,6 +21,10 @@ impl<'a> Lifter<'a> {
             Mnemonic::Jmp => self.handle_jmp(instruction),
             Mnemonic::Je => self.handle_jz(instruction),
             Mnemonic::Jne => self.handle_jnz(instruction),
+            Mnemonic::Push => self.handle_push(instruction),
+            Mnemonic::Pop => self.handle_pop(instruction),
+            Mnemonic::Call => self.handle_call(instruction),
+            Mnemonic::Syscall => self.handle_syscall(instruction),
             Mnemonic::Nop => self.handle_nop(instruction),
             _ => Err(MicroliftError::UnsupportedInstruction {
                 mnemonic: format!("{:?}", instruction.mnemonic()),
@@ -86,9 +90,153 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    fn handle_ret(&mut self, _instruction: &Instruction) -> crate::Result<()> {
-        // Sync modified state back to context before returning
-        self.sync_to_context()?;
+    fn handle_ret(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let imm = instruction.immediate16(); // for RET n
+
+        let rsp = self.get_reg_val(Register::RSP)?;
+        let target_ip = self.builder.ins().load(types::I64, MemFlags::new(), rsp, 0);
+
+        let mut new_rsp = self.builder.ins().iadd_imm(rsp, 8);
+        if imm > 0 {
+            new_rsp = self.builder.ins().iadd_imm(new_rsp, imm as i64);
+        }
+        self.set_reg_val(Register::RSP, new_rsp)?;
+
+        // Internal Dispatch via Switch
+        let mut switch = cranelift_frontend::Switch::new();
+        let image_base = self.builder.use_var(self.state.image_base);
+        
+        // target_offset = target_ip - image_base + lift_base
+        let sub_base = self.builder.ins().isub(target_ip, image_base);
+        let target_offset = self.builder.ins().iadd_imm(sub_base, self.lift_base as i64);
+
+        for (&offset, &block) in &self.blocks {
+            switch.set_entry(offset as u128, block);
+        }
+
+        let external_check_block = self.builder.create_block();
+        switch.emit(&mut self.builder, target_offset, external_check_block);
+
+        // Handle Return via Trampoline or Unknown
+        self.builder.switch_to_block(external_check_block);
+        self.builder.seal_block(external_check_block);
+
+        let trampoline = self
+            .builder
+            .ins()
+            .iconst(types::I64, self.exit_trampoline_address as i64);
+        let is_trampoline = self.builder.ins().icmp(IntCC::Equal, target_ip, trampoline);
+
+        let exit_block = self.builder.create_block();
+        let unknown_block = self.builder.create_block();
+
+        self.builder
+            .ins()
+            .brif(is_trampoline, exit_block, &[], unknown_block, &[]);
+
+        // Handle Return via Trampoline
+        self.builder.switch_to_block(exit_block);
+        self.sync_to_context(Some(target_ip), crate::context::ExitReason::Return)?;
+        self.builder.ins().return_(&[]);
+
+        // Handle Unknown Jump/Return
+        self.builder.switch_to_block(unknown_block);
+        self.sync_to_context(Some(target_ip), crate::context::ExitReason::UnknownJump)?;
+        self.builder.ins().return_(&[]);
+
+        self.block_terminated = true;
+        Ok(())
+    }
+
+    fn handle_push(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let op0 = instruction.op0_kind();
+        let push_size = 8; // Default to 8 bytes for x86-64 PUSH
+
+        let val = match op0 {
+            OpKind::Register => self.get_reg_val(instruction.op0_register())?,
+            OpKind::Immediate8
+            | OpKind::Immediate16
+            | OpKind::Immediate32
+            | OpKind::Immediate64
+            | OpKind::Immediate8to16
+            | OpKind::Immediate8to32
+            | OpKind::Immediate8to64
+            | OpKind::Immediate32to64 => {
+                let imm = instruction.immediate64();
+                self.builder.ins().iconst(types::I64, imm as i64)
+            }
+            OpKind::Memory => {
+                let ptr = self.get_mem_ptr(instruction, 0)?;
+                self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0)
+            }
+            _ => {
+                return Err(MicroliftError::UnsupportedInstruction {
+                    mnemonic: format!("push-{:?}", op0),
+                });
+            }
+        };
+
+        let rsp = self.get_reg_val(Register::RSP)?;
+        let new_rsp = self.builder.ins().iadd_imm(rsp, -(push_size as i64));
+        self.set_reg_val(Register::RSP, new_rsp)?;
+
+        self.builder.ins().store(MemFlags::new(), val, new_rsp, 0);
+        Ok(())
+    }
+
+    fn handle_pop(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let op0 = instruction.op0_kind();
+        let pop_size = 8;
+
+        let rsp = self.get_reg_val(Register::RSP)?;
+        let val = self.builder.ins().load(types::I64, MemFlags::new(), rsp, 0);
+
+        let new_rsp = self.builder.ins().iadd_imm(rsp, pop_size as i64);
+        self.set_reg_val(Register::RSP, new_rsp)?;
+
+        match op0 {
+            OpKind::Register => {
+                self.set_reg_val(instruction.op0_register(), val)?;
+            }
+            OpKind::Memory => {
+                let ptr = self.get_mem_ptr(instruction, 0)?;
+                self.builder.ins().store(MemFlags::new(), val, ptr, 0);
+            }
+            _ => {
+                return Err(MicroliftError::UnsupportedInstruction {
+                    mnemonic: format!("pop-{:?}", op0),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_call(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let target = instruction.near_branch_target();
+        let next_ip = instruction.next_ip();
+        
+        // Ensure return address is a known block
+        self.get_block(next_ip);
+
+        // Push return address (current_ip) reconciled with image_base
+        let image_base = self.builder.use_var(self.state.image_base);
+        let offset = self.current_ip.wrapping_sub(self.lift_base);
+        let ret_addr = self.builder.ins().iadd_imm(image_base, offset as i64);
+
+        let rsp = self.get_reg_val(Register::RSP)?;
+        let new_rsp = self.builder.ins().iadd_imm(rsp, -8);
+        self.set_reg_val(Register::RSP, new_rsp)?;
+        self.builder.ins().store(MemFlags::new(), ret_addr, new_rsp, 0);
+
+        // Jump to target
+        let target_block = self.get_block(target);
+        self.builder.ins().jump(target_block, &[]);
+        self.block_terminated = true;
+        Ok(())
+    }
+
+    fn handle_syscall(&mut self, _instruction: &Instruction) -> crate::Result<()> {
+        self.sync_to_context(None, crate::context::ExitReason::Syscall)?;
         self.builder.ins().return_(&[]);
         self.block_terminated = true;
         Ok(())

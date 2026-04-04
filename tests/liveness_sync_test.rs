@@ -23,27 +23,34 @@ fn test_liveness_sync_add() {
     let mut lifter = Lifter::new(builder);
 
     // add rax, rbx; ret
-    // 48 01 D8 (add rax, rbx)
-    // C3 (ret)
     let bytes = [0x48, 0x01, 0xD8, 0xC3];
-    lifter.lift(&bytes, 0x1000).expect("lifting failed");
-
-    let mut backend = CraneliftBackend::new().expect("backend init failed");
-    let code_ptr = backend.compile(func).expect("compilation failed");
 
     let mut ctx = RegisterContext::default();
+    let mut stack = [0u64; 1024];
+    let stack_ptr = stack.as_mut_ptr() as u64;
+    let stack_top = stack_ptr + 8192;
+    ctx.rsp = stack_top - 8;
     ctx.image_base = 0x1000;
     ctx.rax = 100;
     ctx.rbx = 42;
+
+    let exit_trampoline = lifter.exit_trampoline_address;
+    unsafe {
+        *(ctx.rsp as *mut u64) = exit_trampoline;
+    }
+
+    lifter.lift(&bytes, 0x1000).expect("lifting failed");
+
+    let mut backend = CraneliftBackend::new().expect("backend init failed");
+    drop(lifter);
+    let code_ptr = backend.compile(func).expect("compilation failed");
 
     let f: fn(*mut RegisterContext) = unsafe { std::mem::transmute(code_ptr) };
     f(&mut ctx);
 
     // Verify sync
     assert_eq!(ctx.rax, 142);
-    // RBX should remain 42
     assert_eq!(ctx.rbx, 42);
-    // ZF should be 0 because result is not zero
     assert_eq!(ctx.zf, 0);
 }
 
@@ -64,28 +71,31 @@ fn test_liveness_sync_flags() {
     let mut lifter = Lifter::new(builder);
 
     // xor rax, rax; ret (should set ZF=1)
-    // 48 31 C0 (xor rax, rax)
-    // C3 (ret)
     let bytes = [0x48, 0x31, 0xC0, 0xC3];
-    lifter.lift(&bytes, 0x2000).expect("lifting failed");
-
-    println!("IR:\n{}", func.display());
-
-    let mut backend = CraneliftBackend::new().expect("backend init failed");
-    let code_ptr = backend.compile(func).expect("compilation failed");
 
     let mut ctx = RegisterContext::default();
+    let mut stack = [0u64; 1024];
+    let stack_ptr = stack.as_mut_ptr() as u64;
+    let stack_top = stack_ptr + 8192;
+    ctx.rsp = stack_top - 8;
     ctx.image_base = 0x2000;
     ctx.rax = 999;
 
-    println!("CTX before: {:?}", ctx);
+    let exit_trampoline = lifter.exit_trampoline_address;
+    unsafe {
+        *(ctx.rsp as *mut u64) = exit_trampoline;
+    }
+
+    lifter.lift(&bytes, 0x2000).expect("lifting failed");
+
+    let mut backend = CraneliftBackend::new().expect("backend init failed");
+    drop(lifter);
+    let code_ptr = backend.compile(func).expect("compilation failed");
+
     let f: fn(*mut RegisterContext) = unsafe { std::mem::transmute(code_ptr) };
     f(&mut ctx);
 
-    println!("CTX after: {:?}", ctx);
-
     // Verify sync
     assert_eq!(ctx.rax, 0);
-    // ZF should be 1
     assert_eq!(ctx.zf, 1);
 }
