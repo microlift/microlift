@@ -81,3 +81,44 @@ fn test_rip_sync_on_exit() {
     // reconciled_rip = 0x500000 + (0x2008 - 0x2000) = 0x500008.
     assert_eq!(ctx.rip, 0x500008);
 }
+
+#[test]
+fn test_rip_relative_jmp() {
+    // jmp 0x1010; nop; ret
+    // eb 0e (jmp 0x1010) - next_ip is 0x1002, 0x1002 + 0x0e = 0x1010
+    // 90 (nop)
+    // c3 (ret)
+    let bytes = [0xEB, 0x0E, 0x90, 0xC3];
+    let ip = 0x1000;
+    // We only lift 4 bytes. Target is 0x1010, which is outside the lifted range.
+    // The lifter should sync and return.
+    let base_address = 0x8000;
+    let ctx = run_rip_test(&bytes, ip, base_address, RegisterContext::default());
+
+    // reconciled_rip = 0x8000 + (0x1010 - 0x1000) = 0x8010
+    assert_eq!(ctx.rip, 0x8010);
+}
+
+#[test]
+fn test_rip_relative_cond_jmp() {
+    // xor rax, rax; jz 0x1010; ret
+    // 48 31 c0 (xor rax, rax)
+    // 74 0b (jz 0x1010) - next_ip is 1005, 1005+0b = 1010
+    // c3 (ret)
+    let bytes = [0x48, 0x31, 0xC0, 0x74, 0x0B, 0xC3];
+    let ip = 0x1000;
+    let base_address = 0x9000;
+
+    // Test Case 1: ZF=1 (jz taken)
+    let ctx = run_rip_test(&bytes, ip, base_address, RegisterContext::default());
+    // reconciled_rip = 0x9000 + (0x1010 - 0x1000) = 0x9010
+    assert_eq!(ctx.rip, 0x9010);
+
+    // Test Case 2: ZF=0 (jz not taken)
+    // We can't easily force ZF=0 without changing code, so let's use 'jnz' instead.
+    // 75 0b (jnz 0x1010)
+    let bytes_jnz = [0x48, 0x31, 0xC0, 0x75, 0x0B, 0xC3];
+    let ctx = run_rip_test(&bytes_jnz, ip, base_address, RegisterContext::default());
+    // next_ip after ret is 1006. Reconciled: 0x9000 + 6 = 0x9006.
+    assert_eq!(ctx.rip, 0x9006);
+}

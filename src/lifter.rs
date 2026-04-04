@@ -124,6 +124,10 @@ pub struct Lifter<'a> {
     /// retires, and is what we materialise on `Register::RIP` reads and store
     /// into `RegisterContext::rip` on VM exit.
     pub current_ip: u64,
+    /// Blocks that have been filled with instructions during the lift loop.
+    pub visited_blocks: HashSet<Block>,
+    /// Tracks if the current block has been terminated (jmp, ret, etc.)
+    pub block_terminated: bool,
 }
 
 impl<'a> Lifter<'a> {
@@ -142,6 +146,8 @@ impl<'a> Lifter<'a> {
             sealed_blocks: HashSet::new(),
             lift_base: 0,
             current_ip: 0,
+            visited_blocks: HashSet::new(),
+            block_terminated: false,
         }
     }
 
@@ -166,6 +172,8 @@ impl<'a> Lifter<'a> {
         self.builder
             .append_block_params_for_function_params(initial_block);
         self.builder.switch_to_block(initial_block);
+        self.visited_blocks.insert(initial_block);
+        self.block_terminated = false;
         self.builder.seal_block(initial_block);
         self.sealed_blocks.insert(initial_block);
 
@@ -204,15 +212,17 @@ impl<'a> Lifter<'a> {
         self.builder.def_var(self.state.image_base, image_base_val);
 
         while decoder.can_decode() {
-            let current_ip = decoder.ip();
+            let current_ip_dec = decoder.ip();
 
             // Check if this IP is a jump target
-            if let Some(&block) = self.blocks.get(&current_ip) {
-                if Some(block) != self.builder.current_block() {
-                    if !self.builder.is_unreachable() {
+            if let Some(&block) = self.blocks.get(&current_ip_dec) {
+                if Some(block) != self.builder.current_block() || self.block_terminated {
+                    if !self.block_terminated {
                         self.builder.ins().jump(block, &[]);
                     }
                     self.builder.switch_to_block(block);
+                    self.visited_blocks.insert(block);
+                    self.block_terminated = false;
                 }
                 if !self.sealed_blocks.contains(&block) {
                     self.builder.seal_block(block);
@@ -220,7 +230,7 @@ impl<'a> Lifter<'a> {
                 }
             }
 
-            if self.builder.is_unreachable() {
+            if self.block_terminated {
                 // Dead code after a terminator — decode and skip.
                 let mut instruction = Instruction::default();
                 decoder.decode_out(&mut instruction);
@@ -243,6 +253,40 @@ impl<'a> Lifter<'a> {
             self.current_ip = instruction.next_ip();
 
             self.lift_instruction(&instruction)?;
+        }
+
+        // Handle fallthrough at the end of the lifted region.
+        if !self.block_terminated {
+            self.sync_to_context()?;
+            self.builder.ins().return_(&[]);
+            self.block_terminated = true;
+        }
+
+        self.finish()
+    }
+
+    /// Fill any blocks that were created (e.g. as jump targets) but never 
+    /// visited by the decoder. These represent "VM Exits" to addresses 
+    /// outside the currently lifted region.
+    pub fn finish(&mut self) -> crate::Result<()> {
+        let mut processed_blocks = HashSet::new();
+        let all_offsets: Vec<u64> = self.blocks.keys().cloned().collect();
+
+        for offset in all_offsets {
+            let block = self.blocks[&offset];
+            if !self.visited_blocks.contains(&block) && !processed_blocks.contains(&block) {
+                self.builder.switch_to_block(block);
+                // Note: we don't check is_unreachable here because unvisited blocks are pristine.
+                if !self.sealed_blocks.contains(&block) {
+                    self.builder.seal_block(block);
+                    self.sealed_blocks.insert(block);
+                }
+                // Sync to context at this target IP
+                self.current_ip = offset;
+                self.sync_to_context()?;
+                self.builder.ins().return_(&[]);
+                processed_blocks.insert(block);
+            }
         }
 
         Ok(())

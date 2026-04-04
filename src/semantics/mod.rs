@@ -21,6 +21,7 @@ impl<'a> Lifter<'a> {
             Mnemonic::Jmp => self.handle_jmp(instruction),
             Mnemonic::Je => self.handle_jz(instruction),
             Mnemonic::Jne => self.handle_jnz(instruction),
+            Mnemonic::Nop => self.handle_nop(instruction),
             _ => Err(MicroliftError::UnsupportedInstruction {
                 mnemonic: format!("{:?}", instruction.mnemonic()),
             }),
@@ -81,10 +82,15 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
+    fn handle_nop(&mut self, _instruction: &Instruction) -> crate::Result<()> {
+        Ok(())
+    }
+
     fn handle_ret(&mut self, _instruction: &Instruction) -> crate::Result<()> {
         // Sync modified state back to context before returning
         self.sync_to_context()?;
         self.builder.ins().return_(&[]);
+        self.block_terminated = true;
         Ok(())
     }
 
@@ -637,6 +643,7 @@ impl<'a> Lifter<'a> {
         let target = instruction.near_branch_target();
         let target_block = self.get_block(target);
         self.builder.ins().jump(target_block, &[]);
+        self.block_terminated = true;
         Ok(())
     }
 
@@ -657,6 +664,8 @@ impl<'a> Lifter<'a> {
 
         // Switch to the next block for fallthrough
         self.builder.switch_to_block(next_block);
+        self.visited_blocks.insert(next_block);
+        self.block_terminated = false;
 
         Ok(())
     }
@@ -679,6 +688,8 @@ impl<'a> Lifter<'a> {
         // After handle_jnz, the current block in lifter.rs will be finished.
         // We should switch to the block that logically follows it in terms of instruction order.
         self.builder.switch_to_block(next_block);
+        self.visited_blocks.insert(next_block);
+        self.block_terminated = false;
 
         Ok(())
     }
