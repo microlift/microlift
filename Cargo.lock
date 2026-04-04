@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "adler2"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
+
+[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -108,6 +114,7 @@ dependencies = [
  "hashbrown 0.16.1",
  "libm",
  "log",
+ "pulley-interpreter",
  "regalloc2",
  "rustc-hash",
  "serde",
@@ -126,6 +133,7 @@ dependencies = [
  "cranelift-codegen-shared",
  "cranelift-srcgen",
  "heck",
+ "pulley-interpreter",
 ]
 
 [[package]]
@@ -214,16 +222,50 @@ dependencies = [
 ]
 
 [[package]]
+name = "cranelift-object"
+version = "0.130.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9809d2d419cd18f17377f4ce64a7ad22eeda0d042c08833d3796657f1ddebc82"
+dependencies = [
+ "anyhow",
+ "cranelift-codegen",
+ "cranelift-control",
+ "cranelift-module",
+ "log",
+ "object 0.38.1",
+ "target-lexicon",
+]
+
+[[package]]
 name = "cranelift-srcgen"
 version = "0.130.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8594dc6bb4860fa8292f1814c76459dbfb933e1978d8222de6380efce45c7cee"
 
 [[package]]
+name = "crc32fast"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
+
+[[package]]
+name = "flate2"
+version = "1.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
+dependencies = [
+ "crc32fast",
+ "miniz_oxide",
+]
 
 [[package]]
 name = "fnv"
@@ -323,6 +365,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "memchr"
+version = "2.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
+
+[[package]]
 name = "microlift"
 version = "0.1.0"
 dependencies = [
@@ -332,9 +380,44 @@ dependencies = [
  "cranelift-jit",
  "cranelift-module",
  "cranelift-native",
+ "cranelift-object",
  "iced-x86",
+ "object 0.36.7",
  "target-lexicon",
  "thiserror",
+]
+
+[[package]]
+name = "miniz_oxide"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
+dependencies = [
+ "adler2",
+ "simd-adler32",
+]
+
+[[package]]
+name = "object"
+version = "0.36.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62948e14d923ea95ea2c7c86c71013138b66525b86bdc08d2dcc262bdb497b87"
+dependencies = [
+ "flate2",
+ "memchr",
+ "ruzstd",
+]
+
+[[package]]
+name = "object"
+version = "0.38.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "271638cd5fa9cca89c4c304675ca658efc4e64a66c716b7cfe1afb4b9611dbbc"
+dependencies = [
+ "crc32fast",
+ "hashbrown 0.16.1",
+ "indexmap",
+ "memchr",
 ]
 
 [[package]]
@@ -344,6 +427,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "pulley-interpreter"
+version = "43.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7975f0975fa2c047bf47d617bdf716689e42ee82b159bd000ead7330d7697a1b"
+dependencies = [
+ "cranelift-bitset",
+ "log",
+ "pulley-macros",
+]
+
+[[package]]
+name = "pulley-macros"
+version = "43.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a210c0386ef0ddedb337ec99b91e560ae9c341415ef75958cb39ddb537bb0c84"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -388,6 +493,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94300abf3f1ae2e2b8ffb7b58043de3d399c73fa6f4b73826402a5c457614dbe"
 
 [[package]]
+name = "ruzstd"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fad02996bfc73da3e301efe90b1837be9ed8f4a462b6ed410aa35d00381de89f"
+dependencies = [
+ "twox-hash",
+]
+
+[[package]]
 name = "serde"
 version = "1.0.228"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -417,6 +531,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "simd-adler32"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "703d5c7ef118737c72f1af64ad2f6f8c5e1921f818cdcb97b8fe6fc69bf66214"
+
+[[package]]
 name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -427,6 +547,12 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "static_assertions"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "syn"
@@ -463,6 +589,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "twox-hash"
+version = "1.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97fee6b57c6a41524a810daee9286c02d7752c4253064d0b05472833a438f675"
+dependencies = [
+ "cfg-if",
+ "static_assertions",
 ]
 
 [[package]]
