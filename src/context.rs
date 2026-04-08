@@ -19,6 +19,8 @@ pub struct RegisterContext {
     pub r15: u64,
     pub rip: u64,
     pub image_base: u64,
+    // A syscall handler intended for the RuntimeAssisted execution mode.
+    pub syscall_handler: Option<unsafe extern "C" fn(ctx: *mut RegisterContext)>,
     // Flags as individual bytes for simpler IR load/store
     pub cf: u8,
     pub pf: u8,

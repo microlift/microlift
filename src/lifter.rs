@@ -1,5 +1,10 @@
-use crate::{MicroliftError, context::{RegisterContext, ExitReason}};
+use crate::{
+    MicroliftError,
+    context::{ExitReason, RegisterContext},
+};
 use cranelift::prelude::*;
+use cranelift_codegen::ir::SigRef;
+use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, Variable};
 use iced_x86::{Decoder, DecoderOptions, Instruction, Register};
 use std::collections::{HashMap, HashSet};
@@ -111,9 +116,32 @@ impl RegisterState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExecutionMode {
+    #[default]
+    Jit,
+    RuntimeAssisted,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LifterConfig {
+    pub execution_mode: ExecutionMode,
+    pub syscall_handler_call_conv: CallConv,
+}
+
+impl Default for LifterConfig {
+    fn default() -> Self {
+        Self {
+            execution_mode: ExecutionMode::Jit,
+            syscall_handler_call_conv: CallConv::SystemV,
+        }
+    }
+}
+
 pub struct Lifter<'a> {
     pub builder: FunctionBuilder<'a>,
     pub state: RegisterState,
+    pub config: LifterConfig,
     pub blocks: HashMap<u64, Block>,
     pub sealed_blocks: HashSet<Block>,
     /// The `ip` value passed to `lift()` — i.e. the original VA of the first
@@ -130,20 +158,35 @@ pub struct Lifter<'a> {
     pub block_terminated: bool,
     /// Designated address for controlled VM exit via RET.
     pub exit_trampoline_address: u64,
+    pub syscall_handler_sig: Option<SigRef>,
 }
 
 impl<'a> Lifter<'a> {
     /// Create a new `Lifter`.
     ///
     /// RIP is reconciled dynamically at runtime as `image_base + (current_ip - lift_base)`,
-    /// where `image_base` is loaded from the `RegisterContext`. This allows the 
+    /// where `image_base` is loaded from the `RegisterContext`. This allows the
     /// lifted code to remain correct even if the program image is relocated by ASLR.
     pub fn new(builder: FunctionBuilder<'a>) -> Self {
+        Self::with_config(builder, LifterConfig::default())
+    }
+
+    pub fn with_config(builder: FunctionBuilder<'a>, config: LifterConfig) -> Self {
         let mut builder = builder;
         let state = RegisterState::new(&mut builder);
+        let syscall_handler_sig = match config.execution_mode {
+            ExecutionMode::Jit => None,
+            ExecutionMode::RuntimeAssisted => {
+                let mut sig = Signature::new(config.syscall_handler_call_conv);
+                sig.params.push(AbiParam::new(types::I64));
+                Some(builder.import_signature(sig))
+            }
+        };
+
         Self {
             builder,
             state,
+            config,
             blocks: HashMap::new(),
             sealed_blocks: HashSet::new(),
             lift_base: 0,
@@ -151,6 +194,7 @@ impl<'a> Lifter<'a> {
             visited_blocks: HashSet::new(),
             block_terminated: false,
             exit_trampoline_address: 0xFFFF_FFFF_FFFF_FFFF, // Default to a safe high address
+            syscall_handler_sig,
         }
     }
 
@@ -191,35 +235,7 @@ impl<'a> Lifter<'a> {
         self.visited_blocks.insert(start_block);
         self.block_terminated = false;
 
-        // Load initial GPR state from context (RIP is NOT loaded into a
-        // Cranelift variable — it is reconciled lazily via current_ip).
-        for (&reg, &var) in &self.state.gprs {
-            let offset = RegisterState::get_gpr_offset(reg)?;
-            let val = self
-                .builder
-                .ins()
-                .load(types::I64, MemFlags::trusted(), ctx_ptr_val, offset);
-            self.builder.def_var(var, val);
-        }
-
-        for (&flag, &var) in &self.state.flags {
-            let offset = RegisterState::get_flag_offset(flag)?;
-            let val = self
-                .builder
-                .ins()
-                .load(types::I8, MemFlags::trusted(), ctx_ptr_val, offset);
-            self.builder.def_var(var, val);
-        }
-
-        // Load image_base from context for dynamic RIP reconciliation.
-        let image_base_offset = std::mem::offset_of!(RegisterContext, image_base) as i32;
-        let image_base_val = self.builder.ins().load(
-            types::I64,
-            MemFlags::trusted(),
-            ctx_ptr_val,
-            image_base_offset,
-        );
-        self.builder.def_var(self.state.image_base, image_base_val);
+        self.load_state_from_context()?;
 
         while decoder.can_decode() {
             let current_ip_dec = decoder.ip();
@@ -271,8 +287,8 @@ impl<'a> Lifter<'a> {
         self.finish()
     }
 
-    /// Fill any blocks that were created (e.g. as jump targets) but never 
-    /// visited by the decoder. These represent "VM Exits" to addresses 
+    /// Fill any blocks that were created (e.g. as jump targets) but never
+    /// visited by the decoder. These represent "VM Exits" to addresses
     /// outside the currently lifted region.
     pub fn finish(&mut self) -> crate::Result<()> {
         let mut processed_blocks = HashSet::new();
@@ -301,11 +317,7 @@ impl<'a> Lifter<'a> {
         self.handle_instruction(instruction)
     }
 
-    pub fn sync_to_context(
-        &mut self,
-        rip: Option<Value>,
-        reason: ExitReason,
-    ) -> crate::Result<()> {
+    pub fn sync_to_context(&mut self, rip: Option<Value>, reason: ExitReason) -> crate::Result<()> {
         let ctx_ptr = self.builder.use_var(self.state.context_ptr);
 
         for (&reg, &var) in &self.state.gprs {
@@ -341,10 +353,44 @@ impl<'a> Lifter<'a> {
 
         // Store exit reason
         let reason_val = self.builder.ins().iconst(types::I32, reason as i64);
-        let reason_offset = std::mem::offset_of!(crate::context::RegisterContext, exit_reason) as i32;
+        let reason_offset =
+            std::mem::offset_of!(crate::context::RegisterContext, exit_reason) as i32;
         self.builder
             .ins()
             .store(MemFlags::trusted(), reason_val, ctx_ptr, reason_offset);
+
+        Ok(())
+    }
+
+    pub fn load_state_from_context(&mut self) -> crate::Result<()> {
+        let ctx_ptr = self.builder.use_var(self.state.context_ptr);
+
+        // RIP is not kept as an SSA variable. We materialize it from current_ip
+        // when syncing state back to the context.
+        for (&reg, &var) in &self.state.gprs {
+            let offset = RegisterState::get_gpr_offset(reg)?;
+            let val = self
+                .builder
+                .ins()
+                .load(types::I64, MemFlags::trusted(), ctx_ptr, offset);
+            self.builder.def_var(var, val);
+        }
+
+        for (&flag, &var) in &self.state.flags {
+            let offset = RegisterState::get_flag_offset(flag)?;
+            let val = self
+                .builder
+                .ins()
+                .load(types::I8, MemFlags::trusted(), ctx_ptr, offset);
+            self.builder.def_var(var, val);
+        }
+
+        let image_base_offset = std::mem::offset_of!(RegisterContext, image_base) as i32;
+        let image_base_val =
+            self.builder
+                .ins()
+                .load(types::I64, MemFlags::trusted(), ctx_ptr, image_base_offset);
+        self.builder.def_var(self.state.image_base, image_base_val);
 
         Ok(())
     }
