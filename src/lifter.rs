@@ -9,7 +9,7 @@ use cranelift_frontend::{FunctionBuilder, Variable};
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, Register};
 use std::collections::{HashMap, HashSet};
 
-/// Mapping of x86nd registers to Cranelift variables.
+/// Mapping of x86 registers to Cranelift variables.
 pub struct RegisterState {
     pub gprs: HashMap<Register, Variable>,
     pub flags: HashMap<X86Flag, Variable>,
@@ -144,7 +144,7 @@ pub struct Lifter<'a> {
     pub config: LifterConfig,
     pub blocks: HashMap<u64, Block>,
     pub sealed_blocks: HashSet<Block>,
-    /// The `ip` value passed to `lift()` — i.e. the original VA of the first
+    /// The `ip` value passed to `lift()` - i.e. the original VA of the first
     /// instruction in the lifted region.  RIP offsets are relative to this.
     pub lift_base: u64,
     /// Tracks `instruction.next_ip()` for the instruction currently being
@@ -159,6 +159,10 @@ pub struct Lifter<'a> {
     /// Designated address for controlled VM exit via RET.
     pub exit_trampoline_address: u64,
     pub syscall_handler_sig: Option<SigRef>,
+    /// Dirty-bit tracking: GPRs that have been written since the last sync.
+    pub dirty_gprs: HashSet<Register>,
+    /// Dirty-bit tracking: flags that have been written since the last sync.
+    pub dirty_flags: HashSet<X86Flag>,
 }
 
 impl<'a> Lifter<'a> {
@@ -195,6 +199,8 @@ impl<'a> Lifter<'a> {
             block_terminated: false,
             exit_trampoline_address: 0xFFFF_FFFF_FFFF_FFFF, // Default to a safe high address
             syscall_handler_sig,
+            dirty_gprs: HashSet::new(),
+            dirty_flags: HashSet::new(),
         }
     }
 
@@ -285,7 +291,7 @@ impl<'a> Lifter<'a> {
             }
 
             if self.block_terminated {
-                // Dead code after a terminator — decode and skip.
+                // Dead code after a terminator - decode and skip.
                 let mut instruction = Instruction::default();
                 decoder.decode_out(&mut instruction);
                 continue;
@@ -339,6 +345,9 @@ impl<'a> Lifter<'a> {
         self.handle_instruction(instruction)
     }
 
+    /// Full sync - writes all GPRs and flags back to the `RegisterContext`.
+    /// Used on context reload paths and in unvisited exit stubs where we have
+    /// no accurate dirty-set information.
     pub fn sync_to_context(&mut self, rip: Option<Value>, reason: ExitReason) -> crate::Result<()> {
         let ctx_ptr = self.builder.use_var(self.state.context_ptr);
 
@@ -358,7 +367,57 @@ impl<'a> Lifter<'a> {
                 .store(MemFlags::trusted(), val, ctx_ptr, offset);
         }
 
-        // Flush RIP.
+        self.flush_rip_and_reason(rip, reason)?;
+        Ok(())
+    }
+
+    /// Selective sync - only writes GPRs and flags that have been written since
+    /// the last `load_state_from_context` call. RIP and exit_reason are always
+    /// written. This is the preferred sync to use on normal VM-exit paths.
+    pub fn sync_to_context_selective(
+        &mut self,
+        rip: Option<Value>,
+        reason: ExitReason,
+    ) -> crate::Result<()> {
+        let ctx_ptr = self.builder.use_var(self.state.context_ptr);
+
+        // Clone the dirty sets so we can iterate without borrowing self.
+        let dirty_gprs: Vec<Register> = self.dirty_gprs.iter().cloned().collect();
+        let dirty_flags: Vec<X86Flag> = self.dirty_flags.iter().cloned().collect();
+
+        for reg in dirty_gprs {
+            if let Some(&var) = self.state.gprs.get(&reg) {
+                let val = self.builder.use_var(var);
+                let offset = RegisterState::get_gpr_offset(reg)?;
+                self.builder
+                    .ins()
+                    .store(MemFlags::trusted(), val, ctx_ptr, offset);
+            }
+        }
+
+        for flag in dirty_flags {
+            if let Some(&var) = self.state.flags.get(&flag) {
+                let val = self.builder.use_var(var);
+                let offset = RegisterState::get_flag_offset(flag)?;
+                self.builder
+                    .ins()
+                    .store(MemFlags::trusted(), val, ctx_ptr, offset);
+            }
+        }
+
+        self.flush_rip_and_reason(rip, reason)?;
+        Ok(())
+    }
+
+    /// Shared helper: write RIP and exit_reason to the context. Always called
+    /// by both `sync_to_context` and `sync_to_context_selective`.
+    fn flush_rip_and_reason(
+        &mut self,
+        rip: Option<Value>,
+        reason: ExitReason,
+    ) -> crate::Result<()> {
+        let ctx_ptr = self.builder.use_var(self.state.context_ptr);
+
         let rip_val = if let Some(r) = rip {
             r
         } else {
@@ -413,6 +472,11 @@ impl<'a> Lifter<'a> {
                 .ins()
                 .load(types::I64, MemFlags::trusted(), ctx_ptr, image_base_offset);
         self.builder.def_var(self.state.image_base, image_base_val);
+
+        // After a full reload, the dirty sets are cleared - everything in the
+        // context is now in sync with our SSA variables.
+        self.dirty_gprs.clear();
+        self.dirty_flags.clear();
 
         Ok(())
     }
