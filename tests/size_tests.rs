@@ -126,3 +126,30 @@ fn test_inc_8_overflow() {
     assert_eq!(ctx.of, 1);
     assert_eq!(ctx.sf, 1);
 }
+
+#[test]
+fn test_not_preserves_flags() {
+    let bytes = [
+        0xB0, 0x00, // mov al, 0
+        0x2C, 0x01, // sub al, 1
+        0xF6, 0xD0, // not al
+        0xC3, // ret
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rax & 0xFF, 0x00);
+    assert_eq!(ctx.cf, 1);
+    assert_eq!(ctx.zf, 0);
+    assert_eq!(ctx.sf, 1);
+}
+
+#[test]
+fn test_movzx_reg8_to_reg32() {
+    let bytes = [
+        0x48, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF, // mov rcx, -1
+        0xB3, 0x80, // mov bl, 0x80
+        0x0F, 0xB6, 0xCB, // movzx ecx, bl
+        0xC3, // ret
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rcx, 0x80);
+}

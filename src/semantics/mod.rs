@@ -1,26 +1,32 @@
 use crate::MicroliftError;
 use crate::lifter::{ExecutionMode, Lifter};
 use cranelift::prelude::*;
-use iced_x86::{Instruction, Mnemonic, OpKind, Register};
+use iced_x86::{Code, CodeSize, Instruction, Mnemonic, OpKind, Register};
 
 impl<'a> Lifter<'a> {
     pub fn handle_instruction(&mut self, instruction: &Instruction) -> crate::Result<()> {
         match instruction.mnemonic() {
             Mnemonic::Mov => self.handle_mov(instruction),
+            Mnemonic::Movzx => self.handle_movzx(instruction),
             Mnemonic::Ret => self.handle_ret(instruction),
             Mnemonic::Add => self.handle_add(instruction),
             Mnemonic::Sub => self.handle_sub(instruction),
+            Mnemonic::Xadd => self.handle_xadd(instruction),
             Mnemonic::Xor => self.handle_xor(instruction),
             Mnemonic::And => self.handle_and(instruction),
             Mnemonic::Or => self.handle_or(instruction),
+            Mnemonic::Not => self.handle_not(instruction),
             Mnemonic::Test => self.handle_test(instruction),
             Mnemonic::Cmp => self.handle_cmp(instruction),
             Mnemonic::Inc => self.handle_inc(instruction),
             Mnemonic::Dec => self.handle_dec(instruction),
             Mnemonic::Lea => self.handle_lea(instruction),
             Mnemonic::Jmp => self.handle_jmp(instruction),
+            Mnemonic::Jb => self.handle_jb(instruction),
+            Mnemonic::Jbe => self.handle_jbe(instruction),
             Mnemonic::Je => self.handle_jz(instruction),
             Mnemonic::Jne => self.handle_jnz(instruction),
+            Mnemonic::Loop => self.handle_loop(instruction),
             Mnemonic::Push => self.handle_push(instruction),
             Mnemonic::Pop => self.handle_pop(instruction),
             Mnemonic::Call => self.handle_call(instruction),
@@ -33,56 +39,26 @@ impl<'a> Lifter<'a> {
     }
 
     fn handle_mov(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let op0 = instruction.op0_kind();
-        let op1 = instruction.op1_kind();
+        let size = self.operand_size(instruction, 0)?;
+        let src_val = self.read_operand(instruction, 1, size)?;
+        self.write_operand(instruction, 0, src_val)?;
 
-        let size = if op0 == OpKind::Register {
-            instruction.op0_register().size()
+        Ok(())
+    }
+
+    fn handle_movzx(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst_reg = instruction.op0_register();
+        let dst_ty = size_to_type(dst_reg.size());
+        let src_size = self.operand_size(instruction, 1)?;
+        let src_val = self.read_operand(instruction, 1, src_size)?;
+
+        let extended = if self.builder.func.dfg.value_type(src_val) == dst_ty {
+            src_val
         } else {
-            instruction.memory_size().size()
-        };
-        let ty = size_to_type(size);
-
-        let src_val = match op1 {
-            OpKind::Register => self.get_reg_val(instruction.op1_register())?,
-            OpKind::Immediate8
-            | OpKind::Immediate16
-            | OpKind::Immediate32
-            | OpKind::Immediate64
-            | OpKind::Immediate8to16
-            | OpKind::Immediate8to32
-            | OpKind::Immediate8to64
-            | OpKind::Immediate32to64 => {
-                let imm = instruction.immediate64();
-                self.builder.ins().iconst(ty, imm as i64)
-            }
-            OpKind::Memory => {
-                let ptr = self.get_mem_ptr(instruction, 1)?;
-                self.builder.ins().load(ty, MemFlags::new(), ptr, 0)
-            }
-            _ => {
-                return Err(MicroliftError::UnsupportedInstruction {
-                    mnemonic: format!("mov-src-{:?}", op1),
-                });
-            }
+            self.builder.ins().uextend(dst_ty, src_val)
         };
 
-        match op0 {
-            OpKind::Register => {
-                let reg = instruction.op0_register();
-                self.set_reg_val(reg, src_val)?;
-            }
-            OpKind::Memory => {
-                let ptr = self.get_mem_ptr(instruction, 0)?;
-                self.builder.ins().store(MemFlags::new(), src_val, ptr, 0);
-            }
-            _ => {
-                return Err(MicroliftError::UnsupportedInstruction {
-                    mnemonic: "mov-dst-unknown".into(),
-                });
-            }
-        }
-
+        self.set_reg_val(dst_reg, extended)?;
         Ok(())
     }
 
@@ -340,6 +316,16 @@ impl<'a> Lifter<'a> {
                 });
             }
         }
+        Ok(())
+    }
+
+    fn handle_not(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let size = self.operand_size(instruction, 0)?;
+        let ty = size_to_type(size);
+        let dst_val = self.read_operand(instruction, 0, size)?;
+        let all_ones = self.builder.ins().iconst(ty, -1);
+        let result = self.builder.ins().bxor(dst_val, all_ones);
+        self.write_operand(instruction, 0, result)?;
         Ok(())
     }
 
@@ -642,6 +628,19 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
+    fn handle_xadd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let size = self.operand_size(instruction, 0)?;
+        let dst_val = self.read_operand(instruction, 0, size)?;
+        let src_reg = instruction.op1_register();
+        let src_val = self.get_reg_val(src_reg)?;
+
+        let result = self.builder.ins().iadd(dst_val, src_val);
+        self.write_operand(instruction, 0, result)?;
+        self.set_reg_val(src_reg, dst_val)?;
+        self.update_flags_add(dst_val, src_val, result, size)?;
+        Ok(())
+    }
+
     fn handle_cmp(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let op0 = instruction.op0_kind();
         let op1 = instruction.op1_kind();
@@ -848,22 +847,75 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
+    fn handle_jb(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let cf = self
+            .builder
+            .use_var(self.state.flags[&crate::lifter::X86Flag::Carry]);
+        self.handle_conditional_branch(instruction, cf)
+    }
+
+    fn handle_jbe(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let cf = self
+            .builder
+            .use_var(self.state.flags[&crate::lifter::X86Flag::Carry]);
+        let zf = self
+            .builder
+            .use_var(self.state.flags[&crate::lifter::X86Flag::Zero]);
+        let cond = self.builder.ins().bor(cf, zf);
+        self.handle_conditional_branch(instruction, cond)
+    }
+
     fn handle_jz(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let zf = self
+            .builder
+            .use_var(self.state.flags[&crate::lifter::X86Flag::Zero]);
+        self.handle_conditional_branch(instruction, zf)
+    }
+
+    fn handle_jnz(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let zf = self
+            .builder
+            .use_var(self.state.flags[&crate::lifter::X86Flag::Zero]);
+        self.handle_conditional_branch_inverted(instruction, zf)
+    }
+
+    fn handle_loop(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let counter_reg = match instruction.code() {
+            Code::Loop_rel8_16_CX | Code::Loop_rel8_16_ECX | Code::Loop_rel8_16_RCX => {
+                Register::CX
+            }
+            Code::Loop_rel8_32_CX | Code::Loop_rel8_32_ECX => Register::ECX,
+            Code::Loop_rel8_64_ECX => Register::ECX,
+            Code::Loop_rel8_64_RCX => Register::RCX,
+            _ => match instruction.code_size() {
+                CodeSize::Code16 => Register::CX,
+                CodeSize::Code32 => Register::ECX,
+                _ => Register::RCX,
+            },
+        };
+
+        let counter = self.get_reg_val(counter_reg)?;
+        let one = self.builder.ins().iconst(size_to_type(counter_reg.size()), 1);
+        let decremented = self.builder.ins().isub(counter, one);
+        self.set_reg_val(counter_reg, decremented)?;
+        self.handle_conditional_branch(instruction, decremented)
+    }
+
+    fn handle_conditional_branch(
+        &mut self,
+        instruction: &Instruction,
+        cond: Value,
+    ) -> crate::Result<()> {
         let target = instruction.near_branch_target();
         let next_ip = instruction.next_ip();
 
         let target_block = self.get_block(target);
         let next_block = self.get_block(next_ip);
 
-        let zf = self
-            .builder
-            .use_var(self.state.flags[&crate::lifter::X86Flag::Zero]);
-        // brif takes a i8/i32/i64 boolean-like value
         self.builder
             .ins()
-            .brif(zf, target_block, &[], next_block, &[]);
+            .brif(cond, target_block, &[], next_block, &[]);
 
-        // Switch to the next block for fallthrough
         self.builder.switch_to_block(next_block);
         self.visited_blocks.insert(next_block);
         self.block_terminated = false;
@@ -871,28 +923,105 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    fn handle_jnz(&mut self, instruction: &Instruction) -> crate::Result<()> {
+    fn handle_conditional_branch_inverted(
+        &mut self,
+        instruction: &Instruction,
+        cond: Value,
+    ) -> crate::Result<()> {
         let target = instruction.near_branch_target();
         let next_ip = instruction.next_ip();
 
         let target_block = self.get_block(target);
         let next_block = self.get_block(next_ip);
 
-        let zf = self
-            .builder
-            .use_var(self.state.flags[&crate::lifter::X86Flag::Zero]);
-        // Jump if ZF is 0
         self.builder
             .ins()
-            .brif(zf, next_block, &[], target_block, &[]);
+            .brif(cond, next_block, &[], target_block, &[]);
 
-        // After handle_jnz, the current block in lifter.rs will be finished.
-        // We should switch to the block that logically follows it in terms of instruction order.
         self.builder.switch_to_block(next_block);
         self.visited_blocks.insert(next_block);
         self.block_terminated = false;
 
         Ok(())
+    }
+
+    fn operand_kind(&self, instruction: &Instruction, op_index: u32) -> OpKind {
+        match op_index {
+            0 => instruction.op0_kind(),
+            1 => instruction.op1_kind(),
+            _ => unreachable!("unsupported operand index {op_index}"),
+        }
+    }
+
+    fn operand_register(&self, instruction: &Instruction, op_index: u32) -> Register {
+        match op_index {
+            0 => instruction.op0_register(),
+            1 => instruction.op1_register(),
+            _ => unreachable!("unsupported operand index {op_index}"),
+        }
+    }
+
+    fn operand_size(&self, instruction: &Instruction, op_index: u32) -> crate::Result<usize> {
+        let op_kind = self.operand_kind(instruction, op_index);
+        match op_kind {
+            OpKind::Register => Ok(self.operand_register(instruction, op_index).size()),
+            OpKind::Memory => Ok(instruction.memory_size().size()),
+            OpKind::Immediate8 | OpKind::Immediate8to16 | OpKind::Immediate8to32 | OpKind::Immediate8to64 => Ok(1),
+            OpKind::Immediate16 => Ok(2),
+            OpKind::Immediate32 | OpKind::Immediate32to64 => Ok(4),
+            OpKind::Immediate64 => Ok(8),
+            _ => Err(MicroliftError::UnsupportedInstruction {
+                mnemonic: format!("operand-size-{}-{:?}", op_index, op_kind),
+            }),
+        }
+    }
+
+    fn read_operand(
+        &mut self,
+        instruction: &Instruction,
+        op_index: u32,
+        size: usize,
+    ) -> crate::Result<Value> {
+        let op_kind = self.operand_kind(instruction, op_index);
+        let ty = size_to_type(size);
+        match op_kind {
+            OpKind::Register => self.get_reg_val(self.operand_register(instruction, op_index)),
+            OpKind::Memory => {
+                let ptr = self.get_mem_ptr(instruction, op_index)?;
+                Ok(self.builder.ins().load(ty, MemFlags::new(), ptr, 0))
+            }
+            OpKind::Immediate8
+            | OpKind::Immediate16
+            | OpKind::Immediate32
+            | OpKind::Immediate64
+            | OpKind::Immediate8to16
+            | OpKind::Immediate8to32
+            | OpKind::Immediate8to64
+            | OpKind::Immediate32to64 => Ok(self.builder.ins().iconst(ty, instruction.immediate64() as i64)),
+            _ => Err(MicroliftError::UnsupportedInstruction {
+                mnemonic: format!("read-op-{}-{:?}", op_index, op_kind),
+            }),
+        }
+    }
+
+    fn write_operand(
+        &mut self,
+        instruction: &Instruction,
+        op_index: u32,
+        val: Value,
+    ) -> crate::Result<()> {
+        let op_kind = self.operand_kind(instruction, op_index);
+        match op_kind {
+            OpKind::Register => self.set_reg_val(self.operand_register(instruction, op_index), val),
+            OpKind::Memory => {
+                let ptr = self.get_mem_ptr(instruction, op_index)?;
+                self.builder.ins().store(MemFlags::new(), val, ptr, 0);
+                Ok(())
+            }
+            _ => Err(MicroliftError::UnsupportedInstruction {
+                mnemonic: format!("write-op-{}-{:?}", op_index, op_kind),
+            }),
+        }
     }
 
     fn get_mem_ptr(&mut self, instruction: &Instruction, _op_index: u32) -> crate::Result<Value> {

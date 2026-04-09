@@ -6,7 +6,7 @@ use cranelift::prelude::*;
 use cranelift_codegen::ir::SigRef;
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, Variable};
-use iced_x86::{Decoder, DecoderOptions, Instruction, Register};
+use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, Register};
 use std::collections::{HashMap, HashSet};
 
 /// Mapping of x86nd registers to Cranelift variables.
@@ -210,6 +210,35 @@ impl<'a> Lifter<'a> {
 
     pub fn lift(&mut self, bytes: &[u8], ip: u64) -> crate::Result<()> {
         let mut decoder = Decoder::with_ip(64, bytes, ip, DecoderOptions::NONE);
+        let mut instructions = Vec::new();
+        let mut leaders = HashSet::from([ip]);
+
+        while decoder.can_decode() {
+            let mut instruction = Instruction::default();
+            decoder.decode_out(&mut instruction);
+
+            if instruction.is_invalid() {
+                return Err(MicroliftError::DecodeError {
+                    offset: decoder.ip(),
+                    reason: "invalid instruction".to_string(),
+                });
+            }
+
+            match instruction.mnemonic() {
+                Mnemonic::Jmp
+                | Mnemonic::Je
+                | Mnemonic::Jne
+                | Mnemonic::Jb
+                | Mnemonic::Jbe
+                | Mnemonic::Loop
+                | Mnemonic::Call => {
+                    leaders.insert(instruction.near_branch_target());
+                }
+                _ => {}
+            }
+
+            instructions.push(instruction);
+        }
 
         // Record the base IP for RIP-offset arithmetic.
         self.lift_base = ip;
@@ -228,6 +257,9 @@ impl<'a> Lifter<'a> {
         self.builder.def_var(self.state.context_ptr, ctx_ptr_val);
 
         // Jump to the actual start block (this will be in the blocks map)
+        for leader in leaders {
+            self.get_block(leader);
+        }
         let start_block = self.get_block(ip);
         self.builder.ins().jump(start_block, &[]);
 
@@ -237,8 +269,8 @@ impl<'a> Lifter<'a> {
 
         self.load_state_from_context()?;
 
-        while decoder.can_decode() {
-            let current_ip_dec = decoder.ip();
+        for instruction in instructions {
+            let current_ip_dec = instruction.ip();
 
             // Check if this IP is a jump target
             if let Some(&block) = self.blocks.get(&current_ip_dec) {
@@ -257,16 +289,6 @@ impl<'a> Lifter<'a> {
                 let mut instruction = Instruction::default();
                 decoder.decode_out(&mut instruction);
                 continue;
-            }
-
-            let mut instruction = Instruction::default();
-            decoder.decode_out(&mut instruction);
-
-            if instruction.is_invalid() {
-                return Err(MicroliftError::DecodeError {
-                    offset: decoder.ip(),
-                    reason: "invalid instruction".to_string(),
-                });
             }
 
             // Advance current_ip to next_ip *before* dispatching so that any
