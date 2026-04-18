@@ -45,3 +45,39 @@ impl RegisterContext {
         Self::default()
     }
 }
+
+#[derive(Debug, Clone)]
+pub struct MemorySegment {
+    pub address: u64,
+    pub data: Vec<u8>,
+    pub writable: bool,
+}
+
+impl MemorySegment {
+    pub fn new(address: u64, data: Vec<u8>, writable: bool) -> Self {
+        Self {
+            address,
+            data,
+            writable,
+        }
+    }
+
+    pub fn contains(&self, addr: u64) -> bool {
+        addr >= self.address && addr < self.address + self.data.len() as u64
+    }
+
+    pub fn read(&self, addr: u64, size: usize) -> Option<u64> {
+        if !self.contains(addr) || !self.contains(addr + size as u64 - 1) {
+            return None;
+        }
+
+        let offset = (addr - self.address) as usize;
+        let bytes = &self.data[offset..offset + size];
+
+        let mut val = 0u64;
+        for (i, &b) in bytes.iter().enumerate() {
+            val |= (b as u64) << (i * 8);
+        }
+        Some(val)
+    }
+}

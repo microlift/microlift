@@ -115,6 +115,7 @@ fn test_syscall_runtime_assisted_continues() {
     let config = LifterConfig {
         execution_mode: ExecutionMode::RuntimeAssisted,
         syscall_handler_call_conv: CallConv::SystemV,
+        segments: Vec::new(),
     };
     let ctx = run_stack_test_with_config(
         &bytes,
@@ -141,6 +142,7 @@ fn test_syscall_runtime_assisted_falls_back_to_exit_without_handler() {
     let config = LifterConfig {
         execution_mode: ExecutionMode::RuntimeAssisted,
         syscall_handler_call_conv: CallConv::SystemV,
+        segments: Vec::new(),
     };
     let ctx = run_stack_test_with_config(&bytes, RegisterContext::default(), config);
 

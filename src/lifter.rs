@@ -1,6 +1,6 @@
 use crate::{
     MicroliftError,
-    context::{ExitReason, RegisterContext},
+    context::{ExitReason, MemorySegment, RegisterContext},
 };
 use cranelift::prelude::*;
 use cranelift_codegen::ir::SigRef;
@@ -123,10 +123,11 @@ pub enum ExecutionMode {
     RuntimeAssisted,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct LifterConfig {
     pub execution_mode: ExecutionMode,
     pub syscall_handler_call_conv: CallConv,
+    pub segments: Vec<MemorySegment>,
 }
 
 impl Default for LifterConfig {
@@ -134,6 +135,7 @@ impl Default for LifterConfig {
         Self {
             execution_mode: ExecutionMode::Jit,
             syscall_handler_call_conv: CallConv::SystemV,
+            segments: Vec::new(),
         }
     }
 }

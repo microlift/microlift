@@ -19,7 +19,8 @@
 //!            Empty   (unreachable)
 //! ```
 
-use iced_x86::{Instruction, Mnemonic, OpKind, Register};
+use crate::context::MemorySegment;
+use iced_x86::{Instruction, MemorySize, Mnemonic, OpKind, Register};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 // Value Set lattice
@@ -222,14 +223,20 @@ impl RegisterValueSet {
 pub struct ValueSetAnalyzer {
     /// Map from instruction IP -> inferred register value sets *before* that instruction.
     pub value_sets: HashMap<u64, RegisterValueSet>,
+    pub segments: Vec<MemorySegment>,
     worklist: VecDeque<usize>,
     visited: HashSet<usize>,
 }
 
 impl ValueSetAnalyzer {
     pub fn new() -> Self {
+        Self::with_segments(Vec::new())
+    }
+
+    pub fn with_segments(segments: Vec<MemorySegment>) -> Self {
         Self {
             value_sets: HashMap::new(),
+            segments,
             worklist: VecDeque::new(),
             visited: HashSet::new(),
         }
@@ -326,7 +333,7 @@ impl ValueSetAnalyzer {
 
     /// Abstract transfer function - apply one instruction to a pre-state to
     /// produce a post-state.
-    fn transfer(&self, state: &RegisterValueSet, inst: &Instruction) -> RegisterValueSet {
+    pub fn transfer(&self, state: &RegisterValueSet, inst: &Instruction) -> RegisterValueSet {
         let mut out = state.clone();
 
         match inst.mnemonic() {
@@ -433,7 +440,70 @@ impl ValueSetAnalyzer {
             OpKind::Immediate8to32 => ValueSet::Constant(inst.immediate8to32() as i64),
             OpKind::Immediate8to64 => ValueSet::Constant(inst.immediate8to64()),
             OpKind::Immediate32to64 => ValueSet::Constant(inst.immediate32to64()),
-            // Memory and other operands are unknown
+
+            // Memory operands: try to resolve if they point into a rodata segment
+            OpKind::Memory => {
+                let base_reg = inst.memory_base();
+                let index_reg = inst.memory_index();
+                let disp = inst.memory_displacement64();
+                let scale = inst.memory_index_scale();
+
+                let mut addr = disp;
+
+                if base_reg != Register::None {
+                    let base_vs = state.get(base_reg);
+                    if let ValueSet::Constant(c) = base_vs {
+                        addr = addr.wrapping_add(c as u64);
+                    } else if base_reg == Register::RIP {
+                        // RIP-relative addressing: iced-x86 already resolves the
+                        // displacement to an absolute address (disp = RIP + offset).
+                        // So 'addr' is already correct.
+                    } else {
+                        return ValueSet::Top;
+                    }
+                }
+
+                if index_reg != Register::None {
+                    let index_vs = state.get(index_reg);
+                    if let ValueSet::Constant(c) = index_vs {
+                        addr = addr.wrapping_add((c as u64).wrapping_mul(scale as u64));
+                    } else {
+                        return ValueSet::Top;
+                    }
+                }
+
+                // Address resolved to a constant. Check segments.
+                for segment in &self.segments {
+                    if segment.contains(addr) {
+                        if segment.writable {
+                            return ValueSet::Top; // Writable is unpredictable
+                        }
+
+                        let size = match inst.memory_size() {
+                            MemorySize::UInt8 | MemorySize::Int8 => 1,
+                            MemorySize::UInt16 | MemorySize::Int16 => 2,
+                            MemorySize::UInt32 | MemorySize::Int32 => 4,
+                            MemorySize::UInt64 | MemorySize::Int64 => 8,
+                            _ => return ValueSet::Top,
+                        };
+
+                        if let Some(val) = segment.read(addr, size) {
+                            // Sign extend if necessary
+                            let val = match inst.memory_size() {
+                                MemorySize::Int8 => val as i8 as i64,
+                                MemorySize::Int16 => val as i16 as i64,
+                                MemorySize::Int32 => val as i32 as i64,
+                                _ => val as i64,
+                            };
+                            return ValueSet::Constant(val);
+                        }
+                    }
+                }
+
+                ValueSet::Top
+            }
+
+            // Other operands are unknown
             _ => ValueSet::Top,
         }
     }
