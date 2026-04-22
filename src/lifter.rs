@@ -5,7 +5,7 @@ use crate::{
 use cranelift::prelude::*;
 use cranelift_codegen::ir::SigRef;
 use cranelift_codegen::isa::CallConv;
-use cranelift_frontend::{FunctionBuilder, Variable};
+use cranelift_frontend::{FunctionBuilder, Switch, Variable};
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, Register};
 use std::collections::{HashMap, HashSet};
 
@@ -128,6 +128,8 @@ pub struct LifterConfig {
     pub execution_mode: ExecutionMode,
     pub syscall_handler_call_conv: CallConv,
     pub segments: Vec<MemorySegment>,
+    pub interpreter_fallback: bool,
+    pub emit_resume_blocks: bool,
 }
 
 impl Default for LifterConfig {
@@ -136,6 +138,8 @@ impl Default for LifterConfig {
             execution_mode: ExecutionMode::Jit,
             syscall_handler_call_conv: CallConv::SystemV,
             segments: Vec::new(),
+            interpreter_fallback: false,
+            emit_resume_blocks: false,
         }
     }
 }
@@ -264,18 +268,49 @@ impl<'a> Lifter<'a> {
         let ctx_ptr_val = self.builder.block_params(entry_block)[0];
         self.builder.def_var(self.state.context_ptr, ctx_ptr_val);
 
-        // Jump to the actual start block (this will be in the blocks map)
-        for leader in leaders {
+        // Load state from context *before* dispatching. Logic in blocks will use
+        // the SSA variables defined here.
+        self.load_state_from_context()?;
+
+        if self.config.emit_resume_blocks {
+            for instruction in &instructions {
+                leaders.insert(instruction.ip());
+                leaders.insert(instruction.next_ip());
+            }
+        }
+
+        // Populate blocks map for all leaders
+        for &leader in &leaders {
             self.get_block(leader);
         }
+
+        // Resumable Dispatch:
+        // Instead of always jumping to the 'ip' passed to lift, we look at the
+        // current RIP in the context. If it matches one of our blocks, we jump there.
+        // This is what enables resumable AOT.
+        let rip_val = self.builder.ins().load(
+            types::I64,
+            MemFlags::trusted(),
+            ctx_ptr_val,
+            std::mem::offset_of!(RegisterContext, rip) as i32,
+        );
+        let image_base_val = self.builder.use_var(self.state.image_base);
+
+        // Normalize RIP to a region-relative offset
+        let relative_rip = self.builder.ins().isub(rip_val, image_base_val);
+
+        let mut switch = Switch::new();
+        for (&offset, &block) in &self.blocks {
+            let relative_offset = offset.wrapping_sub(self.lift_base);
+            switch.set_entry(relative_offset.into(), block);
+        }
+
         let start_block = self.get_block(ip);
-        self.builder.ins().jump(start_block, &[]);
+        switch.emit(&mut self.builder, relative_rip, start_block);
 
-        self.builder.switch_to_block(start_block);
+        // We don't switch_to_block here yet, we'll do it in the loop
         self.visited_blocks.insert(start_block);
-        self.block_terminated = false;
-
-        self.load_state_from_context()?;
+        self.block_terminated = true; // Force switch to first block in loop
 
         for instruction in instructions {
             let current_ip_dec = instruction.ip();

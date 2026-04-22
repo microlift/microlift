@@ -3,11 +3,14 @@ use cranelift_codegen::ir::{Function, UserFuncName};
 use cranelift_codegen::isa::CallConv;
 use microlift::backend::ArtifactBackend;
 use microlift::lifter::{ExecutionMode, Lifter, LifterConfig};
+use microlift::os::get_host_calling_conv;
 
 #[test]
 fn test_compile_host_object() {
-    let mut func =
-        Function::with_name_signature(UserFuncName::user(0, 0), Signature::new(CallConv::SystemV));
+    let mut func = Function::with_name_signature(
+        UserFuncName::user(0, 0),
+        Signature::new(get_host_calling_conv()),
+    );
     func.signature.params.push(AbiParam::new(types::I64));
 
     let mut func_ctx = cranelift_frontend::FunctionBuilderContext::new();
@@ -125,7 +128,7 @@ fn test_compile_runtime_assisted_syscall_object() {
         LifterConfig {
             execution_mode: ExecutionMode::RuntimeAssisted,
             syscall_handler_call_conv: CallConv::SystemV,
-            segments: Vec::new(),
+            ..Default::default()
         },
     );
 

@@ -5,14 +5,17 @@ use cranelift_codegen::settings;
 use microlift::backend::CraneliftBackend;
 use microlift::context::RegisterContext;
 use microlift::lifter::Lifter;
+use microlift::os::get_host_calling_conv;
 
 fn run_test(bytes: &[u8], mut ctx: RegisterContext) -> RegisterContext {
     let mut flag_builder = settings::builder();
     flag_builder.set("use_colocated_libcalls", "false").unwrap();
     flag_builder.set("is_pic", "false").unwrap();
 
-    let mut func =
-        Function::with_name_signature(UserFuncName::user(0, 0), Signature::new(CallConv::Fast));
+    let mut func = Function::with_name_signature(
+        UserFuncName::user(0, 0),
+        Signature::new(get_host_calling_conv()),
+    );
     func.signature.params.push(AbiParam::new(types::I64));
 
     let mut func_ctx = cranelift_frontend::FunctionBuilderContext::new();

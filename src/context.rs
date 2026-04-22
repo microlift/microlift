@@ -19,8 +19,12 @@ pub struct RegisterContext {
     pub r15: u64,
     pub rip: u64,
     pub image_base: u64,
-    // A syscall handler intended for the RuntimeAssisted execution mode.
+    /// A syscall handler intended for the RuntimeAssisted execution mode.
     pub syscall_handler: Option<unsafe extern "C" fn(ctx: *mut RegisterContext)>,
+    /// FIXME:
+    /// # **DO NOT USE!!!**
+    /// Resume function pointer for AOT block dispatch (**not implemented yet** - this is a placeholder)
+    pub resume_function: Option<unsafe extern "C" fn(ctx: *mut RegisterContext)>,
     // Flags as individual bytes for simpler IR load/store
     pub cf: u8,
     pub pf: u8,
@@ -29,6 +33,7 @@ pub struct RegisterContext {
     pub sf: u8,
     pub of: u8,
     pub exit_reason: u32,
+    pub exit_code: u32,
 }
 
 #[repr(u32)]
@@ -38,6 +43,7 @@ pub enum ExitReason {
     Return = 1,
     Syscall = 2,
     UnknownJump = 3,
+    UnimplementedInstruction = 4,
 }
 
 impl RegisterContext {

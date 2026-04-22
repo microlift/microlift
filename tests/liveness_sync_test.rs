@@ -5,6 +5,7 @@ use cranelift_codegen::settings;
 use microlift::backend::CraneliftBackend;
 use microlift::context::RegisterContext;
 use microlift::lifter::Lifter;
+use microlift::os::get_host_calling_conv;
 
 #[test]
 fn test_liveness_sync_add() {
@@ -12,8 +13,10 @@ fn test_liveness_sync_add() {
     flag_builder.set("use_colocated_libcalls", "false").unwrap();
     flag_builder.set("is_pic", "false").unwrap();
 
-    let mut func =
-        Function::with_name_signature(UserFuncName::user(0, 0), Signature::new(CallConv::Fast));
+    let mut func = Function::with_name_signature(
+        UserFuncName::user(0, 0),
+        Signature::new(get_host_calling_conv()),
+    );
     // Input: *mut RegisterContext (I64)
     func.signature.params.push(AbiParam::new(types::I64));
 

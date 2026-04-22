@@ -10,6 +10,7 @@ pub mod flags;
 pub mod helpers;
 pub mod memory;
 pub mod syscall;
+pub mod unimplemented;
 
 use crate::MicroliftError;
 use crate::lifter::Lifter;
@@ -130,9 +131,15 @@ impl<'a> Lifter<'a> {
             // System
             Mnemonic::Syscall => self.handle_syscall(instruction),
 
-            _ => Err(MicroliftError::UnsupportedInstruction {
-                mnemonic: format!("{:?}", instruction.mnemonic()),
-            }),
+            _ => {
+                if self.config.interpreter_fallback {
+                    self.handle_unimplemented_instruction(instruction)
+                } else {
+                    Err(MicroliftError::UnsupportedInstruction {
+                        mnemonic: format!("{:?}", instruction.mnemonic()),
+                    })
+                }
+            }
         }
     }
 }

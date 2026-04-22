@@ -1,10 +1,10 @@
 use cranelift::prelude::*;
 use cranelift_codegen::ir::{Function, UserFuncName};
-use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::settings;
 use microlift::backend::CraneliftBackend;
 use microlift::context::RegisterContext;
 use microlift::lifter::Lifter;
+use microlift::os::get_host_calling_conv;
 
 #[test]
 fn test_mov_rax_imm() {
@@ -16,8 +16,10 @@ fn test_mov_rax_imm() {
         .finish(settings::Flags::new(flag_builder))
         .unwrap();
 
-    let mut func =
-        Function::with_name_signature(UserFuncName::user(0, 0), Signature::new(CallConv::Fast));
+    let mut func = Function::with_name_signature(
+        UserFuncName::user(0, 0),
+        Signature::new(get_host_calling_conv()),
+    );
     // Input: *mut RegisterContext (I64)
     func.signature.params.push(AbiParam::new(types::I64));
     // Output: void
