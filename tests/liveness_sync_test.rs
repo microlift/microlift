@@ -44,7 +44,8 @@ fn test_liveness_sync_add() {
 
     lifter.lift(&bytes, 0x1000).expect("lifting failed");
 
-    let mut backend = CraneliftBackend::new().expect("backend init failed");
+    let mut backend = CraneliftBackend::with_flags(settings::Flags::new(flag_builder))
+        .expect("backend init failed");
     drop(lifter);
     let code_ptr = backend.compile(func).expect("compilation failed");
 

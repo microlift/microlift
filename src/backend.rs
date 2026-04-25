@@ -18,11 +18,14 @@ pub struct CraneliftBackend {
 
 impl CraneliftBackend {
     pub fn new() -> Result<Self> {
+        Self::with_flags(settings::Flags::new(settings::builder()))
+    }
+
+    pub fn with_flags(flags: settings::Flags) -> Result<Self> {
         let isa_builder =
             native_builder().map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
-        let flag_builder = settings::builder();
         let isa = isa_builder
-            .finish(settings::Flags::new(flag_builder))
+            .finish(flags)
             .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
 
         let jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
@@ -57,7 +60,10 @@ impl CraneliftBackend {
 pub struct ArtifactBackend;
 
 impl ArtifactBackend {
-    fn get_isa(triple: Option<&str>) -> Result<Arc<dyn isa::TargetIsa>> {
+    fn get_isa(
+        triple: Option<&str>,
+        flags: Option<settings::Flags>,
+    ) -> Result<Arc<dyn isa::TargetIsa>> {
         let triple_obj = if let Some(t) = triple {
             t.parse::<Triple>().map_err(|_| {
                 crate::MicroliftError::CraneliftError("invalid target triple".into())
@@ -69,16 +75,23 @@ impl ArtifactBackend {
         let isa_builder = cranelift_codegen::isa::lookup(triple_obj)
             .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
 
-        let flag_builder = settings::builder();
         let isa = isa_builder
-            .finish(settings::Flags::new(flag_builder))
+            .finish(if let Some(f) = flags {
+                f
+            } else {
+                settings::Flags::new(settings::builder())
+            })
             .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
 
         Ok(isa)
     }
 
-    pub fn compile_to_object(func: Function, triple: Option<&str>) -> Result<Vec<u8>> {
-        let isa = Self::get_isa(triple)?;
+    pub fn compile_to_object(
+        func: Function,
+        triple: Option<&str>,
+        flags: Option<settings::Flags>,
+    ) -> Result<Vec<u8>> {
+        let isa = Self::get_isa(triple, flags)?;
         let obj_builder =
             ObjectBuilder::new(isa, "lifted", cranelift_module::default_libcall_names())
                 .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
@@ -100,8 +113,12 @@ impl ArtifactBackend {
             .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?)
     }
 
-    pub fn compile_to_raw(func: Function, triple: Option<&str>) -> Result<Vec<u8>> {
-        let obj_bytes = Self::compile_to_object(func, triple)?;
+    pub fn compile_to_raw(
+        func: Function,
+        triple: Option<&str>,
+        flags: Option<settings::Flags>,
+    ) -> Result<Vec<u8>> {
+        let obj_bytes = Self::compile_to_object(func, triple, flags)?;
         let obj = object::File::parse(&*obj_bytes)
             .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
 
