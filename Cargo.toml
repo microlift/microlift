@@ -14,7 +14,7 @@ cranelift-jit = "0.130.0"
 cranelift-native = "0.130.0"
 cranelift-object = "0.130.0"
 object = "0.36"
-capstone = { version = "0.13.0", optional = true }
+capstone = { version = "0.13", optional = true }
 iced-x86 = "1"
 target-lexicon = "0.13"
 thiserror = "1"
