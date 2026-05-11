@@ -230,10 +230,11 @@ impl<'a> Lifter<'a> {
             decoder.decode_out(&mut instruction);
 
             if instruction.is_invalid() {
-                return Err(MicroliftError::DecodeError {
-                    offset: decoder.ip(),
-                    reason: "invalid instruction".to_string(),
-                });
+                // Treat as block terminator - next IP may still be a
+                // valid branch target from elsewhere in the function.
+                leaders.insert(instruction.next_ip());
+                instructions.push(instruction); // keep it, phase 2 will emit a fault stub
+                continue; // keep scanning past it
             }
 
             match instruction.mnemonic() {
@@ -331,6 +332,16 @@ impl<'a> Lifter<'a> {
                 // Dead code after a terminator - decode and skip.
                 let mut instruction = Instruction::default();
                 decoder.decode_out(&mut instruction);
+                continue;
+            }
+
+            if instruction.is_invalid() {
+                // Sync RIP to point AT the invalid instruction so the host
+                // sees the correct faulting address.
+                self.current_ip = instruction.ip(); // not next_ip - we didn't execute it
+                self.sync_to_context(None, ExitReason::InvalidInstruction)?;
+                self.builder.ins().return_(&[]);
+                self.block_terminated = true;
                 continue;
             }
 

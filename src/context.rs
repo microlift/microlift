@@ -40,10 +40,19 @@ pub struct RegisterContext {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitReason {
     None = 0,
+    /// A terminating block was reached. The code has executed successfully up to its VM return trampoline.
     Return = 1,
+    /// A system call was issued by the guest.
     Syscall = 2,
+    /// The code would have branched out to an unresolvable address in memory.
+    /// It is up to the runtime to decide what to do with this.
     UnknownJump = 3,
+    /// The instruction that was about to be executed is not implemented in Microlift.
+    /// This becomes a resumable VM exit in RuntimeAssisted mode when ran with `interpreter_fallback`.
     UnimplementedInstruction = 4,
+    /// The code that was about to be executed did not decode as
+    /// valid x64.
+    InvalidInstruction = 5,
 }
 
 impl RegisterContext {
