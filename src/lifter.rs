@@ -15,6 +15,10 @@ pub struct RegisterState {
     pub flags: HashMap<X86Flag, Variable>,
     pub context_ptr: Variable,
     pub image_base: Variable,
+    /// XMM0–XMM15 low 64 bits (index 0–15).
+    pub xmms_lo: HashMap<u8, Variable>,
+    /// XMM0–XMM15 high 64 bits (index 0–15).
+    pub xmms_hi: HashMap<u8, Variable>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -74,11 +78,20 @@ impl RegisterState {
         let context_ptr = builder.declare_var(types::I64); // Assume 64-bit pointer
         let image_base = builder.declare_var(types::I64);
 
+        let mut xmms_lo = HashMap::new();
+        let mut xmms_hi = HashMap::new();
+        for i in 0u8..16 {
+            xmms_lo.insert(i, builder.declare_var(types::I64));
+            xmms_hi.insert(i, builder.declare_var(types::I64));
+        }
+
         Self {
             gprs,
             flags,
             context_ptr,
             image_base,
+            xmms_lo,
+            xmms_hi,
         }
     }
 
@@ -113,6 +126,13 @@ impl RegisterState {
             X86Flag::Sign => Ok(std::mem::offset_of!(RegisterContext, sf) as i32),
             X86Flag::Overflow => Ok(std::mem::offset_of!(RegisterContext, of) as i32),
         }
+    }
+
+    /// Returns the byte offset of the low (hi=false) or high (hi=true) 64-bit
+    /// half of XMM register `idx` (0–15) within `RegisterContext`.
+    pub fn get_xmm_offset(idx: u8, hi: bool) -> i32 {
+        let base = std::mem::offset_of!(RegisterContext, xmm) as i32;
+        base + (idx as i32) * 16 + if hi { 8 } else { 0 }
     }
 }
 
@@ -169,6 +189,8 @@ pub struct Lifter<'a> {
     pub dirty_gprs: HashSet<Register>,
     /// Dirty-bit tracking: flags that have been written since the last sync.
     pub dirty_flags: HashSet<X86Flag>,
+    /// Dirty-bit tracking: XMM registers (by index 0–15) written since last sync.
+    pub dirty_xmms: HashSet<u8>,
 }
 
 impl<'a> Lifter<'a> {
@@ -207,6 +229,7 @@ impl<'a> Lifter<'a> {
             syscall_handler_sig,
             dirty_gprs: HashSet::new(),
             dirty_flags: HashSet::new(),
+            dirty_xmms: HashSet::new(),
         }
     }
 
@@ -415,6 +438,19 @@ impl<'a> Lifter<'a> {
                 .store(MemFlags::trusted(), val, ctx_ptr, offset);
         }
 
+        for i in 0u8..16 {
+            let lo_var = *self.state.xmms_lo.get(&i).unwrap();
+            let hi_var = *self.state.xmms_hi.get(&i).unwrap();
+            let lo_val = self.builder.use_var(lo_var);
+            let hi_val = self.builder.use_var(hi_var);
+            self.builder
+                .ins()
+                .store(MemFlags::trusted(), lo_val, ctx_ptr, RegisterState::get_xmm_offset(i, false));
+            self.builder
+                .ins()
+                .store(MemFlags::trusted(), hi_val, ctx_ptr, RegisterState::get_xmm_offset(i, true));
+        }
+
         self.flush_rip_and_reason(rip, reason)?;
         Ok(())
     }
@@ -451,6 +487,26 @@ impl<'a> Lifter<'a> {
                     .ins()
                     .store(MemFlags::trusted(), val, ctx_ptr, offset);
             }
+        }
+
+        let dirty_xmms: Vec<u8> = self.dirty_xmms.iter().cloned().collect();
+        for idx in dirty_xmms {
+            let lo_var = *self.state.xmms_lo.get(&idx).unwrap();
+            let hi_var = *self.state.xmms_hi.get(&idx).unwrap();
+            let lo_val = self.builder.use_var(lo_var);
+            let hi_val = self.builder.use_var(hi_var);
+            self.builder.ins().store(
+                MemFlags::trusted(),
+                lo_val,
+                ctx_ptr,
+                RegisterState::get_xmm_offset(idx, false),
+            );
+            self.builder.ins().store(
+                MemFlags::trusted(),
+                hi_val,
+                ctx_ptr,
+                RegisterState::get_xmm_offset(idx, true),
+            );
         }
 
         self.flush_rip_and_reason(rip, reason)?;
@@ -521,10 +577,28 @@ impl<'a> Lifter<'a> {
                 .load(types::I64, MemFlags::trusted(), ctx_ptr, image_base_offset);
         self.builder.def_var(self.state.image_base, image_base_val);
 
+        for i in 0u8..16 {
+            let lo_var = *self.state.xmms_lo.get(&i).unwrap();
+            let hi_var = *self.state.xmms_hi.get(&i).unwrap();
+            let lo_offset = RegisterState::get_xmm_offset(i, false);
+            let hi_offset = RegisterState::get_xmm_offset(i, true);
+            let lo_val =
+                self.builder
+                    .ins()
+                    .load(types::I64, MemFlags::trusted(), ctx_ptr, lo_offset);
+            let hi_val =
+                self.builder
+                    .ins()
+                    .load(types::I64, MemFlags::trusted(), ctx_ptr, hi_offset);
+            self.builder.def_var(lo_var, lo_val);
+            self.builder.def_var(hi_var, hi_val);
+        }
+
         // After a full reload, the dirty sets are cleared - everything in the
         // context is now in sync with our SSA variables.
         self.dirty_gprs.clear();
         self.dirty_flags.clear();
+        self.dirty_xmms.clear();
 
         Ok(())
     }

@@ -34,6 +34,8 @@ pub struct RegisterContext {
     pub of: u8,
     pub exit_reason: u32,
     pub exit_code: u32,
+    /// XMM0–XMM15, each stored as [lo_64, hi_64].
+    pub xmm: [[u64; 2]; 16],
 }
 
 #[repr(u32)]

@@ -9,12 +9,13 @@ pub mod control_flow;
 pub mod flags;
 pub mod helpers;
 pub mod memory;
+pub mod sse;
 pub mod syscall;
 pub mod unimplemented;
 
 use crate::MicroliftError;
 use crate::lifter::Lifter;
-use iced_x86::{Instruction, Mnemonic};
+use iced_x86::{Instruction, Mnemonic, OpKind};
 
 impl<'a> Lifter<'a> {
     pub fn handle_instruction(&mut self, instruction: &Instruction) -> crate::Result<()> {
@@ -30,10 +31,37 @@ impl<'a> Lifter<'a> {
             Mnemonic::Xchg => self.handle_xchg(instruction),
             Mnemonic::Nop => self.handle_nop(instruction),
 
+            // CET
+            Mnemonic::Endbr64 | Mnemonic::Endbr32 => self.handle_endbr64(instruction),
+
+            // SSE / SSE2 — XMM data movement
+            Mnemonic::Movaps | Mnemonic::Movapd | Mnemonic::Movups | Mnemonic::Movupd
+            | Mnemonic::Movdqa | Mnemonic::Movdqu => self.handle_movaps(instruction),
+            Mnemonic::Movq => self.handle_movq_sse(instruction),
+            Mnemonic::Movss => self.handle_movss(instruction),
+
+            // SSE / SSE2 — XMM logic
+            Mnemonic::Xorps | Mnemonic::Xorpd => self.handle_xorps(instruction),
+            Mnemonic::Pxor => self.handle_pxor(instruction),
+            Mnemonic::Andps | Mnemonic::Andpd | Mnemonic::Pand => self.handle_andps(instruction),
+            Mnemonic::Orps | Mnemonic::Orpd | Mnemonic::Por => self.handle_orps(instruction),
+            Mnemonic::Andnps | Mnemonic::Andnpd | Mnemonic::Pandn => {
+                self.handle_andnps(instruction)
+            }
+
             // String Operations
             Mnemonic::Movsb => self.handle_movsb(instruction),
             Mnemonic::Movsw => self.handle_movsw(instruction),
-            Mnemonic::Movsd => self.handle_movsd_mem(instruction),
+            // MOVSD is shared between the string op (no register operands) and
+            // SSE2 scalar-double (XMM register operands). Disambiguate by
+            // checking whether op0 is a memory-string kind.
+            Mnemonic::Movsd => {
+                if instruction.op0_kind() == OpKind::MemoryESDI {
+                    self.handle_movsd_mem(instruction)
+                } else {
+                    self.handle_movsd_sse(instruction)
+                }
+            }
             Mnemonic::Movsq => self.handle_movsq(instruction),
             Mnemonic::Stosb => self.handle_stosb(instruction),
             Mnemonic::Stosw => self.handle_stosw(instruction),

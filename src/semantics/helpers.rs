@@ -15,6 +15,30 @@ pub fn size_to_type(size: usize) -> Type {
     }
 }
 
+/// Returns the XMM register index (0–15) for an XMM register, or `None` if
+/// the register is not an XMM register.
+pub fn xmm_register_index(reg: Register) -> Option<u8> {
+    match reg {
+        Register::XMM0 => Some(0),
+        Register::XMM1 => Some(1),
+        Register::XMM2 => Some(2),
+        Register::XMM3 => Some(3),
+        Register::XMM4 => Some(4),
+        Register::XMM5 => Some(5),
+        Register::XMM6 => Some(6),
+        Register::XMM7 => Some(7),
+        Register::XMM8 => Some(8),
+        Register::XMM9 => Some(9),
+        Register::XMM10 => Some(10),
+        Register::XMM11 => Some(11),
+        Register::XMM12 => Some(12),
+        Register::XMM13 => Some(13),
+        Register::XMM14 => Some(14),
+        Register::XMM15 => Some(15),
+        _ => None,
+    }
+}
+
 pub fn is_high_8_reg(reg: Register) -> bool {
     matches!(
         reg,
@@ -280,5 +304,29 @@ impl<'a> Lifter<'a> {
     /// Read the immediate from an instruction, sign-extended to i64.
     pub fn read_imm64(&self, instruction: &Instruction) -> i64 {
         instruction.immediate64() as i64
+    }
+
+    // XMM accessors
+
+    pub fn get_xmm_lo(&mut self, idx: u8) -> Value {
+        let var = *self.state.xmms_lo.get(&idx).unwrap();
+        self.builder.use_var(var)
+    }
+
+    pub fn get_xmm_hi(&mut self, idx: u8) -> Value {
+        let var = *self.state.xmms_hi.get(&idx).unwrap();
+        self.builder.use_var(var)
+    }
+
+    pub fn set_xmm_lo(&mut self, idx: u8, val: Value) {
+        let var = *self.state.xmms_lo.get(&idx).unwrap();
+        self.builder.def_var(var, val);
+        self.dirty_xmms.insert(idx);
+    }
+
+    pub fn set_xmm_hi(&mut self, idx: u8, val: Value) {
+        let var = *self.state.xmms_hi.get(&idx).unwrap();
+        self.builder.def_var(var, val);
+        self.dirty_xmms.insert(idx);
     }
 }
