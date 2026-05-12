@@ -266,3 +266,20 @@ impl DeferredSymbol {
         }
     }
 }
+
+/// Convenience macro for creating a Function with proper casting.
+#[macro_export]
+macro_rules! trampoline_func {
+    // Variadic (ellipsis) support
+    ($func:path, $($arg:ty),*, ...) => {
+        $func as unsafe extern "C" fn($($arg),*, ...) -> _
+    };
+    // No arguments
+    ($func:path) => {
+        $func as unsafe extern "C" fn() -> _
+    };
+    // Fixed arguments
+    ($func:path, $($arg:ty),+) => {
+        $func as unsafe extern "C" fn($($arg),*) -> _
+    };
+}

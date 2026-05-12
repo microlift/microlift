@@ -377,8 +377,6 @@ impl<'a> Lifter<'a> {
                     // Only direct (near-branch) calls have a statically known
                     // target. Indirect calls (register/memory) return 0 from
                     // near_branch_target() which we don't want as a leader.
-                    // Also skip registered import addresses — they are
-                    // intercepted inline and must not become IR blocks.
                     if matches!(
                         instruction.op0_kind(),
                         OpKind::NearBranch16
@@ -386,7 +384,14 @@ impl<'a> Lifter<'a> {
                             | OpKind::NearBranch64
                     ) {
                         let target = instruction.near_branch_target();
-                        if !self.import_vas.contains(&target) {
+                        if self.import_vas.contains(&target) {
+                            // Import call: don't add the import address as a
+                            // block (we intercept it inline). Instead, add the
+                            // resume point (next_ip) so it appears in the
+                            // entry dispatch switch and slow-call exits can
+                            // resume here without needing emit_resume_blocks.
+                            leaders.insert(instruction.next_ip());
+                        } else {
                             leaders.insert(target);
                         }
                     }
