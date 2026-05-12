@@ -98,6 +98,8 @@ impl<'a> Lifter<'a> {
             Mnemonic::Sar => self.handle_sar(instruction),
             Mnemonic::Rol => self.handle_rol(instruction),
             Mnemonic::Ror => self.handle_ror(instruction),
+            Mnemonic::Shld => self.handle_shld(instruction),
+            Mnemonic::Shrd => self.handle_shrd(instruction),
 
             // Bit Manipulation
             Mnemonic::Bt => self.handle_bt(instruction),

@@ -2,7 +2,7 @@ use crate::MicroliftError;
 use crate::lifter::{Lifter, X86Flag};
 use crate::semantics::helpers::size_to_type;
 use cranelift::prelude::*;
-use iced_x86::{Instruction, OpKind};
+use iced_x86::{Instruction, OpKind, Register};
 
 impl<'a> Lifter<'a> {
     pub(super) fn handle_xor(&mut self, instruction: &Instruction) -> crate::Result<()> {
@@ -363,6 +363,104 @@ impl<'a> Lifter<'a> {
         // CF = MSB of result (the bit that rotated out of bit 0)
         let cf_bit = self.builder.ins().ushr_imm(result, (size * 8 - 1) as i64);
         self.set_flag(X86Flag::Carry, cf_bit)?;
+        Ok(())
+    }
+
+    /// Resolve the shift count for a double-shift instruction (SHLD/SHRD).
+    ///
+    /// The count is op2: either an `imm8` or the `CL` register, masked to
+    /// 5 bits for 8/16/32-bit operands or 6 bits for 64-bit operands.
+    fn double_shift_count(
+        &mut self,
+        instruction: &Instruction,
+        ty: Type,
+    ) -> crate::Result<Value> {
+        let count_raw = match instruction.op2_kind() {
+            OpKind::Register => {
+                let cl = self.get_reg_val(Register::CL)?;
+                let cl8 = self.builder.ins().ireduce(types::I8, cl);
+                self.builder.ins().uextend(ty, cl8)
+            }
+            OpKind::Immediate8
+            | OpKind::Immediate8to16
+            | OpKind::Immediate8to32
+            | OpKind::Immediate8to64 => self
+                .builder
+                .ins()
+                .iconst(ty, instruction.immediate8() as i64),
+            other => {
+                return Err(MicroliftError::UnsupportedInstruction {
+                    mnemonic: format!("double-shift-count-{:?}", other),
+                });
+            }
+        };
+        let mask = match ty {
+            types::I64 => self.builder.ins().iconst(ty, 0x3F),
+            _ => self.builder.ins().iconst(ty, 0x1F),
+        };
+        Ok(self.builder.ins().band(count_raw, mask))
+    }
+
+    /// SHLD — Shift Left Double.
+    ///
+    /// `SHLD dst, src, count`
+    /// result = (dst << count) | (src >> (N - count))
+    /// CF = last bit shifted out of dst's MSB side.
+    pub(super) fn handle_shld(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let size = self.operand_size(instruction, 0)?;
+        let ty = size_to_type(size);
+        let bits = self.builder.ins().iconst(ty, (size * 8) as i64);
+
+        let dst = self.read_operand(instruction, 0, size)?;
+        let src = self.get_reg_val(instruction.op1_register())?;
+        // get_reg_val returns the natural width of the register, which matches
+        // the destination size for well-formed SHLD.
+        let count = self.double_shift_count(instruction, ty)?;
+
+        // result = (dst << count) | (src >> (N - count))
+        let right_count = self.builder.ins().isub(bits, count);
+        let shifted_dst = self.builder.ins().ishl(dst, count);
+        let shifted_src = self.builder.ins().ushr(src, right_count);
+        let result = self.builder.ins().bor(shifted_dst, shifted_src);
+
+        self.write_operand(instruction, 0, result)?;
+
+        // CF = (dst >> (N - count)) & 1  (last bit shifted out of dst's MSB)
+        let cf_raw = self.builder.ins().ushr(dst, right_count);
+        let one = self.builder.ins().iconst(ty, 1);
+        let cf_bit = self.builder.ins().band(cf_raw, one);
+        self.update_flags_shift(result, cf_bit, size)?;
+        Ok(())
+    }
+
+    /// SHRD — Shift Right Double.
+    ///
+    /// `SHRD dst, src, count`
+    /// result = (src << (N - count)) | (dst >> count)
+    /// CF = last bit shifted out of dst's LSB side.
+    pub(super) fn handle_shrd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let size = self.operand_size(instruction, 0)?;
+        let ty = size_to_type(size);
+        let bits = self.builder.ins().iconst(ty, (size * 8) as i64);
+
+        let dst = self.read_operand(instruction, 0, size)?;
+        let src = self.get_reg_val(instruction.op1_register())?;
+        let count = self.double_shift_count(instruction, ty)?;
+
+        // result = (src << (N - count)) | (dst >> count)
+        let left_count = self.builder.ins().isub(bits, count);
+        let shifted_src = self.builder.ins().ishl(src, left_count);
+        let shifted_dst = self.builder.ins().ushr(dst, count);
+        let result = self.builder.ins().bor(shifted_src, shifted_dst);
+
+        self.write_operand(instruction, 0, result)?;
+
+        // CF = (dst >> (count - 1)) & 1  (last bit shifted out of dst's LSB)
+        let one = self.builder.ins().iconst(ty, 1);
+        let cf_shift = self.builder.ins().isub(count, one);
+        let cf_raw = self.builder.ins().ushr(dst, cf_shift);
+        let cf_bit = self.builder.ins().band(cf_raw, one);
+        self.update_flags_shift(result, cf_bit, size)?;
         Ok(())
     }
 
