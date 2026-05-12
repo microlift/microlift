@@ -1,6 +1,5 @@
 use cranelift::prelude::*;
 use cranelift_codegen::ir::{Function, UserFuncName};
-use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::settings;
 use microlift::backend::CraneliftBackend;
 use microlift::context::RegisterContext;

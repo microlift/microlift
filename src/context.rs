@@ -34,6 +34,13 @@ pub struct RegisterContext {
     pub of: u8,
     pub exit_reason: u32,
     pub exit_code: u32,
+    /// On `ImportedFunctionCall` exits, contains the virtual address of the
+    /// imported function that was called (i.e. the value of RIP at the `CALL`
+    /// target, before execution was intercepted). For indirect calls this is
+    /// the runtime-resolved target address. The host uses this to look up the
+    /// function and dispatch it. `rip` points to the instruction *after* the
+    /// `CALL` — the resume point once the host has handled the call.
+    pub imported_function_va: u64,
     /// XMM0–XMM15, each stored as [lo_64, hi_64].
     pub xmm: [[u64; 2]; 16],
 }
@@ -55,6 +62,14 @@ pub enum ExitReason {
     /// The code that was about to be executed did not decode as
     /// valid x64.
     InvalidInstruction = 5,
+    /// A `CALL` to a registered import address was intercepted (and the import
+    /// either had no fast-call metadata or has a variadic/unsupported ABI), or
+    /// an indirect `CALL` (via register or memory) was encountered.
+    ///
+    /// `RegisterContext::imported_function_va` holds the callee address.
+    /// `RegisterContext::rip` holds the address of the instruction after the
+    /// `CALL` — i.e. where execution should resume after the host handles it.
+    ImportedFunctionCall = 6,
 }
 
 impl RegisterContext {

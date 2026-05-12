@@ -3,6 +3,7 @@ use thiserror::Error;
 
 pub mod backend;
 pub mod context;
+pub mod function_traits;
 pub mod lifter;
 pub mod os;
 pub mod semantics;

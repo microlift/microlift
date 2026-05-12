@@ -1,8 +1,10 @@
 use crate::MicroliftError;
-use crate::context::ExitReason;
+use crate::context::{ExitReason, RegisterContext};
+use crate::function_traits::FunctionArgumentType;
 use crate::lifter::Lifter;
 use crate::semantics::helpers::size_to_type;
 use cranelift::prelude::*;
+use cranelift_codegen::ir::SigRef;
 use iced_x86::{Code, CodeSize, Instruction, OpKind, Register};
 
 impl<'a> Lifter<'a> {
@@ -117,28 +119,234 @@ impl<'a> Lifter<'a> {
     }
 
     pub(super) fn handle_call(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let target = instruction.near_branch_target();
-        let next_ip = instruction.next_ip();
+        match instruction.op0_kind() {
+            OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
+                let target = instruction.near_branch_target();
 
-        // Ensure return address is a known block
-        self.get_block(next_ip);
+                if self.import_vas.contains(&target) {
+                    // Registered import — fast-call or slow VM exit.
+                    return self.emit_import_call(target);
+                }
 
-        // Push return address (current_ip) reconciled with image_base
-        let image_base = self.builder.use_var(self.state.image_base);
-        let offset = self.current_ip.wrapping_sub(self.lift_base);
-        let ret_addr = self.builder.ins().iadd_imm(image_base, offset as i64);
+                // Internal direct call — push return address and jump.
+                let next_ip = instruction.next_ip();
+                self.get_block(next_ip);
 
-        let rsp = self.get_reg_val(Register::RSP)?;
-        let new_rsp = self.builder.ins().iadd_imm(rsp, -8);
-        self.set_reg_val(Register::RSP, new_rsp)?;
+                let image_base = self.builder.use_var(self.state.image_base);
+                let offset = self.current_ip.wrapping_sub(self.lift_base);
+                let ret_addr = self.builder.ins().iadd_imm(image_base, offset as i64);
+
+                let rsp = self.get_reg_val(Register::RSP)?;
+                let new_rsp = self.builder.ins().iadd_imm(rsp, -8);
+                self.set_reg_val(Register::RSP, new_rsp)?;
+                self.builder.ins().store(MemFlags::new(), ret_addr, new_rsp, 0);
+
+                let target_block = self.get_block(target);
+                self.builder.ins().jump(target_block, &[]);
+                self.block_terminated = true;
+                Ok(())
+            }
+            OpKind::Register => {
+                let target_val = self.get_reg_val(instruction.op0_register())?;
+                self.emit_indirect_call_exit(target_val)
+            }
+            OpKind::Memory => {
+                let ptr = self.get_mem_ptr(instruction, 0)?;
+                let target_val = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0);
+                self.emit_indirect_call_exit(target_val)
+            }
+            other => Err(MicroliftError::UnsupportedInstruction {
+                mnemonic: format!("call-{:?}", other),
+            }),
+        }
+    }
+
+    /// Dispatch a call to a registered import address: either emit a fast
+    /// inline call or a slow `ImportedFunctionCall` VM exit.
+    fn emit_import_call(&mut self, import_va: u64) -> crate::Result<()> {
+        if let Some((sig_ref, fn_ptr, arg_types)) = self.fast_call_data.get(&import_va).cloned() {
+            // Fast path: emit inline call_indirect using SysV AMD64 ABI.
+            self.emit_fast_import_call(sig_ref, fn_ptr, arg_types)
+        } else {
+            // Slow path: VM exit so the host can handle it.
+            self.emit_import_slow_exit(import_va)
+        }
+    }
+
+    /// Emit an `ImportedFunctionCall` VM exit for a direct import call.
+    ///
+    /// `self.current_ip` already holds the instruction after the CALL (the
+    /// resume point), so we sync and store that as RIP.
+    fn emit_import_slow_exit(&mut self, import_va: u64) -> crate::Result<()> {
+        // Ensure the resume block exists even without emit_resume_blocks.
+        self.get_block(self.current_ip);
+
+        let ctx_ptr = self.builder.use_var(self.state.context_ptr);
+        let va_val = self.builder.ins().iconst(types::I64, import_va as i64);
+        let va_offset =
+            std::mem::offset_of!(RegisterContext, imported_function_va) as i32;
         self.builder
             .ins()
-            .store(MemFlags::new(), ret_addr, new_rsp, 0);
+            .store(MemFlags::trusted(), va_val, ctx_ptr, va_offset);
 
-        // Jump to target
-        let target_block = self.get_block(target);
-        self.builder.ins().jump(target_block, &[]);
+        self.sync_to_context_selective(None, ExitReason::ImportedFunctionCall)?;
+        self.builder.ins().return_(&[]);
         self.block_terminated = true;
+        Ok(())
+    }
+
+    /// Emit an `ImportedFunctionCall` VM exit for an indirect call whose
+    /// target address is only known at runtime.
+    ///
+    /// `target_val` is the runtime callee address (I64). `self.current_ip`
+    /// holds the resume point (next instruction after the CALL).
+    fn emit_indirect_call_exit(&mut self, target_val: Value) -> crate::Result<()> {
+        self.get_block(self.current_ip);
+
+        let ctx_ptr = self.builder.use_var(self.state.context_ptr);
+        let va_offset =
+            std::mem::offset_of!(RegisterContext, imported_function_va) as i32;
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), target_val, ctx_ptr, va_offset);
+
+        self.sync_to_context_selective(None, ExitReason::ImportedFunctionCall)?;
+        self.builder.ins().return_(&[]);
+        self.block_terminated = true;
+        Ok(())
+    }
+
+    /// Emit an inline `call_indirect` for a non-variadic fast-call import,
+    /// following the SysV AMD64 calling convention:
+    ///
+    /// - Integer / pointer args: RDI, RSI, RDX, RCX, R8, R9 (up to 6).
+    /// - Float args: XMM0–XMM7 (F32 from lo-32 bits; F64 from full lo-64).
+    /// - Return value: RAX for integer/pointer, XMM0 lo for floats.
+    ///
+    /// Arguments beyond the 6th integer register or 8th XMM register are
+    /// not yet supported (they would require stack placement).
+    fn emit_fast_import_call(
+        &mut self,
+        sig_ref: SigRef,
+        fn_ptr: i64,
+        arg_types: Vec<FunctionArgumentType>,
+    ) -> crate::Result<()> {
+        const INT_ARG_REGS: [Register; 6] = [
+            Register::RDI,
+            Register::RSI,
+            Register::RDX,
+            Register::RCX,
+            Register::R8,
+            Register::R9,
+        ];
+
+        let ret_type = arg_types[0];
+        let mut int_idx = 0usize;
+        let mut xmm_idx = 0u8;
+        let mut call_args: Vec<Value> = Vec::new();
+
+        for &ty in arg_types.iter().skip(1) {
+            match ty {
+                FunctionArgumentType::VariadicList | FunctionArgumentType::None => break,
+                FunctionArgumentType::SinglePrecisionFp => {
+                    // XMM lo (I64) → ireduce to I32 → bitcast to F32.
+                    let lo = self.get_xmm_lo(xmm_idx);
+                    let i32_val = self.builder.ins().ireduce(types::I32, lo);
+                    let f32_val =
+                        self.builder.ins().bitcast(types::F32, MemFlags::new(), i32_val);
+                    call_args.push(f32_val);
+                    xmm_idx += 1;
+                }
+                FunctionArgumentType::DoublePrecisionFp => {
+                    // XMM lo (I64) → bitcast to F64.
+                    let lo = self.get_xmm_lo(xmm_idx);
+                    let f64_val =
+                        self.builder.ins().bitcast(types::F64, MemFlags::new(), lo);
+                    call_args.push(f64_val);
+                    xmm_idx += 1;
+                }
+                _ => {
+                    if int_idx >= INT_ARG_REGS.len() {
+                        // Stack-based args are not yet supported; skip them.
+                        int_idx += 1;
+                        continue;
+                    }
+                    let reg = INT_ARG_REGS[int_idx];
+                    let val = self.get_reg_val(reg)?;
+                    let narrowed = match ty {
+                        FunctionArgumentType::SignedByte
+                        | FunctionArgumentType::UnsignedByte => {
+                            self.builder.ins().ireduce(types::I8, val)
+                        }
+                        FunctionArgumentType::SignedHalfword
+                        | FunctionArgumentType::UnsignedHalfword => {
+                            self.builder.ins().ireduce(types::I16, val)
+                        }
+                        FunctionArgumentType::SignedWord
+                        | FunctionArgumentType::UnsignedWord => {
+                            self.builder.ins().ireduce(types::I32, val)
+                        }
+                        _ => val, // I64 / Pointer — already correct width
+                    };
+                    call_args.push(narrowed);
+                    int_idx += 1;
+                }
+            }
+        }
+
+        let fn_ptr_val = self.builder.ins().iconst(types::I64, fn_ptr);
+        let call = self.builder.ins().call_indirect(sig_ref, fn_ptr_val, &call_args);
+        let results: Vec<Value> = self.builder.inst_results(call).to_vec();
+
+        if !results.is_empty() {
+            let ret_val = results[0];
+            match ret_type {
+                FunctionArgumentType::None => {}
+                FunctionArgumentType::SinglePrecisionFp => {
+                    // F32 → bitcast to I32 → zero-extend to I64 → XMM0 lo.
+                    let i32_val =
+                        self.builder.ins().bitcast(types::I32, MemFlags::new(), ret_val);
+                    let i64_val = self.builder.ins().uextend(types::I64, i32_val);
+                    self.set_xmm_lo(0, i64_val);
+                    let zero = self.builder.ins().iconst(types::I64, 0);
+                    self.set_xmm_hi(0, zero);
+                }
+                FunctionArgumentType::DoublePrecisionFp => {
+                    // F64 → bitcast to I64 → XMM0 lo.
+                    let i64_val =
+                        self.builder.ins().bitcast(types::I64, MemFlags::new(), ret_val);
+                    self.set_xmm_lo(0, i64_val);
+                    let zero = self.builder.ins().iconst(types::I64, 0);
+                    self.set_xmm_hi(0, zero);
+                }
+                ty => {
+                    let i64_val = match ty {
+                        FunctionArgumentType::SignedByte => {
+                            self.builder.ins().sextend(types::I64, ret_val)
+                        }
+                        FunctionArgumentType::UnsignedByte => {
+                            self.builder.ins().uextend(types::I64, ret_val)
+                        }
+                        FunctionArgumentType::SignedHalfword => {
+                            self.builder.ins().sextend(types::I64, ret_val)
+                        }
+                        FunctionArgumentType::UnsignedHalfword => {
+                            self.builder.ins().uextend(types::I64, ret_val)
+                        }
+                        FunctionArgumentType::SignedWord => {
+                            self.builder.ins().sextend(types::I64, ret_val)
+                        }
+                        FunctionArgumentType::UnsignedWord => {
+                            self.builder.ins().uextend(types::I64, ret_val)
+                        }
+                        _ => ret_val, // Already I64 / Pointer
+                    };
+                    self.set_reg_val(Register::RAX, i64_val)?;
+                }
+            }
+        }
+
+        // Fast calls do NOT terminate the block; execution continues inline.
         Ok(())
     }
 

@@ -1,12 +1,14 @@
 use crate::{
     MicroliftError,
     context::{ExitReason, MemorySegment, RegisterContext},
+    function_traits::{DynamicSymbol, FunctionArgumentType},
+    os::get_host_calling_conv,
 };
 use cranelift::prelude::*;
 use cranelift_codegen::ir::SigRef;
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, Switch, Variable};
-use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, Register};
+use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
 use std::collections::{HashMap, HashSet};
 
 /// Mapping of x86 registers to Cranelift variables.
@@ -136,6 +138,47 @@ impl RegisterState {
     }
 }
 
+/// Convert a `FunctionArgumentType` to the corresponding Cranelift IR type.
+/// Returns `None` for `None` (void) and `VariadicList` (stop marker).
+pub(crate) fn fat_to_cl_type(ty: FunctionArgumentType) -> Option<types::Type> {
+    match ty {
+        FunctionArgumentType::None | FunctionArgumentType::VariadicList => None,
+        FunctionArgumentType::SignedByte | FunctionArgumentType::UnsignedByte => Some(types::I8),
+        FunctionArgumentType::SignedHalfword | FunctionArgumentType::UnsignedHalfword => {
+            Some(types::I16)
+        }
+        FunctionArgumentType::SignedWord | FunctionArgumentType::UnsignedWord => Some(types::I32),
+        FunctionArgumentType::SignedDoubleword
+        | FunctionArgumentType::UnsignedDoubleword
+        | FunctionArgumentType::Pointer => Some(types::I64),
+        FunctionArgumentType::SinglePrecisionFp => Some(types::F32),
+        FunctionArgumentType::DoublePrecisionFp => Some(types::F64),
+    }
+}
+
+/// Build a Cranelift `Signature` from a `DynamicSymbol`'s `arg_types` slice.
+///
+/// `arg_types[0]` is the return type; `arg_types[1..]` are parameter types.
+/// Stops at the first `VariadicList` entry.
+pub(crate) fn build_import_sig(
+    arg_types: &[FunctionArgumentType],
+    call_conv: CallConv,
+) -> Signature {
+    let mut sig = Signature::new(call_conv);
+    if let Some(ret_ty) = arg_types.first().copied().and_then(fat_to_cl_type) {
+        sig.returns.push(AbiParam::new(ret_ty));
+    }
+    for &ty in arg_types.iter().skip(1) {
+        if ty == FunctionArgumentType::VariadicList {
+            break;
+        }
+        if let Some(param_ty) = fat_to_cl_type(ty) {
+            sig.params.push(AbiParam::new(param_ty));
+        }
+    }
+    sig
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ExecutionMode {
     #[default]
@@ -150,6 +193,16 @@ pub struct LifterConfig {
     pub segments: Vec<MemorySegment>,
     pub interpreter_fallback: bool,
     pub emit_resume_blocks: bool,
+    /// Registered import addresses.
+    ///
+    /// - Key: virtual address of the imported function (e.g. a PLT stub or
+    ///   thunk address) as it appears in the code being lifted.
+    /// - Value: `Some(sym)` → attempt a fast inline call using SysV AMD64
+    ///   argument passing (skipped for variadic functions, which fall back to
+    ///   a slow VM exit). `None` → always emit an `ImportedFunctionCall` exit.
+    ///
+    /// Use [`register_fast_import`] / [`register_slow_import`] to populate.
+    pub imports: HashMap<u64, Option<DynamicSymbol>>,
 }
 
 impl Default for LifterConfig {
@@ -160,7 +213,31 @@ impl Default for LifterConfig {
             segments: Vec::new(),
             interpreter_fallback: false,
             emit_resume_blocks: false,
+            imports: HashMap::new(),
         }
+    }
+}
+
+impl LifterConfig {
+    /// Register an import with full fast-call metadata.
+    ///
+    /// For non-variadic functions the lifter will emit an inline `call_indirect`
+    /// using the SysV AMD64 ABI, reading arguments from the appropriate x86
+    /// registers (RDI/RSI/RDX/RCX/R8/R9 for integers, XMM0–7 for floats) and
+    /// writing the return value into RAX or XMM0.
+    ///
+    /// Variadic functions (`is_ellipsis_function = true`) are automatically
+    /// demoted to slow calls.
+    pub fn register_fast_import(&mut self, va: u64, symbol: DynamicSymbol) {
+        self.imports.insert(va, Some(symbol));
+    }
+
+    /// Register an import address with no fast-call metadata.
+    ///
+    /// Every call to this address will produce an `ImportedFunctionCall` VM exit
+    /// regardless of whether resume blocks are enabled.
+    pub fn register_slow_import(&mut self, va: u64) {
+        self.imports.insert(va, None);
     }
 }
 
@@ -191,6 +268,14 @@ pub struct Lifter<'a> {
     pub dirty_flags: HashSet<X86Flag>,
     /// Dirty-bit tracking: XMM registers (by index 0–15) written since last sync.
     pub dirty_xmms: HashSet<u8>,
+    /// Pre-built fast-call data for registered imports.
+    ///
+    /// Key = import VA.  Value = (signature ref, raw fn pointer as i64, arg
+    /// types cloned from the `DynamicSymbol`). Only populated for non-variadic
+    /// `Some(sym)` entries in `config.imports`.
+    pub fast_call_data: HashMap<u64, (SigRef, i64, Vec<FunctionArgumentType>)>,
+    /// All registered import virtual addresses (both fast and slow).
+    pub import_vas: HashSet<u64>,
 }
 
 impl<'a> Lifter<'a> {
@@ -215,6 +300,23 @@ impl<'a> Lifter<'a> {
             }
         };
 
+        // Build fast-call data for every registered non-variadic import.
+        let host_cc = get_host_calling_conv();
+        let mut fast_call_data: HashMap<u64, (SigRef, i64, Vec<FunctionArgumentType>)> =
+            HashMap::new();
+        let mut import_vas: HashSet<u64> = HashSet::new();
+
+        for (&va, opt_sym) in &config.imports {
+            import_vas.insert(va);
+            if let Some(sym) = opt_sym {
+                if !sym.is_ellipsis_function {
+                    let sig = build_import_sig(&sym.arg_types, host_cc);
+                    let sig_ref = builder.import_signature(sig);
+                    fast_call_data.insert(va, (sig_ref, sym.value as i64, sym.arg_types.clone()));
+                }
+            }
+        }
+
         Self {
             builder,
             state,
@@ -230,6 +332,8 @@ impl<'a> Lifter<'a> {
             dirty_gprs: HashSet::new(),
             dirty_flags: HashSet::new(),
             dirty_xmms: HashSet::new(),
+            fast_call_data,
+            import_vas,
         }
     }
 
@@ -266,9 +370,26 @@ impl<'a> Lifter<'a> {
                 | Mnemonic::Jne
                 | Mnemonic::Jb
                 | Mnemonic::Jbe
-                | Mnemonic::Loop
-                | Mnemonic::Call => {
+                | Mnemonic::Loop => {
                     leaders.insert(instruction.near_branch_target());
+                }
+                Mnemonic::Call => {
+                    // Only direct (near-branch) calls have a statically known
+                    // target. Indirect calls (register/memory) return 0 from
+                    // near_branch_target() which we don't want as a leader.
+                    // Also skip registered import addresses — they are
+                    // intercepted inline and must not become IR blocks.
+                    if matches!(
+                        instruction.op0_kind(),
+                        OpKind::NearBranch16
+                            | OpKind::NearBranch32
+                            | OpKind::NearBranch64
+                    ) {
+                        let target = instruction.near_branch_target();
+                        if !self.import_vas.contains(&target) {
+                            leaders.insert(target);
+                        }
+                    }
                 }
                 _ => {}
             }

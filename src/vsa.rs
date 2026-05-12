@@ -224,6 +224,13 @@ pub struct ValueSetAnalyzer {
     /// Map from instruction IP -> inferred register value sets *before* that instruction.
     pub value_sets: HashMap<u64, RegisterValueSet>,
     pub segments: Vec<MemorySegment>,
+    /// Memory addresses that should always be treated as `Top` when read,
+    /// regardless of what the segment data contains.
+    ///
+    /// Use this to mark GOT slots / PLT relocations that hold 0 before the
+    /// dynamic linker runs. Without this, VSA would infer that a
+    /// `JMP [GOT+off]` or `CALL [GOT+off]` targets address 0.
+    pub relocation_addresses: HashSet<u64>,
     worklist: VecDeque<usize>,
     visited: HashSet<usize>,
 }
@@ -237,9 +244,20 @@ impl ValueSetAnalyzer {
         Self {
             value_sets: HashMap::new(),
             segments,
+            relocation_addresses: HashSet::new(),
             worklist: VecDeque::new(),
             visited: HashSet::new(),
         }
+    }
+
+    /// Mark a set of memory addresses as relocation slots.
+    ///
+    /// Any memory read from these addresses will be conservatively treated as
+    /// `Top` (completely unknown), preventing VSA from propagating stale
+    /// pre-relocation values (typically 0) through them.
+    pub fn with_relocation_addresses(mut self, addrs: HashSet<u64>) -> Self {
+        self.relocation_addresses = addrs;
+        self
     }
 
     /// Run the analysis over a decoded instruction stream.
@@ -470,6 +488,12 @@ impl ValueSetAnalyzer {
                     } else {
                         return ValueSet::Top;
                     }
+                }
+
+                // If this address is a known relocation slot, treat it as Top
+                // so VSA never propagates the pre-relocation value (often 0).
+                if self.relocation_addresses.contains(&addr) {
+                    return ValueSet::Top;
                 }
 
                 // Address resolved to a constant. Check segments.
