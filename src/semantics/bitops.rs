@@ -370,11 +370,7 @@ impl<'a> Lifter<'a> {
     ///
     /// The count is op2: either an `imm8` or the `CL` register, masked to
     /// 5 bits for 8/16/32-bit operands or 6 bits for 64-bit operands.
-    fn double_shift_count(
-        &mut self,
-        instruction: &Instruction,
-        ty: Type,
-    ) -> crate::Result<Value> {
+    fn double_shift_count(&mut self, instruction: &Instruction, ty: Type) -> crate::Result<Value> {
         let count_raw = match instruction.op2_kind() {
             OpKind::Register => {
                 let cl = self.get_reg_val(Register::CL)?;
@@ -401,7 +397,7 @@ impl<'a> Lifter<'a> {
         Ok(self.builder.ins().band(count_raw, mask))
     }
 
-    /// SHLD — Shift Left Double.
+    /// SHLD - Shift Left Double.
     ///
     /// `SHLD dst, src, count`
     /// result = (dst << count) | (src >> (N - count))
@@ -433,7 +429,7 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// SHRD — Shift Right Double.
+    /// SHRD - Shift Right Double.
     ///
     /// `SHRD dst, src, count`
     /// result = (src << (N - count)) | (dst >> count)

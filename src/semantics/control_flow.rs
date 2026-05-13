@@ -1,5 +1,5 @@
 use crate::MicroliftError;
-use crate::context::{ExitReason, RegisterContext};
+use crate::context::{ExitReason, RegisterContext, TransferKind};
 use crate::function_traits::FunctionArgumentType;
 use crate::lifter::Lifter;
 use crate::semantics::helpers::size_to_type;
@@ -12,7 +12,7 @@ impl<'a> Lifter<'a> {
         match instruction.op0_kind() {
             OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
                 let target = instruction.near_branch_target();
-                let target_block = self.get_block(target);
+                let target_block = self.get_block_with_kind(target, TransferKind::DirectJump);
                 self.builder.ins().jump(target_block, &[]);
                 self.block_terminated = true;
             }
@@ -55,6 +55,7 @@ impl<'a> Lifter<'a> {
         self.builder.switch_to_block(external_block);
         self.builder.seal_block(external_block);
         self.sync_to_context(Some(target_val), ExitReason::UnknownJump)?;
+        self.write_exit_code(TransferKind::IndirectJump as u32);
         self.builder.ins().return_(&[]);
         self.block_terminated = true;
         Ok(())
@@ -112,6 +113,7 @@ impl<'a> Lifter<'a> {
         // Handle Unknown Jump/Return
         self.builder.switch_to_block(unknown_block);
         self.sync_to_context(Some(target_ip), ExitReason::UnknownJump)?;
+        self.write_exit_code(TransferKind::Return as u32);
         self.builder.ins().return_(&[]);
 
         self.block_terminated = true;
@@ -124,11 +126,11 @@ impl<'a> Lifter<'a> {
                 let target = instruction.near_branch_target();
 
                 if self.import_vas.contains(&target) {
-                    // Registered import — fast-call or slow VM exit.
+                    // Registered import - fast-call or slow VM exit.
                     return self.emit_import_call(target);
                 }
 
-                // Internal direct call — push return address and jump.
+                // Internal direct call - push return address and jump.
                 let next_ip = instruction.next_ip();
                 self.get_block(next_ip);
 
@@ -139,9 +141,14 @@ impl<'a> Lifter<'a> {
                 let rsp = self.get_reg_val(Register::RSP)?;
                 let new_rsp = self.builder.ins().iadd_imm(rsp, -8);
                 self.set_reg_val(Register::RSP, new_rsp)?;
-                self.builder.ins().store(MemFlags::new(), ret_addr, new_rsp, 0);
+                self.builder
+                    .ins()
+                    .store(MemFlags::new(), ret_addr, new_rsp, 0);
 
-                let target_block = self.get_block(target);
+                // Tag the target so that if it's outside the lifted region its
+                // unvisited-block stub exits with TransferKind::DirectCall,
+                // telling the runtime that a return address was pushed.
+                let target_block = self.get_block_with_kind(target, TransferKind::DirectCall);
                 self.builder.ins().jump(target_block, &[]);
                 self.block_terminated = true;
                 Ok(())
@@ -183,8 +190,7 @@ impl<'a> Lifter<'a> {
 
         let ctx_ptr = self.builder.use_var(self.state.context_ptr);
         let va_val = self.builder.ins().iconst(types::I64, import_va as i64);
-        let va_offset =
-            std::mem::offset_of!(RegisterContext, imported_function_va) as i32;
+        let va_offset = std::mem::offset_of!(RegisterContext, imported_function_va) as i32;
         self.builder
             .ins()
             .store(MemFlags::trusted(), va_val, ctx_ptr, va_offset);
@@ -204,8 +210,7 @@ impl<'a> Lifter<'a> {
         self.get_block(self.current_ip);
 
         let ctx_ptr = self.builder.use_var(self.state.context_ptr);
-        let va_offset =
-            std::mem::offset_of!(RegisterContext, imported_function_va) as i32;
+        let va_offset = std::mem::offset_of!(RegisterContext, imported_function_va) as i32;
         self.builder
             .ins()
             .store(MemFlags::trusted(), target_val, ctx_ptr, va_offset);
@@ -252,16 +257,17 @@ impl<'a> Lifter<'a> {
                     // XMM lo (I64) → ireduce to I32 → bitcast to F32.
                     let lo = self.get_xmm_lo(xmm_idx);
                     let i32_val = self.builder.ins().ireduce(types::I32, lo);
-                    let f32_val =
-                        self.builder.ins().bitcast(types::F32, MemFlags::new(), i32_val);
+                    let f32_val = self
+                        .builder
+                        .ins()
+                        .bitcast(types::F32, MemFlags::new(), i32_val);
                     call_args.push(f32_val);
                     xmm_idx += 1;
                 }
                 FunctionArgumentType::DoublePrecisionFp => {
                     // XMM lo (I64) → bitcast to F64.
                     let lo = self.get_xmm_lo(xmm_idx);
-                    let f64_val =
-                        self.builder.ins().bitcast(types::F64, MemFlags::new(), lo);
+                    let f64_val = self.builder.ins().bitcast(types::F64, MemFlags::new(), lo);
                     call_args.push(f64_val);
                     xmm_idx += 1;
                 }
@@ -274,19 +280,17 @@ impl<'a> Lifter<'a> {
                     let reg = INT_ARG_REGS[int_idx];
                     let val = self.get_reg_val(reg)?;
                     let narrowed = match ty {
-                        FunctionArgumentType::SignedByte
-                        | FunctionArgumentType::UnsignedByte => {
+                        FunctionArgumentType::SignedByte | FunctionArgumentType::UnsignedByte => {
                             self.builder.ins().ireduce(types::I8, val)
                         }
                         FunctionArgumentType::SignedHalfword
                         | FunctionArgumentType::UnsignedHalfword => {
                             self.builder.ins().ireduce(types::I16, val)
                         }
-                        FunctionArgumentType::SignedWord
-                        | FunctionArgumentType::UnsignedWord => {
+                        FunctionArgumentType::SignedWord | FunctionArgumentType::UnsignedWord => {
                             self.builder.ins().ireduce(types::I32, val)
                         }
-                        _ => val, // I64 / Pointer — already correct width
+                        _ => val, // I64 / Pointer - already correct width
                     };
                     call_args.push(narrowed);
                     int_idx += 1;
@@ -295,7 +299,10 @@ impl<'a> Lifter<'a> {
         }
 
         let fn_ptr_val = self.builder.ins().iconst(types::I64, fn_ptr);
-        let call = self.builder.ins().call_indirect(sig_ref, fn_ptr_val, &call_args);
+        let call = self
+            .builder
+            .ins()
+            .call_indirect(sig_ref, fn_ptr_val, &call_args);
         let results: Vec<Value> = self.builder.inst_results(call).to_vec();
 
         if !results.is_empty() {
@@ -304,8 +311,10 @@ impl<'a> Lifter<'a> {
                 FunctionArgumentType::None => {}
                 FunctionArgumentType::SinglePrecisionFp => {
                     // F32 → bitcast to I32 → zero-extend to I64 → XMM0 lo.
-                    let i32_val =
-                        self.builder.ins().bitcast(types::I32, MemFlags::new(), ret_val);
+                    let i32_val = self
+                        .builder
+                        .ins()
+                        .bitcast(types::I32, MemFlags::new(), ret_val);
                     let i64_val = self.builder.ins().uextend(types::I64, i32_val);
                     self.set_xmm_lo(0, i64_val);
                     let zero = self.builder.ins().iconst(types::I64, 0);
@@ -313,8 +322,10 @@ impl<'a> Lifter<'a> {
                 }
                 FunctionArgumentType::DoublePrecisionFp => {
                     // F64 → bitcast to I64 → XMM0 lo.
-                    let i64_val =
-                        self.builder.ins().bitcast(types::I64, MemFlags::new(), ret_val);
+                    let i64_val = self
+                        .builder
+                        .ins()
+                        .bitcast(types::I64, MemFlags::new(), ret_val);
                     self.set_xmm_lo(0, i64_val);
                     let zero = self.builder.ins().iconst(types::I64, 0);
                     self.set_xmm_hi(0, zero);
@@ -728,7 +739,7 @@ impl<'a> Lifter<'a> {
         let target = instruction.near_branch_target();
         let next_ip = instruction.next_ip();
 
-        let target_block = self.get_block(target);
+        let target_block = self.get_block_with_kind(target, TransferKind::ConditionalJump);
         let next_block = self.get_block(next_ip);
 
         self.builder
@@ -750,7 +761,7 @@ impl<'a> Lifter<'a> {
         let target = instruction.near_branch_target();
         let next_ip = instruction.next_ip();
 
-        let target_block = self.get_block(target);
+        let target_block = self.get_block_with_kind(target, TransferKind::ConditionalJump);
         let next_block = self.get_block(next_ip);
 
         self.builder

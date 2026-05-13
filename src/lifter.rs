@@ -1,6 +1,6 @@
 use crate::{
     MicroliftError,
-    context::{ExitReason, MemorySegment, RegisterContext},
+    context::{ExitReason, MemorySegment, RegisterContext, TransferKind},
     function_traits::{DynamicSymbol, FunctionArgumentType},
     os::get_host_calling_conv,
 };
@@ -276,6 +276,10 @@ pub struct Lifter<'a> {
     pub fast_call_data: HashMap<u64, (SigRef, i64, Vec<FunctionArgumentType>)>,
     /// All registered import virtual addresses (both fast and slow).
     pub import_vas: HashSet<u64>,
+    /// Records what kind of x86 transfer targets each Cranelift block.
+    /// Used by `finish()` to emit the correct `TransferKind` into `exit_code`
+    /// when stubbing out unvisited (out-of-region) blocks.
+    pub block_transfer_kinds: HashMap<Block, TransferKind>,
 }
 
 impl<'a> Lifter<'a> {
@@ -334,6 +338,7 @@ impl<'a> Lifter<'a> {
             dirty_xmms: HashSet::new(),
             fast_call_data,
             import_vas,
+            block_transfer_kinds: HashMap::new(),
         }
     }
 
@@ -345,6 +350,27 @@ impl<'a> Lifter<'a> {
             self.blocks.insert(offset, block);
             block
         }
+    }
+
+    /// Like `get_block`, but also records what x86 transfer kind reaches the
+    /// block. The first caller wins - a block may be targeted by multiple
+    /// edges (e.g. both a JMP and a conditional branch), but the first
+    /// registration is sufficient for `finish()` to emit a meaningful exit.
+    pub fn get_block_with_kind(&mut self, offset: u64, kind: TransferKind) -> Block {
+        let block = self.get_block(offset);
+        self.block_transfer_kinds.entry(block).or_insert(kind);
+        block
+    }
+
+    /// Emit a store of `code` into `RegisterContext::exit_code`.
+    /// Call this after any `sync_to_context*` that needs a specific exit code.
+    pub fn write_exit_code(&mut self, code: u32) {
+        let ctx_ptr = self.builder.use_var(self.state.context_ptr);
+        let val = self.builder.ins().iconst(types::I32, code as i64);
+        let offset = std::mem::offset_of!(RegisterContext, exit_code) as i32;
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), val, ctx_ptr, offset);
     }
 
     pub fn lift(&mut self, bytes: &[u8], ip: u64) -> crate::Result<()> {
@@ -391,9 +417,7 @@ impl<'a> Lifter<'a> {
                     // near_branch_target() which we don't want as a leader.
                     if matches!(
                         instruction.op0_kind(),
-                        OpKind::NearBranch16
-                            | OpKind::NearBranch32
-                            | OpKind::NearBranch64
+                        OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
                     ) {
                         let target = instruction.near_branch_target();
                         if self.import_vas.contains(&target) {
@@ -535,9 +559,19 @@ impl<'a> Lifter<'a> {
             let block = self.blocks[&offset];
             if !self.visited_blocks.contains(&block) && !processed_blocks.contains(&block) {
                 self.builder.switch_to_block(block);
-                // Sync to context at this target IP
+                // Sync to context at this target IP, exiting with UnknownJump.
+                // `current_ip` is set to the block's address so that
+                // `flush_rip_and_reason` materialises it as the target RIP.
                 self.current_ip = offset;
-                self.sync_to_context(None, ExitReason::None)?;
+                self.sync_to_context(None, ExitReason::UnknownJump)?;
+                // Write the transfer kind so the runtime knows how control
+                // arrived here (direct JMP, conditional branch, RET, etc.).
+                let kind = self
+                    .block_transfer_kinds
+                    .get(&block)
+                    .copied()
+                    .unwrap_or(TransferKind::Unknown);
+                self.write_exit_code(kind as u32);
                 self.builder.ins().return_(&[]);
                 processed_blocks.insert(block);
             }
@@ -581,12 +615,18 @@ impl<'a> Lifter<'a> {
             let hi_var = *self.state.xmms_hi.get(&i).unwrap();
             let lo_val = self.builder.use_var(lo_var);
             let hi_val = self.builder.use_var(hi_var);
-            self.builder
-                .ins()
-                .store(MemFlags::trusted(), lo_val, ctx_ptr, RegisterState::get_xmm_offset(i, false));
-            self.builder
-                .ins()
-                .store(MemFlags::trusted(), hi_val, ctx_ptr, RegisterState::get_xmm_offset(i, true));
+            self.builder.ins().store(
+                MemFlags::trusted(),
+                lo_val,
+                ctx_ptr,
+                RegisterState::get_xmm_offset(i, false),
+            );
+            self.builder.ins().store(
+                MemFlags::trusted(),
+                hi_val,
+                ctx_ptr,
+                RegisterState::get_xmm_offset(i, true),
+            );
         }
 
         self.flush_rip_and_reason(rip, reason)?;

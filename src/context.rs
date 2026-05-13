@@ -68,8 +68,48 @@ pub enum ExitReason {
     ///
     /// `RegisterContext::imported_function_va` holds the callee address.
     /// `RegisterContext::rip` holds the address of the instruction after the
-    /// `CALL` — i.e. where execution should resume after the host handles it.
+    /// `CALL` - i.e. where execution should resume after the host handles it.
     ImportedFunctionCall = 6,
+}
+
+/// Describes what kind of x86 control transfer caused an `UnknownJump` VM exit.
+///
+/// Stored in `RegisterContext::exit_code` whenever `exit_reason == UnknownJump`.
+/// All other exit reasons leave `exit_code` with its own semantics (e.g.
+/// `UnimplementedInstruction` stores the raw `iced_x86::Code` there).
+///
+/// The runtime can branch on this to decide how to handle the exit:
+/// - `DirectJump` / `IndirectJump` - no return address was pushed; the guest
+///   simply transferred to a new location. The runtime must find and execute
+///   the target (at `ctx.rip`) on behalf of the guest.
+/// - `ConditionalJump` - same as `DirectJump` semantically, but the source
+///   was a `Jcc` whose taken edge landed outside the lifted region.
+/// - `Return` - a `RET` popped a return address that didn't match the exit
+///   trampoline or any in-region block. The guest is returning to a caller
+///   that lives outside the lifted region.
+/// - `DirectCall` - an unconditional `CALL` whose static target is outside the
+///   lifted region and was not registered as an import. A return address has
+///   already been pushed onto the guest stack; `ctx.rip` is the return address
+///   and `ctx.exit_code` identifies the callee address via a secondary field
+///   (see note below). Treat like a function call that must resume.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferKind {
+    /// Origin not tracked - should not occur in practice; treat conservatively.
+    Unknown = 0,
+    /// Unconditional `JMP` to a static (near-branch) target outside the region.
+    DirectJump = 1,
+    /// `JMP` via register or memory operand; target was only known at runtime.
+    IndirectJump = 2,
+    /// A `Jcc` conditional branch whose taken edge fell outside the lifted region.
+    ConditionalJump = 3,
+    /// A `RET` that popped a return address outside the lifted region (and not the
+    /// exit trampoline).
+    Return = 4,
+    /// An unconditional `CALL` to a static out-of-region address that was not
+    /// registered as an import. A return address was pushed; the runtime must
+    /// call the target and then resume at that address.
+    DirectCall = 5,
 }
 
 impl RegisterContext {

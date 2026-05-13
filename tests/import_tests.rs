@@ -21,7 +21,7 @@ use microlift::trampoline_func;
 
 // ── Host-side strlen ────────────────────────────────────────────────────────
 
-/// Pure Rust reimplementation of C `strlen` — counts bytes until the NUL
+/// Pure Rust reimplementation of C `strlen` - counts bytes until the NUL
 /// terminator.  No libc dependency.
 unsafe extern "C" fn host_strlen(s: *const u8) -> u64 {
     let mut n = 0u64;
@@ -60,7 +60,7 @@ fn strlen_call_bytes(string_ptr: u64) -> Vec<u8> {
     b.push(0xBF);
     b.extend_from_slice(&string_ptr.to_le_bytes());
 
-    // call rel32  — rel32 = target - next_ip
+    // call rel32  - rel32 = target - next_ip
     //   next_ip  = 0x1000 + 10 (mov) + 5 (call) = 0x100F
     //   target   = 0x2000
     //   rel32    = 0x2000 - 0x100F = 0xFF1
@@ -159,7 +159,7 @@ fn test_import_fast_call_strlen() {
 ///
 /// Round 1: the lifter exits with `ImportedFunctionCall`.
 ///   - `ctx.imported_function_va` == `IMPORT_VA`.
-///   - `ctx.rip` == 0x100F (the `ret` instruction — the resume point).
+///   - `ctx.rip` == 0x100F (the `ret` instruction - the resume point).
 ///   - `ctx.rdi` holds the string pointer (synced by `sync_to_context_selective`).
 ///
 /// The host reads `ctx.rdi`, calls `host_strlen` itself, writes the result
