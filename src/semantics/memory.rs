@@ -127,6 +127,19 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
+    /// LEAVE - high-level function epilogue: `RSP = RBP; POP RBP`.
+    pub(super) fn handle_leave(&mut self, _instruction: &Instruction) -> crate::Result<()> {
+        let rbp = self.get_reg_val(Register::RBP)?;
+        // RSP <- RBP
+        self.set_reg_val(Register::RSP, rbp)?;
+        // POP RBP: RBP <- [RSP]; RSP += 8
+        let old_rbp = self.builder.ins().load(types::I64, MemFlags::new(), rbp, 0);
+        self.set_reg_val(Register::RBP, old_rbp)?;
+        let new_rsp = self.builder.ins().iadd_imm(rbp, 8);
+        self.set_reg_val(Register::RSP, new_rsp)?;
+        Ok(())
+    }
+
     pub(super) fn handle_xchg(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let size = self.operand_size(instruction, 0)?;
         let a = self.read_operand(instruction, 0, size)?;

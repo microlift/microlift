@@ -466,4 +466,48 @@ impl<'a> Lifter<'a> {
         // DIV leaves flags undefined per x86 manual.
         Ok(())
     }
+
+    // Sign-extension conversions (implicit operand form)
+
+    /// CBW - AX = sign_extend(AL)
+    pub(super) fn handle_cbw(&mut self, _instruction: &Instruction) -> crate::Result<()> {
+        let al = self.get_reg_val(Register::AL)?;
+        let ax = self.builder.ins().sextend(types::I16, al);
+        self.set_reg_val(Register::AX, ax)
+    }
+
+    /// CWDE - EAX = sign_extend(AX)  (upper 32 bits of RAX zeroed per x86-64)
+    pub(super) fn handle_cwde(&mut self, _instruction: &Instruction) -> crate::Result<()> {
+        let ax = self.get_reg_val(Register::AX)?;
+        let eax = self.builder.ins().sextend(types::I32, ax);
+        self.set_reg_val(Register::EAX, eax)
+    }
+
+    /// CDQE - RAX = sign_extend(EAX)
+    pub(super) fn handle_cdqe(&mut self, _instruction: &Instruction) -> crate::Result<()> {
+        let eax = self.get_reg_val(Register::EAX)?;
+        let rax = self.builder.ins().sextend(types::I64, eax);
+        self.set_reg_val(Register::RAX, rax)
+    }
+
+    /// CWD - DX:AX = sign_extend(AX)  (DX = 0 or 0xFFFF)
+    pub(super) fn handle_cwd(&mut self, _instruction: &Instruction) -> crate::Result<()> {
+        let ax = self.get_reg_val(Register::AX)?;
+        let dx = self.builder.ins().sshr_imm(ax, 15);
+        self.set_reg_val(Register::DX, dx)
+    }
+
+    /// CDQ - EDX:EAX = sign_extend(EAX)  (EDX = 0 or 0xFFFFFFFF)
+    pub(super) fn handle_cdq(&mut self, _instruction: &Instruction) -> crate::Result<()> {
+        let eax = self.get_reg_val(Register::EAX)?;
+        let edx = self.builder.ins().sshr_imm(eax, 31);
+        self.set_reg_val(Register::EDX, edx)
+    }
+
+    /// CQO - RDX:RAX = sign_extend(RAX)  (RDX = 0 or -1)
+    pub(super) fn handle_cqo(&mut self, _instruction: &Instruction) -> crate::Result<()> {
+        let rax = self.get_reg_val(Register::RAX)?;
+        let rdx = self.builder.ins().sshr_imm(rax, 63);
+        self.set_reg_val(Register::RDX, rdx)
+    }
 }

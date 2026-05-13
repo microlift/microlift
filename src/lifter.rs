@@ -370,6 +370,18 @@ impl<'a> Lifter<'a> {
                 | Mnemonic::Jne
                 | Mnemonic::Jb
                 | Mnemonic::Jbe
+                | Mnemonic::Ja
+                | Mnemonic::Jae
+                | Mnemonic::Jg
+                | Mnemonic::Jge
+                | Mnemonic::Jl
+                | Mnemonic::Jle
+                | Mnemonic::Js
+                | Mnemonic::Jns
+                | Mnemonic::Jo
+                | Mnemonic::Jno
+                | Mnemonic::Jp
+                | Mnemonic::Jnp
                 | Mnemonic::Loop => {
                     leaders.insert(instruction.near_branch_target());
                 }

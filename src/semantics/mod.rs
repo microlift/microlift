@@ -28,19 +28,24 @@ impl<'a> Lifter<'a> {
             Mnemonic::Lea => self.handle_lea(instruction),
             Mnemonic::Push => self.handle_push(instruction),
             Mnemonic::Pop => self.handle_pop(instruction),
+            Mnemonic::Leave => self.handle_leave(instruction),
             Mnemonic::Xchg => self.handle_xchg(instruction),
             Mnemonic::Nop => self.handle_nop(instruction),
 
             // CET
             Mnemonic::Endbr64 | Mnemonic::Endbr32 => self.handle_endbr64(instruction),
 
-            // SSE / SSE2 — XMM data movement
-            Mnemonic::Movaps | Mnemonic::Movapd | Mnemonic::Movups | Mnemonic::Movupd
-            | Mnemonic::Movdqa | Mnemonic::Movdqu => self.handle_movaps(instruction),
+            // SSE / SSE2 - XMM data movement
+            Mnemonic::Movaps
+            | Mnemonic::Movapd
+            | Mnemonic::Movups
+            | Mnemonic::Movupd
+            | Mnemonic::Movdqa
+            | Mnemonic::Movdqu => self.handle_movaps(instruction),
             Mnemonic::Movq => self.handle_movq_sse(instruction),
             Mnemonic::Movss => self.handle_movss(instruction),
 
-            // SSE / SSE2 — XMM logic
+            // SSE / SSE2 - XMM logic
             Mnemonic::Xorps | Mnemonic::Xorpd => self.handle_xorps(instruction),
             Mnemonic::Pxor => self.handle_pxor(instruction),
             Mnemonic::Andps | Mnemonic::Andpd | Mnemonic::Pand => self.handle_andps(instruction),
@@ -75,6 +80,13 @@ impl<'a> Lifter<'a> {
             // Arithmetic
             Mnemonic::Add => self.handle_add(instruction),
             Mnemonic::Sub => self.handle_sub(instruction),
+            // Sign-extension conversions (implicit operand form)
+            Mnemonic::Cbw => self.handle_cbw(instruction),
+            Mnemonic::Cwde => self.handle_cwde(instruction),
+            Mnemonic::Cdqe => self.handle_cdqe(instruction),
+            Mnemonic::Cwd => self.handle_cwd(instruction),
+            Mnemonic::Cdq => self.handle_cdq(instruction),
+            Mnemonic::Cqo => self.handle_cqo(instruction),
             Mnemonic::Xadd => self.handle_xadd(instruction),
             Mnemonic::Cmp => self.handle_cmp(instruction),
             Mnemonic::Inc => self.handle_inc(instruction),

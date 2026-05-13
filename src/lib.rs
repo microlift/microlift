@@ -5,6 +5,7 @@ pub mod backend;
 pub mod context;
 pub mod function_traits;
 pub mod lifter;
+pub(crate) mod mapfile;
 pub mod os;
 pub mod semantics;
 pub mod vsa;
