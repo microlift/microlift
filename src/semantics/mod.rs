@@ -9,6 +9,7 @@ pub mod control_flow;
 pub mod flags;
 pub mod helpers;
 pub mod memory;
+pub mod setcc;
 pub mod sse;
 pub mod syscall;
 pub mod unimplemented;
@@ -151,6 +152,24 @@ impl<'a> Lifter<'a> {
             Mnemonic::Jp => self.handle_jp(instruction),
             Mnemonic::Jnp => self.handle_jnp(instruction),
             Mnemonic::Jrcxz => self.handle_jrcxz(instruction),
+
+            // SETcc - set byte on condition
+            Mnemonic::Sete => self.handle_sete(instruction),
+            Mnemonic::Setne => self.handle_setne(instruction),
+            Mnemonic::Setb => self.handle_setb(instruction),
+            Mnemonic::Setae => self.handle_setae(instruction),
+            Mnemonic::Setbe => self.handle_setbe(instruction),
+            Mnemonic::Seta => self.handle_seta(instruction),
+            Mnemonic::Setl => self.handle_setl(instruction),
+            Mnemonic::Setge => self.handle_setge(instruction),
+            Mnemonic::Setle => self.handle_setle(instruction),
+            Mnemonic::Setg => self.handle_setg(instruction),
+            Mnemonic::Sets => self.handle_sets(instruction),
+            Mnemonic::Setns => self.handle_setns(instruction),
+            Mnemonic::Seto => self.handle_seto(instruction),
+            Mnemonic::Setno => self.handle_setno(instruction),
+            Mnemonic::Setp => self.handle_setp(instruction),
+            Mnemonic::Setnp => self.handle_setnp(instruction),
 
             // Conditional Move (CMOVcc)
             Mnemonic::Cmove => self.handle_cmove(instruction),
