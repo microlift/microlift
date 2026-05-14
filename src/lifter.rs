@@ -203,6 +203,11 @@ pub struct LifterConfig {
     ///
     /// Use [`register_fast_import`] / [`register_slow_import`] to populate.
     pub imports: HashMap<u64, Option<DynamicSymbol>>,
+    /// When `true`, SSE instruction handlers use Cranelift's native `I64X2`
+    /// SIMD type for XMM operations. This is only supported on hosts where
+    /// Cranelift has vector lowering (e.g. x86-64 JIT). Set to `false` (the
+    /// default) for RISCV64 and other architectures where SIMD is not present.
+    pub use_vector_xmm: bool,
 }
 
 impl Default for LifterConfig {
@@ -214,6 +219,7 @@ impl Default for LifterConfig {
             interpreter_fallback: false,
             emit_resume_blocks: false,
             imports: HashMap::new(),
+            use_vector_xmm: false,
         }
     }
 }
@@ -756,8 +762,6 @@ impl<'a> Lifter<'a> {
         self.builder.def_var(self.state.image_base, image_base_val);
 
         for i in 0u8..16 {
-            let lo_var = *self.state.xmms_lo.get(&i).unwrap();
-            let hi_var = *self.state.xmms_hi.get(&i).unwrap();
             let lo_offset = RegisterState::get_xmm_offset(i, false);
             let hi_offset = RegisterState::get_xmm_offset(i, true);
             let lo_val =
@@ -768,6 +772,8 @@ impl<'a> Lifter<'a> {
                 self.builder
                     .ins()
                     .load(types::I64, MemFlags::trusted(), ctx_ptr, hi_offset);
+            let lo_var = *self.state.xmms_lo.get(&i).unwrap();
+            let hi_var = *self.state.xmms_hi.get(&i).unwrap();
             self.builder.def_var(lo_var, lo_val);
             self.builder.def_var(hi_var, hi_val);
         }

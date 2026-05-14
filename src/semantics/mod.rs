@@ -61,7 +61,7 @@ impl<'a> Lifter<'a> {
             // SSE2 scalar-double (XMM register operands). Disambiguate by
             // checking whether op0 is a memory-string kind.
             Mnemonic::Movsd => {
-                if instruction.op0_kind() == OpKind::MemoryESDI {
+                if matches!(instruction.op0_kind(), OpKind::MemoryESDI | OpKind::MemoryESRDI) {
                     self.handle_movsd_mem(instruction)
                 } else {
                     self.handle_movsd_sse(instruction)

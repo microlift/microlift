@@ -1,8 +1,10 @@
 //! SSE / SSE2 / XMM instruction semantics.
 //!
-//! XMM registers are tracked as two I64 SSA variables each (lo / hi).
-//! This sidesteps the need for 128-bit SIMD types in Cranelift while still
-//! correctly modelling the data flow for the most common patterns.
+//! XMM registers are stored as two scalar `I64` SSA variables (lo + hi).
+//! All handlers operate on scalar lo/hi pairs to remain compatible with
+//! cross-architecture AOT targets (e.g. RISC-V) that lack SIMD lowering.
+//! `LifterConfig::use_vector_xmm` is reserved for a future fast path that
+//! transiently uses `I64X2` on x86-64 JIT targets.
 
 use crate::MicroliftError;
 use crate::lifter::Lifter;
@@ -11,11 +13,12 @@ use cranelift::prelude::*;
 use iced_x86::{Instruction, OpKind};
 
 impl<'a> Lifter<'a> {
-    /// Load the low and high 64-bit halves of an XMM source operand.
+    /// Load a 128-bit XMM source operand as a `(lo, hi)` scalar pair.
     ///
     /// Supports:
-    ///  - XMM register source (reads SSA variables)
-    ///  - Memory source (two 8-byte loads at `ptr` and `ptr+8`)
+    ///  - XMM register source
+    ///  - GPR source (zero-extends 64-bit value into lo; hi = 0)
+    ///  - Memory source (two 8-byte loads)
     fn read_xmm_src(
         &mut self,
         instruction: &Instruction,
@@ -27,7 +30,7 @@ impl<'a> Lifter<'a> {
                 if let Some(idx) = xmm_register_index(reg) {
                     Ok((self.get_xmm_lo(idx), self.get_xmm_hi(idx)))
                 } else {
-                    // GPR used as source (e.g. MOVQ xmm, r64): zero-extend to 128 bits.
+                    // GPR source (e.g. MOVQ xmm, r64): zero-extend to 128 bits.
                     let lo = self.get_reg_val(reg)?;
                     let hi = self.builder.ins().iconst(types::I64, 0);
                     Ok((lo, hi))
@@ -45,11 +48,12 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// Write the low and high 64-bit halves to an XMM destination operand.
+    /// Write a `(lo, hi)` scalar pair to an XMM destination operand.
     ///
     /// Supports:
-    ///  - XMM register destination (writes SSA variables)
-    ///  - Memory destination (two 8-byte stores at `ptr` and `ptr+8`)
+    ///  - XMM register destination
+    ///  - GPR destination (uses lo bits only)
+    ///  - Memory destination (two 8-byte stores)
     fn write_xmm_dst(
         &mut self,
         instruction: &Instruction,
@@ -65,7 +69,7 @@ impl<'a> Lifter<'a> {
                     self.set_xmm_hi(idx, hi);
                     Ok(())
                 } else {
-                    // GPR destination: only use the low 64 bits.
+                    // GPR destination: use lo (low 64 bits).
                     self.set_reg_val(reg, lo)
                 }
             }
@@ -81,7 +85,7 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// ENDBR64 - CET end-branch marker, a NOP for lifting purposes.
+    /// ENDBR64 / ENDBR32 - CET end-branch marker, a NOP for lifting purposes.
     pub(super) fn handle_endbr64(&mut self, _instruction: &Instruction) -> crate::Result<()> {
         Ok(())
     }
@@ -103,7 +107,7 @@ impl<'a> Lifter<'a> {
             OpKind::Register => {
                 let dst_reg = self.operand_register(instruction, 0);
                 if let Some(dst_idx) = xmm_register_index(dst_reg) {
-                    // MOVQ xmm, xmm/r64/m64
+                    // MOVQ xmm, xmm/r64/m64 - move 64 bits, zero high 64.
                     let lo = match self.operand_kind(instruction, 1) {
                         OpKind::Register => {
                             let src = self.operand_register(instruction, 1);
@@ -126,28 +130,26 @@ impl<'a> Lifter<'a> {
                     self.set_xmm_lo(dst_idx, lo);
                     self.set_xmm_hi(dst_idx, zero);
                 } else {
-                    // MOVQ r64, xmm
+                    // MOVQ r64, xmm - extract low 64 bits to GPR.
                     let src_xmm = self.operand_register(instruction, 1);
-                    let lo = if let Some(src_idx) = xmm_register_index(src_xmm) {
-                        self.get_xmm_lo(src_idx)
-                    } else {
-                        return Err(MicroliftError::UnsupportedInstruction {
+                    let src_idx = xmm_register_index(src_xmm).ok_or_else(|| {
+                        MicroliftError::UnsupportedInstruction {
                             mnemonic: "movq-r64-non-xmm-src".into(),
-                        });
-                    };
+                        }
+                    })?;
+                    let lo = self.get_xmm_lo(src_idx);
                     self.set_reg_val(dst_reg, lo)?;
                 }
             }
             OpKind::Memory => {
-                // MOVQ m64, xmm
+                // MOVQ m64, xmm - store low 64 bits.
                 let src_xmm = self.operand_register(instruction, 1);
-                let lo = if let Some(src_idx) = xmm_register_index(src_xmm) {
-                    self.get_xmm_lo(src_idx)
-                } else {
-                    return Err(MicroliftError::UnsupportedInstruction {
+                let src_idx = xmm_register_index(src_xmm).ok_or_else(|| {
+                    MicroliftError::UnsupportedInstruction {
                         mnemonic: "movq-mem-non-xmm-src".into(),
-                    });
-                };
+                    }
+                })?;
+                let lo = self.get_xmm_lo(src_idx);
                 let ptr = self.get_mem_ptr(instruction, 0)?;
                 self.builder.ins().store(MemFlags::new(), lo, ptr, 0);
             }
@@ -167,15 +169,10 @@ impl<'a> Lifter<'a> {
             xmm_register_index(dst_reg).ok_or_else(|| MicroliftError::UnsupportedInstruction {
                 mnemonic: format!("xorps-dst-not-xmm-{:?}", dst_reg),
             })?;
-
-        let dst_lo = self.get_xmm_lo(dst_idx);
-        let dst_hi = self.get_xmm_hi(dst_idx);
-
+        let (dst_lo, dst_hi) = (self.get_xmm_lo(dst_idx), self.get_xmm_hi(dst_idx));
         let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
-
         let res_lo = self.builder.ins().bxor(dst_lo, src_lo);
         let res_hi = self.builder.ins().bxor(dst_hi, src_hi);
-
         self.set_xmm_lo(dst_idx, res_lo);
         self.set_xmm_hi(dst_idx, res_hi);
         Ok(())
@@ -193,15 +190,10 @@ impl<'a> Lifter<'a> {
             xmm_register_index(dst_reg).ok_or_else(|| MicroliftError::UnsupportedInstruction {
                 mnemonic: format!("andps-dst-not-xmm-{:?}", dst_reg),
             })?;
-
-        let dst_lo = self.get_xmm_lo(dst_idx);
-        let dst_hi = self.get_xmm_hi(dst_idx);
-
+        let (dst_lo, dst_hi) = (self.get_xmm_lo(dst_idx), self.get_xmm_hi(dst_idx));
         let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
-
         let res_lo = self.builder.ins().band(dst_lo, src_lo);
         let res_hi = self.builder.ins().band(dst_hi, src_hi);
-
         self.set_xmm_lo(dst_idx, res_lo);
         self.set_xmm_hi(dst_idx, res_hi);
         Ok(())
@@ -214,36 +206,27 @@ impl<'a> Lifter<'a> {
             xmm_register_index(dst_reg).ok_or_else(|| MicroliftError::UnsupportedInstruction {
                 mnemonic: format!("orps-dst-not-xmm-{:?}", dst_reg),
             })?;
-
-        let dst_lo = self.get_xmm_lo(dst_idx);
-        let dst_hi = self.get_xmm_hi(dst_idx);
-
+        let (dst_lo, dst_hi) = (self.get_xmm_lo(dst_idx), self.get_xmm_hi(dst_idx));
         let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
-
         let res_lo = self.builder.ins().bor(dst_lo, src_lo);
         let res_hi = self.builder.ins().bor(dst_hi, src_hi);
-
         self.set_xmm_lo(dst_idx, res_lo);
         self.set_xmm_hi(dst_idx, res_hi);
         Ok(())
     }
 
-    /// ANDNPS / ANDNPD / PANDN - bitwise AND-NOT: dst = ~dst & src.
+    /// ANDNPS / ANDNPD / PANDN - bitwise AND-NOT: `result = ~dst & src`.
     pub(super) fn handle_andnps(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let dst_reg = self.operand_register(instruction, 0);
         let dst_idx =
             xmm_register_index(dst_reg).ok_or_else(|| MicroliftError::UnsupportedInstruction {
                 mnemonic: format!("andnps-dst-not-xmm-{:?}", dst_reg),
             })?;
-
-        let dst_lo = self.get_xmm_lo(dst_idx);
-        let dst_hi = self.get_xmm_hi(dst_idx);
-
+        let (dst_lo, dst_hi) = (self.get_xmm_lo(dst_idx), self.get_xmm_hi(dst_idx));
         let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
-
+        // band_not(a, b) = a & !b - so band_not(src, dst) = src & !dst = ~dst & src
         let res_lo = self.builder.ins().band_not(src_lo, dst_lo);
         let res_hi = self.builder.ins().band_not(src_hi, dst_hi);
-
         self.set_xmm_lo(dst_idx, res_lo);
         self.set_xmm_hi(dst_idx, res_hi);
         Ok(())
@@ -251,10 +234,10 @@ impl<'a> Lifter<'a> {
 
     /// MOVSS - move scalar single-precision float (low 32 bits of XMM).
     ///
-    /// MOVSS xmm1, xmm2: merges low 32 bits of src into dst, preserving
-    /// the upper 96 bits of dst.
-    /// MOVSS xmm, m32: loads 32 bits, zeroes upper 96 bits of dst.
-    /// MOVSS m32, xmm: stores low 32 bits of src to memory.
+    /// - `MOVSS xmm1, xmm2`: replace bits[31:0] of dst with bits[31:0] of src;
+    ///   upper 96 bits of dst are preserved.
+    /// - `MOVSS xmm, m32`: load 32 bits into lo; upper 96 bits zeroed.
+    /// - `MOVSS m32, xmm`: store bits[31:0] of src lo to memory.
     pub(super) fn handle_movss(&mut self, instruction: &Instruction) -> crate::Result<()> {
         match self.operand_kind(instruction, 0) {
             OpKind::Register => {
@@ -267,7 +250,7 @@ impl<'a> Lifter<'a> {
 
                 match self.operand_kind(instruction, 1) {
                     OpKind::Register => {
-                        // MOVSS xmm1, xmm2 - merge low 32 bits, preserve upper 96
+                        // MOVSS xmm1, xmm2 - merge low 32 bits, preserve upper 96.
                         let src_reg = self.operand_register(instruction, 1);
                         let src_idx = xmm_register_index(src_reg).ok_or_else(|| {
                             MicroliftError::UnsupportedInstruction {
@@ -276,17 +259,16 @@ impl<'a> Lifter<'a> {
                         })?;
                         let src_lo = self.get_xmm_lo(src_idx);
                         let dst_lo = self.get_xmm_lo(dst_idx);
-
-                        // Replace bits [31:0] of dst_lo with src_lo[31:0]
+                        // Replace bits[31:0] of dst_lo with src_lo[31:0]; preserve bits[63:32].
                         let mask = self.builder.ins().iconst(types::I64, !0xFFFF_FFFFi64);
                         let cleared = self.builder.ins().band(dst_lo, mask);
                         let src32 = self.builder.ins().band_imm(src_lo, 0xFFFF_FFFF);
-                        let merged = self.builder.ins().bor(cleared, src32);
-                        self.set_xmm_lo(dst_idx, merged);
-                        // hi unchanged
+                        let merged_lo = self.builder.ins().bor(cleared, src32);
+                        // hi 64 bits of dst are preserved (no write needed).
+                        self.set_xmm_lo(dst_idx, merged_lo);
                     }
                     OpKind::Memory => {
-                        // MOVSS xmm, m32 - load 32 bits, zero upper 96
+                        // MOVSS xmm, m32 - load 32 bits, zero upper 96 bits.
                         let ptr = self.get_mem_ptr(instruction, 1)?;
                         let val32 = self.builder.ins().load(types::I32, MemFlags::new(), ptr, 0);
                         let lo = self.builder.ins().uextend(types::I64, val32);
@@ -302,7 +284,7 @@ impl<'a> Lifter<'a> {
                 }
             }
             OpKind::Memory => {
-                // MOVSS m32, xmm - store low 32 bits
+                // MOVSS m32, xmm - store low 32 bits.
                 let src_reg = self.operand_register(instruction, 1);
                 let src_idx = xmm_register_index(src_reg).ok_or_else(|| {
                     MicroliftError::UnsupportedInstruction {
@@ -325,10 +307,10 @@ impl<'a> Lifter<'a> {
 
     /// MOVSD (SSE2 form) - move scalar double-precision float (low 64 bits of XMM).
     ///
-    /// MOVSD xmm1, xmm2: merges low 64 bits of src into dst, preserving
-    /// the upper 64 bits of dst.
-    /// MOVSD xmm, m64: loads 64 bits, zeroes high 64 bits of dst.
-    /// MOVSD m64, xmm: stores low 64 bits of src to memory.
+    /// - `MOVSD xmm1, xmm2`: replace lo of dst with lo of src;
+    ///   hi (high 64 bits) of dst is preserved.
+    /// - `MOVSD xmm, m64`: load 64 bits into lo; hi zeroed.
+    /// - `MOVSD m64, xmm`: store lo of src to memory.
     pub(super) fn handle_movsd_sse(&mut self, instruction: &Instruction) -> crate::Result<()> {
         match self.operand_kind(instruction, 0) {
             OpKind::Register => {
@@ -341,7 +323,7 @@ impl<'a> Lifter<'a> {
 
                 match self.operand_kind(instruction, 1) {
                     OpKind::Register => {
-                        // MOVSD xmm1, xmm2 - copy lo64 of src, preserve hi64 of dst
+                        // MOVSD xmm1, xmm2 - copy lo of src, preserve hi of dst.
                         let src_reg = self.operand_register(instruction, 1);
                         let src_idx = xmm_register_index(src_reg).ok_or_else(|| {
                             MicroliftError::UnsupportedInstruction {
@@ -349,11 +331,11 @@ impl<'a> Lifter<'a> {
                             }
                         })?;
                         let src_lo = self.get_xmm_lo(src_idx);
+                        // hi of dst is preserved (no write needed).
                         self.set_xmm_lo(dst_idx, src_lo);
-                        // hi64 of dst is preserved - no write needed
                     }
                     OpKind::Memory => {
-                        // MOVSD xmm, m64 - load 64 bits, zero high 64 bits
+                        // MOVSD xmm, m64 - load 64 bits, zero hi.
                         let ptr = self.get_mem_ptr(instruction, 1)?;
                         let lo = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0);
                         let hi = self.builder.ins().iconst(types::I64, 0);
@@ -368,7 +350,7 @@ impl<'a> Lifter<'a> {
                 }
             }
             OpKind::Memory => {
-                // MOVSD m64, xmm - store low 64 bits
+                // MOVSD m64, xmm - store lo.
                 let src_reg = self.operand_register(instruction, 1);
                 let src_idx = xmm_register_index(src_reg).ok_or_else(|| {
                     MicroliftError::UnsupportedInstruction {

@@ -254,7 +254,7 @@ impl<'a> Lifter<'a> {
             match ty {
                 FunctionArgumentType::VariadicList | FunctionArgumentType::None => break,
                 FunctionArgumentType::SinglePrecisionFp => {
-                    // XMM lo (I64) → ireduce to I32 → bitcast to F32.
+                    // XMM lo (I64) -> ireduce to I32 -> bitcast to F32.
                     let lo = self.get_xmm_lo(xmm_idx);
                     let i32_val = self.builder.ins().ireduce(types::I32, lo);
                     let f32_val = self
@@ -265,7 +265,7 @@ impl<'a> Lifter<'a> {
                     xmm_idx += 1;
                 }
                 FunctionArgumentType::DoublePrecisionFp => {
-                    // XMM lo (I64) → bitcast to F64.
+                    // XMM lo (I64) -> bitcast to F64.
                     let lo = self.get_xmm_lo(xmm_idx);
                     let f64_val = self.builder.ins().bitcast(types::F64, MemFlags::new(), lo);
                     call_args.push(f64_val);
@@ -310,24 +310,24 @@ impl<'a> Lifter<'a> {
             match ret_type {
                 FunctionArgumentType::None => {}
                 FunctionArgumentType::SinglePrecisionFp => {
-                    // F32 → bitcast to I32 → zero-extend to I64 → XMM0 lo.
+                    // F32 -> bitcast to I32 -> zero-extend to I64 -> XMM0 lo.
                     let i32_val = self
                         .builder
                         .ins()
                         .bitcast(types::I32, MemFlags::new(), ret_val);
                     let i64_val = self.builder.ins().uextend(types::I64, i32_val);
-                    self.set_xmm_lo(0, i64_val);
                     let zero = self.builder.ins().iconst(types::I64, 0);
+                    self.set_xmm_lo(0, i64_val);
                     self.set_xmm_hi(0, zero);
                 }
                 FunctionArgumentType::DoublePrecisionFp => {
-                    // F64 → bitcast to I64 → XMM0 lo.
+                    // F64 -> bitcast to I64 -> XMM0 lo.
                     let i64_val = self
                         .builder
                         .ins()
                         .bitcast(types::I64, MemFlags::new(), ret_val);
-                    self.set_xmm_lo(0, i64_val);
                     let zero = self.builder.ins().iconst(types::I64, 0);
+                    self.set_xmm_lo(0, i64_val);
                     self.set_xmm_hi(0, zero);
                 }
                 ty => {

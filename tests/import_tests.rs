@@ -19,8 +19,6 @@ use microlift::lifter::{Lifter, LifterConfig};
 use microlift::os::get_host_calling_conv;
 use microlift::trampoline_func;
 
-// ── Host-side strlen ────────────────────────────────────────────────────────
-
 /// Pure Rust reimplementation of C `strlen` - counts bytes until the NUL
 /// terminator.  No libc dependency.
 unsafe extern "C" fn host_strlen(s: *const u8) -> u64 {
@@ -31,16 +29,12 @@ unsafe extern "C" fn host_strlen(s: *const u8) -> u64 {
     n
 }
 
-// ── Test constants ───────────────────────────────────────────────────────────
-
 /// VA of the first lifted instruction.
 const LIFT_BASE: u64 = 0x1000;
 /// VA used for the fake "strlen import" stub.
 const IMPORT_VA: u64 = 0x2000;
 /// The exit-trampoline sentinel used by the lifter (always this value).
 const EXIT_TRAMPOLINE: u64 = 0xFFFF_FFFF_FFFF_FFFF;
-
-// ── Byte-sequence builder ────────────────────────────────────────────────────
 
 /// Builds the x86-64 byte sequence for:
 ///
@@ -74,8 +68,6 @@ fn strlen_call_bytes(string_ptr: u64) -> Vec<u8> {
 
     b
 }
-
-// ── Shared lift + compile helper ─────────────────────────────────────────────
 
 /// Lift `bytes` with the given config, compile with the JIT backend, and
 /// return the live backend (which keeps the code allocation alive) together
@@ -116,8 +108,6 @@ fn make_ctx_and_stack() -> (RegisterContext, Vec<u64>) {
 
     (ctx, stack)
 }
-
-// ── Tests ────────────────────────────────────────────────────────────────────
 
 /// Fast-call path: `strlen` is registered with full `DynamicSymbol` metadata.
 ///
@@ -182,7 +172,6 @@ fn test_import_slow_call_strlen_with_resume() {
 
     let f: fn(*mut RegisterContext) = unsafe { std::mem::transmute(code_ptr) };
 
-    // ── Round 1: intercepted import call ────────────────────────────────────
     f(&mut ctx);
 
     assert_eq!(
@@ -206,11 +195,9 @@ fn test_import_slow_call_strlen_with_resume() {
         "rdi should hold the string pointer arg"
     );
 
-    // ── Host handles the call ────────────────────────────────────────────────
     let len = unsafe { host_strlen(ctx.rdi as *const u8) };
     ctx.rax = len; // write return value where the ABI says (RAX)
 
-    // ── Round 2: resume from the ret instruction ─────────────────────────────
     f(&mut ctx);
 
     assert_eq!(
