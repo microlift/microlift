@@ -1,3 +1,5 @@
+use std::num::TryFromIntError;
+
 #[repr(C)]
 #[derive(Default, Debug, Clone, Copy)]
 pub struct RegisterContext {
@@ -78,6 +80,30 @@ pub enum ExitReason {
     /// `RegisterContext::rip` holds the address of the instruction after the
     /// `CALL` - i.e. where execution should resume after the host handles it.
     ImportedFunctionCall = 6,
+}
+
+impl TryFrom<u32> for ExitReason {
+    type Error = ();
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        if value == Self::None as u32 {
+            Ok(Self::None)
+        } else if value == Self::Return as u32 {
+            Ok(Self::Return)
+        } else if value == Self::Syscall as u32 {
+            Ok(Self::Syscall)
+        } else if value == Self::UnknownJump as u32 {
+            Ok(Self::UnknownJump)
+        } else if value == Self::UnimplementedInstruction as u32 {
+            Ok(Self::UnimplementedInstruction)
+        } else if value == Self::InvalidInstruction as u32 {
+            Ok(Self::InvalidInstruction)
+        } else if value == Self::ImportedFunctionCall as u32 {
+            Ok(Self::ImportedFunctionCall)
+        } else {
+            Err(())
+        }
+    }
 }
 
 /// Describes what kind of x86 control transfer caused an `UnknownJump` VM exit.
