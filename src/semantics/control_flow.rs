@@ -130,19 +130,36 @@ impl<'a> Lifter<'a> {
                     return self.emit_import_call(target);
                 }
 
-                // Out-of-region direct call: treat like a slow import so the
-                // runtime can call the target natively and resume at next_ip via
-                // the dispatch switch. Pushing a return address here would put
-                // a mid-function address on the stack that the SIGILL handler
-                // cannot look up by function-start VA, causing a crash on return.
-                //
-                // The target VMA must be rebased at runtime: image_base + (target - lift_base).
-                // emit_indirect_call_exit handles a runtime Value for imported_function_va.
+                // Out-of-region direct call. Emit UnknownJump + DirectCall so
+                // the runtime can distinguish this from a real ImportedFunctionCall
+                // (a registered import whose callee is always a native function).
+                // For DirectCall the callee may itself be a virtualized function,
+                // which the runtime will have to account for appropriately.
                 if target < self.lift_base || target >= self.lift_end {
+                    self.get_block(self.current_ip);
+
                     let image_base = self.builder.use_var(self.state.image_base);
-                    let offset = target.wrapping_sub(self.lift_base);
-                    let rebased = self.builder.ins().iadd_imm(image_base, offset as i64);
-                    return self.emit_indirect_call_exit(rebased);
+                    let callee_offset = target.wrapping_sub(self.lift_base);
+                    let rebased_callee = self
+                        .builder
+                        .ins()
+                        .iadd_imm(image_base, callee_offset as i64);
+
+                    let ctx_ptr = self.builder.use_var(self.state.context_ptr);
+                    let va_offset =
+                        std::mem::offset_of!(RegisterContext, imported_function_va) as i32;
+                    self.builder.ins().store(
+                        MemFlags::trusted(),
+                        rebased_callee,
+                        ctx_ptr,
+                        va_offset,
+                    );
+
+                    self.sync_to_context_selective(None, ExitReason::UnknownJump)?;
+                    self.write_exit_code(TransferKind::DirectCall as u32);
+                    self.builder.ins().return_(&[]);
+                    self.block_terminated = true;
+                    return Ok(());
                 }
 
                 // Internal direct call - push return address and jump.
