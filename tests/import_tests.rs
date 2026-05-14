@@ -156,7 +156,7 @@ fn test_import_fast_call_strlen() {
 /// into `ctx.rax`, and invokes the lifted function a second time.
 ///
 /// Round 2: the dispatch switch routes to the `ret` block (RIP == 0x100F).
-///   `ret` pops the exit trampoline → `Return` exit.  `ctx.rax` still holds
+///   `ret` pops the exit trampoline -> `Return` exit.  `ctx.rax` still holds
 ///   the value the host wrote.
 #[test]
 fn test_import_slow_call_strlen_with_resume() {

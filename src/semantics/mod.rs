@@ -173,6 +173,12 @@ impl<'a> Lifter<'a> {
             // System
             Mnemonic::Syscall => self.handle_syscall(instruction),
 
+            // FS/GS base (FSGSBASE extension)
+            Mnemonic::Rdfsbase => self.handle_rdfsbase(instruction),
+            Mnemonic::Wrfsbase => self.handle_wrfsbase(instruction),
+            Mnemonic::Rdgsbase => self.handle_rdgsbase(instruction),
+            Mnemonic::Wrgsbase => self.handle_wrgsbase(instruction),
+
             _ => {
                 if self.config.interpreter_fallback {
                     self.handle_unimplemented_instruction(instruction)

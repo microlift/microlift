@@ -43,6 +43,14 @@ pub struct RegisterContext {
     pub imported_function_va: u64,
     /// XMM0–XMM15, each stored as [lo_64, hi_64].
     pub xmm: [[u64; 2]; 16],
+    /// FS segment base address. In x86-64 user mode this is set via
+    /// `arch_prctl(ARCH_SET_FS)` or `wrfsbase` and used for thread-local
+    /// storage. Reads/writes through `fs:` prefixed addresses add this base.
+    pub fs_base: u64,
+    /// GS segment base address. On Windows this points to the TEB; on Linux
+    /// it is often used for kernel->user communication via `swapgs`.
+    /// Reads/writes through `gs:` prefixed addresses add this base.
+    pub gs_base: u64,
 }
 
 #[repr(u32)]

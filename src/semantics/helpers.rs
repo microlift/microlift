@@ -268,6 +268,7 @@ impl<'a> Lifter<'a> {
         let index_reg = instruction.memory_index();
         let scale = instruction.memory_index_scale();
         let disp = instruction.memory_displacement64();
+        let segment = instruction.memory_segment();
 
         let mut ptr = if base_reg == Register::RIP {
             // RIP-relative: iced-x86 sets 'disp' to the absolute target address (as decoded).
@@ -296,6 +297,20 @@ impl<'a> Lifter<'a> {
         // For RIP-relative, the target address is already our 'ptr'.
         if base_reg != Register::RIP && disp != 0 {
             ptr = self.builder.ins().iadd_imm(ptr, disp as i64);
+        }
+
+        // Add FS or GS segment base. In x86-64 long mode DS/ES/SS/CS have
+        // base 0 and are ignored; only FS and GS carry non-zero bases.
+        match segment {
+            Register::FS => {
+                let fs_base = self.get_fs_base();
+                ptr = self.builder.ins().iadd(fs_base, ptr);
+            }
+            Register::GS => {
+                let gs_base = self.get_gs_base();
+                ptr = self.builder.ins().iadd(gs_base, ptr);
+            }
+            _ => {}
         }
 
         Ok(ptr)
@@ -332,5 +347,27 @@ impl<'a> Lifter<'a> {
         let var = *self.state.xmms_hi.get(&idx).unwrap();
         self.builder.def_var(var, val);
         self.dirty_xmms.insert(idx);
+    }
+
+    /// Read the current FS segment base from the SSA variable.
+    pub fn get_fs_base(&mut self) -> Value {
+        self.builder.use_var(self.state.fs_base)
+    }
+
+    /// Read the current GS segment base from the SSA variable.
+    pub fn get_gs_base(&mut self) -> Value {
+        self.builder.use_var(self.state.gs_base)
+    }
+
+    /// Write a new FS segment base and mark it dirty.
+    pub fn set_fs_base(&mut self, val: Value) {
+        self.builder.def_var(self.state.fs_base, val);
+        self.dirty_fs_base = true;
+    }
+
+    /// Write a new GS segment base and mark it dirty.
+    pub fn set_gs_base(&mut self, val: Value) {
+        self.builder.def_var(self.state.gs_base, val);
+        self.dirty_gs_base = true;
     }
 }

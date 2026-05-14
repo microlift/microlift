@@ -1,0 +1,285 @@
+//! Thread-Local Storage (TLS) / FS-GS segment selector tests.
+//!
+//! These tests verify that:
+//!  - FS- and GS-prefixed memory accesses correctly add the segment base.
+//!  - `rdfsbase` / `rdgsbase` read the segment base into a GPR.
+//!  - `wrfsbase` / `wrgsbase` write a GPR into the segment base.
+//!
+//! No real multithreading is required; we simply pre-load `ctx.fs_base` /
+//! `ctx.gs_base` with the address of a local buffer and verify that the
+//! segment-prefixed instructions address that buffer correctly.
+
+use cranelift::prelude::*;
+use cranelift_codegen::ir::{Function, UserFuncName};
+use cranelift_codegen::settings;
+use microlift::backend::CraneliftBackend;
+use microlift::context::RegisterContext;
+use microlift::lifter::Lifter;
+use microlift::os::get_host_calling_conv;
+
+fn run_test(bytes: &[u8], mut ctx: RegisterContext) -> RegisterContext {
+    let mut flag_builder = settings::builder();
+    flag_builder.set("use_colocated_libcalls", "false").unwrap();
+    flag_builder.set("is_pic", "false").unwrap();
+
+    let mut func = Function::with_name_signature(
+        UserFuncName::user(0, 0),
+        Signature::new(get_host_calling_conv()),
+    );
+    func.signature.params.push(AbiParam::new(types::I64));
+
+    let mut func_ctx = cranelift_frontend::FunctionBuilderContext::new();
+    let builder = cranelift_frontend::FunctionBuilder::new(&mut func, &mut func_ctx);
+    let mut lifter = Lifter::new(builder);
+
+    let mut stack = [0u64; 1024];
+    let stack_top = stack.as_mut_ptr() as u64 + 8192;
+    ctx.rsp = stack_top - 8;
+    ctx.image_base = 0x1000;
+
+    let exit_trampoline = lifter.exit_trampoline_address;
+    unsafe {
+        *(ctx.rsp as *mut u64) = exit_trampoline;
+    }
+
+    lifter.lift(bytes, 0x1000).expect("lifting failed");
+
+    let mut backend = CraneliftBackend::new().expect("backend init failed");
+    drop(lifter);
+    let code_ptr = backend.compile(func).expect("compilation failed");
+
+    let f: fn(*mut RegisterContext) = unsafe { std::mem::transmute(code_ptr) };
+    f(&mut ctx);
+    ctx
+}
+
+#[test]
+fn test_fs_segment_read_via_reg() {
+    // mov rax, qword ptr fs:[rcx]  ; 64 48 8B 01
+    // ret                           ; C3
+    //
+    // Loads a 64-bit value from (fs_base + rcx).
+    let bytes = [0x64, 0x48, 0x8B, 0x01, 0xC3];
+
+    let tls_data: [u64; 2] = [0xDEAD_BEEF_1234_5678, 0xCAFE_BABE_0000_0001];
+    let mut ctx = RegisterContext::default();
+    ctx.fs_base = tls_data.as_ptr() as u64;
+    ctx.rcx = 0; // offset 0 -> first element
+
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.rax, 0xDEAD_BEEF_1234_5678, "fs:[rcx+0] read mismatch");
+}
+
+#[test]
+fn test_fs_segment_read_with_offset() {
+    // mov rax, qword ptr fs:[rcx]  ; 64 48 8B 01
+    // ret                           ; C3
+    //
+    // Same instruction, but rcx = 8 to read the second element.
+    let bytes = [0x64, 0x48, 0x8B, 0x01, 0xC3];
+
+    let tls_data: [u64; 2] = [0x1111_1111_1111_1111, 0x2222_2222_2222_2222];
+    let mut ctx = RegisterContext::default();
+    ctx.fs_base = tls_data.as_ptr() as u64;
+    ctx.rcx = 8; // offset 8 -> second element
+
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.rax, 0x2222_2222_2222_2222, "fs:[rcx+8] read mismatch");
+}
+
+#[test]
+fn test_gs_segment_read_via_reg() {
+    // mov rax, qword ptr gs:[rcx]  ; 65 48 8B 01
+    // ret                           ; C3
+    let bytes = [0x65, 0x48, 0x8B, 0x01, 0xC3];
+
+    let tls_data: [u64; 2] = [0xAAAA_BBBB_CCCC_DDDD, 0xEEEE_FFFF_0000_1111];
+    let mut ctx = RegisterContext::default();
+    ctx.gs_base = tls_data.as_ptr() as u64;
+    ctx.rcx = 8; // second element
+
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.rax, 0xEEEE_FFFF_0000_1111, "gs:[rcx+8] read mismatch");
+}
+
+#[test]
+fn test_fs_segment_write_via_reg() {
+    // mov qword ptr fs:[rcx], rax  ; 64 48 89 01
+    // ret                           ; C3
+    //
+    // Stores rax into (fs_base + rcx).
+    let bytes = [0x64, 0x48, 0x89, 0x01, 0xC3];
+
+    let mut tls_data: [u64; 2] = [0, 0];
+    let mut ctx = RegisterContext::default();
+    ctx.fs_base = tls_data.as_mut_ptr() as u64;
+    ctx.rcx = 0;
+    ctx.rax = 0x1234_5678_9ABC_DEF0;
+
+    run_test(&bytes, ctx);
+    // The JIT wrote directly into our buffer.
+    assert_eq!(
+        tls_data[0], 0x1234_5678_9ABC_DEF0,
+        "fs:[rcx] write mismatch"
+    );
+}
+
+#[test]
+fn test_fs_segment_write_with_offset() {
+    // mov qword ptr fs:[rcx], rax  ; 64 48 89 01
+    // ret                           ; C3
+    let bytes = [0x64, 0x48, 0x89, 0x01, 0xC3];
+
+    let mut tls_data: [u64; 2] = [0xDEAD, 0xDEAD];
+    let mut ctx = RegisterContext::default();
+    ctx.fs_base = tls_data.as_mut_ptr() as u64;
+    ctx.rcx = 8; // second slot
+    ctx.rax = 0x0BAD_C0DE_CAFE_BABE;
+
+    run_test(&bytes, ctx);
+    assert_eq!(tls_data[0], 0xDEAD, "first slot must be untouched");
+    assert_eq!(
+        tls_data[1], 0x0BAD_C0DE_CAFE_BABE,
+        "fs:[rcx+8] write mismatch"
+    );
+}
+
+#[test]
+fn test_gs_segment_write_via_reg() {
+    // mov qword ptr gs:[rcx], rax  ; 65 48 89 01
+    // ret                           ; C3
+    let bytes = [0x65, 0x48, 0x89, 0x01, 0xC3];
+
+    let mut tls_data: [u64; 1] = [0];
+    let mut ctx = RegisterContext::default();
+    ctx.gs_base = tls_data.as_mut_ptr() as u64;
+    ctx.rcx = 0;
+    ctx.rax = 0xFEED_FACE_DEAD_BEEF;
+
+    run_test(&bytes, ctx);
+    assert_eq!(
+        tls_data[0], 0xFEED_FACE_DEAD_BEEF,
+        "gs:[rcx] write mismatch"
+    );
+}
+
+#[test]
+fn test_rdfsbase() {
+    // rdfsbase rax  ; F3 48 0F AE C0
+    // ret           ; C3
+    //
+    // Reads ctx.fs_base into rax.
+    let bytes = [0xF3, 0x48, 0x0F, 0xAE, 0xC0, 0xC3];
+
+    let mut ctx = RegisterContext::default();
+    ctx.fs_base = 0x7FFF_0000_DEAD_CAFE;
+
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(
+        ctx.rax, 0x7FFF_0000_DEAD_CAFE,
+        "rdfsbase must copy fs_base -> rax"
+    );
+}
+
+#[test]
+fn test_wrfsbase() {
+    // wrfsbase rax  ; F3 48 0F AE D0
+    // ret           ; C3
+    //
+    // Writes rax into ctx.fs_base.
+    let bytes = [0xF3, 0x48, 0x0F, 0xAE, 0xD0, 0xC3];
+
+    let mut ctx = RegisterContext::default();
+    ctx.rax = 0x1234_5678_9ABC_DEF0;
+
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(
+        ctx.fs_base, 0x1234_5678_9ABC_DEF0,
+        "wrfsbase must copy rax -> fs_base"
+    );
+}
+
+#[test]
+fn test_wrfsbase_then_read() {
+    // wrfsbase rax        ; F3 48 0F AE D0
+    // mov rbx, [fs:rcx]  ; 64 48 8B 19
+    // ret                 ; C3
+    //
+    // Sets fs_base = rax, then reads from the new base + rcx.
+    let bytes = [
+        0xF3, 0x48, 0x0F, 0xAE, 0xD0, // wrfsbase rax
+        0x64, 0x48, 0x8B, 0x19, // mov rbx, [fs:rcx]
+        0xC3, // ret
+    ];
+
+    let tls_data: [u64; 1] = [0xABCD_EF01_2345_6789];
+    let mut ctx = RegisterContext::default();
+    ctx.rax = tls_data.as_ptr() as u64; // new fs_base
+    ctx.rcx = 0;
+
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(
+        ctx.rbx, 0xABCD_EF01_2345_6789,
+        "fs read after wrfsbase mismatch"
+    );
+    assert_eq!(
+        ctx.fs_base,
+        tls_data.as_ptr() as u64,
+        "fs_base not persisted"
+    );
+}
+
+#[test]
+fn test_rdgsbase() {
+    // rdgsbase rax  ; F3 48 0F AE C8
+    // ret           ; C3
+    let bytes = [0xF3, 0x48, 0x0F, 0xAE, 0xC8, 0xC3];
+
+    let mut ctx = RegisterContext::default();
+    ctx.gs_base = 0xBEEF_CAFE_1234_5678;
+
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(
+        ctx.rax, 0xBEEF_CAFE_1234_5678,
+        "rdgsbase must copy gs_base -> rax"
+    );
+}
+
+#[test]
+fn test_wrgsbase() {
+    // wrgsbase rax  ; F3 48 0F AE D8
+    // ret           ; C3
+    let bytes = [0xF3, 0x48, 0x0F, 0xAE, 0xD8, 0xC3];
+
+    let mut ctx = RegisterContext::default();
+    ctx.rax = 0xDEAD_BEEF_0000_CAFE;
+
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(
+        ctx.gs_base, 0xDEAD_BEEF_0000_CAFE,
+        "wrgsbase must copy rax -> gs_base"
+    );
+}
+
+#[test]
+fn test_fs_gs_independent() {
+    // rdfsbase rax   ; F3 48 0F AE C0
+    // rdgsbase rcx   ; F3 48 0F AE C8  (but dst = rcx, ModRM C9)
+    // ret            ; C3
+    //
+    // rdgsbase rcx: F3 48 0F AE C9
+    //   C9 = mod=11, reg=001 (rdgsbase), rm=001 (RCX)
+    let bytes = [
+        0xF3, 0x48, 0x0F, 0xAE, 0xC0, // rdfsbase rax
+        0xF3, 0x48, 0x0F, 0xAE, 0xC9, // rdgsbase rcx
+        0xC3, // ret
+    ];
+
+    let mut ctx = RegisterContext::default();
+    ctx.fs_base = 0x1111_1111_1111_1111;
+    ctx.gs_base = 0x2222_2222_2222_2222;
+
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.rax, 0x1111_1111_1111_1111, "rax must hold fs_base");
+    assert_eq!(ctx.rcx, 0x2222_2222_2222_2222, "rcx must hold gs_base");
+}

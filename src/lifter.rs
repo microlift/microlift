@@ -21,6 +21,10 @@ pub struct RegisterState {
     pub xmms_lo: HashMap<u8, Variable>,
     /// XMM0–XMM15 high 64 bits (index 0–15).
     pub xmms_hi: HashMap<u8, Variable>,
+    /// FS segment base address SSA variable.
+    pub fs_base: Variable,
+    /// GS segment base address SSA variable.
+    pub gs_base: Variable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -87,6 +91,9 @@ impl RegisterState {
             xmms_hi.insert(i, builder.declare_var(types::I64));
         }
 
+        let fs_base = builder.declare_var(types::I64);
+        let gs_base = builder.declare_var(types::I64);
+
         Self {
             gprs,
             flags,
@@ -94,6 +101,8 @@ impl RegisterState {
             image_base,
             xmms_lo,
             xmms_hi,
+            fs_base,
+            gs_base,
         }
     }
 
@@ -135,6 +144,14 @@ impl RegisterState {
     pub fn get_xmm_offset(idx: u8, hi: bool) -> i32 {
         let base = std::mem::offset_of!(RegisterContext, xmm) as i32;
         base + (idx as i32) * 16 + if hi { 8 } else { 0 }
+    }
+
+    pub fn get_fs_base_offset() -> i32 {
+        std::mem::offset_of!(RegisterContext, fs_base) as i32
+    }
+
+    pub fn get_gs_base_offset() -> i32 {
+        std::mem::offset_of!(RegisterContext, gs_base) as i32
     }
 }
 
@@ -197,9 +214,9 @@ pub struct LifterConfig {
     ///
     /// - Key: virtual address of the imported function (e.g. a PLT stub or
     ///   thunk address) as it appears in the code being lifted.
-    /// - Value: `Some(sym)` → attempt a fast inline call using SysV AMD64
+    /// - Value: `Some(sym)` -> attempt a fast inline call using SysV AMD64
     ///   argument passing (skipped for variadic functions, which fall back to
-    ///   a slow VM exit). `None` → always emit an `ImportedFunctionCall` exit.
+    ///   a slow VM exit). `None` -> always emit an `ImportedFunctionCall` exit.
     ///
     /// Use [`register_fast_import`] / [`register_slow_import`] to populate.
     pub imports: HashMap<u64, Option<DynamicSymbol>>,
@@ -274,6 +291,10 @@ pub struct Lifter<'a> {
     pub dirty_flags: HashSet<X86Flag>,
     /// Dirty-bit tracking: XMM registers (by index 0–15) written since last sync.
     pub dirty_xmms: HashSet<u8>,
+    /// Dirty-bit tracking: FS base written since last sync.
+    pub dirty_fs_base: bool,
+    /// Dirty-bit tracking: GS base written since last sync.
+    pub dirty_gs_base: bool,
     /// Pre-built fast-call data for registered imports.
     ///
     /// Key = import VA.  Value = (signature ref, raw fn pointer as i64, arg
@@ -342,6 +363,8 @@ impl<'a> Lifter<'a> {
             dirty_gprs: HashSet::new(),
             dirty_flags: HashSet::new(),
             dirty_xmms: HashSet::new(),
+            dirty_fs_base: false,
+            dirty_gs_base: false,
             fast_call_data,
             import_vas,
             block_transfer_kinds: HashMap::new(),
@@ -635,6 +658,21 @@ impl<'a> Lifter<'a> {
             );
         }
 
+        let fs_base_val = self.builder.use_var(self.state.fs_base);
+        self.builder.ins().store(
+            MemFlags::trusted(),
+            fs_base_val,
+            ctx_ptr,
+            RegisterState::get_fs_base_offset(),
+        );
+        let gs_base_val = self.builder.use_var(self.state.gs_base);
+        self.builder.ins().store(
+            MemFlags::trusted(),
+            gs_base_val,
+            ctx_ptr,
+            RegisterState::get_gs_base_offset(),
+        );
+
         self.flush_rip_and_reason(rip, reason)?;
         Ok(())
     }
@@ -690,6 +728,25 @@ impl<'a> Lifter<'a> {
                 hi_val,
                 ctx_ptr,
                 RegisterState::get_xmm_offset(idx, true),
+            );
+        }
+
+        if self.dirty_fs_base {
+            let fs_base_val = self.builder.use_var(self.state.fs_base);
+            self.builder.ins().store(
+                MemFlags::trusted(),
+                fs_base_val,
+                ctx_ptr,
+                RegisterState::get_fs_base_offset(),
+            );
+        }
+        if self.dirty_gs_base {
+            let gs_base_val = self.builder.use_var(self.state.gs_base);
+            self.builder.ins().store(
+                MemFlags::trusted(),
+                gs_base_val,
+                ctx_ptr,
+                RegisterState::get_gs_base_offset(),
             );
         }
 
@@ -778,11 +835,29 @@ impl<'a> Lifter<'a> {
             self.builder.def_var(hi_var, hi_val);
         }
 
+        let fs_base_val = self.builder.ins().load(
+            types::I64,
+            MemFlags::trusted(),
+            ctx_ptr,
+            RegisterState::get_fs_base_offset(),
+        );
+        self.builder.def_var(self.state.fs_base, fs_base_val);
+
+        let gs_base_val = self.builder.ins().load(
+            types::I64,
+            MemFlags::trusted(),
+            ctx_ptr,
+            RegisterState::get_gs_base_offset(),
+        );
+        self.builder.def_var(self.state.gs_base, gs_base_val);
+
         // After a full reload, the dirty sets are cleared - everything in the
         // context is now in sync with our SSA variables.
         self.dirty_gprs.clear();
         self.dirty_flags.clear();
         self.dirty_xmms.clear();
+        self.dirty_fs_base = false;
+        self.dirty_gs_base = false;
 
         Ok(())
     }

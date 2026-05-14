@@ -235,4 +235,36 @@ impl<'a> Lifter<'a> {
         self.set_reg_val(Register::RSI, new_rsi)?;
         Ok(())
     }
+
+    // FS/GS base (FSGSBASE) instructions
+
+    /// RDFSBASE r64 - read FS segment base into a GPR.
+    pub(super) fn handle_rdfsbase(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst = instruction.op0_register();
+        let val = self.get_fs_base();
+        self.set_reg_val(dst, val)
+    }
+
+    /// WRFSBASE r64 - write a GPR into the FS segment base.
+    pub(super) fn handle_wrfsbase(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let src = instruction.op0_register();
+        let val = self.get_reg_val(src)?;
+        self.set_fs_base(val);
+        Ok(())
+    }
+
+    /// RDGSBASE r64 - read GS segment base into a GPR.
+    pub(super) fn handle_rdgsbase(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst = instruction.op0_register();
+        let val = self.get_gs_base();
+        self.set_reg_val(dst, val)
+    }
+
+    /// WRGSBASE r64 - write a GPR into the GS segment base.
+    pub(super) fn handle_wrgsbase(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let src = instruction.op0_register();
+        let val = self.get_reg_val(src)?;
+        self.set_gs_base(val);
+        Ok(())
+    }
 }
