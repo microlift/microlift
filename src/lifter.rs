@@ -460,8 +460,19 @@ impl<'a> Lifter<'a> {
                             // entry dispatch switch and slow-call exits can
                             // resume here without needing emit_resume_blocks.
                             leaders.insert(instruction.next_ip());
-                        } else {
+                        } else if target >= ip && target < ip + bytes.len() as u64 {
+                            // In-region call: add the callee as a block leader.
                             leaders.insert(target);
+                        } else {
+                            // Out-of-region direct call: the callee is outside
+                            // the lifted bytes so it will be handled as a
+                            // DirectCall VM exit. Add the resume point (next_ip)
+                            // so the entry dispatch switch can route back here
+                            // after the runtime handles the call - without this
+                            // the switch has no entry for the resume RIP and
+                            // falls through to start_block, restarting the
+                            // function from the top (infinite loop).
+                            leaders.insert(instruction.next_ip());
                         }
                     }
                 }
