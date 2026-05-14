@@ -135,8 +135,14 @@ impl<'a> Lifter<'a> {
                 // the dispatch switch. Pushing a return address here would put
                 // a mid-function address on the stack that the SIGILL handler
                 // cannot look up by function-start VA, causing a crash on return.
+                //
+                // The target VMA must be rebased at runtime: image_base + (target - lift_base).
+                // emit_indirect_call_exit handles a runtime Value for imported_function_va.
                 if target < self.lift_base || target >= self.lift_end {
-                    return self.emit_import_slow_exit(target);
+                    let image_base = self.builder.use_var(self.state.image_base);
+                    let offset = target.wrapping_sub(self.lift_base);
+                    let rebased = self.builder.ins().iadd_imm(image_base, offset as i64);
+                    return self.emit_indirect_call_exit(rebased);
                 }
 
                 // Internal direct call - push return address and jump.
