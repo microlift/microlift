@@ -130,6 +130,15 @@ impl<'a> Lifter<'a> {
                     return self.emit_import_call(target);
                 }
 
+                // Out-of-region direct call: treat like a slow import so the
+                // runtime can call the target natively and resume at next_ip via
+                // the dispatch switch. Pushing a return address here would put
+                // a mid-function address on the stack that the SIGILL handler
+                // cannot look up by function-start VA, causing a crash on return.
+                if target < self.lift_base || target >= self.lift_end {
+                    return self.emit_import_slow_exit(target);
+                }
+
                 // Internal direct call - push return address and jump.
                 let next_ip = instruction.next_ip();
                 self.get_block(next_ip);
@@ -145,9 +154,6 @@ impl<'a> Lifter<'a> {
                     .ins()
                     .store(MemFlags::new(), ret_addr, new_rsp, 0);
 
-                // Tag the target so that if it's outside the lifted region its
-                // unvisited-block stub exits with TransferKind::DirectCall,
-                // telling the runtime that a return address was pushed.
                 let target_block = self.get_block_with_kind(target, TransferKind::DirectCall);
                 self.builder.ins().jump(target_block, &[]);
                 self.block_terminated = true;

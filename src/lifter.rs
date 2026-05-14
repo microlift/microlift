@@ -273,6 +273,9 @@ pub struct Lifter<'a> {
     /// The `ip` value passed to `lift()` - i.e. the original VA of the first
     /// instruction in the lifted region.  RIP offsets are relative to this.
     pub lift_base: u64,
+    /// One past the last byte of the lifted region (`lift_base + bytes.len()`).
+    /// Used to detect out-of-region call targets.
+    pub lift_end: u64,
     /// Tracks `instruction.next_ip()` for the instruction currently being
     /// lifted.  This is the value RIP would hold after that instruction
     /// retires, and is what we materialise on `Register::RIP` reads and store
@@ -355,6 +358,7 @@ impl<'a> Lifter<'a> {
             blocks: HashMap::new(),
             sealed_blocks: HashSet::new(),
             lift_base: 0,
+            lift_end: 0,
             current_ip: 0,
             visited_blocks: HashSet::new(),
             block_terminated: false,
@@ -469,15 +473,13 @@ impl<'a> Lifter<'a> {
 
         // Record the base IP for RIP-offset arithmetic.
         self.lift_base = ip;
+        self.lift_end = ip + bytes.len() as u64;
 
         // Create an entry block that receives function parameters
         let entry_block = self.builder.create_block();
         self.builder
             .append_block_params_for_function_params(entry_block);
         self.builder.switch_to_block(entry_block);
-
-        // Record the base IP for RIP-offset arithmetic.
-        self.lift_base = ip;
 
         // Use the first function parameter as the context pointer
         let ctx_ptr_val = self.builder.block_params(entry_block)[0];
