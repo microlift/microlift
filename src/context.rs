@@ -146,6 +146,28 @@ pub enum TransferKind {
     DirectCall = 5,
 }
 
+impl TryFrom<u32> for TransferKind {
+    type Error = ();
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        if value == Self::Unknown as u32 {
+            Ok(Self::Unknown)
+        } else if value == Self::DirectJump as u32 {
+            Ok(Self::DirectJump)
+        } else if value == Self::IndirectJump as u32 {
+            Ok(Self::IndirectJump)
+        } else if value == Self::ConditionalJump as u32 {
+            Ok(Self::ConditionalJump)
+        } else if value == Self::Return as u32 {
+            Ok(Self::Return)
+        } else if value == Self::DirectCall as u32 {
+            Ok(Self::DirectCall)
+        } else {
+            Err(())
+        }
+    }
+}
+
 impl RegisterContext {
     pub fn new() -> Self {
         Self::default()
