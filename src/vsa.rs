@@ -147,9 +147,10 @@ impl ValueSet {
     pub fn abstract_and(&self, other: &ValueSet) -> ValueSet {
         match (self, other) {
             (ValueSet::Empty, _) | (_, ValueSet::Empty) => ValueSet::Empty,
+            // x & 0 = 0 for all x (including Top).
+            (ValueSet::Constant(0), _) | (_, ValueSet::Constant(0)) => ValueSet::Constant(0),
             (ValueSet::Top, _) | (_, ValueSet::Top) => ValueSet::Top,
             (ValueSet::Constant(a), ValueSet::Constant(b)) => ValueSet::Constant(a & b),
-            (ValueSet::Constant(0), _) | (_, ValueSet::Constant(0)) => ValueSet::Constant(0),
             _ => ValueSet::Top,
         }
     }
