@@ -79,8 +79,8 @@ impl<'a> Lifter<'a> {
             | OpKind::Immediate8to32
             | OpKind::Immediate8to64
             | OpKind::Immediate32to64 => {
-                let imm = instruction.immediate64();
-                self.builder.ins().iconst(types::I64, imm as i64)
+                let imm = instruction.immediate32to64();
+                self.builder.ins().iconst(types::I64, imm)
             }
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 0)?;

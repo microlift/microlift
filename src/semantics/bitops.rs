@@ -18,14 +18,16 @@ impl<'a> Lifter<'a> {
 
         let src_val = match op1 {
             OpKind::Register => self.get_reg_val(instruction.op1_register())?,
+            OpKind::Immediate32to64 => {
+                self.builder.ins().iconst(ty, instruction.immediate32to64())
+            }
             OpKind::Immediate8
             | OpKind::Immediate16
             | OpKind::Immediate32
             | OpKind::Immediate64
             | OpKind::Immediate8to16
             | OpKind::Immediate8to32
-            | OpKind::Immediate8to64
-            | OpKind::Immediate32to64 => self
+            | OpKind::Immediate8to64 => self
                 .builder
                 .ins()
                 .iconst(ty, instruction.immediate64() as i64),
@@ -77,14 +79,16 @@ impl<'a> Lifter<'a> {
 
         let src_val = match op1 {
             OpKind::Register => self.get_reg_val(instruction.op1_register())?,
+            OpKind::Immediate32to64 => {
+                self.builder.ins().iconst(ty, instruction.immediate32to64())
+            }
             OpKind::Immediate8
             | OpKind::Immediate16
             | OpKind::Immediate32
             | OpKind::Immediate64
             | OpKind::Immediate8to16
             | OpKind::Immediate8to32
-            | OpKind::Immediate8to64
-            | OpKind::Immediate32to64 => self
+            | OpKind::Immediate8to64 => self
                 .builder
                 .ins()
                 .iconst(ty, instruction.immediate64() as i64),
@@ -136,14 +140,16 @@ impl<'a> Lifter<'a> {
 
         let src_val = match op1 {
             OpKind::Register => self.get_reg_val(instruction.op1_register())?,
+            OpKind::Immediate32to64 => {
+                self.builder.ins().iconst(ty, instruction.immediate32to64())
+            }
             OpKind::Immediate8
             | OpKind::Immediate16
             | OpKind::Immediate32
             | OpKind::Immediate64
             | OpKind::Immediate8to16
             | OpKind::Immediate8to32
-            | OpKind::Immediate8to64
-            | OpKind::Immediate32to64 => self
+            | OpKind::Immediate8to64 => self
                 .builder
                 .ins()
                 .iconst(ty, instruction.immediate64() as i64),
@@ -206,14 +212,16 @@ impl<'a> Lifter<'a> {
 
         let src_val = match op1 {
             OpKind::Register => self.get_reg_val(instruction.op1_register())?,
+            OpKind::Immediate32to64 => {
+                self.builder.ins().iconst(ty, instruction.immediate32to64())
+            }
             OpKind::Immediate8
             | OpKind::Immediate16
             | OpKind::Immediate32
             | OpKind::Immediate64
             | OpKind::Immediate8to16
             | OpKind::Immediate8to32
-            | OpKind::Immediate8to64
-            | OpKind::Immediate32to64 => self
+            | OpKind::Immediate8to64 => self
                 .builder
                 .ins()
                 .iconst(ty, instruction.immediate64() as i64),
@@ -253,9 +261,13 @@ impl<'a> Lifter<'a> {
         let op1 = instruction.op1_kind();
         let count = match op1 {
             OpKind::Register => {
+                // get_reg_val(CL) already returns I8; just extend to the target type.
                 let cl_val = self.get_reg_val(iced_x86::Register::CL)?;
-                let cl = self.builder.ins().ireduce(types::I8, cl_val);
-                self.builder.ins().uextend(ty, cl)
+                if ty == types::I8 {
+                    cl_val
+                } else {
+                    self.builder.ins().uextend(ty, cl_val)
+                }
             }
             OpKind::Immediate8
             | OpKind::Immediate8to16
@@ -373,9 +385,9 @@ impl<'a> Lifter<'a> {
     fn double_shift_count(&mut self, instruction: &Instruction, ty: Type) -> crate::Result<Value> {
         let count_raw = match instruction.op2_kind() {
             OpKind::Register => {
+                // get_reg_val(CL) already returns I8; just extend to the target type.
                 let cl = self.get_reg_val(Register::CL)?;
-                let cl8 = self.builder.ins().ireduce(types::I8, cl);
-                self.builder.ins().uextend(ty, cl8)
+                self.builder.ins().uextend(ty, cl)
             }
             OpKind::Immediate8
             | OpKind::Immediate8to16
@@ -468,8 +480,9 @@ impl<'a> Lifter<'a> {
         let base = self.read_operand(instruction, 0, size)?;
         let bit_idx = match instruction.op1_kind() {
             OpKind::Register => {
-                let reg_val = self.get_reg_val(instruction.op1_register())?;
-                self.builder.ins().ireduce(ty, reg_val)
+                // get_reg_val returns the natural type of the register, which for BT
+                // always matches the operand size — no reduction needed.
+                self.get_reg_val(instruction.op1_register())?
             }
             OpKind::Immediate8 => self
                 .builder

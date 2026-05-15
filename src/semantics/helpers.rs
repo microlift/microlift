@@ -222,14 +222,16 @@ impl<'a> Lifter<'a> {
                 let ptr = self.get_mem_ptr(instruction, op_index)?;
                 Ok(self.builder.ins().load(ty, MemFlags::new(), ptr, 0))
             }
+            OpKind::Immediate32to64 => {
+                Ok(self.builder.ins().iconst(ty, instruction.immediate32to64()))
+            }
             OpKind::Immediate8
             | OpKind::Immediate16
             | OpKind::Immediate32
             | OpKind::Immediate64
             | OpKind::Immediate8to16
             | OpKind::Immediate8to32
-            | OpKind::Immediate8to64
-            | OpKind::Immediate32to64 => Ok(self
+            | OpKind::Immediate8to64 => Ok(self
                 .builder
                 .ins()
                 .iconst(ty, instruction.immediate64() as i64)),

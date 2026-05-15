@@ -609,9 +609,8 @@ impl<'a> Lifter<'a> {
         let zf = self
             .builder
             .use_var(self.state.flags[&crate::lifter::X86Flag::Zero]);
-        let nzf = self.builder.ins().bnot(zf);
-        let nzf8 = self.builder.ins().ireduce(types::I8, nzf);
-        self.handle_cmov_cond(instruction, nzf8)
+        let cond = self.builder.ins().icmp_imm(IntCC::Equal, zf, 0);
+        self.handle_cmov_cond(instruction, cond)
     }
 
     pub(super) fn handle_cmovb(&mut self, instruction: &Instruction) -> crate::Result<()> {
@@ -625,9 +624,8 @@ impl<'a> Lifter<'a> {
         let cf = self
             .builder
             .use_var(self.state.flags[&crate::lifter::X86Flag::Carry]);
-        let ncf = self.builder.ins().bnot(cf);
-        let ncf8 = self.builder.ins().ireduce(types::I8, ncf);
-        self.handle_cmov_cond(instruction, ncf8)
+        let cond = self.builder.ins().icmp_imm(IntCC::Equal, cf, 0);
+        self.handle_cmov_cond(instruction, cond)
     }
 
     pub(super) fn handle_cmovbe(&mut self, instruction: &Instruction) -> crate::Result<()> {
@@ -649,9 +647,8 @@ impl<'a> Lifter<'a> {
             .builder
             .use_var(self.state.flags[&crate::lifter::X86Flag::Zero]);
         let cf_or_zf = self.builder.ins().bor(cf, zf);
-        let cond = self.builder.ins().bnot(cf_or_zf);
-        let cond8 = self.builder.ins().ireduce(types::I8, cond);
-        self.handle_cmov_cond(instruction, cond8)
+        let cond = self.builder.ins().icmp_imm(IntCC::Equal, cf_or_zf, 0);
+        self.handle_cmov_cond(instruction, cond)
     }
 
     pub(super) fn handle_cmovl(&mut self, instruction: &Instruction) -> crate::Result<()> {
@@ -673,9 +670,8 @@ impl<'a> Lifter<'a> {
             .builder
             .use_var(self.state.flags[&crate::lifter::X86Flag::Overflow]);
         let sf_xor = self.builder.ins().bxor(sf, of);
-        let cond = self.builder.ins().bnot(sf_xor);
-        let cond8 = self.builder.ins().ireduce(types::I8, cond);
-        self.handle_cmov_cond(instruction, cond8)
+        let cond = self.builder.ins().icmp_imm(IntCC::Equal, sf_xor, 0);
+        self.handle_cmov_cond(instruction, cond)
     }
 
     pub(super) fn handle_cmovle(&mut self, instruction: &Instruction) -> crate::Result<()> {
@@ -705,9 +701,8 @@ impl<'a> Lifter<'a> {
             .use_var(self.state.flags[&crate::lifter::X86Flag::Overflow]);
         let sf_xor = self.builder.ins().bxor(sf, of);
         let not_g = self.builder.ins().bor(zf, sf_xor);
-        let cond = self.builder.ins().bnot(not_g);
-        let cond8 = self.builder.ins().ireduce(types::I8, cond);
-        self.handle_cmov_cond(instruction, cond8)
+        let cond = self.builder.ins().icmp_imm(IntCC::Equal, not_g, 0);
+        self.handle_cmov_cond(instruction, cond)
     }
 
     pub(super) fn handle_cmovs(&mut self, instruction: &Instruction) -> crate::Result<()> {
@@ -721,9 +716,8 @@ impl<'a> Lifter<'a> {
         let sf = self
             .builder
             .use_var(self.state.flags[&crate::lifter::X86Flag::Sign]);
-        let cond = self.builder.ins().bnot(sf);
-        let cond8 = self.builder.ins().ireduce(types::I8, cond);
-        self.handle_cmov_cond(instruction, cond8)
+        let cond = self.builder.ins().icmp_imm(IntCC::Equal, sf, 0);
+        self.handle_cmov_cond(instruction, cond)
     }
 
     pub(super) fn handle_cmovo(&mut self, instruction: &Instruction) -> crate::Result<()> {
@@ -737,9 +731,8 @@ impl<'a> Lifter<'a> {
         let of = self
             .builder
             .use_var(self.state.flags[&crate::lifter::X86Flag::Overflow]);
-        let cond = self.builder.ins().bnot(of);
-        let cond8 = self.builder.ins().ireduce(types::I8, cond);
-        self.handle_cmov_cond(instruction, cond8)
+        let cond = self.builder.ins().icmp_imm(IntCC::Equal, of, 0);
+        self.handle_cmov_cond(instruction, cond)
     }
 
     pub(super) fn handle_cmovp(&mut self, instruction: &Instruction) -> crate::Result<()> {
@@ -753,9 +746,8 @@ impl<'a> Lifter<'a> {
         let pf = self
             .builder
             .use_var(self.state.flags[&crate::lifter::X86Flag::Parity]);
-        let cond = self.builder.ins().bnot(pf);
-        let cond8 = self.builder.ins().ireduce(types::I8, cond);
-        self.handle_cmov_cond(instruction, cond8)
+        let cond = self.builder.ins().icmp_imm(IntCC::Equal, pf, 0);
+        self.handle_cmov_cond(instruction, cond)
     }
 
     // Shared branch helpers

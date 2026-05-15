@@ -18,14 +18,16 @@ impl<'a> Lifter<'a> {
 
         let src_val = match op1 {
             OpKind::Register => self.get_reg_val(instruction.op1_register())?,
+            OpKind::Immediate32to64 => {
+                self.builder.ins().iconst(ty, instruction.immediate32to64())
+            }
             OpKind::Immediate8
             | OpKind::Immediate16
             | OpKind::Immediate32
             | OpKind::Immediate64
             | OpKind::Immediate8to16
             | OpKind::Immediate8to32
-            | OpKind::Immediate8to64
-            | OpKind::Immediate32to64 => self
+            | OpKind::Immediate8to64 => self
                 .builder
                 .ins()
                 .iconst(ty, instruction.immediate64() as i64),
@@ -77,14 +79,16 @@ impl<'a> Lifter<'a> {
 
         let src_val = match op1 {
             OpKind::Register => self.get_reg_val(instruction.op1_register())?,
+            OpKind::Immediate32to64 => {
+                self.builder.ins().iconst(ty, instruction.immediate32to64())
+            }
             OpKind::Immediate8
             | OpKind::Immediate16
             | OpKind::Immediate32
             | OpKind::Immediate64
             | OpKind::Immediate8to16
             | OpKind::Immediate8to32
-            | OpKind::Immediate8to64
-            | OpKind::Immediate32to64 => self
+            | OpKind::Immediate8to64 => self
                 .builder
                 .ins()
                 .iconst(ty, instruction.immediate64() as i64),
@@ -149,14 +153,16 @@ impl<'a> Lifter<'a> {
 
         let src_val = match op1 {
             OpKind::Register => self.get_reg_val(instruction.op1_register())?,
+            OpKind::Immediate32to64 => {
+                self.builder.ins().iconst(ty, instruction.immediate32to64())
+            }
             OpKind::Immediate8
             | OpKind::Immediate16
             | OpKind::Immediate32
             | OpKind::Immediate64
             | OpKind::Immediate8to16
             | OpKind::Immediate8to32
-            | OpKind::Immediate8to64
-            | OpKind::Immediate32to64 => self
+            | OpKind::Immediate8to64 => self
                 .builder
                 .ins()
                 .iconst(ty, instruction.immediate64() as i64),
@@ -301,12 +307,8 @@ impl<'a> Lifter<'a> {
             3 => {
                 // 3-operand: dst = src1 * imm
                 let size = self.operand_size(instruction, 0)?;
-                let ty = size_to_type(size);
                 let src = self.read_operand(instruction, 1, size)?;
-                let imm = self
-                    .builder
-                    .ins()
-                    .iconst(ty, instruction.immediate64() as i64);
+                let imm = self.read_operand(instruction, 2, size)?;
                 let result = self.builder.ins().imul(src, imm);
                 self.write_operand(instruction, 0, result)?;
                 // OF/CF
