@@ -80,7 +80,9 @@ impl<'a> Lifter<'a> {
 
             // Arithmetic
             Mnemonic::Add => self.handle_add(instruction),
+            Mnemonic::Adc => self.handle_adc(instruction),
             Mnemonic::Sub => self.handle_sub(instruction),
+            Mnemonic::Sbb => self.handle_sbb(instruction),
             // Sign-extension conversions (implicit operand form)
             Mnemonic::Cbw => self.handle_cbw(instruction),
             Mnemonic::Cwde => self.handle_cwde(instruction),

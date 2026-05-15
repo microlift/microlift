@@ -83,6 +83,66 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
+    /// Update flags for ADC (add with carry). `cf_out` is the precomputed carry-out (I8, 0/1).
+    pub fn update_flags_adc(
+        &mut self,
+        lhs: Value,
+        rhs: Value,
+        res: Value,
+        cf_out: Value,
+        size: usize,
+    ) -> crate::Result<()> {
+        let bit_width = (size * 8) as i64;
+
+        let zf = self.builder.ins().icmp_imm(IntCC::Equal, res, 0);
+        self.set_flag(X86Flag::Zero, zf)?;
+
+        let sf = self.builder.ins().ushr_imm(res, bit_width - 1);
+        self.set_flag(X86Flag::Sign, sf)?;
+
+        self.set_flag(X86Flag::Carry, cf_out)?;
+
+        // OF: signed overflow in lhs + rhs + cf_in
+        // Formula: ((lhs ^ res) & (rhs ^ res)) >> (bit_width - 1)
+        let xor1 = self.builder.ins().bxor(lhs, res);
+        let xor2 = self.builder.ins().bxor(rhs, res);
+        let and = self.builder.ins().band(xor1, xor2);
+        let of = self.builder.ins().ushr_imm(and, bit_width - 1);
+        self.set_flag(X86Flag::Overflow, of)?;
+
+        Ok(())
+    }
+
+    /// Update flags for SBB (subtract with borrow). `cf_out` is the precomputed borrow-out (I8, 0/1).
+    pub fn update_flags_sbb(
+        &mut self,
+        lhs: Value,
+        rhs: Value,
+        res: Value,
+        cf_out: Value,
+        size: usize,
+    ) -> crate::Result<()> {
+        let bit_width = (size * 8) as i64;
+
+        let zf = self.builder.ins().icmp_imm(IntCC::Equal, res, 0);
+        self.set_flag(X86Flag::Zero, zf)?;
+
+        let sf = self.builder.ins().ushr_imm(res, bit_width - 1);
+        self.set_flag(X86Flag::Sign, sf)?;
+
+        self.set_flag(X86Flag::Carry, cf_out)?;
+
+        // OF: signed overflow in lhs - rhs - cf_in
+        // Formula: ((lhs ^ rhs) & (lhs ^ res)) >> (bit_width - 1)
+        let xor1 = self.builder.ins().bxor(lhs, rhs);
+        let xor2 = self.builder.ins().bxor(lhs, res);
+        let and = self.builder.ins().band(xor1, xor2);
+        let of = self.builder.ins().ushr_imm(and, bit_width - 1);
+        self.set_flag(X86Flag::Overflow, of)?;
+
+        Ok(())
+    }
+
     pub fn update_flags_inc_dec(
         &mut self,
         lhs: Value,

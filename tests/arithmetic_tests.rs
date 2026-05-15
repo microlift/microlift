@@ -137,7 +137,7 @@ fn test_imul_one_operand() {
     ];
     let ctx = run_test(&bytes, RegisterContext::default());
     assert_eq!(ctx.rax, 42); // low half in rax
-    assert_eq!(ctx.rdx, 0);  // high half = 0 (result fits in 64 bits)
+    assert_eq!(ctx.rdx, 0); // high half = 0 (result fits in 64 bits)
     assert_eq!(ctx.of, 0);
     assert_eq!(ctx.cf, 0);
 }
@@ -181,7 +181,7 @@ fn test_mul() {
     ];
     let ctx = run_test(&bytes, RegisterContext::default());
     assert_eq!(ctx.rax, 42);
-    assert_eq!(ctx.rdx, 0);  // no overflow
+    assert_eq!(ctx.rdx, 0); // no overflow
     assert_eq!(ctx.of, 0);
     assert_eq!(ctx.cf, 0);
 }
@@ -610,4 +610,150 @@ fn test_bt_register() {
     ];
     let ctx = run_test(&bytes, RegisterContext::default());
     assert_eq!(ctx.cf, 0);
+}
+
+#[test]
+fn test_adc_no_carry_in() {
+    // adc rax, 7 when CF=0: rax = 0 + 7 + 0 = 7
+    // xor rax, rax clears rax and sets CF=0
+    // adc rax, 7: 48 83 D0 07
+    #[rustfmt::skip]
+    let bytes = [
+        0x48, 0x31, 0xC0,       // xor rax, rax  (rax=0, CF=0)
+        0x48, 0x83, 0xD0, 0x07, // adc rax, 7
+        0xC3,
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rax, 7);
+    assert_eq!(ctx.cf, 0);
+    assert_eq!(ctx.zf, 0);
+}
+
+#[test]
+fn test_adc_with_carry_in() {
+    // Set CF=1 via overflowing add, then adc rax, 5
+    // mov rax, -1 / add rax, 1 -> rax=0, CF=1
+    // adc rax, 5 -> rax = 0 + 5 + 1 = 6, CF=0
+    #[rustfmt::skip]
+    let bytes = [
+        0x48, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF, // mov rax, -1
+        0x48, 0x83, 0xC0, 0x01,                    // add rax, 1  (rax=0, CF=1)
+        0x48, 0x83, 0xD0, 0x05,                    // adc rax, 5
+        0xC3,
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rax, 6);
+    assert_eq!(ctx.cf, 0);
+    assert_eq!(ctx.zf, 0);
+}
+
+#[test]
+fn test_adc_produces_carry_out() {
+    // rax=0 (from overflowing add that set CF=1), rcx=-1
+    // adc rax, rcx -> 0 + 0xFFFFFFFFFFFFFFFF + 1 = 0, CF=1, ZF=1
+    // adc rax, rcx: opcode 0x11 (ADC r/m64, r64)
+    //   ModRM: mod=11, reg=rcx(001), rm=rax(000) -> 0xC8
+    #[rustfmt::skip]
+    let bytes = [
+        0x48, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF, // mov rax, -1
+        0x48, 0x83, 0xC0, 0x01,                    // add rax, 1  (rax=0, CF=1)
+        0x48, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF, // mov rcx, -1
+        0x48, 0x11, 0xC8,                          // adc rax, rcx
+        0xC3,
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rax, 0);
+    assert_eq!(ctx.cf, 1);
+    assert_eq!(ctx.zf, 1);
+}
+
+#[test]
+fn test_adc_overflow_flag() {
+    // Signed overflow: 0x7FFFFFFFFFFFFFFF + 0 + 1 (CF=1) = 0x8000000000000000
+    // This is i64::MAX + 1, which overflows into negative -> OF=1
+    // mov rax, i64::MAX (0x7FFFFFFFFFFFFFFF): 48 B8 FF FF FF FF FF FF FF 7F
+    // Set CF=1 using same trick as before but with rcx
+    // Strategy: use rcx to generate CF=1, then adc rax, 0
+    // mov rcx, -1 / add rcx, 1 -> rcx=0, CF=1
+    // adc rax, 0: 48 83 D0 00
+    #[rustfmt::skip]
+    let bytes = [
+        0x48, 0xB8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F, // mov rax, i64::MAX
+        0x48, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF,                    // mov rcx, -1
+        0x48, 0x83, 0xC1, 0x01,                                       // add rcx, 1 (rcx=0, CF=1)
+        0x48, 0x83, 0xD0, 0x00,                                       // adc rax, 0
+        0xC3,
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rax, i64::MIN as u64); // 0x8000000000000000
+    assert_eq!(ctx.of, 1);
+    assert_eq!(ctx.sf, 1);
+    assert_eq!(ctx.cf, 0);
+}
+
+#[test]
+fn test_sbb_no_borrow_in() {
+    // sbb rax, 3 when CF=0: rax = 10 - 3 - 0 = 7
+    // xor ensures CF=0, add rax, 10 adds without overflow
+    #[rustfmt::skip]
+    let bytes = [
+        0x48, 0x31, 0xC0,       // xor rax, rax  (rax=0, CF=0)
+        0x48, 0x83, 0xC0, 0x0A, // add rax, 10
+        0x48, 0x83, 0xD8, 0x03, // sbb rax, 3
+        0xC3,
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rax, 7);
+    assert_eq!(ctx.cf, 0);
+    assert_eq!(ctx.zf, 0);
+}
+
+#[test]
+fn test_sbb_with_borrow_in() {
+    // sbb rax, rax when CF=1: rax = 0 - 0 - 1 = -1, CF=1
+    // Set CF=1 via overflow, then sbb rax, rax
+    // sbb rax, rax: 48 19 C0
+    //   ModRM: mod=11, reg=rax(000), rm=rax(000) -> 0xC0
+    #[rustfmt::skip]
+    let bytes = [
+        0x48, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF, // mov rax, -1
+        0x48, 0x83, 0xC0, 0x01,                    // add rax, 1  (rax=0, CF=1)
+        0x48, 0x19, 0xC0,                          // sbb rax, rax
+        0xC3,
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rax, u64::MAX); // -1
+    assert_eq!(ctx.cf, 1);
+}
+
+#[test]
+fn test_sbb_produces_borrow_out() {
+    // sbb rax, 1 when CF=0 and rax=0: 0 - 1 - 0 = -1, CF=1
+    #[rustfmt::skip]
+    let bytes = [
+        0x48, 0x31, 0xC0,       // xor rax, rax  (rax=0, CF=0)
+        0x48, 0x83, 0xD8, 0x01, // sbb rax, 1
+        0xC3,
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rax, u64::MAX); // 0 - 1 wraps
+    assert_eq!(ctx.cf, 1);
+    assert_eq!(ctx.sf, 1);
+    assert_eq!(ctx.zf, 0);
+}
+
+#[test]
+fn test_sbb_result_zero() {
+    // sbb rax, rax when CF=0: rax = x - x - 0 = 0, CF=0, ZF=1
+    #[rustfmt::skip]
+    let bytes = [
+        0x48, 0xC7, 0xC0, 0x2A, 0x00, 0x00, 0x00, // mov rax, 42
+        0x48, 0x31, 0xC9,                          // xor rcx, rcx  (clears CF)
+        0x48, 0x19, 0xC0,                          // sbb rax, rax
+        0xC3,
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rax, 0);
+    assert_eq!(ctx.cf, 0);
+    assert_eq!(ctx.zf, 1);
 }
