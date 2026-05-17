@@ -73,13 +73,30 @@ pub enum ExitReason {
     /// valid x64.
     InvalidInstruction = 5,
     /// A `CALL` to a registered import address was intercepted (and the import
-    /// either had no fast-call metadata or has a variadic/unsupported ABI), or
-    /// an indirect `CALL` (via register or memory) was encountered.
+    /// either had no fast-call metadata or has a variadic/unsupported ABI).
     ///
     /// `RegisterContext::imported_function_va` holds the callee address.
     /// `RegisterContext::rip` holds the address of the instruction after the
-    /// `CALL` - i.e. where execution should resume after the host handles it.
+    /// `CALL` — the resume point once the host has handled the call.
+    ///
+    /// **RSP is unchanged.** The host is expected to call the target as a
+    /// native C function and then resume the guest at `ctx.rip`.
     ImportedFunctionCall = 6,
+
+    /// An indirect `CALL` (via register or memory) to an address that was not
+    /// registered as an import.
+    ///
+    /// `RegisterContext::imported_function_va` holds the runtime-resolved
+    /// callee address. `RegisterContext::rip` holds the resume point (the
+    /// instruction after the `CALL`).
+    ///
+    /// **RSP is unchanged.** The host must decide how to dispatch the callee:
+    /// - If the target is a **native function**, call it via C and resume at
+    ///   `ctx.rip` — no stack adjustment is needed.
+    /// - If the target is **guest code**, push `ctx.rip` onto `ctx.rsp` before
+    ///   re-entering the guest so that the callee's eventual `RET` finds the
+    ///   correct return address.
+    IndirectCall = 7,
 }
 
 impl TryFrom<u32> for ExitReason {
@@ -100,6 +117,8 @@ impl TryFrom<u32> for ExitReason {
             Ok(Self::InvalidInstruction)
         } else if value == Self::ImportedFunctionCall as u32 {
             Ok(Self::ImportedFunctionCall)
+        } else if value == Self::IndirectCall as u32 {
+            Ok(Self::IndirectCall)
         } else {
             Err(())
         }

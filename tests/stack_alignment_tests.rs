@@ -32,14 +32,15 @@
 //! unsigned 8-bit value (0–255). For negative 8-bit values (e.g. `push -1`
 //! = `6A FF`), this would push 255 instead of 0xFFFF_FFFF_FFFF_FFFF.
 //!
-//! ## Bug 3 - Indirect CALL (via register or memory) does not adjust RSP
+//! ## IndirectCall exit reason — unregistered indirect CALL
 //!
-//! `emit_indirect_call_exit` (`control_flow.rs:238-251`) exits via
-//! `ImportedFunctionCall` without decrementing RSP or pushing a return
-//! address. For calls to native imports this is intentional (the host
-//! manages its own native call stack), but any runtime that JIT-dispatches
-//! an indirect call to guest code will find an unmodified RSP in the
-//! context, causing the callee's RET to pop from the wrong location.
+//! `emit_indirect_call_exit` emits `ExitReason::IndirectCall` (distinct from
+//! `ImportedFunctionCall`) and leaves RSP unchanged. The host must decide how
+//! to dispatch the callee:
+//! - **Native function**: call via C and resume at `ctx.rip` — no stack
+//!   adjustment needed.
+//! - **Guest code**: push `ctx.rip` onto `ctx.rsp` before re-entering the
+//!   guest so the callee's eventual `RET` finds the correct return address.
 
 use cranelift::prelude::*;
 use cranelift_codegen::ir::{Function, UserFuncName};
@@ -345,25 +346,19 @@ fn test_push_positive_imm8_unaffected() {
 }
 
 // ---------------------------------------------------------------------------
-// Bug 3: Indirect CALL via register does not adjust RSP
+// IndirectCall exit reason contract
 // ---------------------------------------------------------------------------
 
-/// `CALL RAX` (indirect call via register) is handled by `emit_indirect_call_exit`.
-/// The lifter exits with `ImportedFunctionCall` but does **not** decrement RSP
-/// or write a return address to the stack.
-///
-/// For hosts that dispatch the target as guest code, the callee will find an
-/// unmodified RSP and its eventual `RET` will pop from the wrong location.
+/// `CALL RAX` (indirect call via register) exits with `ExitReason::IndirectCall`.
+/// RSP is intentionally left unchanged — the host decides whether to dispatch
+/// the callee as a native function (no stack adjustment needed) or as guest
+/// code (host must push `ctx.rip` onto `ctx.rsp` before re-entering).
 ///
 /// Byte sequence at `0x1000`:
 ///   `48 C7 C0 00 20 00 00`  →  `mov rax, 0x2000`  (7 bytes)
 ///   `FF D0`                 →  `call rax`          (2 bytes, next_ip = 0x1009)
-///
-/// image_base = 0x1000, rebased return address = 0x1000 + (0x1009 − 0x1000) = 0x1009.
 #[test]
-fn test_indirect_call_via_reg_decrements_rsp() {
-    // mov rax, 0x2000  (7 bytes: 48 C7 C0 00 20 00 00)
-    // call rax         (2 bytes: FF D0)
+fn test_indirect_call_via_reg_exits_with_indirect_call_reason() {
     #[rustfmt::skip]
     let bytes = [
         0x48u8, 0xC7, 0xC0, 0x00, 0x20, 0x00, 0x00, // mov rax, 0x2000
@@ -380,55 +375,48 @@ fn test_indirect_call_via_reg_decrements_rsp() {
 
     let ctx = compile_and_run(&bytes, ctx);
 
-    assert_eq!(ctx.exit_reason, ExitReason::ImportedFunctionCall as u32);
-    // 0x2000 is the raw value in RAX (not rebased - indirect call just uses what's in the register)
+    // Must use the dedicated IndirectCall exit reason, not ImportedFunctionCall.
+    assert_eq!(ctx.exit_reason, ExitReason::IndirectCall as u32);
+    // imported_function_va holds the raw runtime target (value of RAX).
     assert_eq!(ctx.imported_function_va, 0x2000);
-
-    // Bug 3 assertion: RSP must be decremented by 8.
+    // rip holds the resume point (instruction after the CALL).
+    assert_eq!(ctx.rip, ctx.image_base + 9);
+    // RSP is unchanged — host is responsible for stack management.
     assert_eq!(
-        ctx.rsp,
-        initial_rsp - 8,
-        "Bug 3: indirect CALL (CALL reg) must decrement RSP by 8"
+        ctx.rsp, initial_rsp,
+        "IndirectCall must leave RSP unchanged; host manages the stack"
     );
 }
 
-/// Companion: the return address written to [new RSP] must equal the rebased
-/// next_ip after `call rax` (i.e. 0x1009 with the byte sequence above).
+/// `CALL [mem]` (indirect call via memory) produces the same `IndirectCall`
+/// contract as `CALL reg`. This uses a stack slot as the pointer target.
 #[test]
-fn test_indirect_call_via_reg_writes_return_address() {
+fn test_indirect_call_via_mem_exits_with_indirect_call_reason() {
+    // Store target address 0x3000 at [RSP-16], then CALL [RSP-16].
+    // mov qword [rsp-16], 0x3000   (48 C7 44 24 F0 00 30 00 00)  9 bytes
+    // call [rsp-16]                (FF 54 24 F0)                  4 bytes  next_ip = 0x100D
     #[rustfmt::skip]
     let bytes = [
-        0x48u8, 0xC7, 0xC0, 0x00, 0x20, 0x00, 0x00, // mov rax, 0x2000
-        0xFF, 0xD0,                                  // call rax  (next_ip = 0x1009)
+        0x48u8, 0xC7, 0x44, 0x24, 0xF0, 0x00, 0x30, 0x00, 0x00, // mov qword [rsp-16], 0x3000
+        0xFF, 0x54, 0x24, 0xF0,                                   // call [rsp-16]
     ];
 
-    let mut stack = [0u64; 16];
-    // Start one slot below top so reading ctx.rsp is in-bounds whether or
-    // not Bug 3 is present.
-    let stack_base = stack.as_mut_ptr() as u64;
-    let initial_rsp = stack_base + 14 * 8;
+    let mut stack = [0u64; 32];
+    let stack_top = stack.as_mut_ptr() as u64 + 32 * 8;
 
     let mut ctx = RegisterContext::default();
     ctx.image_base = 0x1000;
-    ctx.rsp = initial_rsp;
+    ctx.rsp = stack_top;
+    let initial_rsp = ctx.rsp;
 
     let ctx = compile_and_run(&bytes, ctx);
 
-    assert_eq!(ctx.exit_reason, ExitReason::ImportedFunctionCall as u32);
-
-    // RSP must have been decremented before we read the slot.
+    assert_eq!(ctx.exit_reason, ExitReason::IndirectCall as u32);
+    assert_eq!(ctx.imported_function_va, 0x3000);
+    assert_eq!(ctx.rip, ctx.image_base + 13); // next_ip = 0x100D
     assert_eq!(
-        ctx.rsp,
-        initial_rsp - 8,
-        "Bug 3: RSP must be decremented before checking the stored return address"
-    );
-
-    // Bug 3 assertion: return address at [new RSP] = image_base + 9.
-    let stored: u64 = unsafe { *(ctx.rsp as *const u64) };
-    assert_eq!(
-        stored,
-        ctx.image_base + 9, // 0x1009 - next instruction after call rax
-        "Bug 3: return address was not written to [RSP] by indirect CALL"
+        ctx.rsp, initial_rsp,
+        "IndirectCall must leave RSP unchanged; host manages the stack"
     );
 }
 

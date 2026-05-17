@@ -239,11 +239,14 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Emit an `ImportedFunctionCall` VM exit for an indirect call whose
-    /// target address is only known at runtime.
+    /// Emit an `IndirectCall` VM exit for an indirect call whose target
+    /// address is only known at runtime (unregistered `CALL reg` / `CALL [mem]`).
     ///
     /// `target_val` is the runtime callee address (I64). `self.current_ip`
     /// holds the resume point (next instruction after the CALL).
+    ///
+    /// RSP is intentionally left unchanged. See `ExitReason::IndirectCall` for
+    /// the contract the host must uphold when dispatching the callee.
     fn emit_indirect_call_exit(&mut self, target_val: Value) -> crate::Result<()> {
         self.get_block(self.current_ip);
 
@@ -253,18 +256,7 @@ impl<'a> Lifter<'a> {
             .ins()
             .store(MemFlags::trusted(), target_val, ctx_ptr, va_offset);
 
-        // Push the return address onto the guest stack exactly as a real CALL
-        // does, so a host that dispatches the callee as guest code finds a
-        // properly set-up stack frame.
-        let image_base = self.builder.use_var(self.state.image_base);
-        let ret_offset = self.current_ip.wrapping_sub(self.lift_base);
-        let ret_addr = self.builder.ins().iadd_imm(image_base, ret_offset as i64);
-        let rsp = self.get_reg_val(Register::RSP)?;
-        let new_rsp = self.builder.ins().iadd_imm(rsp, -8);
-        self.set_reg_val(Register::RSP, new_rsp)?;
-        self.builder.ins().store(MemFlags::new(), ret_addr, new_rsp, 0);
-
-        self.sync_to_context_selective(None, ExitReason::ImportedFunctionCall)?;
+        self.sync_to_context_selective(None, ExitReason::IndirectCall)?;
         self.builder.ins().return_(&[]);
         self.block_terminated = true;
         Ok(())
