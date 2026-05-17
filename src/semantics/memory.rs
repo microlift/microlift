@@ -71,13 +71,19 @@ impl<'a> Lifter<'a> {
 
         let val = match op0 {
             OpKind::Register => self.get_reg_val(instruction.op0_register())?,
+            OpKind::Immediate8to64 => {
+                // Must use immediate8to64() - immediate32to64() does not
+                // sign-extend from 8 bits and returns the raw unsigned value.
+                self.builder
+                    .ins()
+                    .iconst(types::I64, instruction.immediate8to64())
+            }
             OpKind::Immediate8
             | OpKind::Immediate16
             | OpKind::Immediate32
             | OpKind::Immediate64
             | OpKind::Immediate8to16
             | OpKind::Immediate8to32
-            | OpKind::Immediate8to64
             | OpKind::Immediate32to64 => {
                 let imm = instruction.immediate32to64();
                 self.builder.ins().iconst(types::I64, imm)

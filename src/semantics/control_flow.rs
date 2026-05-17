@@ -155,6 +155,15 @@ impl<'a> Lifter<'a> {
                         va_offset,
                     );
 
+                    // Push the return address onto the guest stack exactly as a
+                    // real CALL does, so the callee can RET correctly.
+                    let ret_offset = self.current_ip.wrapping_sub(self.lift_base);
+                    let ret_addr = self.builder.ins().iadd_imm(image_base, ret_offset as i64);
+                    let rsp = self.get_reg_val(Register::RSP)?;
+                    let new_rsp = self.builder.ins().iadd_imm(rsp, -8);
+                    self.set_reg_val(Register::RSP, new_rsp)?;
+                    self.builder.ins().store(MemFlags::new(), ret_addr, new_rsp, 0);
+
                     self.sync_to_context_selective(None, ExitReason::UnknownJump)?;
                     self.write_exit_code(TransferKind::DirectCall as u32);
                     self.builder.ins().return_(&[]);
@@ -243,6 +252,17 @@ impl<'a> Lifter<'a> {
         self.builder
             .ins()
             .store(MemFlags::trusted(), target_val, ctx_ptr, va_offset);
+
+        // Push the return address onto the guest stack exactly as a real CALL
+        // does, so a host that dispatches the callee as guest code finds a
+        // properly set-up stack frame.
+        let image_base = self.builder.use_var(self.state.image_base);
+        let ret_offset = self.current_ip.wrapping_sub(self.lift_base);
+        let ret_addr = self.builder.ins().iadd_imm(image_base, ret_offset as i64);
+        let rsp = self.get_reg_val(Register::RSP)?;
+        let new_rsp = self.builder.ins().iadd_imm(rsp, -8);
+        self.set_reg_val(Register::RSP, new_rsp)?;
+        self.builder.ins().store(MemFlags::new(), ret_addr, new_rsp, 0);
 
         self.sync_to_context_selective(None, ExitReason::ImportedFunctionCall)?;
         self.builder.ins().return_(&[]);
