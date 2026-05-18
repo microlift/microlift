@@ -44,6 +44,33 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
+    /// Handle a `UD2` instruction - emit a `Ud2` VM exit with RIP pointing at
+    /// the `UD2` itself (matching real hardware behaviour where #UD points at
+    /// the faulting instruction).
+    pub(super) fn handle_ud2(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let rip_at = self
+            .builder
+            .ins()
+            .iconst(types::I64, instruction.ip() as i64);
+        self.sync_to_context(Some(rip_at), ExitReason::Ud2)?;
+        self.builder.ins().return_(&[]);
+        self.block_terminated = true;
+        Ok(())
+    }
+
+    /// Handle an `INT3` breakpoint - emit a `Breakpoint` VM exit with RIP
+    /// pointing at the `INT3` itself so the host can inspect or skip it.
+    pub(super) fn handle_int3(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let rip_at = self
+            .builder
+            .ins()
+            .iconst(types::I64, instruction.ip() as i64);
+        self.sync_to_context(Some(rip_at), ExitReason::Breakpoint)?;
+        self.builder.ins().return_(&[]);
+        self.block_terminated = true;
+        Ok(())
+    }
+
     /// Helper to set a placeholder in the resume_function field.
     fn set_resume_placeholder(&mut self) -> crate::Result<()> {
         let ctx_ptr = self.builder.use_var(self.state.context_ptr);

@@ -191,6 +191,10 @@ impl<'a> Lifter<'a> {
             Mnemonic::Cmovp => self.handle_cmovp(instruction),
             Mnemonic::Cmovnp => self.handle_cmovnp(instruction),
 
+            // Traps / faults
+            Mnemonic::Ud2 => self.handle_ud2(instruction),
+            Mnemonic::Int3 => self.handle_int3(instruction),
+
             // System
             Mnemonic::Syscall => self.handle_syscall(instruction),
 
