@@ -61,7 +61,16 @@ impl<'a> Lifter<'a> {
     pub(super) fn handle_lea(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let reg = instruction.op0_register();
         let ptr = self.get_mem_ptr(instruction, 1)?;
-        self.set_reg_val(reg, ptr)?;
+        // get_mem_ptr always returns I64. set_reg_val expects the value to match
+        // the register's natural width (I32 for 32-bit regs, etc.) so that its
+        // internal uextend/merge logic works. Reduce before passing.
+        let val = if reg.size() == 8 {
+            ptr
+        } else {
+            let ty = size_to_type(reg.size());
+            self.builder.ins().ireduce(ty, ptr)
+        };
+        self.set_reg_val(reg, val)?;
         Ok(())
     }
 
