@@ -97,6 +97,18 @@ pub enum ExitReason {
     ///   re-entering the guest so that the callee's eventual `RET` finds the
     ///   correct return address.
     IndirectCall = 7,
+
+    /// A `UD2` instruction was executed. This is an architecturally-defined
+    /// invalid opcode used to trigger a fault intentionally (e.g. assertions,
+    /// panic handlers, sanitizer traps).`RegisterContext::rip` points *at*
+    /// the `UD2` instruction itself.
+    Ud2 = 8,
+
+    /// An `INT3` breakpoint trap was executed. `RegisterContext::rip` points
+    /// *at* the `INT3` instruction itself. The host debugger or runtime may
+    /// resume execution by advancing `rip` past the instruction before
+    /// re-entering the guest.
+    Breakpoint = 9,
 }
 
 impl TryFrom<u32> for ExitReason {
@@ -119,6 +131,10 @@ impl TryFrom<u32> for ExitReason {
             Ok(Self::ImportedFunctionCall)
         } else if value == Self::IndirectCall as u32 {
             Ok(Self::IndirectCall)
+        } else if value == Self::Ud2 as u32 {
+            Ok(Self::Ud2)
+        } else if value == Self::Breakpoint as u32 {
+            Ok(Self::Breakpoint)
         } else {
             Err(())
         }
