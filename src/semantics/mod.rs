@@ -4,6 +4,7 @@
 //! sub-modules below, each focused on a specific instruction category.
 
 pub mod arithmetic;
+pub mod atomics;
 pub mod bitops;
 pub mod control_flow;
 pub mod flags;
@@ -20,6 +21,12 @@ use iced_x86::{Instruction, Mnemonic, OpKind};
 
 impl<'a> Lifter<'a> {
     pub fn handle_instruction(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        // LOCK-prefixed instructions require atomic semantics; dispatch them
+        // before the main match so that ADD, SUB, etc. only see non-locked ops.
+        if instruction.has_lock_prefix() {
+            return self.handle_locked_instruction(instruction);
+        }
+
         match instruction.mnemonic() {
             // Memory / Data Movement
             Mnemonic::Mov => self.handle_mov(instruction),
@@ -32,6 +39,14 @@ impl<'a> Lifter<'a> {
             Mnemonic::Leave => self.handle_leave(instruction),
             Mnemonic::Xchg => self.handle_xchg(instruction),
             Mnemonic::Nop => self.handle_nop(instruction),
+
+            // Atomics / synchronisation
+            Mnemonic::Cmpxchg => self.handle_cmpxchg(instruction),
+            Mnemonic::Cmpxchg8b => self.handle_cmpxchg8b(instruction),
+            Mnemonic::Mfence | Mnemonic::Sfence | Mnemonic::Lfence => {
+                self.handle_mfence(instruction)
+            }
+            Mnemonic::Pause => self.handle_pause(instruction),
 
             // CET
             Mnemonic::Endbr64 | Mnemonic::Endbr32 => self.handle_endbr64(instruction),
