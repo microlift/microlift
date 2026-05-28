@@ -554,6 +554,33 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
+    /// BSWAP - reverse byte order of a 32- or 64-bit register.
+    ///
+    /// For 16-bit operands the result is architecturally undefined; we follow
+    /// the common convention of zeroing the destination.
+    pub(super) fn handle_bswap(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let reg = instruction.op0_register();
+        let size = reg.size();
+        match size {
+            4 | 8 => {
+                let val = self.get_reg_val(reg)?;
+                let result = self.builder.ins().bswap(val);
+                self.set_reg_val(reg, result)?;
+            }
+            2 => {
+                // Undefined per Intel SDM; zero the register.
+                let zero = self.builder.ins().iconst(size_to_type(size), 0);
+                self.set_reg_val(reg, zero)?;
+            }
+            _ => {
+                return Err(MicroliftError::UnsupportedInstruction {
+                    mnemonic: format!("bswap-size-{}", size),
+                });
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn handle_bsr(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let size = self.operand_size(instruction, 1)?;
         let src = self.read_operand(instruction, 1, size)?;

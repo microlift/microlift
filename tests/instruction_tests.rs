@@ -187,6 +187,29 @@ fn test_jb_and_jbe() {
 }
 
 #[test]
+fn test_bswap() {
+    // 64-bit: mov rax, 0x0123456789ABCDEF; bswap rax; ret
+    let bytes = [
+        0x48, 0xB8, 0xEF, 0xCD, 0xAB, 0x89, 0x67, 0x45, 0x23,
+        0x01, // movabs rax, 0x0123456789ABCDEF
+        0x48, 0x0F, 0xC8, // bswap rax
+        0xC3, // ret
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rax, 0xEFCDAB8967452301);
+
+    // 32-bit: mov eax, 0xDEADBEEF; bswap eax; ret
+    // (32-bit ops zero-extend into rax.)
+    let bytes = [
+        0xB8, 0xEF, 0xBE, 0xAD, 0xDE, // mov eax, 0xDEADBEEF
+        0x0F, 0xC8, // bswap eax
+        0xC3, // ret
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rax, 0x00000000_EFBEADDE);
+}
+
+#[test]
 fn test_loop() {
     // mov rcx, 2; mov rax, 0; inc rax; loop inc; ret
     let bytes = [

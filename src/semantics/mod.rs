@@ -138,6 +138,7 @@ impl<'a> Lifter<'a> {
             Mnemonic::Btc => self.handle_btc(instruction),
             Mnemonic::Bsf => self.handle_bsf(instruction),
             Mnemonic::Bsr => self.handle_bsr(instruction),
+            Mnemonic::Bswap => self.handle_bswap(instruction),
 
             // Unconditional Control Flow
             Mnemonic::Jmp => self.handle_jmp(instruction),
