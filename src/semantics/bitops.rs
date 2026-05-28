@@ -305,7 +305,7 @@ impl<'a> Lifter<'a> {
         let cf_raw = self.builder.ins().ushr(val, cf_shift);
         let one = self.builder.ins().iconst(ty, 1);
         let cf_bit = self.builder.ins().band(cf_raw, one);
-        self.update_flags_shift(result, cf_bit, size)?;
+        self.update_flags_shift(result, cf_bit, count, size)?;
         Ok(())
     }
 
@@ -322,7 +322,7 @@ impl<'a> Lifter<'a> {
         let cf_shift = self.builder.ins().isub(count, one_val);
         let cf_raw = self.builder.ins().ushr(val, cf_shift);
         let cf_bit = self.builder.ins().band(cf_raw, one_val);
-        self.update_flags_shift(result, cf_bit, size)?;
+        self.update_flags_shift(result, cf_bit, count, size)?;
         Ok(())
     }
 
@@ -339,7 +339,7 @@ impl<'a> Lifter<'a> {
         let cf_shift = self.builder.ins().isub(count, one_val);
         let cf_raw = self.builder.ins().ushr(val, cf_shift);
         let cf_bit = self.builder.ins().band(cf_raw, one_val);
-        self.update_flags_shift(result, cf_bit, size)?;
+        self.update_flags_shift(result, cf_bit, count, size)?;
         Ok(())
     }
 
@@ -437,7 +437,7 @@ impl<'a> Lifter<'a> {
         let cf_raw = self.builder.ins().ushr(dst, right_count);
         let one = self.builder.ins().iconst(ty, 1);
         let cf_bit = self.builder.ins().band(cf_raw, one);
-        self.update_flags_shift(result, cf_bit, size)?;
+        self.update_flags_shift(result, cf_bit, count, size)?;
         Ok(())
     }
 
@@ -468,7 +468,7 @@ impl<'a> Lifter<'a> {
         let cf_shift = self.builder.ins().isub(count, one);
         let cf_raw = self.builder.ins().ushr(dst, cf_shift);
         let cf_bit = self.builder.ins().band(cf_raw, one);
-        self.update_flags_shift(result, cf_bit, size)?;
+        self.update_flags_shift(result, cf_bit, count, size)?;
         Ok(())
     }
 

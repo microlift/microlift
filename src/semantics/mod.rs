@@ -219,6 +219,10 @@ impl<'a> Lifter<'a> {
             Mnemonic::Rdgsbase => self.handle_rdgsbase(instruction),
             Mnemonic::Wrgsbase => self.handle_wrgsbase(instruction),
 
+            Mnemonic::Stc => self.handle_stc(instruction),
+            Mnemonic::Clc => self.handle_clc(instruction),
+            Mnemonic::Cmc => self.handle_cmc(instruction),
+
             _ => {
                 if self.config.interpreter_fallback {
                     self.handle_unimplemented_instruction(instruction)

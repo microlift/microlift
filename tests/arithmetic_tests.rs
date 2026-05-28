@@ -757,3 +757,170 @@ fn test_sbb_result_zero() {
     assert_eq!(ctx.cf, 0);
     assert_eq!(ctx.zf, 1);
 }
+
+// ---------------------------------------------------------------------------
+// Regression: shift by masked-zero count must NOT touch flags.
+// Per x86: when the masked shift count is 0, CF/ZF/SF/OF are all unchanged.
+// Earlier the lifter computed CF as `(val >> bit_width) & 1` for SHL and
+// `(val >> -1) & 1` for SHR/SAR — both Cranelift-masked-to-0/63 — silently
+// corrupting CF for any subsequent JC/JNC.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_shl_by_zero_preserves_flags() {
+    // Set up RAX=1, CL=0, CF=1, ZF=1. After `shl rax, cl` with cl=0,
+    // RAX must be unchanged and CF=1, ZF=1 must survive.
+    #[rustfmt::skip]
+    let bytes = [
+        0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00, // mov rax, 1
+        0x48, 0x31, 0xC9,                          // xor rcx, rcx  -> cl=0, ZF=1
+        0xF9,                                       // stc           -> CF=1 (ZF still 1)
+        0x48, 0xD3, 0xE0,                          // shl rax, cl
+        0xC3,
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rax, 1);
+    assert_eq!(ctx.cf, 1, "SHL by 0 must preserve CF");
+    assert_eq!(ctx.zf, 1, "SHL by 0 must preserve ZF");
+}
+
+#[test]
+fn test_shr_by_zero_preserves_flags() {
+    #[rustfmt::skip]
+    let bytes = [
+        0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00, // mov rax, 1
+        0x48, 0x31, 0xC9,                          // xor rcx, rcx
+        0xF9,                                       // stc -> CF=1, ZF=1
+        0x48, 0xD3, 0xE8,                          // shr rax, cl
+        0xC3,
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rax, 1);
+    assert_eq!(ctx.cf, 1, "SHR by 0 must preserve CF");
+    assert_eq!(ctx.zf, 1, "SHR by 0 must preserve ZF");
+}
+
+#[test]
+fn test_sar_by_zero_preserves_flags() {
+    // Use RAX=-1 so the buggy SAR-by-0 would push MSB (=1) into CF and SF.
+    // We confirm the prior (CF=1, SF=0) is preserved.
+    #[rustfmt::skip]
+    let bytes = [
+        0x48, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF, // mov rax, -1
+        0x48, 0x31, 0xC9,                          // xor rcx, rcx -> ZF=1, SF=0, CF=0
+        0xF9,                                       // stc -> CF=1
+        0x48, 0xD3, 0xF8,                          // sar rax, cl
+        0xC3,
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rax, u64::MAX);
+    assert_eq!(ctx.cf, 1, "SAR by 0 must preserve CF (not pick up MSB of val)");
+    assert_eq!(ctx.zf, 1, "SAR by 0 must preserve ZF");
+    assert_eq!(ctx.sf, 0, "SAR by 0 must preserve SF (not pick up MSB of val)");
+}
+
+// Direct STC/CLC/CMC sanity tests.
+
+#[test]
+fn test_stc_sets_cf() {
+    let bytes = [0xF9, 0xC3]; // stc; ret
+    let mut ctx = RegisterContext::default();
+    ctx.cf = 0;
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.cf, 1);
+}
+
+#[test]
+fn test_clc_clears_cf() {
+    let bytes = [0xF8, 0xC3]; // clc; ret
+    let mut ctx = RegisterContext::default();
+    ctx.cf = 1;
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.cf, 0);
+}
+
+#[test]
+fn test_cmc_toggles_cf() {
+    let bytes = [0xF5, 0xC3]; // cmc; ret
+    let mut ctx = RegisterContext::default();
+    ctx.cf = 1;
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.cf, 0);
+
+    let mut ctx = RegisterContext::default();
+    ctx.cf = 0;
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.cf, 1);
+}
+
+#[test]
+fn test_shr_by_zero_does_not_pick_msb_into_cf() {
+    // Specifically targets the prior bug: SHR/SAR computed
+    // cf_shift = count - 1 = -1, which Cranelift masked to bit_width-1 = 63,
+    // putting the MSB of val into CF. With RAX's MSB = 1, the buggy code
+    // would set CF=1 from the shift even though caller cleared CF.
+    #[rustfmt::skip]
+    let bytes = [
+        // RAX = 0x8000000000000000 (MSB set)
+        0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80,
+        0x48, 0x31, 0xC9,                          // xor rcx, rcx -> CF=0, cl=0
+        0x48, 0xD3, 0xE8,                          // shr rax, cl
+        0xC3,
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.cf, 0, "SHR by 0 must not move val's MSB into CF");
+}
+
+#[test]
+fn test_shl_by_zero_does_not_pick_lsb_into_cf() {
+    // Mirror of the above for SHL: buggy code computed cf_shift = bit_width-0
+    // = 64, Cranelift-masked to 0, putting LSB of val into CF.
+    #[rustfmt::skip]
+    let bytes = [
+        0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00, // mov rax, 1 (LSB=1)
+        0x48, 0x31, 0xC9,                          // xor rcx, rcx -> CF=0, cl=0
+        0x48, 0xD3, 0xE0,                          // shl rax, cl
+        0xC3,
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.cf, 0, "SHL by 0 must not move val's LSB into CF");
+}
+
+// ---------------------------------------------------------------------------
+// Regression: 8-bit DIV/IDIV must use AX (not AL) as the dividend.
+// x86 8-bit divide: AL = AX / r/m8, AH = AX % r/m8 — AH (high byte of AX)
+// must contribute to the dividend.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_div_8bit_uses_ax_as_dividend() {
+    // AX = 0x0100 (256), BL = 0x10 (16). 256 / 16 = 16 (AL=0x10), 256 % 16 = 0.
+    // Buggy code took only AL (=0) as dividend and computed 0/16=0.
+    #[rustfmt::skip]
+    let bytes = [
+        0x66, 0xB8, 0x00, 0x01, // mov ax, 0x0100
+        0xB3, 0x10,             // mov bl, 0x10
+        0xF6, 0xF3,             // div bl
+        0xC3,
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rax & 0xFF, 0x10, "AL (quotient) should be 16");
+    assert_eq!((ctx.rax >> 8) & 0xFF, 0x00, "AH (remainder) should be 0");
+}
+
+#[test]
+fn test_idiv_8bit_uses_ax_as_dividend() {
+    // AX = -100 (0xFF9C), BL = 7. -100 / 7 = -14 (AL = 0xF2),
+    // -100 % 7 = -2 (AH = 0xFE).
+    // Buggy code took AL=0x9C as the dividend, giving wrong values.
+    #[rustfmt::skip]
+    let bytes = [
+        0x66, 0xB8, 0x9C, 0xFF, // mov ax, 0xFF9C  (-100)
+        0xB3, 0x07,             // mov bl, 7
+        0xF6, 0xFB,             // idiv bl
+        0xC3,
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!((ctx.rax & 0xFF) as i8, -14, "AL (quotient) should be -14");
+    assert_eq!(((ctx.rax >> 8) & 0xFF) as i8, -2, "AH (remainder) should be -2");
+}

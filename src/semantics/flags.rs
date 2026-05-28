@@ -1,7 +1,29 @@
 use crate::lifter::{Lifter, X86Flag};
 use cranelift::prelude::*;
+use iced_x86::Instruction;
 
 impl<'a> Lifter<'a> {
+    /// STC - set carry flag.
+    pub(super) fn handle_stc(&mut self, _instruction: &Instruction) -> crate::Result<()> {
+        let one = self.builder.ins().iconst(types::I8, 1);
+        self.set_flag(X86Flag::Carry, one)
+    }
+
+    /// CLC - clear carry flag.
+    pub(super) fn handle_clc(&mut self, _instruction: &Instruction) -> crate::Result<()> {
+        let zero = self.builder.ins().iconst(types::I8, 0);
+        self.set_flag(X86Flag::Carry, zero)
+    }
+
+    /// CMC - complement (toggle) carry flag.
+    pub(super) fn handle_cmc(&mut self, _instruction: &Instruction) -> crate::Result<()> {
+        let cf = self.builder.use_var(self.state.flags[&X86Flag::Carry]);
+        let one = self.builder.ins().iconst(types::I8, 1);
+        let toggled = self.builder.ins().bxor(cf, one);
+        self.set_flag(X86Flag::Carry, toggled)
+    }
+
+
     pub fn update_flags_add(
         &mut self,
         lhs: Value,
@@ -182,31 +204,56 @@ impl<'a> Lifter<'a> {
     }
 
     /// Update flags for a shift operation (SHL/SHR/SAR).
-    /// `res` is the result, `shifted_out_bit` is the last bit shifted out (for CF),
-    /// `size` is the operand size in bytes.
+    /// `res` is the result, `cf_bit` is the last bit shifted out (for CF),
+    /// `count` is the masked shift count (in operand type), `size` is the operand size in bytes.
+    ///
+    /// Per x86 semantics: if the masked shift count is 0, **no flags are
+    /// affected** — including CF/ZF/SF/OF. We must preserve the prior flag
+    /// values in that case rather than clobbering them with the (garbage)
+    /// values that fall out of the shift formula for count=0.
     pub fn update_flags_shift(
         &mut self,
         res: Value,
         cf_bit: Value,
+        count: Value,
         size: usize,
     ) -> crate::Result<()> {
         let bit_width = (size * 8) as i64;
 
-        // ZF
-        let zf = self.builder.ins().icmp_imm(IntCC::Equal, res, 0);
-        self.set_flag(X86Flag::Zero, zf)?;
+        // Load prior values of each flag so we can keep them when count == 0.
+        let old_zf = self.builder.use_var(self.state.flags[&X86Flag::Zero]);
+        let old_sf = self.builder.use_var(self.state.flags[&X86Flag::Sign]);
+        let old_cf = self.builder.use_var(self.state.flags[&X86Flag::Carry]);
+        let old_of = self.builder.use_var(self.state.flags[&X86Flag::Overflow]);
 
-        // SF
-        let sf = self.builder.ins().ushr_imm(res, bit_width - 1);
-        self.set_flag(X86Flag::Sign, sf)?;
+        // Newly-computed flag values (in operand width), reduced to I8 to
+        // match the flag SSA variable type that `select` requires.
+        let new_zf = self.builder.ins().icmp_imm(IntCC::Equal, res, 0);
+        let new_sf_w = self.builder.ins().ushr_imm(res, bit_width - 1);
+        let new_sf = if size == 1 {
+            new_sf_w
+        } else {
+            self.builder.ins().ireduce(types::I8, new_sf_w)
+        };
+        let new_cf = if size == 1 {
+            cf_bit
+        } else {
+            self.builder.ins().ireduce(types::I8, cf_bit)
+        };
+        // OF is undefined for shifts other than by 1; conservatively clear it.
+        let new_of = self.builder.ins().iconst(types::I8, 0);
 
-        // CF = last bit shifted out
-        self.set_flag(X86Flag::Carry, cf_bit)?;
+        // is_zero is I8 (icmp_imm result); select uses any nonzero as true.
+        let is_zero = self.builder.ins().icmp_imm(IntCC::Equal, count, 0);
+        let final_zf = self.builder.ins().select(is_zero, old_zf, new_zf);
+        let final_sf = self.builder.ins().select(is_zero, old_sf, new_sf);
+        let final_cf = self.builder.ins().select(is_zero, old_cf, new_cf);
+        let final_of = self.builder.ins().select(is_zero, old_of, new_of);
 
-        // OF is defined only for shift-by-1, but we set it to 0 conservatively
-        // (full OF semantics for arbitrary shifts is "undefined" per x86 manual)
-        let zero = self.builder.ins().iconst(types::I8, 0);
-        self.set_flag(X86Flag::Overflow, zero)?;
+        self.set_flag(X86Flag::Zero, final_zf)?;
+        self.set_flag(X86Flag::Sign, final_sf)?;
+        self.set_flag(X86Flag::Carry, final_cf)?;
+        self.set_flag(X86Flag::Overflow, final_of)?;
 
         Ok(())
     }

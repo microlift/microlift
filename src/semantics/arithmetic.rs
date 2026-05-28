@@ -558,12 +558,23 @@ impl<'a> Lifter<'a> {
         let size = self.operand_size(instruction, 0)?;
         let divisor = self.read_operand(instruction, 0, size)?;
 
+        // Special case: 8-bit IDIV uses AX (signed 16-bit) as the dividend,
+        // not AL. We must widen the divisor to I16 and divide in I16, then
+        // truncate the quotient/remainder back into AL/AH.
+        if size == 1 {
+            let dividend = self.get_reg_val(Register::AX)?; // I16
+            let div16 = self.builder.ins().sextend(types::I16, divisor);
+            let quot = self.builder.ins().sdiv(dividend, div16);
+            let rem = self.builder.ins().srem(dividend, div16);
+            let quot8 = self.builder.ins().ireduce(types::I8, quot);
+            let rem8 = self.builder.ins().ireduce(types::I8, rem);
+            self.set_reg_val(Register::AL, quot8)?;
+            self.set_reg_val(Register::AH, rem8)?;
+            return Ok(());
+        }
+
         let (quot_reg, rem_reg, dividend) = match size {
-            1 => {
-                let ax = self.get_reg_val(Register::AX)?;
-                let ax8 = self.builder.ins().ireduce(types::I8, ax);
-                (Register::AL, Register::AH, ax8)
-            }
+            1 => unreachable!("handled above"),
             2 => {
                 let ax = self.get_reg_val(Register::AX)?;
                 let ax16 = self.builder.ins().ireduce(types::I16, ax);
@@ -597,12 +608,22 @@ impl<'a> Lifter<'a> {
         let size = self.operand_size(instruction, 0)?;
         let divisor = self.read_operand(instruction, 0, size)?;
 
+        // Special case: 8-bit DIV uses AX (unsigned 16-bit) as the dividend,
+        // not AL. Widen divisor to I16, divide in I16, truncate back.
+        if size == 1 {
+            let dividend = self.get_reg_val(Register::AX)?; // I16
+            let div16 = self.builder.ins().uextend(types::I16, divisor);
+            let quot = self.builder.ins().udiv(dividend, div16);
+            let rem = self.builder.ins().urem(dividend, div16);
+            let quot8 = self.builder.ins().ireduce(types::I8, quot);
+            let rem8 = self.builder.ins().ireduce(types::I8, rem);
+            self.set_reg_val(Register::AL, quot8)?;
+            self.set_reg_val(Register::AH, rem8)?;
+            return Ok(());
+        }
+
         let (quot_reg, rem_reg, dividend) = match size {
-            1 => {
-                let ax = self.get_reg_val(Register::AX)?;
-                let ax8 = self.builder.ins().ireduce(types::I8, ax);
-                (Register::AL, Register::AH, ax8)
-            }
+            1 => unreachable!("handled above"),
             2 => {
                 let ax = self.get_reg_val(Register::AX)?;
                 let ax16 = self.builder.ins().ireduce(types::I16, ax);
