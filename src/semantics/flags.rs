@@ -52,6 +52,24 @@ impl<'a> Lifter<'a> {
         let of = self.builder.ins().ushr_imm(and, bit_width - 1);
         self.set_flag(X86Flag::Overflow, of)?;
 
+        // Auxiliary Carry (AF): carry from bit 3 -> ((lhs ^ rhs ^ res) >> 4) & 1
+        let lhs_xor_rhs = self.builder.ins().bxor(lhs, rhs);
+        let af_xor = self.builder.ins().bxor(lhs_xor_rhs, res);
+        let af_shifted = self.builder.ins().ushr_imm(af_xor, 4);
+        let af = self.builder.ins().band_imm(af_shifted, 1);
+        self.set_flag(X86Flag::Auxiliary, af)?;
+
+        // Parity Flag (PF): 1 if low 8 bits of result have even popcount
+        let res_lo = if self.builder.func.dfg.value_type(res) == types::I8 {
+            res
+        } else {
+            self.builder.ins().ireduce(types::I8, res)
+        };
+        let pop = self.builder.ins().popcnt(res_lo);
+        let pop_lsb = self.builder.ins().band_imm(pop, 1);
+        let pf = self.builder.ins().bxor_imm(pop_lsb, 1);
+        self.set_flag(X86Flag::Parity, pf)?;
+
         Ok(())
     }
 
@@ -83,6 +101,23 @@ impl<'a> Lifter<'a> {
         let of = self.builder.ins().ushr_imm(and, bit_width - 1);
         self.set_flag(X86Flag::Overflow, of)?;
 
+        // Auxiliary Carry (AF): borrow from bit 3 -> ((lhs ^ rhs ^ res) >> 4) & 1
+        let af_xor = self.builder.ins().bxor(xor1, res);
+        let af_shifted = self.builder.ins().ushr_imm(af_xor, 4);
+        let af = self.builder.ins().band_imm(af_shifted, 1);
+        self.set_flag(X86Flag::Auxiliary, af)?;
+
+        // Parity Flag (PF): 1 if low 8 bits of result have even popcount
+        let res_lo = if self.builder.func.dfg.value_type(res) == types::I8 {
+            res
+        } else {
+            self.builder.ins().ireduce(types::I8, res)
+        };
+        let pop = self.builder.ins().popcnt(res_lo);
+        let pop_lsb = self.builder.ins().band_imm(pop, 1);
+        let pf = self.builder.ins().bxor_imm(pop_lsb, 1);
+        self.set_flag(X86Flag::Parity, pf)?;
+
         Ok(())
     }
 
@@ -101,6 +136,19 @@ impl<'a> Lifter<'a> {
         let zero = self.builder.ins().iconst(types::I8, 0);
         self.set_flag(X86Flag::Carry, zero)?;
         self.set_flag(X86Flag::Overflow, zero)?;
+
+        // Parity Flag (PF): 1 if low 8 bits of result have even popcount
+        let res_lo = if self.builder.func.dfg.value_type(res) == types::I8 {
+            res
+        } else {
+            self.builder.ins().ireduce(types::I8, res)
+        };
+        let pop = self.builder.ins().popcnt(res_lo);
+        let pop_lsb = self.builder.ins().band_imm(pop, 1);
+        let pf = self.builder.ins().bxor_imm(pop_lsb, 1);
+        self.set_flag(X86Flag::Parity, pf)?;
+
+        // AF is undefined for logical ops per Intel SDM; leave unchanged.
 
         Ok(())
     }
@@ -132,6 +180,26 @@ impl<'a> Lifter<'a> {
         let of = self.builder.ins().ushr_imm(and, bit_width - 1);
         self.set_flag(X86Flag::Overflow, of)?;
 
+        // AF: bit-3 carry/borrow chain - ((lhs ^ rhs ^ res) >> 4) & 1.
+        // For ADC/SBB this matches hardware because the cf_in only affects bit 0,
+        // and bit-3 carry into bit 4 is captured by the xor of the three operands.
+        let lhs_xor_rhs = self.builder.ins().bxor(lhs, rhs);
+        let af_xor = self.builder.ins().bxor(lhs_xor_rhs, res);
+        let af_shifted = self.builder.ins().ushr_imm(af_xor, 4);
+        let af = self.builder.ins().band_imm(af_shifted, 1);
+        self.set_flag(X86Flag::Auxiliary, af)?;
+
+        // PF: even popcount of low 8 bits of result.
+        let res_lo = if self.builder.func.dfg.value_type(res) == types::I8 {
+            res
+        } else {
+            self.builder.ins().ireduce(types::I8, res)
+        };
+        let pop = self.builder.ins().popcnt(res_lo);
+        let pop_lsb = self.builder.ins().band_imm(pop, 1);
+        let pf = self.builder.ins().bxor_imm(pop_lsb, 1);
+        self.set_flag(X86Flag::Parity, pf)?;
+
         Ok(())
     }
 
@@ -161,6 +229,23 @@ impl<'a> Lifter<'a> {
         let and = self.builder.ins().band(xor1, xor2);
         let of = self.builder.ins().ushr_imm(and, bit_width - 1);
         self.set_flag(X86Flag::Overflow, of)?;
+
+        // AF: ((lhs ^ rhs ^ res) >> 4) & 1 - reuses xor1 = lhs ^ rhs.
+        let af_xor = self.builder.ins().bxor(xor1, res);
+        let af_shifted = self.builder.ins().ushr_imm(af_xor, 4);
+        let af = self.builder.ins().band_imm(af_shifted, 1);
+        self.set_flag(X86Flag::Auxiliary, af)?;
+
+        // PF: even popcount of low 8 bits of result.
+        let res_lo = if self.builder.func.dfg.value_type(res) == types::I8 {
+            res
+        } else {
+            self.builder.ins().ireduce(types::I8, res)
+        };
+        let pop = self.builder.ins().popcnt(res_lo);
+        let pop_lsb = self.builder.ins().band_imm(pop, 1);
+        let pf = self.builder.ins().bxor_imm(pop_lsb, 1);
+        self.set_flag(X86Flag::Parity, pf)?;
 
         Ok(())
     }
@@ -199,6 +284,24 @@ impl<'a> Lifter<'a> {
         };
         self.set_flag(X86Flag::Overflow, of)?;
 
+        // AF: ((lhs ^ rhs ^ res) >> 4) & 1
+        let lhs_xor_rhs = self.builder.ins().bxor(lhs, rhs);
+        let af_xor = self.builder.ins().bxor(lhs_xor_rhs, res);
+        let af_shifted = self.builder.ins().ushr_imm(af_xor, 4);
+        let af = self.builder.ins().band_imm(af_shifted, 1);
+        self.set_flag(X86Flag::Auxiliary, af)?;
+
+        // PF: even popcount of low 8 bits of result.
+        let res_lo = if self.builder.func.dfg.value_type(res) == types::I8 {
+            res
+        } else {
+            self.builder.ins().ireduce(types::I8, res)
+        };
+        let pop = self.builder.ins().popcnt(res_lo);
+        let pop_lsb = self.builder.ins().band_imm(pop, 1);
+        let pf = self.builder.ins().bxor_imm(pop_lsb, 1);
+        self.set_flag(X86Flag::Parity, pf)?;
+
         // Carry Flag (CF) is NOT affected by INC/DEC
         Ok(())
     }
@@ -208,7 +311,7 @@ impl<'a> Lifter<'a> {
     /// `count` is the masked shift count (in operand type), `size` is the operand size in bytes.
     ///
     /// Per x86 semantics: if the masked shift count is 0, **no flags are
-    /// affected** — including CF/ZF/SF/OF. We must preserve the prior flag
+    /// affected** - including CF/ZF/SF/OF. We must preserve the prior flag
     /// values in that case rather than clobbering them with the (garbage)
     /// values that fall out of the shift formula for count=0.
     pub fn update_flags_shift(
