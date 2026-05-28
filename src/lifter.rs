@@ -18,9 +18,17 @@ pub struct RegisterState {
     pub context_ptr: Variable,
     pub image_base: Variable,
     /// XMM0–XMM15 low 64 bits (index 0–15).
+    /// Populated only when [`LifterConfig::use_vector_xmm`] is `false`.
     pub xmms_lo: HashMap<u8, Variable>,
     /// XMM0–XMM15 high 64 bits (index 0–15).
+    /// Populated only when [`LifterConfig::use_vector_xmm`] is `false`.
     pub xmms_hi: HashMap<u8, Variable>,
+    /// XMM0–XMM15 as a single native `I64X2` SSA variable per register.
+    /// Populated only when [`LifterConfig::use_vector_xmm`] is `true`.
+    pub xmms_vec: HashMap<u8, Variable>,
+    /// Mirror of [`LifterConfig::use_vector_xmm`] - selects between the
+    /// scalar-pair representation and the native vector representation.
+    pub use_vector_xmm: bool,
     /// FS segment base address SSA variable.
     pub fs_base: Variable,
     /// GS segment base address SSA variable.
@@ -38,7 +46,7 @@ pub enum X86Flag {
 }
 
 impl RegisterState {
-    pub fn new(builder: &mut FunctionBuilder) -> Self {
+    pub fn new(builder: &mut FunctionBuilder, use_vector_xmm: bool) -> Self {
         let mut gprs = HashMap::new();
 
         // Define all 64-bit GPRs
@@ -86,9 +94,16 @@ impl RegisterState {
 
         let mut xmms_lo = HashMap::new();
         let mut xmms_hi = HashMap::new();
-        for i in 0u8..16 {
-            xmms_lo.insert(i, builder.declare_var(types::I64));
-            xmms_hi.insert(i, builder.declare_var(types::I64));
+        let mut xmms_vec = HashMap::new();
+        if use_vector_xmm {
+            for i in 0u8..16 {
+                xmms_vec.insert(i, builder.declare_var(types::I64X2));
+            }
+        } else {
+            for i in 0u8..16 {
+                xmms_lo.insert(i, builder.declare_var(types::I64));
+                xmms_hi.insert(i, builder.declare_var(types::I64));
+            }
         }
 
         let fs_base = builder.declare_var(types::I64);
@@ -101,6 +116,8 @@ impl RegisterState {
             image_base,
             xmms_lo,
             xmms_hi,
+            xmms_vec,
+            use_vector_xmm,
             fs_base,
             gs_base,
         }
@@ -144,6 +161,14 @@ impl RegisterState {
     pub fn get_xmm_offset(idx: u8, hi: bool) -> i32 {
         let base = std::mem::offset_of!(RegisterContext, xmm) as i32;
         base + (idx as i32) * 16 + if hi { 8 } else { 0 }
+    }
+
+    /// Byte offset of the whole 128-bit XMM register `idx` (0–15) within
+    /// `RegisterContext`. Used for native `I64X2` loads/stores when
+    /// [`LifterConfig::use_vector_xmm`] is enabled.
+    pub fn get_xmm_vec_offset(idx: u8) -> i32 {
+        let base = std::mem::offset_of!(RegisterContext, xmm) as i32;
+        base + (idx as i32) * 16
     }
 
     pub fn get_fs_base_offset() -> i32 {
@@ -220,10 +245,16 @@ pub struct LifterConfig {
     ///
     /// Use [`register_fast_import`] / [`register_slow_import`] to populate.
     pub imports: HashMap<u64, Option<DynamicSymbol>>,
-    /// When `true`, SSE instruction handlers use Cranelift's native `I64X2`
-    /// SIMD type for XMM operations. This is only supported on hosts where
-    /// Cranelift has vector lowering (e.g. x86-64 JIT). Set to `false` (the
-    /// default) for RISCV64 and other architectures where SIMD is not present.
+    /// When `true`, XMM registers are stored as native `I64X2` SSA
+    /// variables and whole-register SSE handlers (movaps / xorps /
+    /// andps / orps / andnps and their `pd`/integer aliases) take a
+    /// vector fast path, lowering directly to host XMM registers on
+    /// x86-64 JIT targets.
+    ///
+    /// When `false` (the default) XMM state is stored as scalar lo/hi
+    /// 64-bit pairs and all handlers operate on the pair. This avoids
+    /// relying on Cranelift's vector lowering and is required for AOT
+    /// targets that lack SIMD support (e.g. RISC-V64).
     pub use_vector_xmm: bool,
 }
 
@@ -324,7 +355,7 @@ impl<'a> Lifter<'a> {
 
     pub fn with_config(builder: FunctionBuilder<'a>, config: LifterConfig) -> Self {
         let mut builder = builder;
-        let state = RegisterState::new(&mut builder);
+        let state = RegisterState::new(&mut builder, config.use_vector_xmm);
         let syscall_handler_sig = match config.execution_mode {
             ExecutionMode::Jit => None,
             ExecutionMode::RuntimeAssisted => {
@@ -652,23 +683,36 @@ impl<'a> Lifter<'a> {
                 .store(MemFlags::trusted(), val, ctx_ptr, offset);
         }
 
-        for i in 0u8..16 {
-            let lo_var = *self.state.xmms_lo.get(&i).unwrap();
-            let hi_var = *self.state.xmms_hi.get(&i).unwrap();
-            let lo_val = self.builder.use_var(lo_var);
-            let hi_val = self.builder.use_var(hi_var);
-            self.builder.ins().store(
-                MemFlags::trusted(),
-                lo_val,
-                ctx_ptr,
-                RegisterState::get_xmm_offset(i, false),
-            );
-            self.builder.ins().store(
-                MemFlags::trusted(),
-                hi_val,
-                ctx_ptr,
-                RegisterState::get_xmm_offset(i, true),
-            );
+        if self.state.use_vector_xmm {
+            for i in 0u8..16 {
+                let var = *self.state.xmms_vec.get(&i).unwrap();
+                let val = self.builder.use_var(var);
+                self.builder.ins().store(
+                    MemFlags::new().with_notrap(),
+                    val,
+                    ctx_ptr,
+                    RegisterState::get_xmm_vec_offset(i),
+                );
+            }
+        } else {
+            for i in 0u8..16 {
+                let lo_var = *self.state.xmms_lo.get(&i).unwrap();
+                let hi_var = *self.state.xmms_hi.get(&i).unwrap();
+                let lo_val = self.builder.use_var(lo_var);
+                let hi_val = self.builder.use_var(hi_var);
+                self.builder.ins().store(
+                    MemFlags::trusted(),
+                    lo_val,
+                    ctx_ptr,
+                    RegisterState::get_xmm_offset(i, false),
+                );
+                self.builder.ins().store(
+                    MemFlags::trusted(),
+                    hi_val,
+                    ctx_ptr,
+                    RegisterState::get_xmm_offset(i, true),
+                );
+            }
         }
 
         let fs_base_val = self.builder.use_var(self.state.fs_base);
@@ -725,23 +769,36 @@ impl<'a> Lifter<'a> {
         }
 
         let dirty_xmms: Vec<u8> = self.dirty_xmms.iter().cloned().collect();
-        for idx in dirty_xmms {
-            let lo_var = *self.state.xmms_lo.get(&idx).unwrap();
-            let hi_var = *self.state.xmms_hi.get(&idx).unwrap();
-            let lo_val = self.builder.use_var(lo_var);
-            let hi_val = self.builder.use_var(hi_var);
-            self.builder.ins().store(
-                MemFlags::trusted(),
-                lo_val,
-                ctx_ptr,
-                RegisterState::get_xmm_offset(idx, false),
-            );
-            self.builder.ins().store(
-                MemFlags::trusted(),
-                hi_val,
-                ctx_ptr,
-                RegisterState::get_xmm_offset(idx, true),
-            );
+        if self.state.use_vector_xmm {
+            for idx in dirty_xmms {
+                let var = *self.state.xmms_vec.get(&idx).unwrap();
+                let val = self.builder.use_var(var);
+                self.builder.ins().store(
+                    MemFlags::new().with_notrap(),
+                    val,
+                    ctx_ptr,
+                    RegisterState::get_xmm_vec_offset(idx),
+                );
+            }
+        } else {
+            for idx in dirty_xmms {
+                let lo_var = *self.state.xmms_lo.get(&idx).unwrap();
+                let hi_var = *self.state.xmms_hi.get(&idx).unwrap();
+                let lo_val = self.builder.use_var(lo_var);
+                let hi_val = self.builder.use_var(hi_var);
+                self.builder.ins().store(
+                    MemFlags::trusted(),
+                    lo_val,
+                    ctx_ptr,
+                    RegisterState::get_xmm_offset(idx, false),
+                );
+                self.builder.ins().store(
+                    MemFlags::trusted(),
+                    hi_val,
+                    ctx_ptr,
+                    RegisterState::get_xmm_offset(idx, true),
+                );
+            }
         }
 
         if self.dirty_fs_base {
@@ -831,21 +888,35 @@ impl<'a> Lifter<'a> {
                 .load(types::I64, MemFlags::trusted(), ctx_ptr, image_base_offset);
         self.builder.def_var(self.state.image_base, image_base_val);
 
-        for i in 0u8..16 {
-            let lo_offset = RegisterState::get_xmm_offset(i, false);
-            let hi_offset = RegisterState::get_xmm_offset(i, true);
-            let lo_val =
-                self.builder
-                    .ins()
-                    .load(types::I64, MemFlags::trusted(), ctx_ptr, lo_offset);
-            let hi_val =
-                self.builder
-                    .ins()
-                    .load(types::I64, MemFlags::trusted(), ctx_ptr, hi_offset);
-            let lo_var = *self.state.xmms_lo.get(&i).unwrap();
-            let hi_var = *self.state.xmms_hi.get(&i).unwrap();
-            self.builder.def_var(lo_var, lo_val);
-            self.builder.def_var(hi_var, hi_val);
+        if self.state.use_vector_xmm {
+            for i in 0u8..16 {
+                let offset = RegisterState::get_xmm_vec_offset(i);
+                let val = self.builder.ins().load(
+                    types::I64X2,
+                    MemFlags::new().with_notrap(),
+                    ctx_ptr,
+                    offset,
+                );
+                let var = *self.state.xmms_vec.get(&i).unwrap();
+                self.builder.def_var(var, val);
+            }
+        } else {
+            for i in 0u8..16 {
+                let lo_offset = RegisterState::get_xmm_offset(i, false);
+                let hi_offset = RegisterState::get_xmm_offset(i, true);
+                let lo_val =
+                    self.builder
+                        .ins()
+                        .load(types::I64, MemFlags::trusted(), ctx_ptr, lo_offset);
+                let hi_val =
+                    self.builder
+                        .ins()
+                        .load(types::I64, MemFlags::trusted(), ctx_ptr, hi_offset);
+                let lo_var = *self.state.xmms_lo.get(&i).unwrap();
+                let hi_var = *self.state.xmms_hi.get(&i).unwrap();
+                self.builder.def_var(lo_var, lo_val);
+                self.builder.def_var(hi_var, hi_val);
+            }
         }
 
         let fs_base_val = self.builder.ins().load(

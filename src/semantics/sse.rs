@@ -1,10 +1,18 @@
 //! SSE / SSE2 / XMM instruction semantics.
 //!
-//! XMM registers are stored as two scalar `I64` SSA variables (lo + hi).
-//! All handlers operate on scalar lo/hi pairs to remain compatible with
-//! cross-architecture AOT targets (e.g. RISC-V) that lack SIMD lowering.
-//! `LifterConfig::use_vector_xmm` is reserved for a future fast path that
-//! transiently uses `I64X2` on x86-64 JIT targets.
+//! XMM registers have two interchangeable backing representations,
+//! selected by [`crate::lifter::LifterConfig::use_vector_xmm`]:
+//!  - scalar (default): two `I64` SSA variables per register (lo + hi).
+//!    Portable to AOT targets without vector lowering (e.g. RISC-V64).
+//!  - vector: a single native `I64X2` SSA variable per register, which
+//!    lowers directly to host XMM registers on x86-64.
+//!
+//! Whole-register bitwise handlers (movaps / xorps / andps / orps /
+//! andnps and their `pd`/integer aliases) take a vector fast path when
+//! the option is enabled; scalar move/extract helpers fall back to lo/hi
+//! lane access via [`crate::lifter::Lifter::get_xmm_lo`] /
+//! [`crate::lifter::Lifter::get_xmm_hi`] which transparently handle both
+//! representations.
 
 use crate::MicroliftError;
 use crate::lifter::Lifter;
@@ -85,6 +93,77 @@ impl<'a> Lifter<'a> {
         }
     }
 
+    /// Load a 128-bit XMM source operand as a native `I64X2` value.
+    ///
+    /// - XMM register source: direct vec read (or assembled from lo/hi
+    ///   in scalar mode).
+    /// - GPR source (e.g. MOVQ xmm, r64): zero-extends 64-bit value
+    ///   into lane 0; lane 1 = 0.
+    /// - Memory source: single 128-bit unaligned load.
+    fn read_xmm_src_vec(
+        &mut self,
+        instruction: &Instruction,
+        op_index: u32,
+    ) -> crate::Result<Value> {
+        match self.operand_kind(instruction, op_index) {
+            OpKind::Register => {
+                let reg = self.operand_register(instruction, op_index);
+                if let Some(idx) = xmm_register_index(reg) {
+                    Ok(self.get_xmm_vec(idx))
+                } else {
+                    let lo = self.get_reg_val(reg)?;
+                    let v = self.builder.ins().scalar_to_vector(types::I64X2, lo);
+                    let zero = self.builder.ins().iconst(types::I64, 0);
+                    Ok(self.builder.ins().insertlane(v, zero, 1))
+                }
+            }
+            OpKind::Memory => {
+                let ptr = self.get_mem_ptr(instruction, op_index)?;
+                Ok(self
+                    .builder
+                    .ins()
+                    .load(types::I64X2, MemFlags::new(), ptr, 0))
+            }
+            other => Err(MicroliftError::UnsupportedInstruction {
+                mnemonic: format!("xmm-src-vec-op{}-{:?}", op_index, other),
+            }),
+        }
+    }
+
+    /// Write a 128-bit `I64X2` value to an XMM destination operand.
+    ///
+    /// - XMM register destination: direct vec write (or split into
+    ///   lo/hi in scalar mode).
+    /// - GPR destination: uses lane 0 (low 64 bits).
+    /// - Memory destination: single 128-bit unaligned store.
+    fn write_xmm_dst_vec(
+        &mut self,
+        instruction: &Instruction,
+        op_index: u32,
+        val: Value,
+    ) -> crate::Result<()> {
+        match self.operand_kind(instruction, op_index) {
+            OpKind::Register => {
+                let reg = self.operand_register(instruction, op_index);
+                if let Some(idx) = xmm_register_index(reg) {
+                    self.set_xmm_vec(idx, val);
+                    Ok(())
+                } else {
+                    let lo = self.builder.ins().extractlane(val, 0);
+                    self.set_reg_val(reg, lo)
+                }
+            }
+            OpKind::Memory => {
+                let ptr = self.get_mem_ptr(instruction, op_index)?;
+                self.builder.ins().store(MemFlags::new(), val, ptr, 0);
+                Ok(())
+            }
+            other => Err(MicroliftError::UnsupportedInstruction {
+                mnemonic: format!("xmm-dst-vec-op{}-{:?}", op_index, other),
+            }),
+        }
+    }
+
     /// ENDBR64 / ENDBR32 - CET end-branch marker, a NOP for lifting purposes.
     pub(super) fn handle_endbr64(&mut self, _instruction: &Instruction) -> crate::Result<()> {
         Ok(())
@@ -92,6 +171,10 @@ impl<'a> Lifter<'a> {
 
     /// MOVAPS / MOVAPD / MOVUPS / MOVUPD / MOVDQA / MOVDQU - 128-bit XMM move.
     pub(super) fn handle_movaps(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        if self.config.use_vector_xmm {
+            let v = self.read_xmm_src_vec(instruction, 1)?;
+            return self.write_xmm_dst_vec(instruction, 0, v);
+        }
         let (lo, hi) = self.read_xmm_src(instruction, 1)?;
         self.write_xmm_dst(instruction, 0, lo, hi)
     }
@@ -169,6 +252,13 @@ impl<'a> Lifter<'a> {
             xmm_register_index(dst_reg).ok_or_else(|| MicroliftError::UnsupportedInstruction {
                 mnemonic: format!("xorps-dst-not-xmm-{:?}", dst_reg),
             })?;
+        if self.config.use_vector_xmm {
+            let dst = self.get_xmm_vec(dst_idx);
+            let src = self.read_xmm_src_vec(instruction, 1)?;
+            let res = self.builder.ins().bxor(dst, src);
+            self.set_xmm_vec(dst_idx, res);
+            return Ok(());
+        }
         let (dst_lo, dst_hi) = (self.get_xmm_lo(dst_idx), self.get_xmm_hi(dst_idx));
         let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
         let res_lo = self.builder.ins().bxor(dst_lo, src_lo);
@@ -190,6 +280,13 @@ impl<'a> Lifter<'a> {
             xmm_register_index(dst_reg).ok_or_else(|| MicroliftError::UnsupportedInstruction {
                 mnemonic: format!("andps-dst-not-xmm-{:?}", dst_reg),
             })?;
+        if self.config.use_vector_xmm {
+            let dst = self.get_xmm_vec(dst_idx);
+            let src = self.read_xmm_src_vec(instruction, 1)?;
+            let res = self.builder.ins().band(dst, src);
+            self.set_xmm_vec(dst_idx, res);
+            return Ok(());
+        }
         let (dst_lo, dst_hi) = (self.get_xmm_lo(dst_idx), self.get_xmm_hi(dst_idx));
         let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
         let res_lo = self.builder.ins().band(dst_lo, src_lo);
@@ -206,6 +303,13 @@ impl<'a> Lifter<'a> {
             xmm_register_index(dst_reg).ok_or_else(|| MicroliftError::UnsupportedInstruction {
                 mnemonic: format!("orps-dst-not-xmm-{:?}", dst_reg),
             })?;
+        if self.config.use_vector_xmm {
+            let dst = self.get_xmm_vec(dst_idx);
+            let src = self.read_xmm_src_vec(instruction, 1)?;
+            let res = self.builder.ins().bor(dst, src);
+            self.set_xmm_vec(dst_idx, res);
+            return Ok(());
+        }
         let (dst_lo, dst_hi) = (self.get_xmm_lo(dst_idx), self.get_xmm_hi(dst_idx));
         let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
         let res_lo = self.builder.ins().bor(dst_lo, src_lo);
@@ -222,6 +326,14 @@ impl<'a> Lifter<'a> {
             xmm_register_index(dst_reg).ok_or_else(|| MicroliftError::UnsupportedInstruction {
                 mnemonic: format!("andnps-dst-not-xmm-{:?}", dst_reg),
             })?;
+        if self.config.use_vector_xmm {
+            let dst = self.get_xmm_vec(dst_idx);
+            let src = self.read_xmm_src_vec(instruction, 1)?;
+            // band_not(a, b) = a & !b - so band_not(src, dst) = src & !dst = ~dst & src
+            let res = self.builder.ins().band_not(src, dst);
+            self.set_xmm_vec(dst_idx, res);
+            return Ok(());
+        }
         let (dst_lo, dst_hi) = (self.get_xmm_lo(dst_idx), self.get_xmm_hi(dst_idx));
         let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
         // band_not(a, b) = a & !b - so band_not(src, dst) = src & !dst = ~dst & src

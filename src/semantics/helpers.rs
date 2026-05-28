@@ -323,31 +323,107 @@ impl<'a> Lifter<'a> {
         instruction.immediate64() as i64
     }
 
-    // XMM accessors (scalar)
+    // XMM accessors
+    //
+    // The lifter supports two backing representations for XMM registers,
+    // selected by [`LifterConfig::use_vector_xmm`]:
+    //   - scalar (default): two `I64` SSA variables per register (lo, hi).
+    //   - vector: a single `I64X2` SSA variable per register.
+    //
+    // The lo/hi accessors below work in both modes; in vector mode they
+    // synthesize lane access via `extractlane`/`insertlane`. Use the native
+    // `get_xmm_vec` / `set_xmm_vec` accessors when an entire 128-bit value
+    // is being moved or operated on, so the vector mode avoids the
+    // lane-shuffle round-trip.
 
     /// Return the low 64 bits of XMM register `idx` (0-15).
     pub fn get_xmm_lo(&mut self, idx: u8) -> Value {
-        let var = *self.state.xmms_lo.get(&idx).unwrap();
-        self.builder.use_var(var)
+        if self.state.use_vector_xmm {
+            let var = *self.state.xmms_vec.get(&idx).unwrap();
+            let vec = self.builder.use_var(var);
+            self.builder.ins().extractlane(vec, 0)
+        } else {
+            let var = *self.state.xmms_lo.get(&idx).unwrap();
+            self.builder.use_var(var)
+        }
     }
 
     /// Return the high 64 bits of XMM register `idx` (0-15).
     pub fn get_xmm_hi(&mut self, idx: u8) -> Value {
-        let var = *self.state.xmms_hi.get(&idx).unwrap();
-        self.builder.use_var(var)
+        if self.state.use_vector_xmm {
+            let var = *self.state.xmms_vec.get(&idx).unwrap();
+            let vec = self.builder.use_var(var);
+            self.builder.ins().extractlane(vec, 1)
+        } else {
+            let var = *self.state.xmms_hi.get(&idx).unwrap();
+            self.builder.use_var(var)
+        }
     }
 
     /// Write the low 64 bits of XMM register `idx` (0-15) and mark dirty.
     pub fn set_xmm_lo(&mut self, idx: u8, val: Value) {
-        let var = *self.state.xmms_lo.get(&idx).unwrap();
-        self.builder.def_var(var, val);
+        if self.state.use_vector_xmm {
+            let var = *self.state.xmms_vec.get(&idx).unwrap();
+            let vec = self.builder.use_var(var);
+            let new_vec = self.builder.ins().insertlane(vec, val, 0);
+            self.builder.def_var(var, new_vec);
+        } else {
+            let var = *self.state.xmms_lo.get(&idx).unwrap();
+            self.builder.def_var(var, val);
+        }
         self.dirty_xmms.insert(idx);
     }
 
     /// Write the high 64 bits of XMM register `idx` (0-15) and mark dirty.
     pub fn set_xmm_hi(&mut self, idx: u8, val: Value) {
-        let var = *self.state.xmms_hi.get(&idx).unwrap();
-        self.builder.def_var(var, val);
+        if self.state.use_vector_xmm {
+            let var = *self.state.xmms_vec.get(&idx).unwrap();
+            let vec = self.builder.use_var(var);
+            let new_vec = self.builder.ins().insertlane(vec, val, 1);
+            self.builder.def_var(var, new_vec);
+        } else {
+            let var = *self.state.xmms_hi.get(&idx).unwrap();
+            self.builder.def_var(var, val);
+        }
+        self.dirty_xmms.insert(idx);
+    }
+
+    /// Return the full 128-bit value of XMM register `idx` (0-15) as a
+    /// native `I64X2` value.
+    ///
+    /// In vector mode this is a direct `use_var`. In scalar mode it
+    /// assembles the two halves with `scalar_to_vector` + `insertlane`.
+    pub fn get_xmm_vec(&mut self, idx: u8) -> Value {
+        if self.state.use_vector_xmm {
+            let var = *self.state.xmms_vec.get(&idx).unwrap();
+            self.builder.use_var(var)
+        } else {
+            let lo_var = *self.state.xmms_lo.get(&idx).unwrap();
+            let hi_var = *self.state.xmms_hi.get(&idx).unwrap();
+            let lo = self.builder.use_var(lo_var);
+            let hi = self.builder.use_var(hi_var);
+            let v = self.builder.ins().scalar_to_vector(types::I64X2, lo);
+            self.builder.ins().insertlane(v, hi, 1)
+        }
+    }
+
+    /// Write a full 128-bit `I64X2` value to XMM register `idx` (0-15)
+    /// and mark dirty.
+    ///
+    /// In vector mode this is a direct `def_var`. In scalar mode it
+    /// splits the lanes back into the two scalar halves.
+    pub fn set_xmm_vec(&mut self, idx: u8, val: Value) {
+        if self.state.use_vector_xmm {
+            let var = *self.state.xmms_vec.get(&idx).unwrap();
+            self.builder.def_var(var, val);
+        } else {
+            let lo = self.builder.ins().extractlane(val, 0);
+            let hi = self.builder.ins().extractlane(val, 1);
+            let lo_var = *self.state.xmms_lo.get(&idx).unwrap();
+            let hi_var = *self.state.xmms_hi.get(&idx).unwrap();
+            self.builder.def_var(lo_var, lo);
+            self.builder.def_var(hi_var, hi);
+        }
         self.dirty_xmms.insert(idx);
     }
 

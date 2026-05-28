@@ -9,10 +9,24 @@ use cranelift_codegen::ir::{Function, UserFuncName};
 use cranelift_codegen::settings;
 use microlift::backend::CraneliftBackend;
 use microlift::context::RegisterContext;
-use microlift::lifter::Lifter;
+use microlift::lifter::{Lifter, LifterConfig};
 use microlift::os::get_host_calling_conv;
 
-fn run_test(bytes: &[u8], mut ctx: RegisterContext) -> RegisterContext {
+fn run_test(bytes: &[u8], ctx: RegisterContext) -> RegisterContext {
+    run_test_with_config(bytes, ctx, LifterConfig::default())
+}
+
+fn run_test_vec(bytes: &[u8], ctx: RegisterContext) -> RegisterContext {
+    let mut cfg = LifterConfig::default();
+    cfg.use_vector_xmm = true;
+    run_test_with_config(bytes, ctx, cfg)
+}
+
+fn run_test_with_config(
+    bytes: &[u8],
+    mut ctx: RegisterContext,
+    config: LifterConfig,
+) -> RegisterContext {
     let mut flag_builder = settings::builder();
     flag_builder.set("use_colocated_libcalls", "false").unwrap();
     flag_builder.set("is_pic", "false").unwrap();
@@ -25,7 +39,7 @@ fn run_test(bytes: &[u8], mut ctx: RegisterContext) -> RegisterContext {
 
     let mut func_ctx = cranelift_frontend::FunctionBuilderContext::new();
     let builder = cranelift_frontend::FunctionBuilder::new(&mut func, &mut func_ctx);
-    let mut lifter = Lifter::new(builder);
+    let mut lifter = Lifter::with_config(builder, config);
 
     let mut stack = [0u64; 1024];
     let stack_top = stack.as_mut_ptr() as u64 + 8192;
@@ -477,6 +491,107 @@ fn test_movq_roundtrip_gpr_xmm() {
     ctx.rax = 0xCAFE_BABE_1234_5678;
     ctx.rcx = 0;
     let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.rcx, 0xCAFE_BABE_1234_5678);
+    assert_eq!(ctx.xmm[0][1], 0, "movq must zero high lane");
+}
+
+//  Vector-mode (use_vector_xmm = true) regression tests.
+//
+//  Mirror a representative subset of the bitwise / move handlers above
+//  but flip on the I64X2 backing representation. This exercises the
+//  vector load/store paths in `load_state_from_context` /
+//  `sync_to_context_selective` and the vector fast paths in
+//  handle_xorps / handle_andps / handle_orps / handle_andnps /
+//  handle_movaps.
+
+#[test]
+fn test_vec_xorps_two_regs() {
+    let bytes = [0x0F, 0x57, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [0xF0F0_F0F0_F0F0_F0F0, 0x0000_FFFF_0000_FFFF];
+    ctx.xmm[1] = [0xFF00_FF00_FF00_FF00, 0xFFFF_0000_FFFF_0000];
+    let ctx = run_test_vec(&bytes, ctx);
+    assert_eq!(
+        ctx.xmm[0],
+        [
+            0xF0F0_F0F0_F0F0_F0F0 ^ 0xFF00_FF00_FF00_FF00,
+            0x0000_FFFF_0000_FFFF ^ 0xFFFF_0000_FFFF_0000,
+        ],
+    );
+}
+
+#[test]
+fn test_vec_andps() {
+    let bytes = [0x0F, 0x54, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [0xFF00_FF00_FF00_FF00, 0x0F0F_0F0F_0F0F_0F0F];
+    ctx.xmm[1] = [0xF0F0_F0F0_F0F0_F0F0, 0xAAAA_AAAA_AAAA_AAAA];
+    let ctx = run_test_vec(&bytes, ctx);
+    assert_eq!(
+        ctx.xmm[0],
+        [
+            0xFF00_FF00_FF00_FF00 & 0xF0F0_F0F0_F0F0_F0F0,
+            0x0F0F_0F0F_0F0F_0F0F & 0xAAAA_AAAA_AAAA_AAAA,
+        ],
+    );
+}
+
+#[test]
+fn test_vec_orps() {
+    // orps xmm0, xmm1; ret   ->   0F 56 C1  C3
+    let bytes = [0x0F, 0x56, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [0x00FF_00FF_00FF_00FF, 0xAAAA_0000_AAAA_0000];
+    ctx.xmm[1] = [0xFF00_FF00_FF00_FF00, 0x0000_5555_0000_5555];
+    let ctx = run_test_vec(&bytes, ctx);
+    assert_eq!(
+        ctx.xmm[0],
+        [
+            0x00FF_00FF_00FF_00FF | 0xFF00_FF00_FF00_FF00,
+            0xAAAA_0000_AAAA_0000 | 0x0000_5555_0000_5555,
+        ],
+    );
+}
+
+#[test]
+fn test_vec_andnps() {
+    // andnps xmm0, xmm1; ret   ->   0F 55 C1  C3   (result = ~xmm0 & xmm1)
+    let bytes = [0x0F, 0x55, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [0xFF00_FF00_FF00_FF00, 0x0F0F_0F0F_0F0F_0F0F];
+    ctx.xmm[1] = [0xFFFF_FFFF_FFFF_FFFF, 0xAAAA_AAAA_AAAA_AAAA];
+    let ctx = run_test_vec(&bytes, ctx);
+    assert_eq!(
+        ctx.xmm[0],
+        [
+            !0xFF00_FF00_FF00_FF00u64 & 0xFFFF_FFFF_FFFF_FFFF,
+            !0x0F0F_0F0F_0F0F_0F0Fu64 & 0xAAAA_AAAA_AAAA_AAAA,
+        ],
+    );
+}
+
+#[test]
+fn test_vec_movaps_reg_reg() {
+    // movaps xmm0, xmm1; ret   ->   0F 28 C1  C3
+    let bytes = [0x0F, 0x28, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [0, 0];
+    ctx.xmm[1] = [0xDEAD_BEEF_CAFE_BABE, 0x1234_5678_9ABC_DEF0];
+    let ctx = run_test_vec(&bytes, ctx);
+    assert_eq!(ctx.xmm[0], [0xDEAD_BEEF_CAFE_BABE, 0x1234_5678_9ABC_DEF0]);
+}
+
+#[test]
+fn test_vec_movq_roundtrip_gpr_xmm() {
+    // Exercises lo/hi accessors in vector mode (extractlane / insertlane).
+    let bytes = [
+        0x66, 0x48, 0x0F, 0x6E, 0xC0, // movq xmm0, rax
+        0x66, 0x48, 0x0F, 0x7E, 0xC1, // movq rcx, xmm0
+        0xC3,
+    ];
+    let mut ctx = RegisterContext::default();
+    ctx.rax = 0xCAFE_BABE_1234_5678;
+    let ctx = run_test_vec(&bytes, ctx);
     assert_eq!(ctx.rcx, 0xCAFE_BABE_1234_5678);
     assert_eq!(ctx.xmm[0][1], 0, "movq must zero high lane");
 }
