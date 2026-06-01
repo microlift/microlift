@@ -38,7 +38,7 @@ impl<'a> Lifter<'a> {
             Mnemonic::Pop => self.handle_pop(instruction),
             Mnemonic::Leave => self.handle_leave(instruction),
             Mnemonic::Xchg => self.handle_xchg(instruction),
-            Mnemonic::Nop => self.handle_nop(instruction),
+            Mnemonic::Nop | Mnemonic::Reservednop => self.handle_nop(instruction),
 
             // Atomics / synchronisation
             Mnemonic::Cmpxchg => self.handle_cmpxchg(instruction),
