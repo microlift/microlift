@@ -256,6 +256,17 @@ pub struct LifterConfig {
     /// relying on Cranelift's vector lowering and is required for AOT
     /// targets that lack SIMD support (e.g. RISC-V64).
     pub use_vector_xmm: bool,
+    /// When `true`, calls that would otherwise produce a VM exit
+    /// (`ImportedFunctionCall` for slow imports, `UnknownJump`/`DirectCall`
+    /// for direct out-of-region calls, `IndirectCall` for unregistered
+    /// indirect calls) are instead routed through an x86-64 trampoline
+    /// (see [`crate::trampoline`]). The trampoline syncs the virtual CPU
+    /// state into the real CPU and calls the target natively.
+    ///
+    /// Only meaningful on x86-64 hosts. Use
+    /// [`LifterConfig::set_direct_native_call`] to enable; it returns an
+    /// error on non-x86-64 hosts.
+    pub direct_native_call: bool,
 }
 
 impl Default for LifterConfig {
@@ -268,6 +279,7 @@ impl Default for LifterConfig {
             emit_resume_blocks: false,
             imports: HashMap::new(),
             use_vector_xmm: false,
+            direct_native_call: false,
         }
     }
 }
@@ -292,6 +304,20 @@ impl LifterConfig {
     /// regardless of whether resume blocks are enabled.
     pub fn register_slow_import(&mut self, va: u64) {
         self.imports.insert(va, None);
+    }
+
+    /// Enable or disable [`Self::direct_native_call`].
+    ///
+    /// Returns an error when called with `true` on a host that is not x86-64,
+    /// because the trampoline that implements the feature is x86-64 only.
+    pub fn set_direct_native_call(&mut self, enabled: bool) -> crate::Result<()> {
+        if enabled && !crate::trampoline::HOST_SUPPORTS_DIRECT_NATIVE_CALL {
+            return Err(crate::MicroliftError::UnsupportedInstruction {
+                mnemonic: "direct_native_call requires an x86-64 host".to_string(),
+            });
+        }
+        self.direct_native_call = enabled;
+        Ok(())
     }
 }
 
@@ -341,6 +367,13 @@ pub struct Lifter<'a> {
     /// Used by `finish()` to emit the correct `TransferKind` into `exit_code`
     /// when stubbing out unvisited (out-of-region) blocks.
     pub block_transfer_kinds: HashMap<Block, TransferKind>,
+    /// Cranelift signature ref for the direct-native-call trampoline.
+    /// Populated when `config.direct_native_call` is true.
+    /// Signature: `fn(ctx: i64, target: i64)`.
+    pub direct_native_call_sig: Option<SigRef>,
+    /// Raw address of the direct-native-call trampoline embedded as an
+    /// `i64`. Populated when `config.direct_native_call` is true.
+    pub direct_native_call_addr: i64,
 }
 
 impl<'a> Lifter<'a> {
@@ -382,6 +415,18 @@ impl<'a> Lifter<'a> {
             }
         }
 
+        let (direct_native_call_sig, direct_native_call_addr) = if config.direct_native_call {
+            let mut sig = Signature::new(CallConv::SystemV);
+            sig.params.push(AbiParam::new(types::I64)); // ctx
+            sig.params.push(AbiParam::new(types::I64)); // target
+            (
+                Some(builder.import_signature(sig)),
+                crate::trampoline::direct_native_call_trampoline_addr(),
+            )
+        } else {
+            (None, 0)
+        };
+
         Self {
             builder,
             state,
@@ -403,6 +448,8 @@ impl<'a> Lifter<'a> {
             fast_call_data,
             import_vas,
             block_transfer_kinds: HashMap::new(),
+            direct_native_call_sig,
+            direct_native_call_addr,
         }
     }
 

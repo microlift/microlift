@@ -8,6 +8,7 @@ pub mod lifter;
 pub(crate) mod mapfile;
 pub mod os;
 pub mod semantics;
+pub mod trampoline;
 pub mod vsa;
 
 #[derive(Error, Debug)]

@@ -130,12 +130,18 @@ impl<'a> Lifter<'a> {
                     return self.emit_import_call(target);
                 }
 
-                // Out-of-region direct call. Emit UnknownJump + DirectCall so
-                // the runtime can distinguish this from a real ImportedFunctionCall
-                // (a registered import whose callee is always a native function).
-                // For DirectCall the callee may itself be a virtualized function,
-                // which the runtime will have to account for appropriately.
+                // Out-of-region direct call. If `direct_native_call` is enabled,
+                // dispatch via the trampoline (no VM exit). Otherwise emit
+                // UnknownJump + DirectCall so the runtime can distinguish this
+                // from a real ImportedFunctionCall (a registered import whose
+                // callee is always a native function). For DirectCall the
+                // callee may itself be a virtualized function, which the
+                // runtime will have to account for appropriately.
                 if target < self.lift_base || target >= self.lift_end {
+                    if self.config.direct_native_call {
+                        let target_val = self.builder.ins().iconst(types::I64, target as i64);
+                        return self.emit_direct_native_call(target_val);
+                    }
                     self.get_block(self.current_ip);
 
                     let image_base = self.builder.use_var(self.state.image_base);
@@ -212,10 +218,42 @@ impl<'a> Lifter<'a> {
         if let Some((sig_ref, fn_ptr, arg_types)) = self.fast_call_data.get(&import_va).cloned() {
             // Fast path: emit inline call_indirect using SysV AMD64 ABI.
             self.emit_fast_import_call(sig_ref, fn_ptr, arg_types)
+        } else if self.config.direct_native_call {
+            // Direct native call: sync state, dispatch via the x86-64 trampoline,
+            // reload state, and continue inline (no VM exit).
+            let target_val = self.builder.ins().iconst(types::I64, import_va as i64);
+            self.emit_direct_native_call(target_val)
         } else {
             // Slow path: VM exit so the host can handle it.
             self.emit_import_slow_exit(import_va)
         }
+    }
+
+    /// Emit an inline call to the direct-native-call trampoline, which performs
+    /// a full guest/host CPU state swap and dispatches the target natively.
+    /// After the trampoline returns, guest state in `RegisterContext` reflects
+    /// the post-call register values; SSA variables are reloaded so lifted
+    /// code can continue inline without a VM exit.
+    pub(super) fn emit_direct_native_call(&mut self, target_val: Value) -> crate::Result<()> {
+        let sig_ref = self
+            .direct_native_call_sig
+            .expect("direct_native_call_sig must be set when direct_native_call is enabled");
+        let trampoline_addr = self.direct_native_call_addr;
+
+        // Full sync so the trampoline sees every guest register.
+        self.sync_to_context(None, ExitReason::None)?;
+
+        let ctx_ptr = self.builder.use_var(self.state.context_ptr);
+        let fn_ptr_val = self.builder.ins().iconst(types::I64, trampoline_addr);
+        self.builder
+            .ins()
+            .call_indirect(sig_ref, fn_ptr_val, &[ctx_ptr, target_val]);
+
+        // Trampoline wrote the post-call state back into ctx; reload SSA vars.
+        self.load_state_from_context()?;
+        // Execution continues at the instruction after the CALL — the lifter's
+        // main loop will emit it into this block.
+        Ok(())
     }
 
     /// Emit an `ImportedFunctionCall` VM exit for a direct import call.
@@ -248,6 +286,9 @@ impl<'a> Lifter<'a> {
     /// RSP is intentionally left unchanged. See `ExitReason::IndirectCall` for
     /// the contract the host must uphold when dispatching the callee.
     fn emit_indirect_call_exit(&mut self, target_val: Value) -> crate::Result<()> {
+        if self.config.direct_native_call {
+            return self.emit_direct_native_call(target_val);
+        }
         self.get_block(self.current_ip);
 
         let ctx_ptr = self.builder.use_var(self.state.context_ptr);
