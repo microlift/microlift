@@ -34,6 +34,16 @@ impl CraneliftBackend {
         Ok(Self { module })
     }
 
+    /// Idempotently declare and define the direct-native-call trampoline in
+    /// this JIT module, and obtain a `FuncRef` for it within `func` that the
+    /// lifter can call.  See [`crate::trampoline::declare_trampoline_in_func`].
+    pub fn declare_trampoline_in_func(
+        &mut self,
+        func: &mut Function,
+    ) -> Result<cranelift_codegen::ir::FuncRef> {
+        crate::trampoline::declare_trampoline_in_func(&mut self.module, func)
+    }
+
     pub fn compile(&mut self, func: Function) -> Result<*const u8> {
         let mut ctx = self.module.make_context();
         ctx.func = func;
@@ -58,6 +68,43 @@ impl CraneliftBackend {
 }
 
 pub struct ArtifactBackend;
+
+/// Stateful AOT compile session.  Holds the `ObjectModule` across the
+/// trampoline-declaration step and the `compile` step so the lifted
+/// function's references resolve to the same module that defines them.
+pub struct ArtifactSession {
+    module: ObjectModule,
+}
+
+impl ArtifactSession {
+    /// Idempotently declare and define the direct-native-call trampoline in
+    /// this session's module, and obtain a `FuncRef` for it within `func`.
+    /// See [`crate::trampoline::declare_trampoline_in_func`].
+    pub fn declare_trampoline_in_func(
+        &mut self,
+        func: &mut Function,
+    ) -> Result<cranelift_codegen::ir::FuncRef> {
+        crate::trampoline::declare_trampoline_in_func(&mut self.module, func)
+    }
+
+    /// Declare `func` as `lifted_func`, define it, and emit the final object
+    /// bytes.  Any module-level dependencies registered earlier (e.g. the
+    /// direct-native-call trampoline) are emitted into the same object.
+    pub fn compile(mut self, func: Function) -> Result<Vec<u8>> {
+        let mut ctx = cranelift_codegen::Context::for_function(func);
+        let id = self
+            .module
+            .declare_function("lifted_func", Linkage::Export, &ctx.func.signature)
+            .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
+        self.module
+            .define_function(id, &mut ctx)
+            .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
+        let product = self.module.finish();
+        product
+            .emit()
+            .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))
+    }
+}
 
 impl ArtifactBackend {
     fn get_isa(
@@ -111,6 +158,35 @@ impl ArtifactBackend {
         Ok(product
             .emit()
             .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?)
+    }
+
+    /// Stateful AOT compile session that owns an `ObjectModule` long enough
+    /// for the lifter to declare the direct-native-call trampoline in the
+    /// function being lifted.  Without this, AOT outputs would be missing
+    /// the trampoline bytes that lifted code calls into.
+    ///
+    /// Workflow:
+    ///
+    /// ```ignore
+    /// let mut sess = ArtifactBackend::session(None, None)?;
+    /// let mut func = Function::with_name_signature(...);
+    /// // ... configure func.signature ...
+    /// let funcref = sess.declare_trampoline_in_func(&mut func)?;
+    /// config.direct_native_call_funcref = Some(funcref);
+    /// // ... run the Lifter against `func` ...
+    /// let obj_bytes = sess.compile(func)?;
+    /// ```
+    pub fn session(
+        triple: Option<&str>,
+        flags: Option<settings::Flags>,
+    ) -> Result<ArtifactSession> {
+        let isa = Self::get_isa(triple, flags)?;
+        let obj_builder =
+            ObjectBuilder::new(isa, "lifted", cranelift_module::default_libcall_names())
+                .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
+        Ok(ArtifactSession {
+            module: ObjectModule::new(obj_builder),
+        })
     }
 
     pub fn compile_to_raw(

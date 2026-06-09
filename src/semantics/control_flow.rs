@@ -235,19 +235,16 @@ impl<'a> Lifter<'a> {
     /// the post-call register values; SSA variables are reloaded so lifted
     /// code can continue inline without a VM exit.
     pub(super) fn emit_direct_native_call(&mut self, target_val: Value) -> crate::Result<()> {
-        let sig_ref = self
-            .direct_native_call_sig
-            .expect("direct_native_call_sig must be set when direct_native_call is enabled");
-        let trampoline_addr = self.direct_native_call_addr;
+        let funcref = self.direct_native_call_funcref.expect(
+            "direct_native_call requires direct_native_call_funcref to be set; \
+             use microlift::trampoline::declare_trampoline_in_func to obtain it",
+        );
 
         // Full sync so the trampoline sees every guest register.
         self.sync_to_context(None, ExitReason::None)?;
 
         let ctx_ptr = self.builder.use_var(self.state.context_ptr);
-        let fn_ptr_val = self.builder.ins().iconst(types::I64, trampoline_addr);
-        self.builder
-            .ins()
-            .call_indirect(sig_ref, fn_ptr_val, &[ctx_ptr, target_val]);
+        self.builder.ins().call(funcref, &[ctx_ptr, target_val]);
 
         // Trampoline wrote the post-call state back into ctx; reload SSA vars.
         self.load_state_from_context()?;

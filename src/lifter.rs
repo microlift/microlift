@@ -5,7 +5,7 @@ use crate::{
     os::get_host_calling_conv,
 };
 use cranelift::prelude::*;
-use cranelift_codegen::ir::SigRef;
+use cranelift_codegen::ir::{FuncRef, SigRef};
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, Switch, Variable};
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
@@ -267,6 +267,14 @@ pub struct LifterConfig {
     /// [`LifterConfig::set_direct_native_call`] to enable; it returns an
     /// error on non-x86-64 hosts.
     pub direct_native_call: bool,
+    /// `FuncRef` of the direct-native-call trampoline within the function
+    /// that will be lifted.  Must be set when [`Self::direct_native_call`]
+    /// is `true`.
+    ///
+    /// Obtain via [`crate::trampoline::declare_trampoline_in_func`], which
+    /// also embeds the trampoline's machine bytes into the module so the
+    /// produced object/JIT memory stays self-contained.
+    pub direct_native_call_funcref: Option<FuncRef>,
 }
 
 impl Default for LifterConfig {
@@ -280,6 +288,7 @@ impl Default for LifterConfig {
             imports: HashMap::new(),
             use_vector_xmm: false,
             direct_native_call: false,
+            direct_native_call_funcref: None,
         }
     }
 }
@@ -367,13 +376,16 @@ pub struct Lifter<'a> {
     /// Used by `finish()` to emit the correct `TransferKind` into `exit_code`
     /// when stubbing out unvisited (out-of-region) blocks.
     pub block_transfer_kinds: HashMap<Block, TransferKind>,
-    /// Cranelift signature ref for the direct-native-call trampoline.
-    /// Populated when `config.direct_native_call` is true.
-    /// Signature: `fn(ctx: i64, target: i64)`.
-    pub direct_native_call_sig: Option<SigRef>,
-    /// Raw address of the direct-native-call trampoline embedded as an
-    /// `i64`. Populated when `config.direct_native_call` is true.
-    pub direct_native_call_addr: i64,
+    /// Cranelift `FuncRef` for the direct-native-call trampoline within the
+    /// current function being lifted.  Required when
+    /// `config.direct_native_call` is `true`.
+    ///
+    /// Set by the backend (or by user code) *before* calling [`Self::lift`].
+    /// The helper [`crate::trampoline::declare_trampoline_in_func`] returns
+    /// the appropriate value: it ensures the trampoline is defined in the
+    /// module and declares it in the lifted function so the resulting object
+    /// can be linked into AOT outputs.
+    pub direct_native_call_funcref: Option<FuncRef>,
 }
 
 impl<'a> Lifter<'a> {
@@ -415,17 +427,7 @@ impl<'a> Lifter<'a> {
             }
         }
 
-        let (direct_native_call_sig, direct_native_call_addr) = if config.direct_native_call {
-            let mut sig = Signature::new(CallConv::SystemV);
-            sig.params.push(AbiParam::new(types::I64)); // ctx
-            sig.params.push(AbiParam::new(types::I64)); // target
-            (
-                Some(builder.import_signature(sig)),
-                crate::trampoline::direct_native_call_trampoline_addr(),
-            )
-        } else {
-            (None, 0)
-        };
+        let direct_native_call_funcref = config.direct_native_call_funcref;
 
         Self {
             builder,
@@ -448,8 +450,7 @@ impl<'a> Lifter<'a> {
             fast_call_data,
             import_vas,
             block_transfer_kinds: HashMap::new(),
-            direct_native_call_sig,
-            direct_native_call_addr,
+            direct_native_call_funcref,
         }
     }
 
