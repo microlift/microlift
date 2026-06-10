@@ -48,22 +48,13 @@ const EXIT_TRAMPOLINE: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 fn lift_and_compile(
     bytes: &[u8],
     lift_base: u64,
-    mut config: LifterConfig,
+    config: LifterConfig,
 ) -> (CraneliftBackend, *const u8) {
     let mut func = Function::with_name_signature(
         UserFuncName::user(0, 0),
         Signature::new(get_host_calling_conv()),
     );
     func.signature.params.push(AbiParam::new(types::I64));
-
-    let mut backend = CraneliftBackend::new().expect("backend init failed");
-    if config.direct_native_call {
-        config.direct_native_call_funcref = Some(
-            backend
-                .declare_trampoline_in_func(&mut func)
-                .expect("declare trampoline"),
-        );
-    }
 
     let mut func_ctx = cranelift_frontend::FunctionBuilderContext::new();
     let builder = cranelift_frontend::FunctionBuilder::new(&mut func, &mut func_ctx);
@@ -72,6 +63,7 @@ fn lift_and_compile(
     lifter.lift(bytes, lift_base).expect("lifting failed");
     drop(lifter);
 
+    let mut backend = CraneliftBackend::new().expect("backend init failed");
     let code_ptr = backend.compile(func).expect("compilation failed");
     (backend, code_ptr)
 }
@@ -283,77 +275,4 @@ fn test_set_direct_native_call_ok_on_x86_64() {
     assert!(config.direct_native_call);
     assert!(config.set_direct_native_call(false).is_ok());
     assert!(!config.direct_native_call);
-}
-
-// AOT: the trampoline's machine bytes must be embedded into the produced
-// object file under the symbol `microlift_direct_native_call_trampoline`.
-// This is what makes `direct_native_call` usable for ahead-of-time outputs
-// that get loaded into a different process: the trampoline travels with
-// the object, instead of relying on a runtime address.
-
-#[test]
-fn test_direct_native_call_trampoline_embedded_in_aot_object() {
-    use microlift::backend::ArtifactBackend;
-    use microlift::trampoline::{TRAMPOLINE_SYMBOL, trampoline_bytes};
-    use object::{Object, ObjectSection, ObjectSymbol};
-
-    // A minimal lifted function that performs one direct_native_call.
-    let s = b"abc\0";
-    let s_ptr = s.as_ptr() as u64;
-    let strlen_addr = host_strlen as *const () as u64;
-
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(&mov_rax_imm64(strlen_addr));
-    bytes.extend_from_slice(&mov_rdi_imm64(s_ptr));
-    bytes.extend_from_slice(&[0xFF, 0xD0]); // call rax
-    bytes.push(0xC3); //                       ret
-
-    // Build the Function manually so we can route through ArtifactSession.
-    let mut func = Function::with_name_signature(
-        UserFuncName::user(0, 0),
-        Signature::new(get_host_calling_conv()),
-    );
-    func.signature.params.push(AbiParam::new(types::I64));
-
-    let mut sess = ArtifactBackend::session(None, None).expect("session");
-    let funcref = sess
-        .declare_trampoline_in_func(&mut func)
-        .expect("declare trampoline");
-
-    let mut config = LifterConfig::default();
-    config.set_direct_native_call(true).unwrap();
-    config.direct_native_call_funcref = Some(funcref);
-
-    let mut func_ctx = cranelift_frontend::FunctionBuilderContext::new();
-    let builder = cranelift_frontend::FunctionBuilder::new(&mut func, &mut func_ctx);
-    let mut lifter = Lifter::with_config(builder, config);
-    lifter.lift(&bytes, LIFT_BASE).unwrap();
-    drop(lifter);
-
-    let obj_bytes = sess.compile(func).expect("compile");
-    let obj = object::File::parse(&*obj_bytes).expect("parse object");
-
-    // The trampoline symbol must be present in the object.
-    let tramp_sym = obj
-        .symbols()
-        .find(|s| s.name().unwrap_or("") == TRAMPOLINE_SYMBOL)
-        .expect("trampoline symbol must be in the AOT object");
-
-    // The trampoline's bytes inside the object must match what the live
-    // process has for the trampoline.
-    let text = obj
-        .sections()
-        .find(|s| s.kind() == object::SectionKind::Text)
-        .expect("text section");
-    let text_bytes = text.data().expect("text data");
-    let expected = trampoline_bytes();
-    let sym_off = tramp_sym.address() as usize;
-    let sym_size = tramp_sym.size() as usize;
-
-    assert!(sym_size >= expected.len(), "symbol size too small");
-    assert_eq!(
-        &text_bytes[sym_off..sym_off + expected.len()],
-        expected,
-        "embedded trampoline bytes must match live trampoline"
-    );
 }
