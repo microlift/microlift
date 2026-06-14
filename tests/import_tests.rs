@@ -15,7 +15,7 @@ use cranelift_codegen::ir::{Function, UserFuncName};
 use microlift::backend::CraneliftBackend;
 use microlift::context::{ExitReason, RegisterContext};
 use microlift::function_traits::DynamicSymbol;
-use microlift::lifter::{Lifter, LifterConfig};
+use microlift::lifter::{ExecutionMode, Lifter, LifterConfig};
 use microlift::os::get_host_calling_conv;
 use microlift::trampoline_func;
 
@@ -206,4 +206,187 @@ fn test_import_slow_call_strlen_with_resume() {
         "expected Return exit after resuming"
     );
     assert_eq!(ctx.rax, 9, "strlen(\"microlift\") should be 9");
+}
+
+/// `RuntimeAssisted` fast-call path via `CraneliftBackend::compile_with_fast_imports`.
+///
+/// In `RuntimeAssisted` mode the lifter emits `call(func_ref, ...)` backed by
+/// `ExternalName::user(0, 0)` rather than `call_indirect` with a baked-in
+/// pointer.  `compile_with_fast_imports` creates a fresh JIT module that:
+///   1. Registers the host symbol address so the linker can patch the call site.
+///   2. Declares the import with the same `FuncId` order used in the IR.
+///
+/// The test asserts that execution completes with a single `Return` exit —
+/// no `ImportedFunctionCall` exits — and that `rax` holds the correct length,
+/// proving that the call went through `host_strlen` directly.
+#[test]
+fn test_runtime_assisted_fast_call_strlen() {
+    let test_string = b"hello, world!\0"; // strlen == 13
+    let string_ptr = test_string.as_ptr() as u64;
+    let bytes = strlen_call_bytes(string_ptr);
+
+    let mut config = LifterConfig {
+        execution_mode: ExecutionMode::RuntimeAssisted,
+        ..LifterConfig::default()
+    };
+    config.register_fast_import(
+        IMPORT_VA,
+        DynamicSymbol::new("host_strlen", trampoline_func!(host_strlen, _)),
+    );
+
+    let mut func = Function::with_name_signature(
+        UserFuncName::user(0, 0),
+        Signature::new(get_host_calling_conv()),
+    );
+    func.signature.params.push(AbiParam::new(types::I64));
+
+    let mut func_ctx = cranelift_frontend::FunctionBuilderContext::new();
+    let builder = cranelift_frontend::FunctionBuilder::new(&mut func, &mut func_ctx);
+    let mut lifter = Lifter::with_config(builder, config);
+    lifter.lift(&bytes, LIFT_BASE).expect("lifting failed");
+
+    // Capture the ordered import list before dropping the lifter.
+    let aot_imports: Vec<_> = lifter.aot_imports().to_vec();
+    drop(lifter);
+
+    let code_ptr = CraneliftBackend::compile_with_fast_imports(
+        func,
+        &aot_imports,
+        settings::Flags::new(settings::builder()),
+    )
+    .expect("JIT compilation with fast imports failed");
+
+    let (mut ctx, _stack) = make_ctx_and_stack();
+    let f: fn(*mut RegisterContext) = unsafe { std::mem::transmute(code_ptr) };
+    f(&mut ctx);
+
+    assert_eq!(
+        ctx.exit_reason,
+        ExitReason::Return as u32,
+        "expected a clean Return exit (no ImportedFunctionCall); got {}",
+        ctx.exit_reason,
+    );
+    assert_eq!(ctx.rax, 13, "strlen(\"hello, world!\") should be 13");
+}
+
+/// Same as above but with two registered fast imports to verify that the
+/// `ExternalName::user(0, i)` index assignment correctly maps both symbols.
+///
+/// The lifted code calls `host_strlen` then immediately `host_strcmp`, and the
+/// final result in `rax` is the `strcmp` return value.
+#[test]
+fn test_runtime_assisted_fast_call_two_imports() {
+    unsafe extern "C" fn host_strcmp(s1: *const u8, s2: *const u8) -> i64 {
+        let mut i = 0usize;
+        loop {
+            let c1 = unsafe { *s1.add(i) };
+            let c2 = unsafe { *s2.add(i) };
+            if c1 != c2 {
+                return (c1 as i64) - (c2 as i64);
+            }
+            if c1 == 0 {
+                return 0;
+            }
+            i += 1;
+        }
+    }
+
+    const STRCMP_VA: u64 = 0x3000;
+
+    let s1 = b"abc\0";
+    let s2 = b"abc\0";
+    let p1 = s1.as_ptr() as u64;
+    let p2 = s2.as_ptr() as u64;
+
+    // Build:
+    //   mov rdi, p1
+    //   call IMPORT_VA     ; strlen(p1) -> rax (unused, just exercises the call)
+    //   mov rdi, p1
+    //   mov rsi, p2
+    //   call STRCMP_VA     ; strcmp(p1, p2) -> rax
+    //   ret
+    let mut bytes: Vec<u8> = Vec::new();
+    let encode_call = |target: u64, next_ip: u64| -> Vec<u8> {
+        let rel = (target as i64 - next_ip as i64) as i32;
+        let mut v = vec![0xE8u8];
+        v.extend_from_slice(&rel.to_le_bytes());
+        v
+    };
+    let encode_mov_rdi = |val: u64| -> Vec<u8> {
+        let mut v = vec![0x48u8, 0xBF];
+        v.extend_from_slice(&val.to_le_bytes());
+        v
+    };
+    let encode_mov_rsi = |val: u64| -> Vec<u8> {
+        let mut v = vec![0x48u8, 0xBE];
+        v.extend_from_slice(&val.to_le_bytes());
+        v
+    };
+
+    // ip=LIFT_BASE
+    let mov1 = encode_mov_rdi(p1); // 10 bytes
+    let call1_next = LIFT_BASE + 10 + 5;
+    let call1 = encode_call(IMPORT_VA, call1_next); // 5 bytes
+    let mov2 = encode_mov_rdi(p1); // 10 bytes
+    let mov3 = encode_mov_rsi(p2); // 10 bytes
+    let call2_next = LIFT_BASE + 10 + 5 + 10 + 10 + 5;
+    let call2 = encode_call(STRCMP_VA, call2_next); // 5 bytes
+
+    bytes.extend_from_slice(&mov1);
+    bytes.extend_from_slice(&call1);
+    bytes.extend_from_slice(&mov2);
+    bytes.extend_from_slice(&mov3);
+    bytes.extend_from_slice(&call2);
+    bytes.push(0xC3); // ret
+
+    let mut config = LifterConfig {
+        execution_mode: ExecutionMode::RuntimeAssisted,
+        ..LifterConfig::default()
+    };
+    config.register_fast_import(
+        IMPORT_VA,
+        DynamicSymbol::new("host_strlen", trampoline_func!(host_strlen, _)),
+    );
+    config.register_fast_import(
+        STRCMP_VA,
+        DynamicSymbol::new(
+            "host_strcmp",
+            host_strcmp as unsafe extern "C" fn(*const u8, *const u8) -> i64,
+        ),
+    );
+
+    let mut func = Function::with_name_signature(
+        UserFuncName::user(0, 0),
+        Signature::new(get_host_calling_conv()),
+    );
+    func.signature.params.push(AbiParam::new(types::I64));
+
+    let mut func_ctx = cranelift_frontend::FunctionBuilderContext::new();
+    let builder = cranelift_frontend::FunctionBuilder::new(&mut func, &mut func_ctx);
+    let mut lifter = Lifter::with_config(builder, config);
+    lifter.lift(&bytes, LIFT_BASE).expect("lifting failed");
+
+    let aot_imports: Vec<_> = lifter.aot_imports().to_vec();
+    assert_eq!(aot_imports.len(), 2, "should have exactly 2 AOT imports");
+    drop(lifter);
+
+    let code_ptr = CraneliftBackend::compile_with_fast_imports(
+        func,
+        &aot_imports,
+        settings::Flags::new(settings::builder()),
+    )
+    .expect("JIT compilation with fast imports failed");
+
+    let (mut ctx, _stack) = make_ctx_and_stack();
+    let f: fn(*mut RegisterContext) = unsafe { std::mem::transmute(code_ptr) };
+    f(&mut ctx);
+
+    assert_eq!(
+        ctx.exit_reason,
+        ExitReason::Return as u32,
+        "expected a clean Return; got {}",
+        ctx.exit_reason
+    );
+    // strcmp("abc", "abc") == 0
+    assert_eq!(ctx.rax as i64, 0, "strcmp(\"abc\", \"abc\") should be 0");
 }

@@ -1,10 +1,10 @@
 use crate::MicroliftError;
 use crate::context::{ExitReason, RegisterContext, TransferKind};
 use crate::function_traits::FunctionArgumentType;
-use crate::lifter::Lifter;
+use crate::lifter::{ExecutionMode, Lifter};
 use crate::semantics::helpers::size_to_type;
 use cranelift::prelude::*;
-use cranelift_codegen::ir::SigRef;
+use cranelift_codegen::ir::{FuncRef, SigRef};
 use iced_x86::{Code, CodeSize, Instruction, OpKind, Register};
 
 impl<'a> Lifter<'a> {
@@ -209,13 +209,23 @@ impl<'a> Lifter<'a> {
     /// Dispatch a call to a registered import address: either emit a fast
     /// inline call or a slow `ImportedFunctionCall` VM exit.
     fn emit_import_call(&mut self, import_va: u64) -> crate::Result<()> {
-        if let Some((sig_ref, fn_ptr, arg_types)) = self.fast_call_data.get(&import_va).cloned() {
-            // Fast path: emit inline call_indirect using SysV AMD64 ABI.
-            self.emit_fast_import_call(sig_ref, fn_ptr, arg_types)
-        } else {
-            // Slow path: VM exit so the host can handle it.
-            self.emit_import_slow_exit(import_va)
+        match self.config.execution_mode {
+            ExecutionMode::Jit => {
+                if let Some((sig_ref, fn_ptr, arg_types)) =
+                    self.fast_call_data.get(&import_va).cloned()
+                {
+                    return self.emit_fast_import_call(sig_ref, fn_ptr, arg_types);
+                }
+            }
+            ExecutionMode::RuntimeAssisted => {
+                if let Some((func_ref, arg_types)) =
+                    self.fast_call_funcrefs.get(&import_va).cloned()
+                {
+                    return self.emit_fast_import_call_relocatable(func_ref, arg_types);
+                }
+            }
         }
+        self.emit_import_slow_exit(import_va)
     }
 
     /// Emit an `ImportedFunctionCall` VM exit for a direct import call.
@@ -399,6 +409,133 @@ impl<'a> Lifter<'a> {
         }
 
         // Fast calls do NOT terminate the block; execution continues inline.
+        Ok(())
+    }
+
+    /// Emit an inline `call` for a non-variadic fast-call import in
+    /// `RuntimeAssisted` mode.
+    ///
+    /// Uses `call(func_ref, args)` instead of `call_indirect`, so the
+    /// `ObjectModule` backend emits a named relocation rather than an
+    /// embedded absolute address. Argument marshaling and return-value
+    /// handling follow the same SysV AMD64 ABI rules as `emit_fast_import_call`.
+    fn emit_fast_import_call_relocatable(
+        &mut self,
+        func_ref: FuncRef,
+        arg_types: Vec<FunctionArgumentType>,
+    ) -> crate::Result<()> {
+        const INT_ARG_REGS: [Register; 6] = [
+            Register::RDI,
+            Register::RSI,
+            Register::RDX,
+            Register::RCX,
+            Register::R8,
+            Register::R9,
+        ];
+
+        let ret_type = arg_types[0];
+        let mut int_idx = 0usize;
+        let mut xmm_idx = 0u8;
+        let mut call_args: Vec<Value> = Vec::new();
+
+        for &ty in arg_types.iter().skip(1) {
+            match ty {
+                FunctionArgumentType::VariadicList | FunctionArgumentType::None => break,
+                FunctionArgumentType::SinglePrecisionFp => {
+                    let lo = self.get_xmm_lo(xmm_idx);
+                    let i32_val = self.builder.ins().ireduce(types::I32, lo);
+                    let f32_val = self
+                        .builder
+                        .ins()
+                        .bitcast(types::F32, MemFlags::new(), i32_val);
+                    call_args.push(f32_val);
+                    xmm_idx += 1;
+                }
+                FunctionArgumentType::DoublePrecisionFp => {
+                    let lo = self.get_xmm_lo(xmm_idx);
+                    let f64_val = self.builder.ins().bitcast(types::F64, MemFlags::new(), lo);
+                    call_args.push(f64_val);
+                    xmm_idx += 1;
+                }
+                _ => {
+                    if int_idx >= INT_ARG_REGS.len() {
+                        int_idx += 1;
+                        continue;
+                    }
+                    let reg = INT_ARG_REGS[int_idx];
+                    let val = self.get_reg_val(reg)?;
+                    let narrowed = match ty {
+                        FunctionArgumentType::SignedByte | FunctionArgumentType::UnsignedByte => {
+                            self.builder.ins().ireduce(types::I8, val)
+                        }
+                        FunctionArgumentType::SignedHalfword
+                        | FunctionArgumentType::UnsignedHalfword => {
+                            self.builder.ins().ireduce(types::I16, val)
+                        }
+                        FunctionArgumentType::SignedWord | FunctionArgumentType::UnsignedWord => {
+                            self.builder.ins().ireduce(types::I32, val)
+                        }
+                        _ => val,
+                    };
+                    call_args.push(narrowed);
+                    int_idx += 1;
+                }
+            }
+        }
+
+        let call = self.builder.ins().call(func_ref, &call_args);
+        let results: Vec<Value> = self.builder.inst_results(call).to_vec();
+
+        if !results.is_empty() {
+            let ret_val = results[0];
+            match ret_type {
+                FunctionArgumentType::None => {}
+                FunctionArgumentType::SinglePrecisionFp => {
+                    let i32_val = self
+                        .builder
+                        .ins()
+                        .bitcast(types::I32, MemFlags::new(), ret_val);
+                    let i64_val = self.builder.ins().uextend(types::I64, i32_val);
+                    let zero = self.builder.ins().iconst(types::I64, 0);
+                    self.set_xmm_lo(0, i64_val);
+                    self.set_xmm_hi(0, zero);
+                }
+                FunctionArgumentType::DoublePrecisionFp => {
+                    let i64_val = self
+                        .builder
+                        .ins()
+                        .bitcast(types::I64, MemFlags::new(), ret_val);
+                    let zero = self.builder.ins().iconst(types::I64, 0);
+                    self.set_xmm_lo(0, i64_val);
+                    self.set_xmm_hi(0, zero);
+                }
+                ty => {
+                    let i64_val = match ty {
+                        FunctionArgumentType::SignedByte => {
+                            self.builder.ins().sextend(types::I64, ret_val)
+                        }
+                        FunctionArgumentType::UnsignedByte => {
+                            self.builder.ins().uextend(types::I64, ret_val)
+                        }
+                        FunctionArgumentType::SignedHalfword => {
+                            self.builder.ins().sextend(types::I64, ret_val)
+                        }
+                        FunctionArgumentType::UnsignedHalfword => {
+                            self.builder.ins().uextend(types::I64, ret_val)
+                        }
+                        FunctionArgumentType::SignedWord => {
+                            self.builder.ins().sextend(types::I64, ret_val)
+                        }
+                        FunctionArgumentType::UnsignedWord => {
+                            self.builder.ins().uextend(types::I64, ret_val)
+                        }
+                        _ => ret_val,
+                    };
+                    self.set_reg_val(Register::RAX, i64_val)?;
+                }
+            }
+        }
+
         Ok(())
     }
 

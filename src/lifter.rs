@@ -5,7 +5,9 @@ use crate::{
     os::get_host_calling_conv,
 };
 use cranelift::prelude::*;
-use cranelift_codegen::ir::SigRef;
+use cranelift_codegen::ir::{
+    ExtFuncData, ExternalName, FuncRef, SigRef, UserExternalName,
+};
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, Switch, Variable};
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
@@ -329,12 +331,28 @@ pub struct Lifter<'a> {
     pub dirty_fs_base: bool,
     /// Dirty-bit tracking: GS base written since last sync.
     pub dirty_gs_base: bool,
-    /// Pre-built fast-call data for registered imports.
+    /// Pre-built fast-call data for registered imports in `Jit` mode.
     ///
     /// Key = import VA.  Value = (signature ref, raw fn pointer as i64, arg
     /// types cloned from the `DynamicSymbol`). Only populated for non-variadic
-    /// `Some(sym)` entries in `config.imports`.
+    /// `Some(sym)` entries in `config.imports` when `execution_mode == Jit`.
     pub fast_call_data: HashMap<u64, (SigRef, i64, Vec<FunctionArgumentType>)>,
+    /// Pre-built relocatable fast-call data for registered imports in
+    /// `RuntimeAssisted` mode.
+    ///
+    /// Key = import VA. Value = (FuncRef for `call` instruction, arg types).
+    /// Each `FuncRef` references the function via `ExternalName::user(0, i)`
+    /// where `i` is its position in `aot_imports`. Only populated when
+    /// `execution_mode == RuntimeAssisted`.
+    pub fast_call_funcrefs: HashMap<u64, (FuncRef, Vec<FunctionArgumentType>)>,
+    /// Ordered list of external functions for backends that compile to object
+    /// files. Index `i` corresponds to `ExternalName::user(0, i)` used in
+    /// the IR. Populated alongside `fast_call_funcrefs`.
+    ///
+    /// Each entry is `(symbol_name, fn_ptr, signature)`. The `fn_ptr` is the
+    /// host function address, used by JIT backends to register the symbol;
+    /// AOT backends only need the name and signature to emit relocations.
+    pub aot_imports: Vec<(&'static str, *const u8, Signature)>,
     /// All registered import virtual addresses (both fast and slow).
     pub import_vas: HashSet<u64>,
     /// Records what kind of x86 transfer targets each Cranelift block.
@@ -369,15 +387,43 @@ impl<'a> Lifter<'a> {
         let host_cc = get_host_calling_conv();
         let mut fast_call_data: HashMap<u64, (SigRef, i64, Vec<FunctionArgumentType>)> =
             HashMap::new();
+        let mut fast_call_funcrefs: HashMap<u64, (FuncRef, Vec<FunctionArgumentType>)> =
+            HashMap::new();
+        let mut aot_imports: Vec<(&'static str, *const u8, Signature)> = Vec::new();
         let mut import_vas: HashSet<u64> = HashSet::new();
 
         for (&va, opt_sym) in &config.imports {
             import_vas.insert(va);
             if let Some(sym) = opt_sym {
                 if !sym.is_ellipsis_function {
-                    let sig = build_import_sig(&sym.arg_types, host_cc);
-                    let sig_ref = builder.import_signature(sig);
-                    fast_call_data.insert(va, (sig_ref, sym.value as i64, sym.arg_types.clone()));
+                    match config.execution_mode {
+                        ExecutionMode::Jit => {
+                            let sig = build_import_sig(&sym.arg_types, host_cc);
+                            let sig_ref = builder.import_signature(sig);
+                            fast_call_data
+                                .insert(va, (sig_ref, sym.value as i64, sym.arg_types.clone()));
+                        }
+                        ExecutionMode::RuntimeAssisted => {
+                            let index = aot_imports.len() as u32;
+                            let sig = build_import_sig(&sym.arg_types, host_cc);
+                            let sig_ref = builder.import_signature(sig.clone());
+                            let user_name = builder.func.declare_imported_user_function(
+                                UserExternalName {
+                                    namespace: 0,
+                                    index,
+                                },
+                            );
+                            let func_ref = builder.import_function(ExtFuncData {
+                                name: ExternalName::user(user_name),
+                                signature: sig_ref,
+                                colocated: false,
+                                patchable: false,
+                            });
+                            fast_call_funcrefs
+                                .insert(va, (func_ref, sym.arg_types.clone()));
+                            aot_imports.push((sym.name, sym.value as *const u8, sig));
+                        }
+                    }
                 }
             }
         }
@@ -401,9 +447,21 @@ impl<'a> Lifter<'a> {
             dirty_fs_base: false,
             dirty_gs_base: false,
             fast_call_data,
+            fast_call_funcrefs,
+            aot_imports,
             import_vas,
             block_transfer_kinds: HashMap::new(),
         }
+    }
+
+    /// Returns the ordered list of external functions needed for AOT/JIT
+    /// backends when `execution_mode == RuntimeAssisted`.
+    ///
+    /// Index `i` corresponds to `ExternalName::user(0, i)` baked into the IR.
+    /// Backends must declare these functions in this order so that `FuncId(i)`
+    /// resolves to the correct symbol name for relocation emission.
+    pub fn aot_imports(&self) -> &[(&'static str, *const u8, Signature)] {
+        &self.aot_imports
     }
 
     pub fn get_block(&mut self, offset: u64) -> Block {

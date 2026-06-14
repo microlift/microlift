@@ -9,6 +9,16 @@ use object::{Object, ObjectSection};
 use std::sync::Arc;
 use target_lexicon::Triple;
 
+/// Metadata for a single external function that the lifted IR references via
+/// `ExternalName::user(0, i)`. Produced by `Lifter::aot_imports()`.
+///
+/// The tuple is `(symbol_name, host_fn_ptr, signature)`:
+/// - `symbol_name` — the C symbol the relocation or JIT lookup will resolve.
+/// - `host_fn_ptr` — the in-process address; used by JIT backends to register
+///   the symbol; AOT backends only need the name and signature.
+/// - `signature` — the Cranelift calling-convention signature for the function.
+pub type AotImport = (&'static str, *const u8, Signature);
+
 #[cfg(feature = "disasm")]
 use capstone::prelude::*;
 
@@ -55,6 +65,55 @@ impl CraneliftBackend {
         let code = self.module.get_finalized_function(id);
         Ok(code)
     }
+
+    /// JIT-compile a `RuntimeAssisted`-mode function that uses relocatable
+    /// fast-call imports (i.e. `call(func_ref, ...)` instructions backed by
+    /// `ExternalName::user(0, i)` references).
+    ///
+    /// `imports` must be the slice returned by `Lifter::aot_imports()` —
+    /// element `i` must correspond to `ExternalName::user(0, i)` in the IR.
+    /// Imports are declared first so each receives `FuncId(i)`, which the
+    /// JIT linker maps to the registered symbol address at finalization time.
+    pub fn compile_with_fast_imports(
+        func: Function,
+        imports: &[AotImport],
+        flags: settings::Flags,
+    ) -> Result<*const u8> {
+        let isa_builder = native_builder()
+            .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
+        let isa = isa_builder
+            .finish(flags)
+            .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
+
+        let mut jit_builder =
+            JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+        for &(name, ptr, _) in imports {
+            jit_builder.symbol(name, ptr);
+        }
+        let mut module = JITModule::new(jit_builder);
+
+        // Declare imports first so FuncId(i) == index i in the `imports` slice,
+        // matching ExternalName::user(0, i) baked into the IR.
+        for &(name, _, ref sig) in imports {
+            module
+                .declare_function(name, Linkage::Import, sig)
+                .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
+        }
+
+        let mut ctx = module.make_context();
+        ctx.func = func;
+        let id = module
+            .declare_function("lifted_func", Linkage::Export, &ctx.func.signature)
+            .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
+        module
+            .define_function(id, &mut ctx)
+            .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
+        module
+            .finalize_definitions()
+            .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
+
+        Ok(module.get_finalized_function(id))
+    }
 }
 
 pub struct ArtifactBackend;
@@ -84,6 +143,49 @@ impl ArtifactBackend {
             .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
 
         Ok(isa)
+    }
+
+    /// Compile a `RuntimeAssisted`-mode function to a relocatable object file,
+    /// emitting named external relocations for fast-call imports.
+    ///
+    /// `imports` must be the slice returned by `Lifter::aot_imports()` —
+    /// element `i` corresponds to `ExternalName::user(0, i)` in the IR and
+    /// will be declared as an imported symbol before `lifted_func`.
+    /// Declaring them first ensures `FuncId(i) == i`, so the object module
+    /// can resolve `ExternalName::user(0, i)` to the correct symbol name when
+    /// emitting relocations.
+    pub fn compile_to_object_with_fast_imports(
+        func: Function,
+        imports: &[AotImport],
+        triple: Option<&str>,
+        flags: Option<settings::Flags>,
+    ) -> Result<Vec<u8>> {
+        let isa = Self::get_isa(triple, flags)?;
+        let obj_builder =
+            ObjectBuilder::new(isa, "lifted", cranelift_module::default_libcall_names())
+                .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
+        let mut module = ObjectModule::new(obj_builder);
+
+        // Declare imports first so FuncId(i) == index i in the `imports` slice,
+        // matching ExternalName::user(0, i) baked into the IR.
+        for &(name, _, ref sig) in imports {
+            module
+                .declare_function(name, Linkage::Import, sig)
+                .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
+        }
+
+        let mut ctx = cranelift_codegen::Context::for_function(func);
+        let id = module
+            .declare_function("lifted_func", Linkage::Export, &ctx.func.signature)
+            .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
+        module
+            .define_function(id, &mut ctx)
+            .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
+
+        let product = module.finish();
+        product
+            .emit()
+            .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))
     }
 
     pub fn compile_to_object(

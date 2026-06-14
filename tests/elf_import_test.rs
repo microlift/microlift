@@ -215,6 +215,10 @@ fn find_plt_entry_va(elf_bytes: &[u8], import_name: &str) -> Option<u64> {
 
 #[test]
 fn test_elf_process_string() {
+    if !(cfg!(target_os = "linux") && cfg!(target_arch = "x86_64")) {
+        return;
+    }
+
     let (elf_bytes, map) = compile_shared_lib();
 
     let func_va = parse_map_symbol_va(&map, "process_string")
