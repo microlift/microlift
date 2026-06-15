@@ -15,6 +15,7 @@
 //! `&mut Lifter<'_, Self>`. This module hosts the arch-neutral value types the
 //! trait and engine exchange.
 
+pub mod aarch64;
 pub mod x86_64;
 
 /// What kind of control transfer (if any) an instruction performs. Used during

@@ -1,0 +1,90 @@
+//! aarch64 guest frontend: register file, context struct, yaxpeax-arm
+//! decoder/leader classification, state sync, and instruction semantics. Wired
+//! together through the [`GuestArch`] impl for [`Aarch64`].
+
+pub mod context;
+pub mod decode;
+pub mod regs;
+pub mod semantics;
+pub mod sync;
+
+use crate::core::exit::ExitReason;
+use crate::core::{GuestArch, LiftEngine, LifterConfig};
+use cranelift::prelude::*;
+use cranelift_frontend::{FunctionBuilder, Variable};
+
+use context::Aarch64RegisterContext;
+use decode::A64Instr;
+use regs::Aarch64RegState;
+
+/// aarch64 guest architecture marker.
+pub struct Aarch64;
+
+/// The aarch64 monomorphization of the generic engine. Instruction semantics
+/// are inherent methods on this type.
+pub type Lifter64<'a> = LiftEngine<'a, Aarch64>;
+
+impl GuestArch for Aarch64 {
+    type Instr = A64Instr;
+    type RegState = Aarch64RegState;
+
+    fn pc_offset() -> i32 {
+        std::mem::offset_of!(Aarch64RegisterContext, pc) as i32
+    }
+
+    fn exit_reason_offset() -> i32 {
+        std::mem::offset_of!(Aarch64RegisterContext, exit_reason) as i32
+    }
+
+    fn exit_code_offset() -> i32 {
+        std::mem::offset_of!(Aarch64RegisterContext, exit_code) as i32
+    }
+
+    fn context_ptr_var(state: &Self::RegState) -> Variable {
+        state.context_ptr
+    }
+
+    fn image_base_var(state: &Self::RegState) -> Variable {
+        state.image_base
+    }
+
+    fn new_state(builder: &mut FunctionBuilder, config: &LifterConfig) -> Self::RegState {
+        Aarch64RegState::from_config(builder, config)
+    }
+
+    fn decode_region(bytes: &[u8], ip: u64) -> Vec<Self::Instr> {
+        decode::decode_region(bytes, ip)
+    }
+
+    fn instr_ip(i: &Self::Instr) -> u64 {
+        decode::instr_ip(i)
+    }
+
+    fn instr_next_ip(i: &Self::Instr) -> u64 {
+        decode::instr_next_ip(i)
+    }
+
+    fn is_invalid(i: &Self::Instr) -> bool {
+        decode::is_invalid(i)
+    }
+
+    fn control_flow(i: &Self::Instr) -> crate::arch::ControlFlow {
+        decode::control_flow(i)
+    }
+
+    fn lift_instruction(lifter: &mut LiftEngine<'_, Self>, i: &Self::Instr) -> crate::Result<()> {
+        lifter.handle_instruction(i)
+    }
+
+    fn load_state_from_context(lifter: &mut LiftEngine<'_, Self>) -> crate::Result<()> {
+        lifter.load_state_from_context()
+    }
+
+    fn sync_to_context(
+        lifter: &mut LiftEngine<'_, Self>,
+        pc: Option<Value>,
+        reason: ExitReason,
+    ) -> crate::Result<()> {
+        lifter.sync_to_context(pc, reason)
+    }
+}
