@@ -16,7 +16,7 @@
 
 use crate::MicroliftError;
 use crate::lifter::Lifter;
-use crate::semantics::helpers::xmm_register_index;
+use crate::arch::x86_64::semantics::helpers::xmm_register_index;
 use cranelift::prelude::*;
 use iced_x86::{Instruction, OpKind};
 

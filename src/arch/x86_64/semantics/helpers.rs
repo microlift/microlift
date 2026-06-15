@@ -142,7 +142,7 @@ impl<'a> Lifter<'a> {
             };
             self.builder.def_var(var, new_full_val);
             // Mark this register dirty for selective sync.
-            self.dirty_gprs.insert(base_reg);
+            self.state.dirty_gprs.insert(base_reg);
             Ok(())
         } else {
             Err(MicroliftError::UnsupportedInstruction {
@@ -161,7 +161,7 @@ impl<'a> Lifter<'a> {
             };
             self.builder.def_var(var, val_i8);
             // Mark this flag dirty for selective sync.
-            self.dirty_flags.insert(flag);
+            self.state.dirty_flags.insert(flag);
             Ok(())
         } else {
             Err(MicroliftError::UnsupportedInstruction {
@@ -371,7 +371,7 @@ impl<'a> Lifter<'a> {
             let var = *self.state.xmms_lo.get(&idx).unwrap();
             self.builder.def_var(var, val);
         }
-        self.dirty_xmms.insert(idx);
+        self.state.dirty_xmms.insert(idx);
     }
 
     /// Write the high 64 bits of XMM register `idx` (0-15) and mark dirty.
@@ -385,7 +385,7 @@ impl<'a> Lifter<'a> {
             let var = *self.state.xmms_hi.get(&idx).unwrap();
             self.builder.def_var(var, val);
         }
-        self.dirty_xmms.insert(idx);
+        self.state.dirty_xmms.insert(idx);
     }
 
     /// Return the full 128-bit value of XMM register `idx` (0-15) as a
@@ -424,7 +424,7 @@ impl<'a> Lifter<'a> {
             self.builder.def_var(lo_var, lo);
             self.builder.def_var(hi_var, hi);
         }
-        self.dirty_xmms.insert(idx);
+        self.state.dirty_xmms.insert(idx);
     }
 
     /// Read the current FS segment base from the SSA variable.
@@ -440,12 +440,12 @@ impl<'a> Lifter<'a> {
     /// Write a new FS segment base and mark it dirty.
     pub fn set_fs_base(&mut self, val: Value) {
         self.builder.def_var(self.state.fs_base, val);
-        self.dirty_fs_base = true;
+        self.state.dirty_fs_base = true;
     }
 
     /// Write a new GS segment base and mark it dirty.
     pub fn set_gs_base(&mut self, val: Value) {
         self.builder.def_var(self.state.gs_base, val);
-        self.dirty_gs_base = true;
+        self.state.dirty_gs_base = true;
     }
 }

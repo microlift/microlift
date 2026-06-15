@@ -8,7 +8,7 @@
 
 use crate::MicroliftError;
 use crate::lifter::{Lifter, X86Flag};
-use crate::semantics::helpers::size_to_type;
+use crate::arch::x86_64::semantics::helpers::size_to_type;
 use cranelift::prelude::*;
 use cranelift_codegen::ir::AtomicRmwOp;
 use iced_x86::{Instruction, Mnemonic, OpKind, Register};

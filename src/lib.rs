@@ -1,13 +1,13 @@
-use iced_x86::Register;
 use thiserror::Error;
 
+pub mod arch;
 pub mod backend;
 pub mod context;
+pub mod core;
 pub mod function_traits;
 pub mod lifter;
 pub(crate) mod mapfile;
 pub mod os;
-pub mod semantics;
 pub mod vsa;
 
 #[derive(Error, Debug)]
@@ -21,8 +21,8 @@ pub enum MicroliftError {
     #[error("cranelift error: {0}")]
     CraneliftError(String),
 
-    #[error("unsupported register: {0:?}")]
-    UnsupportedRegister(Register),
+    #[error("unsupported register: {0}")]
+    UnsupportedRegister(String),
 }
 
 pub type Result<T> = std::result::Result<T, MicroliftError>;

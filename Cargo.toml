@@ -19,3 +19,5 @@ iced-x86 = "1"
 target-lexicon = "0.13"
 thiserror = "1"
 cranelift-codegen = { version = "0.131", features = ["all-arch"] }
+yaxpeax-arm = "0.4.0"
+yaxpeax-arch = "0.3.2"

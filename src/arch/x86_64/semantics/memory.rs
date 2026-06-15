@@ -1,6 +1,6 @@
 use crate::MicroliftError;
 use crate::lifter::Lifter;
-use crate::semantics::helpers::size_to_type;
+use crate::arch::x86_64::semantics::helpers::size_to_type;
 use cranelift::prelude::*;
 use iced_x86::{Instruction, OpKind, Register};
 

@@ -2,7 +2,7 @@ use crate::MicroliftError;
 use crate::context::{ExitReason, RegisterContext, TransferKind};
 use crate::function_traits::FunctionArgumentType;
 use crate::lifter::{ExecutionMode, Lifter};
-use crate::semantics::helpers::size_to_type;
+use crate::arch::x86_64::semantics::helpers::size_to_type;
 use cranelift::prelude::*;
 use cranelift_codegen::ir::{FuncRef, SigRef};
 use iced_x86::{Code, CodeSize, Instruction, OpKind, Register};
