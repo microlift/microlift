@@ -10,6 +10,7 @@
 
 use crate::MicroliftError;
 use crate::arch::aarch64::Lifter64;
+use crate::arch::aarch64::context::Aarch64RegisterContext;
 use crate::arch::aarch64::decode::A64Instr;
 use crate::arch::aarch64::regs::{Nzcv, ZR};
 use crate::core::exit::{ExitReason, TransferKind};
@@ -38,6 +39,7 @@ impl<'a> Lifter64<'a> {
         let op0 = instr.inst.operands[0];
         let op1 = instr.inst.operands[1];
         let op2 = instr.inst.operands[2];
+        let op3 = instr.inst.operands[3];
 
         match instr.inst.opcode {
             Opcode::MOVZ => self.handle_movz(op0, op1),
@@ -50,13 +52,25 @@ impl<'a> Lifter64<'a> {
             Opcode::AND => self.handle_logical(op0, op1, op2, LogicOp::And),
             Opcode::ORR => self.handle_logical(op0, op1, op2, LogicOp::Or),
             Opcode::EOR => self.handle_logical(op0, op1, op2, LogicOp::Xor),
+            // ANDS also covers the TST alias (ANDS to the zero register).
+            Opcode::ANDS => self.handle_ands(op0, op1, op2),
+            Opcode::CSEL => self.handle_csel(op0, op1, op2, op3),
+            Opcode::ADRP => self.handle_adrp(instr, op0),
             Opcode::LDR => self.handle_ldr(op0, op1),
             Opcode::STR => self.handle_str(op0, op1),
+            Opcode::STP => self.handle_stp(op0, op1, op2),
             Opcode::B => self.handle_b(instr),
             Opcode::Bcc(cond) => self.handle_bcc(instr, cond),
+            Opcode::TBZ => self.handle_tb(instr, op0, op1, true),
+            Opcode::TBNZ => self.handle_tb(instr, op0, op1, false),
+            Opcode::BLR => self.handle_blr(op0),
             Opcode::RET => self.handle_ret(op0),
             Opcode::SVC => self.handle_svc(),
             Opcode::HINT => Ok(()),
+            // Pointer authentication: without a PAC-enforcing environment the
+            // sign/authenticate pair round-trips to identity, so we model both
+            // as no-ops (the link register is left unchanged).
+            Opcode::PACIASP | Opcode::AUTIASP => Ok(()),
             other => {
                 if self.config.interpreter_fallback {
                     self.exit_unimplemented()
@@ -286,6 +300,64 @@ impl<'a> Lifter64<'a> {
         Ok(())
     }
 
+    /// `ANDS` (and its `TST` alias): bitwise AND that sets NZ from the result
+    /// and clears C and V. `TST` decodes as `ANDS` to the zero register, so the
+    /// discarded-write path in `write_reg_val` handles it transparently.
+    fn handle_ands(&mut self, op0: Operand, op1: Operand, op2: Operand) -> crate::Result<()> {
+        let (d, sz, _) = decode_reg(op0).ok_or_else(|| Self::bad_operand("ands", op0))?;
+        let ty = size_ty(sz);
+        let (n, _, n_sp) = decode_reg(op1).ok_or_else(|| Self::bad_operand("ands", op1))?;
+        let a = self.read_reg_val(n, n_sp, ty);
+        let b = self.read_source(op2, ty)?;
+        let result = self.builder.ins().band(a, b);
+        self.set_nz(result, ty);
+        let zero = self.builder.ins().iconst(types::I8, 0);
+        self.set_flag(Nzcv::C, zero);
+        self.set_flag(Nzcv::V, zero);
+        self.write_reg_val(d, false, ty, result);
+        Ok(())
+    }
+
+    /// `CSEL Rd, Rn, Rm, cond`: write `Rn` if `cond` holds, otherwise `Rm`.
+    fn handle_csel(
+        &mut self,
+        op0: Operand,
+        op1: Operand,
+        op2: Operand,
+        op3: Operand,
+    ) -> crate::Result<()> {
+        let (d, sz, _) = decode_reg(op0).ok_or_else(|| Self::bad_operand("csel", op0))?;
+        let ty = size_ty(sz);
+        let cond = match op3 {
+            Operand::ConditionCode(c) => c,
+            _ => return Err(Self::bad_operand("csel", op3)),
+        };
+        let a = self.read_source(op1, ty)?;
+        let b = self.read_source(op2, ty)?;
+        let cc = self.eval_condition(cond);
+        let result = self.builder.ins().select(cc, a, b);
+        self.write_reg_val(d, false, ty, result);
+        Ok(())
+    }
+
+    /// `ADRP Rd, label`: form the runtime address of the 4 KiB page that is
+    /// `imm` pages away from the page containing this instruction.
+    ///
+    /// The page is computed against the *runtime* PC (`image_base + region
+    /// offset`) so the result stays correct under ASLR rather than baking in the
+    /// lift-time virtual address.
+    fn handle_adrp(&mut self, instr: &A64Instr, op0: Operand) -> crate::Result<()> {
+        let (d, _, _) = decode_reg(op0).ok_or_else(|| Self::bad_operand("adrp", op0))?;
+        let off = self.branch_target_offset(instr)?;
+        let image_base = self.builder.use_var(self.state.image_base);
+        let pc_offset = instr.ip.wrapping_sub(self.lift_base);
+        let runtime_pc = self.builder.ins().iadd_imm(image_base, pc_offset as i64);
+        let page = self.builder.ins().band_imm(runtime_pc, !0xFFFi64);
+        let result = self.builder.ins().iadd_imm(page, off);
+        self.write_reg_val(d, false, types::I64, result);
+        Ok(())
+    }
+
     // --- memory ---------------------------------------------------------------
 
     /// Resolve a memory operand to `(address, optional writeback)`.
@@ -351,6 +423,23 @@ impl<'a> Lifter64<'a> {
         Ok(())
     }
 
+    /// `STP Rt, Rt2, [addr]`: store a register pair to consecutive slots. The
+    /// second register goes one element-width above the first. Any pre/post-index
+    /// writeback on the address operand is applied once, after both stores.
+    fn handle_stp(&mut self, op0: Operand, op1: Operand, op2: Operand) -> crate::Result<()> {
+        let (t1, sz, _) = decode_reg(op0).ok_or_else(|| Self::bad_operand("stp", op0))?;
+        let (t2, _, _) = decode_reg(op1).ok_or_else(|| Self::bad_operand("stp", op1))?;
+        let ty = size_ty(sz);
+        let elem = ty.bytes() as i32;
+        let v1 = self.read_reg_val(t1, false, ty);
+        let v2 = self.read_reg_val(t2, false, ty);
+        let (addr, wb) = self.mem_address(op2)?;
+        self.builder.ins().store(MemFlags::new(), v1, addr, 0);
+        self.builder.ins().store(MemFlags::new(), v2, addr, elem);
+        self.apply_writeback(wb);
+        Ok(())
+    }
+
     fn handle_b(&mut self, instr: &A64Instr) -> crate::Result<()> {
         let target = self.branch_target(instr)?;
         let block = self.get_block_with_kind(target, TransferKind::DirectJump);
@@ -365,6 +454,70 @@ impl<'a> Lifter64<'a> {
         let next = self.get_block(instr.ip + 4);
         let cc = self.eval_condition(cond);
         self.builder.ins().brif(cc, taken, &[], next, &[]);
+        self.block_terminated = true;
+        Ok(())
+    }
+
+    /// `TBZ`/`TBNZ Rt, #bit, label`: branch when the selected bit of `Rt` is
+    /// zero (`branch_if_zero`) or non-zero. The test register is read at full
+    /// 64-bit width so any tested bit position is valid.
+    fn handle_tb(
+        &mut self,
+        instr: &A64Instr,
+        op0: Operand,
+        op1: Operand,
+        branch_if_zero: bool,
+    ) -> crate::Result<()> {
+        let (t, _, _) = decode_reg(op0).ok_or_else(|| Self::bad_operand("tbz", op0))?;
+        let bit = match op1 {
+            Operand::Imm16(b) => b as i64,
+            Operand::Immediate(b) => b as i64,
+            _ => return Err(Self::bad_operand("tbz", op1)),
+        };
+        let val = self.read_reg_val(t, false, types::I64);
+        let masked = self.builder.ins().band_imm(val, 1i64 << bit);
+        let is_zero = self.builder.ins().icmp_imm(IntCC::Equal, masked, 0);
+
+        let target = self.branch_target(instr)?;
+        let taken = self.get_block_with_kind(target, TransferKind::ConditionalJump);
+        let next = self.get_block(instr.ip + 4);
+        if branch_if_zero {
+            self.builder.ins().brif(is_zero, taken, &[], next, &[]);
+        } else {
+            self.builder.ins().brif(is_zero, next, &[], taken, &[]);
+        }
+        self.block_terminated = true;
+        Ok(())
+    }
+
+    /// `BLR Rn`: indirect call through a register. Sets the link register (X30)
+    /// to the return address and exits with `IndirectCall` so the host can
+    /// dispatch the runtime-resolved callee. See [`ExitReason::IndirectCall`].
+    fn handle_blr(&mut self, op0: Operand) -> crate::Result<()> {
+        let target_reg = match op0 {
+            Operand::Register(_, n) => n,
+            _ => return Err(Self::bad_operand("blr", op0)),
+        };
+        let target = self.read_reg_val(target_reg, false, types::I64);
+
+        // The return address (and PC resume point) is the next instruction:
+        // current_ip already points there.
+        let image_base = self.builder.use_var(self.state.image_base);
+        let ret_offset = self.current_ip.wrapping_sub(self.lift_base);
+        let ret_addr = self.builder.ins().iadd_imm(image_base, ret_offset as i64);
+        self.write_reg_val(30, false, types::I64, ret_addr);
+
+        // Ensure the resume block exists so the entry dispatch can route back.
+        self.get_block(self.current_ip);
+
+        let ctx_ptr = self.builder.use_var(self.state.context_ptr);
+        let va_offset = std::mem::offset_of!(Aarch64RegisterContext, imported_function_va) as i32;
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), target, ctx_ptr, va_offset);
+
+        self.sync_to_context_selective(None, ExitReason::IndirectCall)?;
+        self.builder.ins().return_(&[]);
         self.block_terminated = true;
         Ok(())
     }
@@ -407,6 +560,19 @@ impl<'a> Lifter64<'a> {
         }
         Err(MicroliftError::UnsupportedInstruction {
             mnemonic: "branch-without-pcoffset".into(),
+        })
+    }
+
+    /// The raw PC-relative offset operand of an instruction, *not* added to the
+    /// IP. Used by `ADRP`, whose offset is a page delta applied to the masked PC.
+    fn branch_target_offset(&self, instr: &A64Instr) -> crate::Result<i64> {
+        for op in &instr.inst.operands {
+            if let Operand::PCOffset(off) = op {
+                return Ok(*off);
+            }
+        }
+        Err(MicroliftError::UnsupportedInstruction {
+            mnemonic: "adrp-without-pcoffset".into(),
         })
     }
 

@@ -63,6 +63,15 @@ const RET: [u8; 4] = [0xC0, 0x03, 0x5F, 0xD6]; // ret
 const STR_X0_SP: [u8; 4] = [0xE0, 0x03, 0x00, 0xF9]; // str x0, [sp]
 const LDR_X1_SP: [u8; 4] = [0xE1, 0x03, 0x40, 0xF9]; // ldr x1, [sp]
 
+const PACIASP: [u8; 4] = [0x3F, 0x23, 0x03, 0xD5]; // paciasp
+const AUTIASP: [u8; 4] = [0xBF, 0x23, 0x03, 0xD5]; // autiasp
+const STP_X0_X1_SP: [u8; 4] = [0xE0, 0x07, 0x00, 0xA9]; // stp x0, x1, [sp]
+const BLR_X0: [u8; 4] = [0x00, 0x00, 0x3F, 0xD6]; // blr x0
+const ADRP_X0_1: [u8; 4] = [0x00, 0x00, 0x00, 0xB0]; // adrp x0, #0x1000 (1 page)
+const TBZ_X0_0_PLUS8: [u8; 4] = [0x40, 0x00, 0x00, 0x36]; // tbz w0, #0, #+8
+const TST_X0_X1: [u8; 4] = [0x1F, 0x00, 0x01, 0xEA]; // tst x0, x1 (ands xzr, x0, x1)
+const CSEL_X2_X0_X1_EQ: [u8; 4] = [0x02, 0x00, 0x81, 0x9A]; // csel x2, x0, x1, eq
+
 fn program(parts: &[[u8; 4]]) -> Vec<u8> {
     parts.iter().flatten().copied().collect()
 }
@@ -144,6 +153,108 @@ fn store_then_load_roundtrip() {
     assert_eq!(ctx.x[0], 42);
     assert_eq!(ctx.x[1], 42);
     assert_eq!(stack[32], 42); // sp pointed at stack[32]
+}
+
+#[test]
+fn paciasp_autiasp_are_noops() {
+    // The sign/authenticate pair must round-trip the link register to its
+    // original value (identity, since we don't model PAC enforcement).
+    let mut ctx = Aarch64RegisterContext::default();
+    ctx.x[30] = 0xDEAD_BEEF;
+    let ctx = run(&program(&[PACIASP, MOVZ_X0_42, AUTIASP, RET]), ctx);
+    assert_eq!(ctx.x[30], 0xDEAD_BEEF);
+    assert_eq!(ctx.x[0], 42);
+}
+
+#[test]
+fn stp_stores_register_pair() {
+    // stp x0, x1, [sp] writes x0 at [sp+0] and x1 at [sp+8].
+    let mut stack = [0u64; 64];
+    let sp = stack.as_mut_ptr() as u64 + 256;
+    let mut ctx = Aarch64RegisterContext::default();
+    ctx.sp = sp;
+    let bytes = program(&[MOVZ_X0_42, MOVZ_X1_20, STP_X0_X1_SP, RET]);
+    let _ = run(&bytes, ctx);
+    assert_eq!(stack[32], 42); // sp pointed at stack[32]
+    assert_eq!(stack[33], 20);
+}
+
+#[test]
+fn adrp_forms_page_address() {
+    // adrp x0, #0x1000 at PC 0x1000: (0x1000 & ~0xFFF) + 0x1000 = 0x2000.
+    let ctx = run(&program(&[ADRP_X0_1, RET]), Aarch64RegisterContext::default());
+    assert_eq!(ctx.x[0], 0x2000);
+}
+
+#[test]
+fn blr_exits_indirect_with_link() {
+    // movz x0,#42; blr x0  -> IndirectCall to 42, x30/pc = resume (0x1008).
+    let ctx = run(&program(&[MOVZ_X0_42, BLR_X0]), Aarch64RegisterContext::default());
+    assert_eq!(ctx.exit_reason, ExitReason::IndirectCall as u32);
+    assert_eq!(ctx.imported_function_va, 42);
+    assert_eq!(ctx.x[30], BASE + 8); // return address = instruction after BLR
+    assert_eq!(ctx.pc, BASE + 8);
+}
+
+#[test]
+fn tbz_taken_when_bit_clear() {
+    // tbz w0,#0,#+8 with x0=4 (bit0 clear) -> branch to RET, skips movz x0,#0.
+    let mut ctx = Aarch64RegisterContext::default();
+    ctx.x[0] = 4;
+    let ctx = run(&program(&[TBZ_X0_0_PLUS8, MOVZ_X0_0, RET]), ctx);
+    assert_eq!(ctx.x[0], 4);
+}
+
+#[test]
+fn tbz_not_taken_when_bit_set() {
+    // tbz w0,#0,#+8 with x0=5 (bit0 set) -> falls through to movz x0,#0.
+    let mut ctx = Aarch64RegisterContext::default();
+    ctx.x[0] = 5;
+    let ctx = run(&program(&[TBZ_X0_0_PLUS8, MOVZ_X0_0, RET]), ctx);
+    assert_eq!(ctx.x[0], 0);
+}
+
+#[test]
+fn tst_nonzero_clears_carry_and_overflow() {
+    // tst x0,x1 (7 & 7 = 7): Z=0, N=0; C and V are always cleared.
+    let mut ctx = Aarch64RegisterContext::default();
+    ctx.c = 1;
+    ctx.vf = 1;
+    let ctx = run(&program(&[MOVZ_X0_7, MOVZ_X1_7, TST_X0_X1, RET]), ctx);
+    assert_eq!(ctx.x[0], 7); // result discarded, x0 unchanged
+    assert_eq!(ctx.z, 0);
+    assert_eq!(ctx.n, 0);
+    assert_eq!(ctx.c, 0);
+    assert_eq!(ctx.vf, 0);
+}
+
+#[test]
+fn tst_zero_sets_zero_flag() {
+    // tst x0,x1 with 8 & 7 = 0 -> Z=1.
+    let mut ctx = Aarch64RegisterContext::default();
+    ctx.x[0] = 8;
+    ctx.x[1] = 7;
+    let ctx = run(&program(&[TST_X0_X1, RET]), ctx);
+    assert_eq!(ctx.z, 1);
+    assert_eq!(ctx.n, 0);
+}
+
+#[test]
+fn csel_picks_first_when_cond_true() {
+    // csel x2,x0,x1,eq with Z=1 -> x2 = x0 = 10.
+    let mut ctx = Aarch64RegisterContext::default();
+    ctx.z = 1;
+    let ctx = run(&program(&[MOVZ_X0_10, MOVZ_X1_20, CSEL_X2_X0_X1_EQ, RET]), ctx);
+    assert_eq!(ctx.x[2], 10);
+}
+
+#[test]
+fn csel_picks_second_when_cond_false() {
+    // csel x2,x0,x1,eq with Z=0 -> x2 = x1 = 20.
+    let mut ctx = Aarch64RegisterContext::default();
+    ctx.z = 0;
+    let ctx = run(&program(&[MOVZ_X0_10, MOVZ_X1_20, CSEL_X2_X0_X1_EQ, RET]), ctx);
+    assert_eq!(ctx.x[2], 20);
 }
 
 #[test]
