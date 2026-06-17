@@ -72,11 +72,31 @@ const TBZ_X0_0_PLUS8: [u8; 4] = [0x40, 0x00, 0x00, 0x36]; // tbz w0, #0, #+8
 const TST_X0_X1: [u8; 4] = [0x1F, 0x00, 0x01, 0xEA]; // tst x0, x1 (ands xzr, x0, x1)
 const CSEL_X2_X0_X1_EQ: [u8; 4] = [0x02, 0x00, 0x81, 0x9A]; // csel x2, x0, x1, eq
 
+const CBZ_X0_PLUS8: [u8; 4] = [0x40, 0x00, 0x00, 0xB4]; // cbz x0, #+8
+const CBNZ_X0_PLUS8: [u8; 4] = [0x40, 0x00, 0x00, 0xB5]; // cbnz x0, #+8
+const MUL_X2_X0_X1: [u8; 4] = [0x02, 0x7C, 0x01, 0x9B]; // mul x2, x0, x1
+const MADD_X2_X0_X1_X3: [u8; 4] = [0x02, 0x0C, 0x01, 0x9B]; // madd x2, x0, x1, x3
+const MSUB_X2_X0_X1_X3: [u8; 4] = [0x02, 0x8C, 0x01, 0x9B]; // msub x2, x0, x1, x3
+const UDIV_X2_X0_X1: [u8; 4] = [0x02, 0x08, 0xC1, 0x9A]; // udiv x2, x0, x1
+const SDIV_X2_X0_X1: [u8; 4] = [0x02, 0x0C, 0xC1, 0x9A]; // sdiv x2, x0, x1
+const LSLV_X2_X0_X1: [u8; 4] = [0x02, 0x20, 0xC1, 0x9A]; // lslv x2, x0, x1
+const LSRV_X2_X0_X1: [u8; 4] = [0x02, 0x24, 0xC1, 0x9A]; // lsrv x2, x0, x1
+const ASRV_X2_X0_X1: [u8; 4] = [0x02, 0x28, 0xC1, 0x9A]; // asrv x2, x0, x1
+const RORV_X2_X0_X1: [u8; 4] = [0x02, 0x2C, 0xC1, 0x9A]; // rorv x2, x0, x1
+const LDP_X0_X1_SP: [u8; 4] = [0xE0, 0x07, 0x40, 0xA9]; // ldp x0, x1, [sp]
+const CSINC_X2_X0_X1_EQ: [u8; 4] = [0x02, 0x04, 0x81, 0x9A]; // csinc x2, x0, x1, eq
+const CSINV_X2_X0_X1_EQ: [u8; 4] = [0x02, 0x00, 0x81, 0xDA]; // csinv x2, x0, x1, eq
+const CSNEG_X2_X0_X1_EQ: [u8; 4] = [0x02, 0x04, 0x81, 0xDA]; // csneg x2, x0, x1, eq
+const CLZ_X0_X1: [u8; 4] = [0x20, 0x10, 0xC0, 0xDA]; // clz x0, x1
+const RBIT_X0_X1: [u8; 4] = [0x20, 0x00, 0xC0, 0xDA]; // rbit x0, x1
+const REV_X0_X1: [u8; 4] = [0x20, 0x0C, 0xC0, 0xDA]; // rev x0, x1
+const ADR_X0_PLUS8: [u8; 4] = [0x40, 0x00, 0x00, 0x10]; // adr x0, #+8
+const MVN_X0_X1: [u8; 4] = [0xE0, 0x03, 0x21, 0xAA]; // mvn x0, x1 (orn x0, xzr, x1)
+const BIC_X2_X0_X1: [u8; 4] = [0x02, 0x00, 0x21, 0x8A]; // bic x2, x0, x1
+
 fn program(parts: &[[u8; 4]]) -> Vec<u8> {
     parts.iter().flatten().copied().collect()
 }
-
-// --- decode classification ----------------------------------------------------
 
 #[test]
 fn decode_movz_and_ret() {
@@ -100,8 +120,6 @@ fn decode_conditional_branch_target() {
     assert_eq!(cf.kind, ControlFlowKind::CondBranch);
     assert_eq!(cf.static_targets, vec![BASE + 0x14]);
 }
-
-// --- JIT round-trips ----------------------------------------------------------
 
 #[test]
 fn movz_ret() {
@@ -264,4 +282,270 @@ fn conditional_branch_not_taken() {
     let ctx = run(&bytes, Aarch64RegisterContext::default());
     assert_eq!(ctx.z, 0);
     assert_eq!(ctx.x[0], 0);
+}
+
+#[test]
+fn decode_cbz_is_cond_branch() {
+    let bytes = program(&[CBZ_X0_PLUS8, MOVZ_X0_0, RET]);
+    let insts = decode_region(&bytes, BASE);
+    let cf = control_flow(&insts[0]);
+    assert_eq!(cf.kind, ControlFlowKind::CondBranch);
+    assert_eq!(cf.static_targets, vec![BASE + 8]);
+}
+
+#[test]
+fn cbz_taken_when_zero() {
+    // x0 == 0 -> cbz branches over `movz x0,#42`, leaving x0 == 0.
+    let bytes = program(&[CBZ_X0_PLUS8, MOVZ_X0_42, RET]);
+    let ctx = run(&bytes, Aarch64RegisterContext::default());
+    assert_eq!(ctx.x[0], 0);
+}
+
+#[test]
+fn cbz_not_taken_when_nonzero() {
+    // x0 != 0 -> cbz falls through to `movz x0,#42`.
+    let mut ctx = Aarch64RegisterContext::default();
+    ctx.x[0] = 9;
+    let ctx = run(&program(&[CBZ_X0_PLUS8, MOVZ_X0_42, RET]), ctx);
+    assert_eq!(ctx.x[0], 42);
+}
+
+#[test]
+fn cbnz_taken_when_nonzero() {
+    // x0 != 0 -> cbnz branches over `movz x0,#42`, leaving x0 unchanged.
+    let mut ctx = Aarch64RegisterContext::default();
+    ctx.x[0] = 7;
+    let ctx = run(&program(&[CBNZ_X0_PLUS8, MOVZ_X0_42, RET]), ctx);
+    assert_eq!(ctx.x[0], 7);
+}
+
+#[test]
+fn mul_multiplies() {
+    let bytes = program(&[MOVZ_X0_7, MOVZ_X1_3, MUL_X2_X0_X1, RET]);
+    let ctx = run(&bytes, Aarch64RegisterContext::default());
+    assert_eq!(ctx.x[2], 21);
+}
+
+#[test]
+fn madd_multiply_accumulate() {
+    // x2 = x3 + x0 * x1 = 100 + 7 * 3 = 121.
+    let mut ctx = Aarch64RegisterContext::default();
+    ctx.x[0] = 7;
+    ctx.x[1] = 3;
+    ctx.x[3] = 100;
+    let ctx = run(&program(&[MADD_X2_X0_X1_X3, RET]), ctx);
+    assert_eq!(ctx.x[2], 121);
+}
+
+#[test]
+fn msub_multiply_subtract() {
+    // x2 = x3 - x0 * x1 = 100 - 7 * 3 = 79.
+    let mut ctx = Aarch64RegisterContext::default();
+    ctx.x[0] = 7;
+    ctx.x[1] = 3;
+    ctx.x[3] = 100;
+    let ctx = run(&program(&[MSUB_X2_X0_X1_X3, RET]), ctx);
+    assert_eq!(ctx.x[2], 79);
+}
+
+#[test]
+fn udiv_divides() {
+    let mut ctx = Aarch64RegisterContext::default();
+    ctx.x[0] = 20;
+    ctx.x[1] = 3;
+    let ctx = run(&program(&[UDIV_X2_X0_X1, RET]), ctx);
+    assert_eq!(ctx.x[2], 6);
+}
+
+#[test]
+fn udiv_by_zero_yields_zero() {
+    // A64 divide-by-zero produces 0 rather than trapping.
+    let mut ctx = Aarch64RegisterContext::default();
+    ctx.x[0] = 20;
+    ctx.x[1] = 0;
+    let ctx = run(&program(&[UDIV_X2_X0_X1, RET]), ctx);
+    assert_eq!(ctx.x[2], 0);
+}
+
+#[test]
+fn sdiv_rounds_toward_zero() {
+    // -7 / 2 = -3 (truncated toward zero).
+    let mut ctx = Aarch64RegisterContext::default();
+    ctx.x[0] = (-7i64) as u64;
+    ctx.x[1] = 2;
+    let ctx = run(&program(&[SDIV_X2_X0_X1, RET]), ctx);
+    assert_eq!(ctx.x[2] as i64, -3);
+}
+
+#[test]
+fn sdiv_by_zero_yields_zero() {
+    let mut ctx = Aarch64RegisterContext::default();
+    ctx.x[0] = (-7i64) as u64;
+    ctx.x[1] = 0;
+    let ctx = run(&program(&[SDIV_X2_X0_X1, RET]), ctx);
+    assert_eq!(ctx.x[2], 0);
+}
+
+#[test]
+fn sdiv_int_min_over_neg_one_no_trap() {
+    // INT_MIN / -1 overflows; A64 defines the result as INT_MIN (no trap).
+    let mut ctx = Aarch64RegisterContext::default();
+    ctx.x[0] = i64::MIN as u64;
+    ctx.x[1] = (-1i64) as u64;
+    let ctx = run(&program(&[SDIV_X2_X0_X1, RET]), ctx);
+    assert_eq!(ctx.x[2] as i64, i64::MIN);
+}
+
+#[test]
+fn lslv_shifts_left() {
+    let mut ctx = Aarch64RegisterContext::default();
+    ctx.x[0] = 1;
+    ctx.x[1] = 4;
+    let ctx = run(&program(&[LSLV_X2_X0_X1, RET]), ctx);
+    assert_eq!(ctx.x[2], 16);
+}
+
+#[test]
+fn lsrv_shifts_right() {
+    let mut ctx = Aarch64RegisterContext::default();
+    ctx.x[0] = 0x80;
+    ctx.x[1] = 3;
+    let ctx = run(&program(&[LSRV_X2_X0_X1, RET]), ctx);
+    assert_eq!(ctx.x[2], 0x10);
+}
+
+#[test]
+fn asrv_arithmetic_shift_preserves_sign() {
+    let mut ctx = Aarch64RegisterContext::default();
+    ctx.x[0] = (-16i64) as u64;
+    ctx.x[1] = 2;
+    let ctx = run(&program(&[ASRV_X2_X0_X1, RET]), ctx);
+    assert_eq!(ctx.x[2] as i64, -4);
+}
+
+#[test]
+fn rorv_rotates_right() {
+    // Rotate 0x1 right by 4 in 64-bit -> bit moves to position 60.
+    let mut ctx = Aarch64RegisterContext::default();
+    ctx.x[0] = 0x1;
+    ctx.x[1] = 4;
+    let ctx = run(&program(&[RORV_X2_X0_X1, RET]), ctx);
+    assert_eq!(ctx.x[2], 0x1000_0000_0000_0000);
+}
+
+#[test]
+fn ldp_loads_register_pair() {
+    // Stack holds two values; ldp pulls them into x0 and x1.
+    let mut stack = [0u64; 64];
+    stack[32] = 0xAAAA;
+    stack[33] = 0xBBBB;
+    let sp = stack.as_mut_ptr() as u64 + 256;
+    let mut ctx = Aarch64RegisterContext::default();
+    ctx.sp = sp;
+    let ctx = run(&program(&[LDP_X0_X1_SP, RET]), ctx);
+    assert_eq!(ctx.x[0], 0xAAAA);
+    assert_eq!(ctx.x[1], 0xBBBB);
+}
+
+#[test]
+fn stp_ldp_roundtrip() {
+    let mut stack = [0u64; 64];
+    let sp = stack.as_mut_ptr() as u64 + 256;
+    let mut ctx = Aarch64RegisterContext::default();
+    ctx.sp = sp;
+    ctx.x[0] = 0x1234;
+    ctx.x[1] = 0x5678;
+    // stp x0,x1,[sp]; clobber; ldp x0,x1,[sp] back.
+    let ctx = run(
+        &program(&[STP_X0_X1_SP, MOVZ_X0_0, LDP_X0_X1_SP, RET]),
+        ctx,
+    );
+    assert_eq!(ctx.x[0], 0x1234);
+    assert_eq!(ctx.x[1], 0x5678);
+}
+
+#[test]
+fn csinc_else_increments() {
+    // Z=0 -> cond false -> x2 = x1 + 1 = 21.
+    let mut ctx = Aarch64RegisterContext::default();
+    ctx.z = 0;
+    let ctx = run(&program(&[MOVZ_X0_10, MOVZ_X1_20, CSINC_X2_X0_X1_EQ, RET]), ctx);
+    assert_eq!(ctx.x[2], 21);
+}
+
+#[test]
+fn csinc_true_picks_first() {
+    // Z=1 -> cond true -> x2 = x0 = 10 (no increment).
+    let mut ctx = Aarch64RegisterContext::default();
+    ctx.z = 1;
+    let ctx = run(&program(&[MOVZ_X0_10, MOVZ_X1_20, CSINC_X2_X0_X1_EQ, RET]), ctx);
+    assert_eq!(ctx.x[2], 10);
+}
+
+#[test]
+fn csinv_else_inverts() {
+    // Z=0 -> x2 = ~x1 = ~20.
+    let mut ctx = Aarch64RegisterContext::default();
+    ctx.z = 0;
+    let ctx = run(&program(&[MOVZ_X0_10, MOVZ_X1_20, CSINV_X2_X0_X1_EQ, RET]), ctx);
+    assert_eq!(ctx.x[2], !20u64);
+}
+
+#[test]
+fn csneg_else_negates() {
+    // Z=0 -> x2 = -x1 = -20.
+    let mut ctx = Aarch64RegisterContext::default();
+    ctx.z = 0;
+    let ctx = run(&program(&[MOVZ_X0_10, MOVZ_X1_20, CSNEG_X2_X0_X1_EQ, RET]), ctx);
+    assert_eq!(ctx.x[2] as i64, -20);
+}
+
+#[test]
+fn clz_counts_leading_zeros() {
+    let mut ctx = Aarch64RegisterContext::default();
+    ctx.x[1] = 1;
+    let ctx = run(&program(&[CLZ_X0_X1, RET]), ctx);
+    assert_eq!(ctx.x[0], 63);
+}
+
+#[test]
+fn rbit_reverses_bits() {
+    let mut ctx = Aarch64RegisterContext::default();
+    ctx.x[1] = 1;
+    let ctx = run(&program(&[RBIT_X0_X1, RET]), ctx);
+    assert_eq!(ctx.x[0], 0x8000_0000_0000_0000);
+}
+
+#[test]
+fn rev_reverses_bytes() {
+    let mut ctx = Aarch64RegisterContext::default();
+    ctx.x[1] = 0x0011_2233_4455_6677;
+    let ctx = run(&program(&[REV_X0_X1, RET]), ctx);
+    assert_eq!(ctx.x[0], 0x7766_5544_3322_1100);
+}
+
+#[test]
+fn adr_forms_byte_address() {
+    // adr x0,#+8 at PC 0x1000 -> 0x1008 (no page masking).
+    let ctx = run(&program(&[ADR_X0_PLUS8, RET]), Aarch64RegisterContext::default());
+    assert_eq!(ctx.x[0], BASE + 8);
+}
+
+#[test]
+fn mvn_inverts() {
+    // mvn x0,x1 (orn x0,xzr,x1): x0 = ~x1.
+    let mut ctx = Aarch64RegisterContext::default();
+    ctx.x[1] = 0x00FF;
+    let ctx = run(&program(&[MVN_X0_X1, RET]), ctx);
+    assert_eq!(ctx.x[0], !0x00FFu64);
+}
+
+#[test]
+fn bic_and_with_inverted() {
+    // bic x2,x0,x1: x2 = x0 & ~x1 = 0xFF & ~0x0F = 0xF0.
+    let mut ctx = Aarch64RegisterContext::default();
+    ctx.x[0] = 0xFF;
+    ctx.x[1] = 0x0F;
+    let ctx = run(&program(&[BIC_X2_X0_X1, RET]), ctx);
+    assert_eq!(ctx.x[2], 0xF0);
 }

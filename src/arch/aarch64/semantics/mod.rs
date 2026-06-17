@@ -1,9 +1,13 @@
 //! aarch64 instruction semantics (vertical slice).
 //!
-//! Covers a minimal but representative subset proving the `GuestArch`
-//! abstraction end-to-end: moves (MOVZ/MOVK/MOVN, MOV-via-ORR), integer
-//! data-processing (ADD/SUB/ADDS/SUBS incl. CMP, AND/ORR), base+offset
-//! loads/stores (LDR/STR), branches (B/B.cond), RET, NOP, and SVC.
+//! Covers a representative subset proving the `GuestArch` abstraction
+//! end-to-end: moves (MOVZ/MOVK/MOVN, MOV-via-ORR), integer data-processing
+//! (ADD/SUB/ADDS/SUBS incl. CMP, AND/ORR/EOR/ANDS, ORN/EON/BIC incl. MVN),
+//! multiply (MUL/MADD/MSUB), division (UDIV/SDIV with A64's non-trapping
+//! semantics), variable shifts (LSLV/LSRV/ASRV/RORV), bit ops (CLZ/RBIT/REV),
+//! conditional select family (CSEL/CSINC/CSINV/CSNEG), PC-relative addressing
+//! (ADR/ADRP), base+offset and pair loads/stores (LDR/STR/LDP/STP), branches
+//! (B/B.cond/CBZ/CBNZ/TBZ/TBNZ), RET, NOP, and SVC.
 //!
 //! Implemented as inherent methods on the concrete `Lifter64`; the dispatch
 //! entry point is reached from `GuestArch::lift_instruction`.
@@ -54,13 +58,35 @@ impl<'a> Lifter64<'a> {
             Opcode::EOR => self.handle_logical(op0, op1, op2, LogicOp::Xor),
             // ANDS also covers the TST alias (ANDS to the zero register).
             Opcode::ANDS => self.handle_ands(op0, op1, op2),
+            Opcode::ORN => self.handle_logical_neg(op0, op1, op2, LogicOp::Or),
+            Opcode::EON => self.handle_logical_neg(op0, op1, op2, LogicOp::Xor),
+            // BIC/BICS: AND with the inverted second operand; BICS also sets NZ.
+            Opcode::BIC => self.handle_logical_neg(op0, op1, op2, LogicOp::And),
             Opcode::CSEL => self.handle_csel(op0, op1, op2, op3),
+            Opcode::CSINC => self.handle_cs_variant(op0, op1, op2, op3, CsVariant::Inc),
+            Opcode::CSINV => self.handle_cs_variant(op0, op1, op2, op3, CsVariant::Inv),
+            Opcode::CSNEG => self.handle_cs_variant(op0, op1, op2, op3, CsVariant::Neg),
+            Opcode::MADD => self.handle_madd(op0, op1, op2, op3, false),
+            Opcode::MSUB => self.handle_madd(op0, op1, op2, op3, true),
+            Opcode::UDIV => self.handle_div(op0, op1, op2, false),
+            Opcode::SDIV => self.handle_div(op0, op1, op2, true),
+            Opcode::LSLV => self.handle_shift_var(op0, op1, op2, ShiftStyle::LSL),
+            Opcode::LSRV => self.handle_shift_var(op0, op1, op2, ShiftStyle::LSR),
+            Opcode::ASRV => self.handle_shift_var(op0, op1, op2, ShiftStyle::ASR),
+            Opcode::RORV => self.handle_shift_var(op0, op1, op2, ShiftStyle::ROR),
+            Opcode::CLZ => self.handle_bit_unary(op0, op1, BitUnary::Clz),
+            Opcode::RBIT => self.handle_bit_unary(op0, op1, BitUnary::Rbit),
+            Opcode::REV => self.handle_bit_unary(op0, op1, BitUnary::Rev),
             Opcode::ADRP => self.handle_adrp(instr, op0),
+            Opcode::ADR => self.handle_adr(instr, op0),
             Opcode::LDR => self.handle_ldr(op0, op1),
             Opcode::STR => self.handle_str(op0, op1),
             Opcode::STP => self.handle_stp(op0, op1, op2),
+            Opcode::LDP => self.handle_ldp(op0, op1, op2),
             Opcode::B => self.handle_b(instr),
             Opcode::Bcc(cond) => self.handle_bcc(instr, cond),
+            Opcode::CBZ => self.handle_cb(instr, op0, true),
+            Opcode::CBNZ => self.handle_cb(instr, op0, false),
             Opcode::TBZ => self.handle_tb(instr, op0, op1, true),
             Opcode::TBNZ => self.handle_tb(instr, op0, op1, false),
             Opcode::BLR => self.handle_blr(op0),
@@ -340,6 +366,196 @@ impl<'a> Lifter64<'a> {
         Ok(())
     }
 
+    /// `ORN`/`EON`/`BIC` (and the `MVN` alias of `ORN`): a logical op whose
+    /// second operand is bitwise-inverted before combining. `MVN Rd, Rm` decodes
+    /// as `ORN Rd, XZR, Rm`, which the zero-register read handles transparently.
+    fn handle_logical_neg(
+        &mut self,
+        op0: Operand,
+        op1: Operand,
+        op2: Operand,
+        logic: LogicOp,
+    ) -> crate::Result<()> {
+        let (d, sz, d_sp) = decode_reg(op0).ok_or_else(|| Self::bad_operand("logical-neg", op0))?;
+        let ty = size_ty(sz);
+        let (n, _, n_sp) = decode_reg(op1).ok_or_else(|| Self::bad_operand("logical-neg", op1))?;
+        let a = self.read_reg_val(n, n_sp, ty);
+        let b = self.read_source(op2, ty)?;
+        let b_inv = self.builder.ins().bnot(b);
+        let result = match logic {
+            LogicOp::And => self.builder.ins().band(a, b_inv),
+            LogicOp::Or => self.builder.ins().bor(a, b_inv),
+            LogicOp::Xor => self.builder.ins().bxor(a, b_inv),
+        };
+        self.write_reg_val(d, d_sp, ty, result);
+        Ok(())
+    }
+
+    /// `CSINC`/`CSINV`/`CSNEG Rd, Rn, Rm, cond`: write `Rn` when `cond` holds,
+    /// otherwise a transformed `Rm` (`Rm+1`, `~Rm`, or `-Rm`). These also back the
+    /// `CSET`/`CSETM`/`CINC`/`CINV`/`CNEG` aliases.
+    fn handle_cs_variant(
+        &mut self,
+        op0: Operand,
+        op1: Operand,
+        op2: Operand,
+        op3: Operand,
+        variant: CsVariant,
+    ) -> crate::Result<()> {
+        let (d, sz, _) = decode_reg(op0).ok_or_else(|| Self::bad_operand("cs-variant", op0))?;
+        let ty = size_ty(sz);
+        let cond = match op3 {
+            Operand::ConditionCode(c) => c,
+            _ => return Err(Self::bad_operand("cs-variant", op3)),
+        };
+        let a = self.read_source(op1, ty)?;
+        let b = self.read_source(op2, ty)?;
+        let b_xform = match variant {
+            CsVariant::Inc => self.builder.ins().iadd_imm(b, 1),
+            CsVariant::Inv => self.builder.ins().bnot(b),
+            CsVariant::Neg => self.builder.ins().ineg(b),
+        };
+        let cc = self.eval_condition(cond);
+        let result = self.builder.ins().select(cc, a, b_xform);
+        self.write_reg_val(d, false, ty, result);
+        Ok(())
+    }
+
+    /// `MADD`/`MSUB Rd, Rn, Rm, Ra`: `Ra ± (Rn * Rm)`. `MUL Rd, Rn, Rm` decodes
+    /// as `MADD` with `Ra = XZR`, so the multiply-only form needs no special case.
+    fn handle_madd(
+        &mut self,
+        op0: Operand,
+        op1: Operand,
+        op2: Operand,
+        op3: Operand,
+        is_sub: bool,
+    ) -> crate::Result<()> {
+        let (d, sz, _) = decode_reg(op0).ok_or_else(|| Self::bad_operand("madd", op0))?;
+        let ty = size_ty(sz);
+        let n = self.read_source(op1, ty)?;
+        let m = self.read_source(op2, ty)?;
+        let a = self.read_source(op3, ty)?;
+        let prod = self.builder.ins().imul(n, m);
+        let result = if is_sub {
+            self.builder.ins().isub(a, prod)
+        } else {
+            self.builder.ins().iadd(a, prod)
+        };
+        self.write_reg_val(d, false, ty, result);
+        Ok(())
+    }
+
+    /// `UDIV`/`SDIV Rd, Rn, Rm`: integer division that, per the A64 spec, yields
+    /// zero on divide-by-zero instead of trapping. Signed division additionally
+    /// returns `INT_MIN` for the `INT_MIN / -1` overflow case rather than
+    /// trapping. Cranelift's `udiv`/`sdiv` trap on both, so the divisor is forced
+    /// to a safe non-trapping value and the spec result is selected back in.
+    fn handle_div(
+        &mut self,
+        op0: Operand,
+        op1: Operand,
+        op2: Operand,
+        signed: bool,
+    ) -> crate::Result<()> {
+        let (d, sz, _) = decode_reg(op0).ok_or_else(|| Self::bad_operand("div", op0))?;
+        let ty = size_ty(sz);
+        let n = self.read_source(op1, ty)?;
+        let m = self.read_source(op2, ty)?;
+
+        let div_by_zero = self.builder.ins().icmp_imm(IntCC::Equal, m, 0);
+
+        if signed {
+            // Detect the INT_MIN / -1 overflow: numerator == INT_MIN && divisor == -1.
+            let int_min = if ty == types::I64 {
+                i64::MIN
+            } else {
+                i32::MIN as i64
+            };
+            let n_is_min = self.builder.ins().icmp_imm(IntCC::Equal, n, int_min);
+            let m_is_neg1 = self.builder.ins().icmp_imm(IntCC::Equal, m, -1);
+            let overflow = self.builder.ins().band(n_is_min, m_is_neg1);
+            // Force the divisor to 1 whenever dividing would trap, then patch the
+            // result: 0 for divide-by-zero, INT_MIN for the overflow case.
+            let trap = self.builder.ins().bor(div_by_zero, overflow);
+            let one = self.builder.ins().iconst(ty, 1);
+            let safe_m = self.builder.ins().select(trap, one, m);
+            let q = self.builder.ins().sdiv(n, safe_m);
+            let min_val = self.builder.ins().iconst(ty, int_min);
+            let q = self.builder.ins().select(overflow, min_val, q);
+            let zero = self.builder.ins().iconst(ty, 0);
+            let result = self.builder.ins().select(div_by_zero, zero, q);
+            self.write_reg_val(d, false, ty, result);
+        } else {
+            let one = self.builder.ins().iconst(ty, 1);
+            let safe_m = self.builder.ins().select(div_by_zero, one, m);
+            let q = self.builder.ins().udiv(n, safe_m);
+            let zero = self.builder.ins().iconst(ty, 0);
+            let result = self.builder.ins().select(div_by_zero, zero, q);
+            self.write_reg_val(d, false, ty, result);
+        }
+        Ok(())
+    }
+
+    /// `LSLV`/`LSRV`/`ASRV`/`RORV Rd, Rn, Rm`: shift `Rn` by a variable amount
+    /// taken from `Rm`. A64 masks the shift amount modulo the datasize, which is
+    /// exactly how Cranelift's shift instructions interpret their amount operand,
+    /// so the mapping is direct.
+    fn handle_shift_var(
+        &mut self,
+        op0: Operand,
+        op1: Operand,
+        op2: Operand,
+        style: ShiftStyle,
+    ) -> crate::Result<()> {
+        let (d, sz, _) = decode_reg(op0).ok_or_else(|| Self::bad_operand("shift", op0))?;
+        let ty = size_ty(sz);
+        let a = self.read_source(op1, ty)?;
+        let amount = self.read_source(op2, ty)?;
+        let result = match style {
+            ShiftStyle::LSL => self.builder.ins().ishl(a, amount),
+            ShiftStyle::LSR => self.builder.ins().ushr(a, amount),
+            ShiftStyle::ASR => self.builder.ins().sshr(a, amount),
+            ShiftStyle::ROR => self.builder.ins().rotr(a, amount),
+            _ => {
+                return Err(MicroliftError::UnsupportedInstruction {
+                    mnemonic: format!("shift-var-{style:?}"),
+                });
+            }
+        };
+        self.write_reg_val(d, false, ty, result);
+        Ok(())
+    }
+
+    /// `CLZ`/`RBIT`/`REV Rd, Rn`: count-leading-zeros, bit-reverse, and byte-swap
+    /// of a single source register.
+    fn handle_bit_unary(&mut self, op0: Operand, op1: Operand, kind: BitUnary) -> crate::Result<()> {
+        let (d, sz, _) = decode_reg(op0).ok_or_else(|| Self::bad_operand("bit-unary", op0))?;
+        let ty = size_ty(sz);
+        let a = self.read_source(op1, ty)?;
+        let result = match kind {
+            BitUnary::Clz => self.builder.ins().clz(a),
+            BitUnary::Rbit => self.builder.ins().bitrev(a),
+            BitUnary::Rev => self.builder.ins().bswap(a),
+        };
+        self.write_reg_val(d, false, ty, result);
+        Ok(())
+    }
+
+    /// `ADR Rd, label`: form the runtime byte address `PC + imm`. Like `ADRP`
+    /// (but without page alignment) the PC is the runtime value so the result
+    /// survives ASLR. See [`Self::handle_adrp`].
+    fn handle_adr(&mut self, instr: &A64Instr, op0: Operand) -> crate::Result<()> {
+        let (d, _, _) = decode_reg(op0).ok_or_else(|| Self::bad_operand("adr", op0))?;
+        let off = self.branch_target_offset(instr)?;
+        let image_base = self.builder.use_var(self.state.image_base);
+        let pc_offset = instr.ip.wrapping_sub(self.lift_base);
+        let runtime_pc = self.builder.ins().iadd_imm(image_base, pc_offset as i64);
+        let result = self.builder.ins().iadd_imm(runtime_pc, off);
+        self.write_reg_val(d, false, types::I64, result);
+        Ok(())
+    }
+
     /// `ADRP Rd, label`: form the runtime address of the 4 KiB page that is
     /// `imm` pages away from the page containing this instruction.
     ///
@@ -440,6 +656,23 @@ impl<'a> Lifter64<'a> {
         Ok(())
     }
 
+    /// `LDP Rt, Rt2, [addr]`: load a register pair from consecutive slots, the
+    /// complement of [`Self::handle_stp`]. Both loads use the original address;
+    /// any pre/post-index writeback is applied once afterwards.
+    fn handle_ldp(&mut self, op0: Operand, op1: Operand, op2: Operand) -> crate::Result<()> {
+        let (t1, sz, _) = decode_reg(op0).ok_or_else(|| Self::bad_operand("ldp", op0))?;
+        let (t2, _, _) = decode_reg(op1).ok_or_else(|| Self::bad_operand("ldp", op1))?;
+        let ty = size_ty(sz);
+        let elem = ty.bytes() as i32;
+        let (addr, wb) = self.mem_address(op2)?;
+        let v1 = self.builder.ins().load(ty, MemFlags::new(), addr, 0);
+        let v2 = self.builder.ins().load(ty, MemFlags::new(), addr, elem);
+        self.write_reg_val(t1, false, ty, v1);
+        self.write_reg_val(t2, false, ty, v2);
+        self.apply_writeback(wb);
+        Ok(())
+    }
+
     fn handle_b(&mut self, instr: &A64Instr) -> crate::Result<()> {
         let target = self.branch_target(instr)?;
         let block = self.get_block_with_kind(target, TransferKind::DirectJump);
@@ -454,6 +687,31 @@ impl<'a> Lifter64<'a> {
         let next = self.get_block(instr.ip + 4);
         let cc = self.eval_condition(cond);
         self.builder.ins().brif(cc, taken, &[], next, &[]);
+        self.block_terminated = true;
+        Ok(())
+    }
+
+    /// `CBZ`/`CBNZ Rt, label`: branch when `Rt` is zero (`branch_if_zero`) or
+    /// non-zero. The register is compared at its operand width (W or X).
+    fn handle_cb(
+        &mut self,
+        instr: &A64Instr,
+        op0: Operand,
+        branch_if_zero: bool,
+    ) -> crate::Result<()> {
+        let (t, sz, _) = decode_reg(op0).ok_or_else(|| Self::bad_operand("cbz", op0))?;
+        let ty = size_ty(sz);
+        let val = self.read_reg_val(t, false, ty);
+        let is_zero = self.builder.ins().icmp_imm(IntCC::Equal, val, 0);
+
+        let target = self.branch_target(instr)?;
+        let taken = self.get_block_with_kind(target, TransferKind::ConditionalJump);
+        let next = self.get_block(instr.ip + 4);
+        if branch_if_zero {
+            self.builder.ins().brif(is_zero, taken, &[], next, &[]);
+        } else {
+            self.builder.ins().brif(is_zero, next, &[], taken, &[]);
+        }
         self.block_terminated = true;
         Ok(())
     }
@@ -632,4 +890,26 @@ enum LogicOp {
     And,
     Or,
     Xor,
+}
+
+/// Which transform `CSINC`/`CSINV`/`CSNEG` applies to their else-operand.
+#[derive(Clone, Copy)]
+enum CsVariant {
+    /// `Rm + 1` (CSINC).
+    Inc,
+    /// `~Rm` (CSINV).
+    Inv,
+    /// `-Rm` (CSNEG).
+    Neg,
+}
+
+/// Single-source bit-manipulation unary ops.
+#[derive(Clone, Copy)]
+enum BitUnary {
+    /// Count leading zeros (CLZ).
+    Clz,
+    /// Reverse bit order (RBIT).
+    Rbit,
+    /// Reverse byte order (REV).
+    Rev,
 }
