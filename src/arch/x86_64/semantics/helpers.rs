@@ -234,7 +234,7 @@ impl<'a> Lifter<'a> {
             | OpKind::Immediate8to64 => Ok(self
                 .builder
                 .ins()
-                .iconst(ty, instruction.immediate64() as i64)),
+                .iconst(ty, Self::read_imm64(instruction))),
             _ => Err(MicroliftError::UnsupportedInstruction {
                 mnemonic: format!("read-op-{}-{:?}", op_index, op_kind),
             }),
@@ -318,8 +318,29 @@ impl<'a> Lifter<'a> {
         Ok(ptr)
     }
 
-    /// Read the immediate from an instruction, sign-extended to i64.
-    pub fn read_imm64(&self, instruction: &Instruction) -> i64 {
+    /// Read an instruction's immediate operand as an `i64`, honouring x86
+    /// sign-extension of `imm8`/`imm32` immediates into wider operands.
+    ///
+    /// iced-x86's [`Instruction::immediate64`] returns the *raw, unsigned* bits,
+    /// so the sign-extended operand kinds (`Immediate8to16/32/64`,
+    /// `Immediate32to64`) must go through their matching sign-extending
+    /// accessors — otherwise e.g. `and rax, -16` (`imm8 = 0xf0`) would be read as
+    /// `+240` and mask only the low byte. Callers `iconst(ty, ...)` the result,
+    /// truncating to the operand width, so the low `ty` bits are what matter.
+    pub fn read_imm64(instruction: &Instruction) -> i64 {
+        for i in 0..instruction.op_count() {
+            match instruction.op_kind(i) {
+                OpKind::Immediate8 => return instruction.immediate8() as i64,
+                OpKind::Immediate8to16 => return instruction.immediate8to16() as i64,
+                OpKind::Immediate8to32 => return instruction.immediate8to32() as i64,
+                OpKind::Immediate8to64 => return instruction.immediate8to64(),
+                OpKind::Immediate16 => return instruction.immediate16() as i64,
+                OpKind::Immediate32 => return instruction.immediate32() as i64,
+                OpKind::Immediate32to64 => return instruction.immediate32to64(),
+                OpKind::Immediate64 => return instruction.immediate64() as i64,
+                _ => {}
+            }
+        }
         instruction.immediate64() as i64
     }
 

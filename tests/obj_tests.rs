@@ -5,10 +5,9 @@ use cranelift_codegen::settings;
 use microlift::backend::ArtifactBackend;
 use microlift::backend::CraneliftBackend;
 use microlift::context::{ExitReason, RegisterContext};
-use microlift::function_traits::DynamicSymbol;
+use microlift::function_traits::{trampoline_func, DynamicSymbol};
 use microlift::lifter::{ExecutionMode, Lifter, LifterConfig};
 use microlift::os::get_host_calling_conv;
-use microlift::trampoline_func;
 use object::{Object, ObjectSymbol};
 
 #[test]

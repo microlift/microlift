@@ -21,3 +21,4 @@ thiserror = "1"
 cranelift-codegen = { version = "0.131", features = ["all-arch"] }
 yaxpeax-arm = "0.4.0"
 yaxpeax-arch = "0.3.2"
+function_traits = { git = "https://github.com/microlift/function_traits.git", version = "0.1.0" }

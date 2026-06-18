@@ -485,3 +485,36 @@ fn test_in_region_call_callee_rsp_is_decremented() {
         "Callee must observe RSP = caller_RSP − 8 (return address slot)"
     );
 }
+
+// `AND/OR/ADD/... r/m64, imm8` encode the immediate as a sign-extended byte.
+// Reading it with `immediate64()` yields the raw unsigned byte (`0xf0` -> 240)
+// instead of the sign-extended value (`-16`); for `and rsp, -16` that masks only
+// the low byte of RSP and corrupts the stack pointer. Every SysV `_start` opens
+// with `and rsp, -16`, so this must round-trip exactly.
+
+#[test]
+fn and_r64_imm8_sign_extends() {
+    // movabs rax, 0x1_2345_6789 ; and rax, -16   (48 83 E0 F0)
+    let code = [
+        0x48, 0xB8, 0x89, 0x67, 0x45, 0x23, 0x01, 0x00, 0x00, 0x00, 0x48, 0x83, 0xE0, 0xF0,
+    ];
+    let ctx = compile_and_run(&code, RegisterContext::new());
+    assert_eq!(
+        ctx.rax, 0x1_2345_6780,
+        "and r64,-16 must mask the low 4 bits of the full 64-bit value"
+    );
+}
+
+#[test]
+fn add_r64_neg_imm8_sign_extends() {
+    // add rax, -1   (48 83 C0 FF)  with rax = 0  =>  rax = 0xFFFF_FFFF_FFFF_FFFF
+    let mut ctx = RegisterContext::new();
+    ctx.rax = 0;
+    let code = [0x48, 0x83, 0xC0, 0xFF];
+    let ctx = compile_and_run(&code, ctx);
+    assert_eq!(
+        ctx.rax,
+        u64::MAX,
+        "add r64,-1 must sign-extend imm8 0xff to -1, not add +255"
+    );
+}

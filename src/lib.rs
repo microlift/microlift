@@ -1,10 +1,11 @@
 use thiserror::Error;
 
+pub use function_traits;
+
 pub mod arch;
 pub mod backend;
 pub mod context;
 pub mod core;
-pub mod function_traits;
 pub mod lifter;
 pub(crate) mod mapfile;
 pub mod os;

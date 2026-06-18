@@ -30,7 +30,7 @@ impl<'a> Lifter<'a> {
             | OpKind::Immediate8to64 => self
                 .builder
                 .ins()
-                .iconst(ty, instruction.immediate64() as i64),
+                .iconst(ty, Self::read_imm64(instruction)),
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 1)?;
                 self.builder.ins().load(ty, MemFlags::new(), ptr, 0)
@@ -91,7 +91,7 @@ impl<'a> Lifter<'a> {
             | OpKind::Immediate8to64 => self
                 .builder
                 .ins()
-                .iconst(ty, instruction.immediate64() as i64),
+                .iconst(ty, Self::read_imm64(instruction)),
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 1)?;
                 self.builder.ins().load(ty, MemFlags::new(), ptr, 0)
@@ -160,7 +160,7 @@ impl<'a> Lifter<'a> {
             | OpKind::Immediate8to64 => self
                 .builder
                 .ins()
-                .iconst(ty, instruction.immediate64() as i64),
+                .iconst(ty, Self::read_imm64(instruction)),
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 1)?;
                 self.builder.ins().load(ty, MemFlags::new(), ptr, 0)
@@ -238,7 +238,7 @@ impl<'a> Lifter<'a> {
             | OpKind::Immediate8to64 => self
                 .builder
                 .ins()
-                .iconst(ty, instruction.immediate64() as i64),
+                .iconst(ty, Self::read_imm64(instruction)),
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 1)?;
                 self.builder.ins().load(ty, MemFlags::new(), ptr, 0)
@@ -327,7 +327,7 @@ impl<'a> Lifter<'a> {
             | OpKind::Immediate8to64 => self
                 .builder
                 .ins()
-                .iconst(ty, instruction.immediate64() as i64),
+                .iconst(ty, Self::read_imm64(instruction)),
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 1)?;
                 self.builder.ins().load(ty, MemFlags::new(), ptr, 0)

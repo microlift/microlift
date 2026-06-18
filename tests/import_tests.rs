@@ -14,10 +14,9 @@ use cranelift::prelude::*;
 use cranelift_codegen::ir::{Function, UserFuncName};
 use microlift::backend::CraneliftBackend;
 use microlift::context::{ExitReason, RegisterContext};
-use microlift::function_traits::DynamicSymbol;
+use microlift::function_traits::{trampoline_func, DynamicSymbol};
 use microlift::lifter::{ExecutionMode, Lifter, LifterConfig};
 use microlift::os::get_host_calling_conv;
-use microlift::trampoline_func;
 
 /// Pure Rust reimplementation of C `strlen` - counts bytes until the NUL
 /// terminator.  No libc dependency.
