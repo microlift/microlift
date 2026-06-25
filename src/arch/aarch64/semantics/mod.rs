@@ -781,6 +781,14 @@ impl<'a> Lifter64<'a> {
     }
 
     fn handle_ret(&mut self, op0: Operand) -> crate::Result<()> {
+        if self.config.analysis_mode {
+            // Inspection IR: a return terminates the function (see the x86 RET
+            // handler for rationale).
+            self.builder.ins().return_(&[]);
+            self.block_terminated = true;
+            return Ok(());
+        }
+
         // RET branches to the link register (X30) by default, or to an explicit
         // register operand. The target is runtime-only, so we exit like x86 RET.
         let target_reg = match op0 {

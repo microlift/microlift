@@ -314,7 +314,7 @@ fn test_jno() {
 }
 
 // ---------------------------------------------------------------------------
-// JP (PF=1)  opcode 7A  — parity not computed, pre-seed in context
+// JP (PF=1)  opcode 7A  - parity not computed, pre-seed in context
 // ---------------------------------------------------------------------------
 
 #[test]

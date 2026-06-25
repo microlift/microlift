@@ -44,7 +44,7 @@ pub struct RegisterContext {
     pub exit_code: u32,
     /// On `ImportedFunctionCall` exits, the virtual address of the imported
     /// function that was called. `rip` points to the instruction *after* the
-    /// `CALL` — the resume point once the host has handled the call.
+    /// `CALL` - the resume point once the host has handled the call.
     pub imported_function_va: u64,
     /// XMM0–XMM15, each stored as [lo_64, hi_64].
     pub xmm: [[u64; 2]; 16],

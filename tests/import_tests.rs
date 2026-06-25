@@ -215,8 +215,8 @@ fn test_import_slow_call_strlen_with_resume() {
 ///   1. Registers the host symbol address so the linker can patch the call site.
 ///   2. Declares the import with the same `FuncId` order used in the IR.
 ///
-/// The test asserts that execution completes with a single `Return` exit —
-/// no `ImportedFunctionCall` exits — and that `rax` holds the correct length,
+/// The test asserts that execution completes with a single `Return` exit -
+/// no `ImportedFunctionCall` exits - and that `rax` holds the correct length,
 /// proving that the call went through `host_strlen` directly.
 #[test]
 fn test_runtime_assisted_fast_call_strlen() {

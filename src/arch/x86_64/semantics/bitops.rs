@@ -481,7 +481,7 @@ impl<'a> Lifter<'a> {
         let bit_idx = match instruction.op1_kind() {
             OpKind::Register => {
                 // get_reg_val returns the natural type of the register, which for BT
-                // always matches the operand size — no reduction needed.
+                // always matches the operand size - no reduction needed.
                 self.get_reg_val(instruction.op1_register())?
             }
             OpKind::Immediate8 => self

@@ -62,6 +62,15 @@ impl<'a> Lifter<'a> {
     }
 
     pub(super) fn handle_ret(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        if self.config.analysis_mode {
+            // Inspection IR: a return terminates the function. The runtime stack
+            // pop + dispatch switch + trampoline check are execution-only
+            // machinery that only obscure the control-flow view.
+            self.builder.ins().return_(&[]);
+            self.block_terminated = true;
+            return Ok(());
+        }
+
         let imm = instruction.immediate16(); // for RET n
 
         let rsp = self.get_reg_val(Register::RSP)?;

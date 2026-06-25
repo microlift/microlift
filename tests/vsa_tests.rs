@@ -57,7 +57,7 @@ fn test_join_multiple_and_constant_grows_set() {
 
 #[test]
 fn test_join_multiple_at_max_size_stays_multiple() {
-    // Exactly MAX_SET_SIZE = 64 distinct values — must remain Multiple.
+    // Exactly MAX_SET_SIZE = 64 distinct values - must remain Multiple.
     let mut vs = ValueSet::Empty;
     for i in 0..64i64 {
         vs = vs.join(&ValueSet::Constant(i));
@@ -440,7 +440,7 @@ fn test_register_value_set_join_preserves_unmodified_register() {
     let joined = a.join(&b);
     // RCX in a is Constant(99); b contributes Top -> join = Top.
     // (a registers not in b are already in result; b's Top for unknown regs
-    //  means the join computes existing ⊔ Top = Top for every reg in b —
+    //  means the join computes existing ⊔ Top = Top for every reg in b -
     //  but b has no explicit entries, so only a's entries survive unchanged.)
     assert_eq!(joined.get(Register::RCX), ValueSet::Constant(99));
 }
@@ -759,7 +759,7 @@ fn test_indirect_jump_interval_returns_none() {
 
 #[test]
 fn test_indirect_jump_non_jmp_instruction_returns_none() {
-    // ret — not Jmp, so indirect_jump_targets must return None.
+    // ret - not Jmp, so indirect_jump_targets must return None.
     let bytes = [0xC3u8];
     let insts = decode_at(&bytes, 0x1000);
     let mut vsa = ValueSetAnalyzer::new();
@@ -809,7 +809,7 @@ fn test_memory_read_from_writable_segment_is_top() {
 
 #[test]
 fn test_memory_read_with_unknown_base_is_top() {
-    // mov rax, [rbx]  — rbx is Top on entry.
+    // mov rax, [rbx]  - rbx is Top on entry.
     // [48 8B 03] = mov rax, [rbx]
     let bytes = [0x48u8, 0x8B, 0x03];
     let insts = decode_at(&bytes, 0x1000);
@@ -822,7 +822,7 @@ fn test_memory_read_with_unknown_base_is_top() {
 
 #[test]
 fn test_memory_read_with_constant_base_resolves_segment() {
-    // mov rbx, 0x2000 ; mov rax, [rbx]  — base is known, segment contains value.
+    // mov rbx, 0x2000 ; mov rax, [rbx]  - base is known, segment contains value.
     let bytes = [
         0x48u8, 0xC7, 0xC3, 0x00, 0x20, 0x00, 0x00, // mov rbx, 0x2000  (ip 0x1000, 7 bytes)
         0x48, 0x8B, 0x03, // mov rax, [rbx]  (ip 0x1007, 3 bytes)
@@ -890,7 +890,7 @@ fn test_relocation_address_makes_indirect_jump_unresolvable() {
 
 #[test]
 fn test_memory_read_address_outside_any_segment_is_top() {
-    // mov rax, [0x9999]  — no segment covers this address.
+    // mov rax, [0x9999]  - no segment covers this address.
     let bytes = [0x48u8, 0x8B, 0x04, 0x25, 0x99, 0x99, 0x00, 0x00];
     let insts = decode_at(&bytes, 0x1000);
     let seg = MemorySegment::new(0x2000, vec![0u8; 8], false);

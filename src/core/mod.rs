@@ -2,7 +2,7 @@
 //!
 //! Holds the generic `LiftEngine<'a, A: GuestArch>`: block discovery, the
 //! resumable PC-dispatch switch, import fast-call machinery, the context-sync
-//! skeleton, and exit handling — all written once and shared across guest
+//! skeleton, and exit handling - all written once and shared across guest
 //! architectures. Each guest plugs in via the [`GuestArch`] trait.
 //!
 //! `Lifter<'a>` (the historical name) is a type alias for `LiftEngine<'a,
@@ -141,6 +141,20 @@ pub struct LifterConfig {
     /// relying on Cranelift's vector lowering and is required for AOT targets
     /// that lack SIMD support (e.g. RISC-V64).
     pub use_vector_xmm: bool,
+    /// Produce *inspection* IR for static analysis rather than runnable IR.
+    ///
+    /// When `true`, the engine omits the machinery that exists purely to support
+    /// re-entrant JIT/AOT execution:
+    /// - the entry PC-dispatch `Switch` is replaced by a direct jump to the
+    ///   region's first block, and
+    /// - context write-back (`sync_to_context`) is skipped, so guest registers
+    ///   stay as pure SSA values and no per-exit stores are emitted, and
+    /// - out-of-region exit stubs become bare `return`s.
+    ///
+    /// The resulting `Function` is a clean control-flow graph of the guest's own
+    /// blocks - far more readable for analysis - but it does **not** write guest
+    /// state back to the `RegisterContext`, so it is not suitable for execution.
+    pub analysis_mode: bool,
 }
 
 impl Default for LifterConfig {
@@ -153,6 +167,7 @@ impl Default for LifterConfig {
             emit_resume_blocks: false,
             imports: HashMap::new(),
             use_vector_xmm: false,
+            analysis_mode: false,
         }
     }
 }
@@ -408,22 +423,31 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             self.get_block(leader);
         }
 
-        // Resumable dispatch: jump to the block matching the context PC.
-        let pc_val = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlags::trusted(), ctx_ptr_val, A::pc_offset());
-        let image_base_val = self.builder.use_var(A::image_base_var(&self.state));
-        let relative_pc = self.builder.ins().isub(pc_val, image_base_val);
-
-        let mut switch = Switch::new();
-        for (&offset, &block) in &self.blocks {
-            let relative_offset = offset.wrapping_sub(self.lift_base);
-            switch.set_entry(relative_offset.into(), block);
-        }
-
         let start_block = self.get_block(ip);
-        switch.emit(&mut self.builder, relative_pc, start_block);
+
+        if self.config.analysis_mode {
+            // Analysis mode: skip the resumable PC dispatch entirely and just
+            // enter at the region's first instruction.
+            self.builder.ins().jump(start_block, &[]);
+        } else {
+            // Resumable dispatch: jump to the block matching the context PC.
+            let pc_val = self.builder.ins().load(
+                types::I64,
+                MemFlags::trusted(),
+                ctx_ptr_val,
+                A::pc_offset(),
+            );
+            let image_base_val = self.builder.use_var(A::image_base_var(&self.state));
+            let relative_pc = self.builder.ins().isub(pc_val, image_base_val);
+
+            let mut switch = Switch::new();
+            for (&offset, &block) in &self.blocks {
+                let relative_offset = offset.wrapping_sub(self.lift_base);
+                switch.set_entry(relative_offset.into(), block);
+            }
+
+            switch.emit(&mut self.builder, relative_pc, start_block);
+        }
 
         self.visited_blocks.insert(start_block);
         self.block_terminated = true; // force switch to first block in loop
@@ -483,15 +507,21 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             let block = self.blocks[&offset];
             if !self.visited_blocks.contains(&block) && !processed_blocks.contains(&block) {
                 self.builder.switch_to_block(block);
-                self.current_ip = offset;
-                A::sync_to_context(self, None, ExitReason::UnknownJump)?;
-                let kind = self
-                    .block_transfer_kinds
-                    .get(&block)
-                    .copied()
-                    .unwrap_or(TransferKind::Unknown);
-                self.write_exit_code(kind as u32);
-                self.builder.ins().return_(&[]);
+                if self.config.analysis_mode {
+                    // Inspection IR: out-of-region targets are bare returns; no
+                    // context sync or exit code.
+                    self.builder.ins().return_(&[]);
+                } else {
+                    self.current_ip = offset;
+                    A::sync_to_context(self, None, ExitReason::UnknownJump)?;
+                    let kind = self
+                        .block_transfer_kinds
+                        .get(&block)
+                        .copied()
+                        .unwrap_or(TransferKind::Unknown);
+                    self.write_exit_code(kind as u32);
+                    self.builder.ins().return_(&[]);
+                }
                 processed_blocks.insert(block);
             }
         }

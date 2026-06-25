@@ -45,7 +45,7 @@ pub enum ExitReason {
     /// either had no fast-call metadata or has a variadic/unsupported ABI).
     ///
     /// `ControlHeader::imported_function_va` holds the callee address. The PC
-    /// field holds the address of the instruction after the `CALL` — the resume
+    /// field holds the address of the instruction after the `CALL` - the resume
     /// point once the host has handled the call.
     ///
     /// **The stack pointer is unchanged.** The host is expected to call the
@@ -62,7 +62,7 @@ pub enum ExitReason {
     /// **The stack pointer is unchanged.** The host must decide how to dispatch
     /// the callee:
     /// - If the target is a **native function**, call it via C and resume at the
-    ///   PC — no stack adjustment is needed.
+    ///   PC - no stack adjustment is needed.
     /// - If the target is **guest code**, push the return address before
     ///   re-entering the guest so the callee's eventual `RET` finds it.
     IndirectCall = 7,

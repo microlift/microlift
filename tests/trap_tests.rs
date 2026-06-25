@@ -93,7 +93,7 @@ fn test_ud2_after_conditional_branch_not_taken() {
     let bytes = [
         0x75, 0x02,  // jnz +2  (ZF=0 -> taken, skips ud2)
         0x0F, 0x0B,  // ud2
-        0xC3,        // ret  (jump target — reached when branch is taken)
+        0xC3,        // ret  (jump target - reached when branch is taken)
     ];
 
     // ZF=0 -> jnz taken -> branch skips ud2 -> hits ret -> Return exit

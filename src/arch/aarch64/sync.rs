@@ -13,6 +13,10 @@ use cranelift::prelude::*;
 impl<'a> Lifter64<'a> {
     /// Full sync - writes all GPRs, SP, flags and TPIDR back to the context.
     pub fn sync_to_context(&mut self, pc: Option<Value>, reason: ExitReason) -> crate::Result<()> {
+        // Analysis mode produces inspection IR with no context write-back.
+        if self.config.analysis_mode {
+            return Ok(());
+        }
         let ctx_ptr = self.builder.use_var(self.state.context_ptr);
 
         for (&reg, &var) in &self.state.gprs {
@@ -57,6 +61,10 @@ impl<'a> Lifter64<'a> {
         pc: Option<Value>,
         reason: ExitReason,
     ) -> crate::Result<()> {
+        // Analysis mode produces inspection IR with no context write-back.
+        if self.config.analysis_mode {
+            return Ok(());
+        }
         let ctx_ptr = self.builder.use_var(self.state.context_ptr);
 
         let dirty_gprs: Vec<u16> = self.state.dirty_gprs.iter().cloned().collect();

@@ -280,7 +280,7 @@ fn test_compile_runtime_assisted_fast_import_has_relocation() {
     assert!(has_lifted_func, "object must export 'lifted_func'");
 
     // `host_strlen` must appear as an undefined symbol so the linker can
-    // emit a relocation for it — not an embedded absolute address.
+    // emit a relocation for it - not an embedded absolute address.
     let has_undefined_strlen = obj
         .symbols()
         .any(|s| s.is_undefined() && s.name().map(|n| bare(n) == "host_strlen").unwrap_or(false));

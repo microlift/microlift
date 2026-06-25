@@ -15,6 +15,10 @@ impl<'a> Lifter<'a> {
     /// Full sync - writes all GPRs, flags, XMMs and segment bases back to the
     /// `RegisterContext`. Used on context reload paths and unvisited exit stubs.
     pub fn sync_to_context(&mut self, pc: Option<Value>, reason: ExitReason) -> crate::Result<()> {
+        // Analysis mode produces inspection IR with no context write-back.
+        if self.config.analysis_mode {
+            return Ok(());
+        }
         let ctx_ptr = self.builder.use_var(self.state.context_ptr);
 
         for (&reg, &var) in &self.state.gprs {
@@ -91,6 +95,10 @@ impl<'a> Lifter<'a> {
         pc: Option<Value>,
         reason: ExitReason,
     ) -> crate::Result<()> {
+        // Analysis mode produces inspection IR with no context write-back.
+        if self.config.analysis_mode {
+            return Ok(());
+        }
         let ctx_ptr = self.builder.use_var(self.state.context_ptr);
 
         let dirty_gprs: Vec<Register> = self.state.dirty_gprs.iter().cloned().collect();

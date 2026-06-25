@@ -2,7 +2,7 @@
 //! `Aarch64RegisterContext` field offsets.
 //!
 //! SIMD/FP (V) registers are present in the context struct but are not yet
-//! materialised as SSA variables — the current semantics slice is
+//! materialised as SSA variables - the current semantics slice is
 //! integer-only. They will be added alongside FP/SIMD instruction support.
 
 use crate::arch::aarch64::context::Aarch64RegisterContext;

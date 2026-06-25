@@ -324,7 +324,7 @@ impl<'a> Lifter<'a> {
     /// iced-x86's [`Instruction::immediate64`] returns the *raw, unsigned* bits,
     /// so the sign-extended operand kinds (`Immediate8to16/32/64`,
     /// `Immediate32to64`) must go through their matching sign-extending
-    /// accessors — otherwise e.g. `and rax, -16` (`imm8 = 0xf0`) would be read as
+    /// accessors - otherwise e.g. `and rax, -16` (`imm8 = 0xf0`) would be read as
     /// `+240` and mask only the low byte. Callers `iconst(ty, ...)` the result,
     /// truncating to the operand width, so the low `ty` bits are what matter.
     pub fn read_imm64(instruction: &Instruction) -> i64 {

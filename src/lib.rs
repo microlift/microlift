@@ -4,6 +4,7 @@ pub use function_traits;
 
 pub mod arch;
 pub mod backend;
+pub mod cfg;
 pub mod context;
 pub mod core;
 pub mod lifter;

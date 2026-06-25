@@ -1,5 +1,5 @@
 {
-  description = "microlift — x86-64 to Cranelift IR lifter";
+  description = "microlift - x86-64 to Cranelift IR lifter";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

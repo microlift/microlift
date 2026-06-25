@@ -13,10 +13,10 @@ use target_lexicon::Triple;
 /// `ExternalName::user(0, i)`. Produced by `Lifter::aot_imports()`.
 ///
 /// The tuple is `(symbol_name, host_fn_ptr, signature)`:
-/// - `symbol_name` — the C symbol the relocation or JIT lookup will resolve.
-/// - `host_fn_ptr` — the in-process address; used by JIT backends to register
+/// - `symbol_name` - the C symbol the relocation or JIT lookup will resolve.
+/// - `host_fn_ptr` - the in-process address; used by JIT backends to register
 ///   the symbol; AOT backends only need the name and signature.
-/// - `signature` — the Cranelift calling-convention signature for the function.
+/// - `signature` - the Cranelift calling-convention signature for the function.
 pub type AotImport = (&'static str, *const u8, Signature);
 
 #[cfg(feature = "disasm")]
@@ -70,7 +70,7 @@ impl CraneliftBackend {
     /// fast-call imports (i.e. `call(func_ref, ...)` instructions backed by
     /// `ExternalName::user(0, i)` references).
     ///
-    /// `imports` must be the slice returned by `Lifter::aot_imports()` —
+    /// `imports` must be the slice returned by `Lifter::aot_imports()` -
     /// element `i` must correspond to `ExternalName::user(0, i)` in the IR.
     /// Imports are declared first so each receives `FuncId(i)`, which the
     /// JIT linker maps to the registered symbol address at finalization time.
@@ -148,7 +148,7 @@ impl ArtifactBackend {
     /// Compile a `RuntimeAssisted`-mode function to a relocatable object file,
     /// emitting named external relocations for fast-call imports.
     ///
-    /// `imports` must be the slice returned by `Lifter::aot_imports()` —
+    /// `imports` must be the slice returned by `Lifter::aot_imports()` -
     /// element `i` corresponds to `ExternalName::user(0, i)` in the IR and
     /// will be declared as an imported symbol before `lifted_func`.
     /// Declaring them first ensures `FuncId(i) == i`, so the object module

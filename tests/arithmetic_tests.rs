@@ -762,7 +762,7 @@ fn test_sbb_result_zero() {
 // Regression: shift by masked-zero count must NOT touch flags.
 // Per x86: when the masked shift count is 0, CF/ZF/SF/OF are all unchanged.
 // Earlier the lifter computed CF as `(val >> bit_width) & 1` for SHL and
-// `(val >> -1) & 1` for SHR/SAR — both Cranelift-masked-to-0/63 — silently
+// `(val >> -1) & 1` for SHR/SAR - both Cranelift-masked-to-0/63 - silently
 // corrupting CF for any subsequent JC/JNC.
 // ---------------------------------------------------------------------------
 
@@ -888,7 +888,7 @@ fn test_shl_by_zero_does_not_pick_lsb_into_cf() {
 
 // ---------------------------------------------------------------------------
 // Regression: 8-bit DIV/IDIV must use AX (not AL) as the dividend.
-// x86 8-bit divide: AL = AX / r/m8, AH = AX % r/m8 — AH (high byte of AX)
+// x86 8-bit divide: AL = AX / r/m8, AH = AX % r/m8 - AH (high byte of AX)
 // must contribute to the dividend.
 // ---------------------------------------------------------------------------
 

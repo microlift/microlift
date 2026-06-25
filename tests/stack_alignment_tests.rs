@@ -32,12 +32,12 @@
 //! unsigned 8-bit value (0–255). For negative 8-bit values (e.g. `push -1`
 //! = `6A FF`), this would push 255 instead of 0xFFFF_FFFF_FFFF_FFFF.
 //!
-//! ## IndirectCall exit reason — unregistered indirect CALL
+//! ## IndirectCall exit reason - unregistered indirect CALL
 //!
 //! `emit_indirect_call_exit` emits `ExitReason::IndirectCall` (distinct from
 //! `ImportedFunctionCall`) and leaves RSP unchanged. The host must decide how
 //! to dispatch the callee:
-//! - **Native function**: call via C and resume at `ctx.rip` — no stack
+//! - **Native function**: call via C and resume at `ctx.rip` - no stack
 //!   adjustment needed.
 //! - **Guest code**: push `ctx.rip` onto `ctx.rsp` before re-entering the
 //!   guest so the callee's eventual `RET` finds the correct return address.
@@ -350,7 +350,7 @@ fn test_push_positive_imm8_unaffected() {
 // ---------------------------------------------------------------------------
 
 /// `CALL RAX` (indirect call via register) exits with `ExitReason::IndirectCall`.
-/// RSP is intentionally left unchanged — the host decides whether to dispatch
+/// RSP is intentionally left unchanged - the host decides whether to dispatch
 /// the callee as a native function (no stack adjustment needed) or as guest
 /// code (host must push `ctx.rip` onto `ctx.rsp` before re-entering).
 ///
@@ -381,7 +381,7 @@ fn test_indirect_call_via_reg_exits_with_indirect_call_reason() {
     assert_eq!(ctx.imported_function_va, 0x2000);
     // rip holds the resume point (instruction after the CALL).
     assert_eq!(ctx.rip, ctx.image_base + 9);
-    // RSP is unchanged — host is responsible for stack management.
+    // RSP is unchanged - host is responsible for stack management.
     assert_eq!(
         ctx.rsp, initial_rsp,
         "IndirectCall must leave RSP unchanged; host manages the stack"
