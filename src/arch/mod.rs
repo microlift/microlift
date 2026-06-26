@@ -39,6 +39,23 @@ pub enum ControlFlowKind {
     Invalid,
 }
 
+/// Register and memory read/write effects of a single instruction.
+///
+/// Register names are the guest's own lower-case mnemonics (e.g. `"rax"`,
+/// `"x0"`). The lists are de-duplicated. Intended for static analysis (def-use,
+/// liveness, taint) rather than precise emulation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InstructionEffects {
+    /// Registers read by the instruction.
+    pub reads: Vec<String>,
+    /// Registers written (fully or conditionally) by the instruction.
+    pub writes: Vec<String>,
+    /// The instruction reads from memory.
+    pub reads_memory: bool,
+    /// The instruction writes to memory.
+    pub writes_memory: bool,
+}
+
 /// Static control-flow description of a single decoded instruction, consumed by
 /// the engine's leader-discovery pass.
 #[derive(Debug, Clone)]

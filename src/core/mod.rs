@@ -10,14 +10,16 @@
 
 pub mod exit;
 
-use crate::arch::{ControlFlow, ControlFlowKind};
+use crate::arch::{ControlFlow, ControlFlowKind, InstructionEffects};
 use crate::core::exit::{ExitReason, MemorySegment, TransferKind};
 use crate::function_traits::{DynamicSymbol, FunctionArgumentType};
 use crate::os::get_host_calling_conv;
 use cranelift::prelude::*;
-use cranelift_codegen::ir::{ExtFuncData, ExternalName, FuncRef, SigRef, UserExternalName};
+use cranelift_codegen::ir::{
+    ExtFuncData, ExternalName, Function, FuncRef, SigRef, UserExternalName, UserFuncName,
+};
 use cranelift_codegen::isa::CallConv;
-use cranelift_frontend::{FunctionBuilder, Switch, Variable};
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch, Variable};
 use std::collections::{HashMap, HashSet};
 
 /// A guest instruction-set frontend.
@@ -62,6 +64,15 @@ pub trait GuestArch: Sized {
     /// Static control-flow facts for leader discovery.
     fn control_flow(i: &Self::Instr) -> ControlFlow;
 
+    /// Register/memory read-write effects of `i` for static analysis, or `None`
+    /// if this guest frontend cannot compute them yet.
+    ///
+    /// Defaults to `None`; guest frontends override it where instruction-info is
+    /// available (x86-64 does, via iced's instruction-info).
+    fn instruction_effects(_i: &Self::Instr) -> Option<InstructionEffects> {
+        None
+    }
+
     // --- per-instruction lift + state sync (delegate to inherent methods) ---
     fn lift_instruction(lifter: &mut LiftEngine<'_, Self>, i: &Self::Instr) -> crate::Result<()>;
     fn load_state_from_context(lifter: &mut LiftEngine<'_, Self>) -> crate::Result<()>;
@@ -70,6 +81,53 @@ pub trait GuestArch: Sized {
         pc: Option<Value>,
         reason: ExitReason,
     ) -> crate::Result<()>;
+}
+
+/// Lift a region of guest code straight to a Cranelift [`Function`].
+///
+/// This is the one-call entry point for callers that just want IR and do not
+/// need to drive the [`FunctionBuilder`] themselves. It encapsulates the full
+/// setup that every consumer would otherwise hand-roll (and which the crate's
+/// own tests repeat verbatim): build a `Function` with the host calling
+/// convention and the single `*mut RegisterContext` (`I64`) parameter, create a
+/// [`FunctionBuilder`], construct the [`LiftEngine`], run [`LiftEngine::lift`],
+/// and release the builder's mutable borrow before returning the IR.
+///
+/// `A` selects the guest architecture (e.g.
+/// [`crate::arch::x86_64::X86_64`]). `ip` is the virtual address the first byte
+/// maps to.
+///
+/// ```
+/// use microlift::arch::x86_64::X86_64;
+/// use microlift::core::{lift_to_function, LifterConfig};
+///
+/// // mov rax, 42 ; ret
+/// let code = [0x48, 0xC7, 0xC0, 0x2A, 0x00, 0x00, 0x00, 0xC3];
+/// let func = lift_to_function::<X86_64>(&code, 0x1000, LifterConfig::default()).unwrap();
+/// assert!(func.display().to_string().contains("function"));
+/// ```
+pub fn lift_to_function<A: GuestArch>(
+    bytes: &[u8],
+    ip: u64,
+    config: LifterConfig,
+) -> crate::Result<Function> {
+    let mut func = Function::with_name_signature(
+        UserFuncName::user(0, 0),
+        Signature::new(get_host_calling_conv()),
+    );
+    // The lifted function takes a single argument: `*mut RegisterContext`.
+    func.signature.params.push(AbiParam::new(types::I64));
+
+    let mut builder_ctx = FunctionBuilderContext::new();
+    let builder = FunctionBuilder::new(&mut func, &mut builder_ctx);
+
+    let mut engine = LiftEngine::<A>::with_config(builder, config);
+    engine.lift(bytes, ip)?;
+
+    // Release the mutable borrow of `func` held by the builder/engine.
+    drop(engine);
+
+    Ok(func)
 }
 
 /// Convert a `FunctionArgumentType` to the corresponding Cranelift IR type.

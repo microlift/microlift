@@ -72,6 +72,10 @@ impl GuestArch for X86_64 {
         decode::control_flow(i)
     }
 
+    fn instruction_effects(i: &Self::Instr) -> Option<crate::arch::InstructionEffects> {
+        Some(decode::instruction_effects(i))
+    }
+
     fn lift_instruction(lifter: &mut LiftEngine<'_, Self>, i: &Self::Instr) -> crate::Result<()> {
         lifter.handle_instruction(i)
     }
