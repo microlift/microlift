@@ -213,6 +213,8 @@ impl<'a> Lifter<'a> {
 
             // System
             Mnemonic::Syscall => self.handle_syscall(instruction),
+            Mnemonic::Cpuid => self.handle_cpuid(instruction),
+            Mnemonic::Xgetbv => self.handle_xgetbv(instruction),
 
             // FS/GS base (FSGSBASE extension)
             Mnemonic::Rdfsbase => self.handle_rdfsbase(instruction),

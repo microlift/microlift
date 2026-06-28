@@ -5,8 +5,10 @@ edition = "2024"
 
 [features]
 disasm = ["dep:capstone"]
+serde = ["dep:serde"]
 
 [dependencies]
+serde = { version = "1", features = ["derive"], optional = true }
 cranelift = "0.131"
 cranelift-frontend = "0.131"
 cranelift-module = "0.131"

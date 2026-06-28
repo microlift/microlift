@@ -22,6 +22,7 @@ pub mod x86_64;
 /// phase-1 scanning to discover basic-block leaders without the engine needing
 /// to know anything about the guest ISA.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ControlFlowKind {
     /// Falls through to the next instruction; no transfer.
     Fallthrough,
@@ -39,12 +40,27 @@ pub enum ControlFlowKind {
     Invalid,
 }
 
+impl std::fmt::Display for ControlFlowKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ControlFlowKind::Fallthrough => "fallthrough",
+            ControlFlowKind::DirectBranch => "branch",
+            ControlFlowKind::CondBranch => "cond-branch",
+            ControlFlowKind::IndirectBranch => "indirect-branch",
+            ControlFlowKind::Call { .. } => "call",
+            ControlFlowKind::Ret => "ret",
+            ControlFlowKind::Invalid => "invalid",
+        })
+    }
+}
+
 /// Register and memory read/write effects of a single instruction.
 ///
 /// Register names are the guest's own lower-case mnemonics (e.g. `"rax"`,
 /// `"x0"`). The lists are de-duplicated. Intended for static analysis (def-use,
 /// liveness, taint) rather than precise emulation.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct InstructionEffects {
     /// Registers read by the instruction.
     pub reads: Vec<String>,
@@ -59,6 +75,7 @@ pub struct InstructionEffects {
 /// Static control-flow description of a single decoded instruction, consumed by
 /// the engine's leader-discovery pass.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ControlFlow {
     pub kind: ControlFlowKind,
     /// Statically-known branch targets (e.g. the taken edge of a `Jcc`/`B.cond`,

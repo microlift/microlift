@@ -26,6 +26,7 @@ pub struct ControlHeader {
 
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ExitReason {
     None = 0,
     /// A terminating block was reached. The code has executed successfully up to its VM return trampoline.
@@ -76,6 +77,19 @@ pub enum ExitReason {
     /// instruction itself. The host debugger or runtime may resume execution by
     /// advancing the PC past the instruction before re-entering the guest.
     Breakpoint = 9,
+
+    /// A `CPUID` instruction was executed. This is a resumable VM exit: the PC
+    /// points to the instruction *after* `CPUID` (the resume point). `rax` and
+    /// `rcx` hold the leaf and sub-leaf inputs. The runtime should populate
+    /// `rax`, `rbx`, `rcx`, and `rdx` with the desired CPUID response and
+    /// re-enter the guest at the PC.
+    Cpuid = 10,
+
+    /// An `XGETBV` instruction was executed. This is a resumable VM exit: the
+    /// PC points to the instruction *after* `XGETBV` (the resume point). `rcx`
+    /// holds the XCR index. The runtime should populate `rax` (bits 31:0) and
+    /// `rdx` (bits 63:32) with the value of XCR[rcx] and re-enter at the PC.
+    Xgetbv = 11,
 }
 
 impl TryFrom<u32> for ExitReason {
@@ -102,9 +116,32 @@ impl TryFrom<u32> for ExitReason {
             Ok(Self::Ud2)
         } else if value == Self::Breakpoint as u32 {
             Ok(Self::Breakpoint)
+        } else if value == Self::Cpuid as u32 {
+            Ok(Self::Cpuid)
+        } else if value == Self::Xgetbv as u32 {
+            Ok(Self::Xgetbv)
         } else {
             Err(())
         }
+    }
+}
+
+impl std::fmt::Display for ExitReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ExitReason::None => "none",
+            ExitReason::Return => "return",
+            ExitReason::Syscall => "syscall",
+            ExitReason::UnknownJump => "unknown-jump",
+            ExitReason::UnimplementedInstruction => "unimplemented-instruction",
+            ExitReason::InvalidInstruction => "invalid-instruction",
+            ExitReason::ImportedFunctionCall => "imported-function-call",
+            ExitReason::IndirectCall => "indirect-call",
+            ExitReason::Ud2 => "ud2",
+            ExitReason::Breakpoint => "breakpoint",
+            ExitReason::Cpuid => "cpuid",
+            ExitReason::Xgetbv => "xgetbv",
+        })
     }
 }
 
@@ -115,6 +152,7 @@ impl TryFrom<u32> for ExitReason {
 /// `UnimplementedInstruction` stores the raw guest opcode there).
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum TransferKind {
     /// Origin not tracked - should not occur in practice; treat conservatively.
     Unknown = 0,
@@ -155,6 +193,19 @@ impl TryFrom<u32> for TransferKind {
     }
 }
 
+impl std::fmt::Display for TransferKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            TransferKind::Unknown => "unknown",
+            TransferKind::DirectJump => "direct-jump",
+            TransferKind::IndirectJump => "indirect-jump",
+            TransferKind::ConditionalJump => "conditional-jump",
+            TransferKind::Return => "return",
+            TransferKind::DirectCall => "direct-call",
+        })
+    }
+}
+
 /// A contiguous region of guest memory made available to the lifter for static
 /// reads (e.g. constant pools, RIP-relative data).
 #[derive(Debug, Clone)]
@@ -190,5 +241,26 @@ impl MemorySegment {
             val |= (b as u64) << (i * 8);
         }
         Some(val)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_reason_display_and_roundtrip() {
+        assert_eq!(ExitReason::ImportedFunctionCall.to_string(), "imported-function-call");
+        // try_from is the inverse of the discriminant.
+        for r in [ExitReason::None, ExitReason::Return, ExitReason::IndirectCall, ExitReason::Xgetbv] {
+            assert_eq!(ExitReason::try_from(r as u32), Ok(r));
+            assert!(!r.to_string().is_empty());
+        }
+    }
+
+    #[test]
+    fn transfer_kind_display() {
+        assert_eq!(TransferKind::DirectCall.to_string(), "direct-call");
+        assert_eq!(TransferKind::try_from(TransferKind::IndirectJump as u32), Ok(TransferKind::IndirectJump));
     }
 }

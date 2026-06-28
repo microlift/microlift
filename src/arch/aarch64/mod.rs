@@ -56,6 +56,10 @@ impl GuestArch for Aarch64 {
         decode::decode_region(bytes, ip)
     }
 
+    fn decode_one(bytes: &[u8], ip: u64) -> Option<Self::Instr> {
+        decode::decode_one(bytes, ip)
+    }
+
     fn instr_ip(i: &Self::Instr) -> u64 {
         decode::instr_ip(i)
     }

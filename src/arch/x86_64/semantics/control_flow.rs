@@ -130,6 +130,9 @@ impl<'a> Lifter<'a> {
     }
 
     pub(super) fn handle_call(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        if self.config.analysis_mode {
+            return self.handle_call_analysis(instruction);
+        }
         match instruction.op0_kind() {
             OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
                 let target = instruction.near_branch_target();
@@ -213,6 +216,44 @@ impl<'a> Lifter<'a> {
                 mnemonic: format!("call-{:?}", other),
             }),
         }
+    }
+
+    /// Analysis-mode `CALL`: emit a real Cranelift `call`/`call_indirect` to an
+    /// external function representing the callee, then **fall through** to the
+    /// next instruction. Unlike the execution path this does not touch RSP, push
+    /// a return address, jump into the callee, or terminate the block — so the
+    /// IR reads as a clean call with its continuation intact, and in-region
+    /// callees are no longer inlined as jumps.
+    fn handle_call_analysis(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        match instruction.op0_kind() {
+            OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
+                let target = instruction.near_branch_target();
+                let fref = self.analysis_call_funcref(target);
+                self.builder.ins().call(fref, &[]);
+            }
+            OpKind::Register => {
+                // Indirect call: no statically-known callee, so no external
+                // function is declared (and no `analysis_call_targets` entry);
+                // `call_indirect` carries the runtime target value directly.
+                let target_val = self.get_reg_val(instruction.op0_register())?;
+                let sig = self.analysis_call_sig();
+                self.builder.ins().call_indirect(sig, target_val, &[]);
+            }
+            OpKind::Memory => {
+                let ptr = self.get_mem_ptr(instruction, 0)?;
+                let target_val = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0);
+                let sig = self.analysis_call_sig();
+                self.builder.ins().call_indirect(sig, target_val, &[]);
+            }
+            other => {
+                return Err(MicroliftError::UnsupportedInstruction {
+                    mnemonic: format!("call-{:?}", other),
+                });
+            }
+        }
+        // Execution continues at the next instruction; do not terminate.
+        self.block_terminated = false;
+        Ok(())
     }
 
     /// Dispatch a call to a registered import address: either emit a fast
@@ -952,5 +993,44 @@ impl<'a> Lifter<'a> {
         self.block_terminated = false;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod analysis_call_tests {
+    use crate::arch::x86_64::X86_64;
+    use crate::core::{lift_to_function_with_call_targets, LifterConfig};
+
+    fn analysis_ir(bytes: &[u8], base: u64) -> (String, Vec<u64>) {
+        let cfg = LifterConfig { analysis_mode: true, ..Default::default() };
+        let (func, targets) =
+            lift_to_function_with_call_targets::<X86_64>(bytes, base, cfg).unwrap();
+        (func.display().to_string(), targets)
+    }
+
+    #[test]
+    fn direct_call_emits_real_call_op_not_jump() {
+        // call 0x100A ; ret ; padding ; (callee) mov eax,1 ; ret
+        let bytes = [
+            0xE8, 0x05, 0x00, 0x00, 0x00, // call 0x100A
+            0xC3, 0x90, 0x90, 0x90, 0x90, // ret + padding
+            0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3, // mov eax,1 ; ret
+        ];
+        let (ir, targets) = analysis_ir(&bytes, 0x1000);
+        // The call is a first-class IR op referencing an analysis funcref...
+        assert!(ir.contains("call fn0()"), "ir was:\n{ir}");
+        assert!(ir.contains("fn0 = u1:0"), "ir was:\n{ir}");
+        // ...and the index->VA map resolves fn0 to the callee.
+        assert_eq!(targets, vec![0x100A]);
+    }
+
+    #[test]
+    fn indirect_call_emits_call_indirect_without_target_entry() {
+        // call rax (ff d0) ; ret
+        let bytes = [0xFF, 0xD0, 0xC3];
+        let (ir, targets) = analysis_ir(&bytes, 0x1000);
+        assert!(ir.contains("call_indirect"), "ir was:\n{ir}");
+        // No statically-known callee, so no analysis_call_targets entry.
+        assert!(targets.is_empty());
     }
 }

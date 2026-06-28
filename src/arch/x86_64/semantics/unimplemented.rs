@@ -71,6 +71,28 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
+    pub(super) fn handle_cpuid(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let next_ip = instruction.next_ip();
+        let offset = next_ip.wrapping_sub(self.lift_base);
+        let image_base = self.builder.use_var(self.state.image_base);
+        let rip_after = self.builder.ins().iadd_imm(image_base, offset as i64);
+        self.sync_to_context(Some(rip_after), ExitReason::Cpuid)?;
+        self.builder.ins().return_(&[]);
+        self.block_terminated = true;
+        Ok(())
+    }
+
+    pub(super) fn handle_xgetbv(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let next_ip = instruction.next_ip();
+        let offset = next_ip.wrapping_sub(self.lift_base);
+        let image_base = self.builder.use_var(self.state.image_base);
+        let rip_after = self.builder.ins().iadd_imm(image_base, offset as i64);
+        self.sync_to_context(Some(rip_after), ExitReason::Xgetbv)?;
+        self.builder.ins().return_(&[]);
+        self.block_terminated = true;
+        Ok(())
+    }
+
     /// Helper to set a placeholder in the resume_function field.
     fn set_resume_placeholder(&mut self) -> crate::Result<()> {
         let ctx_ptr = self.builder.use_var(self.state.context_ptr);

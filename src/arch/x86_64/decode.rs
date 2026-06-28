@@ -22,6 +22,20 @@ pub fn decode_region(bytes: &[u8], ip: u64) -> Vec<Instruction> {
     instructions
 }
 
+/// Decode a single instruction at the start of `bytes` (first byte at `ip`).
+///
+/// Returns `None` only for an empty slice. A truncated or undecodable encoding
+/// yields an instruction for which [`is_invalid`] returns true.
+pub fn decode_one(bytes: &[u8], ip: u64) -> Option<Instruction> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut decoder = Decoder::with_ip(64, bytes, ip, DecoderOptions::NONE);
+    let mut instruction = Instruction::default();
+    decoder.decode_out(&mut instruction);
+    Some(instruction)
+}
+
 /// Classify an instruction's static control-flow facts for leader discovery.
 ///
 /// This intentionally reproduces the exact leader set the monolithic lifter

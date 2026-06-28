@@ -47,6 +47,16 @@ pub fn decode_region(bytes: &[u8], ip: u64) -> Vec<A64Instr> {
     out
 }
 
+/// Decode the single 4-byte instruction at the start of `bytes` (first byte at
+/// `ip`). Returns `None` if fewer than 4 bytes are available; an undecodable
+/// word yields an `A64Instr` with `valid == false`.
+pub fn decode_one(bytes: &[u8], ip: u64) -> Option<A64Instr> {
+    if bytes.len() < 4 {
+        return None;
+    }
+    decode_region(&bytes[..4], ip).into_iter().next()
+}
+
 /// Find the first PC-relative offset operand and resolve it against `ip`.
 fn branch_target(i: &A64Instr) -> Option<u64> {
     for op in &i.inst.operands {

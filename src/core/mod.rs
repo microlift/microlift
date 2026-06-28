@@ -58,6 +58,12 @@ pub trait GuestArch: Sized {
 
     // --- decode (phase 1) ---
     fn decode_region(bytes: &[u8], ip: u64) -> Vec<Self::Instr>;
+    /// Decode the single instruction at the start of `bytes`, whose first byte
+    /// is at virtual address `ip`. Returns `None` only when `bytes` is too short
+    /// to hold any instruction; invalid encodings are returned as an instruction
+    /// for which [`is_invalid`](GuestArch::is_invalid) is true. Used by
+    /// recursive-descent decoding ([`crate::cfg::decode_reachable`]).
+    fn decode_one(bytes: &[u8], ip: u64) -> Option<Self::Instr>;
     fn instr_ip(i: &Self::Instr) -> u64;
     fn instr_next_ip(i: &Self::Instr) -> u64;
     fn is_invalid(i: &Self::Instr) -> bool;
@@ -111,6 +117,19 @@ pub fn lift_to_function<A: GuestArch>(
     ip: u64,
     config: LifterConfig,
 ) -> crate::Result<Function> {
+    Ok(lift_to_function_with_call_targets::<A>(bytes, ip, config)?.0)
+}
+
+/// Like [`lift_to_function`], but also returns the analysis-mode call-target map
+/// ([`LiftEngine::analysis_call_targets`]): index `i` is the callee virtual
+/// address referenced by `ExternalName::user(ANALYSIS_CALL_NAMESPACE, i)`, i.e.
+/// the `i`-th analysis `call fnN` in the IR. The vec is empty unless
+/// `config.analysis_mode` is set (only that mode emits analysis `call`s).
+pub fn lift_to_function_with_call_targets<A: GuestArch>(
+    bytes: &[u8],
+    ip: u64,
+    config: LifterConfig,
+) -> crate::Result<(Function, Vec<u64>)> {
     let mut func = Function::with_name_signature(
         UserFuncName::user(0, 0),
         Signature::new(get_host_calling_conv()),
@@ -123,11 +142,12 @@ pub fn lift_to_function<A: GuestArch>(
 
     let mut engine = LiftEngine::<A>::with_config(builder, config);
     engine.lift(bytes, ip)?;
+    let call_targets = std::mem::take(&mut engine.analysis_call_targets);
 
     // Release the mutable borrow of `func` held by the builder/engine.
     drop(engine);
 
-    Ok(func)
+    Ok((func, call_targets))
 }
 
 /// Convert a `FunctionArgumentType` to the corresponding Cranelift IR type.
@@ -278,7 +298,20 @@ pub struct LiftEngine<'a, A: GuestArch = crate::arch::x86_64::X86_64> {
     /// Records what kind of transfer targets each unvisited (out-of-region)
     /// block, so `finish()` can emit the correct `TransferKind`.
     pub block_transfer_kinds: HashMap<Block, TransferKind>,
+    /// Analysis-mode only: callee virtual address for each analysis `call`
+    /// emitted, indexed by the external-function index used for that call
+    /// (`ExternalName::user(ANALYSIS_CALL_NAMESPACE, i)`). Indirect calls record
+    /// [`u64::MAX`] since their target is not statically known. Lets a consumer
+    /// map a printed `call fnN` back to the callee it represents.
+    pub analysis_call_targets: Vec<u64>,
+    /// Cached empty (no-arg, no-result) signature used by analysis-mode `call`s.
+    analysis_call_sig: Option<SigRef>,
 }
+
+/// Namespace used for the external functions referenced by analysis-mode
+/// `call`s. Distinct from namespace `0` (AOT imports) so the
+/// [`LiftEngine::analysis_call_targets`] index space is unambiguous.
+pub const ANALYSIS_CALL_NAMESPACE: u32 = 1;
 
 impl<'a, A: GuestArch> LiftEngine<'a, A> {
     pub fn new(builder: FunctionBuilder<'a>) -> Self {
@@ -356,7 +389,47 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             aot_imports,
             import_vas,
             block_transfer_kinds: HashMap::new(),
+            analysis_call_targets: Vec::new(),
+            analysis_call_sig: None,
         }
+    }
+
+    /// Declare (or reuse) an external function representing an analysis-mode call
+    /// to `callee_va`, returning a `FuncRef` to a no-arg/no-result function and
+    /// recording the callee in [`Self::analysis_call_targets`]. Only used when
+    /// `config.analysis_mode` is set.
+    /// The cached empty signature used by analysis-mode `call`/`call_indirect`,
+    /// created on first use.
+    pub fn analysis_call_sig(&mut self) -> SigRef {
+        match self.analysis_call_sig {
+            Some(sig) => sig,
+            None => {
+                let sig = self
+                    .builder
+                    .import_signature(Signature::new(get_host_calling_conv()));
+                self.analysis_call_sig = Some(sig);
+                sig
+            }
+        }
+    }
+
+    pub fn analysis_call_funcref(&mut self, callee_va: u64) -> FuncRef {
+        let sig = self.analysis_call_sig();
+        let index = self.analysis_call_targets.len() as u32;
+        self.analysis_call_targets.push(callee_va);
+        let user = self
+            .builder
+            .func
+            .declare_imported_user_function(UserExternalName {
+                namespace: ANALYSIS_CALL_NAMESPACE,
+                index,
+            });
+        self.builder.import_function(ExtFuncData {
+            name: ExternalName::user(user),
+            signature: sig,
+            colocated: false,
+            patchable: false,
+        })
     }
 
     /// Ordered external functions needed for AOT/JIT backends in

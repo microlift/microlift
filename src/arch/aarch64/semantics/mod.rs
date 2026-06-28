@@ -89,6 +89,7 @@ impl<'a> Lifter64<'a> {
             Opcode::CBNZ => self.handle_cb(instr, op0, false),
             Opcode::TBZ => self.handle_tb(instr, op0, op1, true),
             Opcode::TBNZ => self.handle_tb(instr, op0, op1, false),
+            Opcode::BL => self.handle_bl(instr),
             Opcode::BLR => self.handle_blr(op0),
             Opcode::RET => self.handle_ret(op0),
             Opcode::SVC => self.handle_svc(),
@@ -748,10 +749,38 @@ impl<'a> Lifter64<'a> {
         Ok(())
     }
 
+    /// `BL label`: direct call. In analysis mode this emits a real Cranelift
+    /// `call` to an external function representing the callee and falls through
+    /// (see the x86 `handle_call_analysis` for rationale). Execution-mode `BL`
+    /// is not yet implemented.
+    fn handle_bl(&mut self, instr: &A64Instr) -> crate::Result<()> {
+        if self.config.analysis_mode {
+            let target = self.branch_target(instr)?;
+            let fref = self.analysis_call_funcref(target);
+            self.builder.ins().call(fref, &[]);
+            self.block_terminated = false;
+            return Ok(());
+        }
+        Err(MicroliftError::UnsupportedInstruction { mnemonic: "bl".into() })
+    }
+
     /// `BLR Rn`: indirect call through a register. Sets the link register (X30)
     /// to the return address and exits with `IndirectCall` so the host can
     /// dispatch the runtime-resolved callee. See [`ExitReason::IndirectCall`].
     fn handle_blr(&mut self, op0: Operand) -> crate::Result<()> {
+        if self.config.analysis_mode {
+            // Indirect call: emit `call_indirect` on the runtime target and fall
+            // through; no statically-known callee to record.
+            let target_reg = match op0 {
+                Operand::Register(_, n) => n,
+                _ => return Err(Self::bad_operand("blr", op0)),
+            };
+            let target = self.read_reg_val(target_reg, false, types::I64);
+            let sig = self.analysis_call_sig();
+            self.builder.ins().call_indirect(sig, target, &[]);
+            self.block_terminated = false;
+            return Ok(());
+        }
         let target_reg = match op0 {
             Operand::Register(_, n) => n,
             _ => return Err(Self::bad_operand("blr", op0)),

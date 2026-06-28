@@ -22,6 +22,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// How control reaches a successor block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum EdgeKind {
     /// Execution falls through to the next instruction (no taken transfer, or
     /// the not-taken edge of a conditional branch).
@@ -34,12 +35,24 @@ pub enum EdgeKind {
     Call,
 }
 
+impl std::fmt::Display for EdgeKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            EdgeKind::Fallthrough => "fallthrough",
+            EdgeKind::Branch => "branch",
+            EdgeKind::CondBranch => "cond-branch",
+            EdgeKind::Call => "call",
+        })
+    }
+}
+
 /// A directed edge between two block start addresses.
 ///
 /// `to` may point outside the analyzed region (e.g. a branch or call leaving the
 /// region); such targets have no corresponding [`BasicBlock`]. Use
 /// [`Cfg::block_at`] to check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Edge {
     pub from: u64,
     pub to: u64,
@@ -48,6 +61,7 @@ pub struct Edge {
 
 /// A maximal straight-line run of instructions with a single entry.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct BasicBlock {
     /// Virtual address of the first instruction.
     pub start: u64,
@@ -77,6 +91,7 @@ impl BasicBlock {
 
 /// A control-flow graph over a region of guest code.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Cfg {
     /// Virtual address the region was decoded at.
     pub base: u64,
@@ -258,6 +273,122 @@ pub fn discover_cfg<A: GuestArch>(bytes: &[u8], base: u64) -> Cfg {
     Cfg { base, end, blocks, edges }
 }
 
+/// Recursive-descent decode: starting from `entries`, decode only the
+/// instructions reachable by following static control flow, and return them
+/// sorted by address.
+///
+/// Pass `&[base]` to start at the region entry. Unlike the linear sweep used by
+/// [`discover_cfg`] and `decode_region`, this never decodes embedded data (jump
+/// tables, literal pools, inter-function padding) as code - at the cost of
+/// missing code reachable only through indirect transfers, whose targets are
+/// not statically known. In-region direct `CALL`/`JMP`/branch targets *are*
+/// followed, so callees within the region are discovered.
+///
+/// Each address is decoded at most once. Out-of-range entries and targets are
+/// ignored. Invalid encodings are retained (so a genuine bad byte is visible)
+/// but not followed.
+pub fn decode_reachable<A: GuestArch>(bytes: &[u8], base: u64, entries: &[u64]) -> Vec<A::Instr> {
+    let end = base + bytes.len() as u64;
+    let mut decoded: BTreeMap<u64, A::Instr> = BTreeMap::new();
+    let mut seen: BTreeSet<u64> = BTreeSet::new();
+    let mut work: Vec<u64> = entries.to_vec();
+
+    while let Some(addr) = work.pop() {
+        if addr < base || addr >= end {
+            continue;
+        }
+        if !seen.insert(addr) {
+            continue;
+        }
+        let off = (addr - base) as usize;
+        let Some(inst) = A::decode_one(&bytes[off..], addr) else {
+            continue;
+        };
+
+        if A::is_invalid(&inst) {
+            // Retain the faulting instruction but do not follow past it.
+            decoded.insert(addr, inst);
+            continue;
+        }
+
+        let next = A::instr_next_ip(&inst);
+        let cf = A::control_flow(&inst);
+        decoded.insert(addr, inst);
+
+        match cf.kind {
+            ControlFlowKind::Fallthrough => work.push(next),
+            ControlFlowKind::CondBranch => {
+                work.extend(cf.static_targets.iter().copied());
+                work.push(next);
+            }
+            ControlFlowKind::DirectBranch => {
+                work.extend(cf.static_targets.iter().copied());
+            }
+            ControlFlowKind::Call { static_target } => {
+                if let Some(t) = static_target {
+                    work.push(t);
+                }
+                // A call returns to the following instruction.
+                work.push(next);
+            }
+            ControlFlowKind::Ret
+            | ControlFlowKind::IndirectBranch
+            | ControlFlowKind::Invalid => {}
+        }
+    }
+
+    decoded.into_values().collect()
+}
+
+/// Statically-resolved control-transfer destinations harvested from a region.
+///
+/// These are the targets that fall out of decode alone - direct `CALL`/`JMP`
+/// and conditional-branch destinations - with no value analysis. Indirect
+/// transfers (through a register or memory operand) contribute nothing here.
+///
+/// Targets may point *outside* the scanned region (a call into another
+/// function/section is common); callers that only care about in-region targets
+/// should filter with their own bounds (or [`Cfg::in_region`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Targets {
+    /// Destinations of direct `CALL` instructions - i.e. likely function
+    /// starts. Sorted and de-duplicated.
+    pub calls: BTreeSet<u64>,
+    /// Destinations of direct unconditional/conditional branches. Sorted and
+    /// de-duplicated.
+    pub branches: BTreeSet<u64>,
+}
+
+/// Collect every statically-known call and branch destination in a region.
+///
+/// This is the function-start-discovery primitive: a linear sweep that
+/// classifies each instruction's control flow and accumulates the resolved
+/// direct-`CALL` targets (almost always function entries) and direct-branch
+/// targets. It reuses the same [`GuestArch`] decode + control-flow
+/// classification as [`discover_cfg`], so an analysis framework no longer has to
+/// re-implement the sweep just to harvest call targets.
+///
+/// Indirect calls/branches are invisible to this pass (their targets are not
+/// statically known); resolving those is the job of value-set analysis
+/// ([`crate::vsa`]).
+pub fn static_targets<A: GuestArch>(bytes: &[u8], base: u64) -> Targets {
+    let mut targets = Targets::default();
+    for instr in A::decode_region(bytes, base) {
+        let cf = A::control_flow(&instr);
+        match cf.kind {
+            ControlFlowKind::Call { static_target: Some(t) } => {
+                targets.calls.insert(t);
+            }
+            ControlFlowKind::DirectBranch | ControlFlowKind::CondBranch => {
+                targets.branches.extend(cf.static_targets.iter().copied());
+            }
+            _ => {}
+        }
+    }
+    targets
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,6 +406,26 @@ mod tests {
         assert_eq!(b.instruction_count, 2);
         assert!(matches!(b.terminator, ControlFlowKind::Ret));
         assert!(cfg.edges.is_empty());
+    }
+
+    #[test]
+    fn recursive_descent_skips_embedded_data() {
+        // jmp +3 (over 2 data bytes); .byte 0xC3 padding x2 that must NOT be
+        // decoded as code; mov eax, 1; ret
+        //   EB 02            @1000  jmp 0x1004
+        //   FF FF            @1002  <- garbage data, unreachable
+        //   B8 01 00 00 00   @1004  mov eax, 1
+        //   C3               @1009  ret
+        let bytes = [0xEB, 0x02, 0xFF, 0xFF, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3];
+
+        let reachable = decode_reachable::<X86_64>(&bytes, 0x1000, &[0x1000]);
+        let addrs: Vec<u64> = reachable.iter().map(X86_64::instr_ip).collect();
+        // The jmp, the mov, and the ret are reachable; the 0xFFFF data is not.
+        assert_eq!(addrs, vec![0x1000, 0x1004, 0x1009]);
+
+        // Linear sweep, by contrast, decodes the data bytes too.
+        let linear = X86_64::decode_region(&bytes, 0x1000);
+        assert!(linear.len() > reachable.len());
     }
 
     #[test]
@@ -304,5 +455,35 @@ mod tests {
         // Fallthrough block 0x1007..0x100D ends in ret.
         let ft = cfg.block_at(0x1007).unwrap();
         assert!(matches!(ft.terminator, ControlFlowKind::Ret));
+    }
+
+    #[test]
+    fn static_targets_harvests_call_and_branch_destinations() {
+        // call rel32 +5 (-> 0x100A) ; jmp rel8 +2 (-> 0x1009) ; ret ; ret
+        //   E8 05 00 00 00   @1000  call 0x100A
+        //   EB 02            @1005  jmp 0x1009
+        //   CC               @1007  int3 (filler, in the skipped gap)
+        //   CC               @1008  int3
+        //   C3               @1009  ret
+        //   C3               @100A  ret  (the call target / function start)
+        let bytes = [
+            0xE8, 0x05, 0x00, 0x00, 0x00, 0xEB, 0x02, 0xCC, 0xCC, 0xC3, 0xC3,
+        ];
+        let t = static_targets::<X86_64>(&bytes, 0x1000);
+        assert!(t.calls.contains(&0x100A));
+        assert!(t.branches.contains(&0x1009));
+        // Indirect / non-transfer instructions contribute nothing.
+        assert_eq!(t.calls.len(), 1);
+    }
+
+    #[test]
+    fn static_targets_ignores_indirect_calls() {
+        // call rax  -> indirect, no static target
+        //   FF D0            @1000  call rax
+        //   C3               @1002  ret
+        let bytes = [0xFF, 0xD0, 0xC3];
+        let t = static_targets::<X86_64>(&bytes, 0x1000);
+        assert!(t.calls.is_empty());
+        assert!(t.branches.is_empty());
     }
 }
