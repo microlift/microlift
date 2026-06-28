@@ -90,6 +90,18 @@ pub enum ExitReason {
     /// holds the XCR index. The runtime should populate `rax` (bits 31:0) and
     /// `rdx` (bits 63:32) with the value of XCR[rcx] and re-enter at the PC.
     Xgetbv = 11,
+
+    /// A software interrupt was raised by `INT imm8`, `INT1`/`ICEBP`, or `INTO`
+    /// (the latter only when `OF=1`). The interrupt vector is stored in
+    /// `ControlHeader::exit_code` (e.g. `0x80` for `INT 0x80`, `1` for `INT1`,
+    /// `4` for a taken `INTO`). The PC points to the instruction *after* the
+    /// `INT`, matching the return address a real CPU would push: the host
+    /// services the vector and re-enters the guest at the PC to resume.
+    ///
+    /// Note that `INT3` (the dedicated `0xCC` breakpoint opcode) reports
+    /// [`ExitReason::Breakpoint`] instead, so debuggers can distinguish it from
+    /// a general software interrupt.
+    Interrupt = 12,
 }
 
 impl TryFrom<u32> for ExitReason {
@@ -120,6 +132,8 @@ impl TryFrom<u32> for ExitReason {
             Ok(Self::Cpuid)
         } else if value == Self::Xgetbv as u32 {
             Ok(Self::Xgetbv)
+        } else if value == Self::Interrupt as u32 {
+            Ok(Self::Interrupt)
         } else {
             Err(())
         }
@@ -141,6 +155,7 @@ impl std::fmt::Display for ExitReason {
             ExitReason::Breakpoint => "breakpoint",
             ExitReason::Cpuid => "cpuid",
             ExitReason::Xgetbv => "xgetbv",
+            ExitReason::Interrupt => "interrupt",
         })
     }
 }
@@ -252,7 +267,7 @@ mod tests {
     fn exit_reason_display_and_roundtrip() {
         assert_eq!(ExitReason::ImportedFunctionCall.to_string(), "imported-function-call");
         // try_from is the inverse of the discriminant.
-        for r in [ExitReason::None, ExitReason::Return, ExitReason::IndirectCall, ExitReason::Xgetbv] {
+        for r in [ExitReason::None, ExitReason::Return, ExitReason::IndirectCall, ExitReason::Xgetbv, ExitReason::Interrupt] {
             assert_eq!(ExitReason::try_from(r as u32), Ok(r));
             assert!(!r.to_string().is_empty());
         }

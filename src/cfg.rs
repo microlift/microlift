@@ -17,6 +17,7 @@
 //! is future work.
 
 use crate::arch::{ControlFlow, ControlFlowKind};
+use crate::context::MemorySegment;
 use crate::core::GuestArch;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -387,6 +388,55 @@ pub fn static_targets<A: GuestArch>(bytes: &[u8], base: u64) -> Targets {
         }
     }
     targets
+}
+
+/// Indirect control-transfer targets recovered by value-set analysis ([`crate::vsa`]),
+/// keyed by the address of the indirect `JMP`/`CALL` they were resolved at.
+///
+/// Where [`static_targets`] sees only direct transfers, this resolves the ones
+/// that go through a register or memory operand - jump tables, vtable/function-
+/// pointer calls, import thunks - to the extent VSA can narrow them to a finite
+/// set. Architectures without a value-set analyzer (everything but x86-64 today)
+/// yield an empty result.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ResolvedTargets {
+    /// Resolved indirect-`JMP` destinations, per jump IP.
+    pub jumps: BTreeMap<u64, Vec<u64>>,
+    /// Resolved indirect-`CALL` destinations, per call IP - i.e. likely function
+    /// starts reached through a pointer.
+    pub calls: BTreeMap<u64, Vec<u64>>,
+}
+
+impl ResolvedTargets {
+    /// Whether nothing was resolved.
+    pub fn is_empty(&self) -> bool {
+        self.jumps.is_empty() && self.calls.is_empty()
+    }
+
+    /// Flatten the per-IP maps into the same set-shaped [`Targets`] that
+    /// [`static_targets`] produces: the union of all resolved call destinations
+    /// (`calls`) and all resolved jump destinations (`branches`).
+    pub fn flatten(&self) -> Targets {
+        Targets {
+            calls: self.calls.values().flatten().copied().collect(),
+            branches: self.jumps.values().flatten().copied().collect(),
+        }
+    }
+}
+
+/// Resolve indirect `JMP`/`CALL` targets within a region via value-set analysis.
+///
+/// `base` is the virtual address the first byte maps to. `segments` supplies
+/// extra read-only memory (e.g. a binary's `.rodata`/import sections) so reads
+/// that leave the scanned region can still resolve; the region itself is always
+/// available. Pass `&[]` to analyze the region alone.
+pub fn resolved_indirect_targets<A: GuestArch>(
+    bytes: &[u8],
+    base: u64,
+    segments: &[MemorySegment],
+) -> ResolvedTargets {
+    A::resolved_indirect_targets(bytes, base, segments)
 }
 
 #[cfg(test)]

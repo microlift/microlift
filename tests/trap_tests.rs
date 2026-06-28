@@ -223,3 +223,64 @@ fn test_int3_resume_by_advancing_rip() {
 fn test_ud2_and_int3_exit_reasons_are_distinct() {
     assert_ne!(ExitReason::Ud2 as u32, ExitReason::Breakpoint as u32);
 }
+
+/// `INT imm8` must exit with `ExitReason::Interrupt`, report the vector in
+/// `exit_code`, and point RIP *past* the instruction (the resume point).
+#[test]
+fn test_int_imm8_exit_reason_and_vector() {
+    #[rustfmt::skip]
+    let bytes = [
+        0xCD, 0x80, // int 0x80  @ 0x1000 (2 bytes)
+    ];
+    let ctx = compile_and_run(&bytes, RegisterContext::default());
+    assert_eq!(ctx.exit_reason, ExitReason::Interrupt as u32);
+    assert_eq!(ctx.exit_code, 0x80, "exit_code should hold the interrupt vector");
+    assert_eq!(ctx.rip, 0x1002, "rip should point past the int instruction");
+}
+
+/// Side-effects before `INT imm8` must be visible on exit.
+#[test]
+fn test_int_imm8_state_synced_on_exit() {
+    #[rustfmt::skip]
+    let bytes = [
+        0x48, 0xC7, 0xC0, 0x2A, 0x00, 0x00, 0x00, // mov rax, 42  @ 0x1000
+        0xCD, 0x2A,                                // int 0x2A      @ 0x1007
+    ];
+    let ctx = compile_and_run(&bytes, RegisterContext::default());
+    assert_eq!(ctx.exit_reason, ExitReason::Interrupt as u32);
+    assert_eq!(ctx.exit_code, 0x2A);
+    assert_eq!(ctx.rax, 42);
+    assert_eq!(ctx.rip, 0x1009, "rip should point past the int instruction");
+}
+
+/// `INT1`/`ICEBP` (`0xF1`) must raise vector 1 via `ExitReason::Interrupt`.
+#[test]
+fn test_int1_exit_reason_and_vector() {
+    #[rustfmt::skip]
+    let bytes = [
+        0xF1, // int1 / icebp  @ 0x1000 (1 byte)
+    ];
+    let ctx = compile_and_run(&bytes, RegisterContext::default());
+    assert_eq!(ctx.exit_reason, ExitReason::Interrupt as u32);
+    assert_eq!(ctx.exit_code, 1, "int1 raises the debug-exception vector");
+    assert_eq!(ctx.rip, 0x1001, "rip should point past the int1 byte");
+}
+
+/// `INTO` (`0xCE`) does not exist in 64-bit mode - the decoder rejects it as an
+/// invalid instruction rather than treating it as a software interrupt.
+#[test]
+fn test_into_is_invalid_in_64bit() {
+    #[rustfmt::skip]
+    let bytes = [
+        0xCE, // into (invalid in long mode)  @ 0x1000
+    ];
+    let ctx = compile_and_run(&bytes, RegisterContext::default());
+    assert_eq!(ctx.exit_reason, ExitReason::InvalidInstruction as u32);
+}
+
+/// `INT3`, `INT imm8`, and `INT1` must all be distinguishable: the dedicated
+/// breakpoint opcode reports `Breakpoint`, the rest report `Interrupt`.
+#[test]
+fn test_int_family_exit_reasons_are_distinct() {
+    assert_ne!(ExitReason::Breakpoint as u32, ExitReason::Interrupt as u32);
+}

@@ -955,3 +955,83 @@ fn test_two_paths_with_different_constants_join_to_multiple() {
     let targets = vsa.indirect_jump_targets(&insts[0]).unwrap();
     assert_eq!(targets, vec![0x1000u64, 0x2000]);
 }
+
+#[test]
+fn test_indirect_call_register_resolves() {
+    // mov rax, 0x3000 ; call rax  ->  call resolves to 0x3000.
+    let bytes = [
+        0x48u8, 0xC7, 0xC0, 0x00, 0x30, 0x00, 0x00, // mov rax, 0x3000  (ip 0x1000)
+        0xFF, 0xD0, // call rax  (ip 0x1007)
+    ];
+    let insts = decode_at(&bytes, 0x1000);
+    let mut vsa = ValueSetAnalyzer::new();
+    vsa.analyze(&insts);
+    // The legacy jump-only helper must reject a CALL...
+    assert!(vsa.indirect_jump_targets(&insts[1]).is_none());
+    // ...but the general resolver handles it.
+    assert_eq!(vsa.indirect_targets(&insts[1]), Some(vec![0x3000u64]));
+}
+
+#[test]
+fn test_indirect_call_through_memory_pointer_resolves() {
+    // call qword [0x2000]  where 0x2000 (rodata) holds the pointer 0x4000.
+    // FF 14 25 00 20 00 00 = call qword [0x2000]
+    let bytes = [0xFFu8, 0x14, 0x25, 0x00, 0x20, 0x00, 0x00];
+    let insts = decode_at(&bytes, 0x1000);
+    let data = 0x4000u64.to_le_bytes().to_vec();
+    let seg = MemorySegment::new(0x2000, data, false);
+    let mut vsa = ValueSetAnalyzer::with_segments(vec![seg]);
+    vsa.analyze(&insts);
+    assert_eq!(vsa.indirect_targets(&insts[0]), Some(vec![0x4000u64]));
+}
+
+#[test]
+fn test_call_clobbers_caller_saved_registers() {
+    // mov rax, 0x3000 ; call rax ; jmp rax
+    // The call clobbers rax, so the trailing jmp must NOT resolve to 0x3000.
+    let bytes = [
+        0x48u8, 0xC7, 0xC0, 0x00, 0x30, 0x00, 0x00, // mov rax, 0x3000  (ip 0x1000)
+        0xFF, 0xD0, // call rax  (ip 0x1007)
+        0xFF, 0xE0, // jmp rax   (ip 0x1009)
+    ];
+    let insts = decode_at(&bytes, 0x1000);
+    let mut vsa = ValueSetAnalyzer::new();
+    vsa.analyze(&insts);
+    // The call itself still resolves (uses the pre-call state).
+    assert_eq!(vsa.indirect_targets(&insts[1]), Some(vec![0x3000u64]));
+    // The jmp does not - rax is volatile across the call.
+    assert!(vsa.indirect_targets(&insts[2]).is_none());
+}
+
+#[test]
+fn test_resolved_indirect_targets_collects_calls_and_jumps() {
+    use microlift::arch::x86_64::X86_64;
+    use microlift::cfg::resolved_indirect_targets;
+
+    // mov rax, 0x3000 ; call rax ; mov rcx, 0x4000 ; jmp rcx
+    let bytes = [
+        0x48u8, 0xC7, 0xC0, 0x00, 0x30, 0x00, 0x00, // mov rax, 0x3000  (ip 0x1000)
+        0xFF, 0xD0, // call rax  (ip 0x1007)
+        0x48, 0xC7, 0xC1, 0x00, 0x40, 0x00, 0x00, // mov rcx, 0x4000  (ip 0x1009)
+        0xFF, 0xE1, // jmp rcx   (ip 0x1010)
+    ];
+    let resolved = resolved_indirect_targets::<X86_64>(&bytes, 0x1000, &[]);
+    assert_eq!(resolved.calls.get(&0x1007), Some(&vec![0x3000u64]));
+    assert_eq!(resolved.jumps.get(&0x1010), Some(&vec![0x4000u64]));
+
+    // Flatten merges call/jump destinations into the static-style sets.
+    let flat = resolved.flatten();
+    assert!(flat.calls.contains(&0x3000));
+    assert!(flat.branches.contains(&0x4000));
+}
+
+#[test]
+fn test_resolved_indirect_targets_empty_when_unresolvable() {
+    use microlift::arch::x86_64::X86_64;
+    use microlift::cfg::resolved_indirect_targets;
+
+    // call rax with rax unknown on entry -> nothing resolves.
+    let bytes = [0xFFu8, 0xD0, 0xC3]; // call rax ; ret
+    let resolved = resolved_indirect_targets::<X86_64>(&bytes, 0x1000, &[]);
+    assert!(resolved.is_empty());
+}

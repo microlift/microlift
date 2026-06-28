@@ -19,9 +19,25 @@
 //!            Empty   (unreachable)
 //! ```
 
+use crate::cfg::ResolvedTargets;
 use crate::context::MemorySegment;
-use iced_x86::{Instruction, MemorySize, Mnemonic, OpKind, Register};
+use iced_x86::{Decoder, DecoderOptions, Instruction, MemorySize, Mnemonic, OpKind, Register};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+
+/// Caller-saved (volatile) general-purpose registers. The union of the System V
+/// and Windows x64 volatile sets, so clobbering all of them across a `CALL` is
+/// sound under either ABI.
+const CALLER_SAVED: &[Register] = &[
+    Register::RAX,
+    Register::RCX,
+    Register::RDX,
+    Register::RSI,
+    Register::RDI,
+    Register::R8,
+    Register::R9,
+    Register::R10,
+    Register::R11,
+];
 
 // Value Set lattice
 
@@ -417,6 +433,14 @@ impl ValueSetAnalyzer {
                     }
                 }
             }
+            Mnemonic::Call => {
+                // A call clobbers the ABI's caller-saved registers. Invalidate
+                // the volatile set so a stale pre-call value can't leak into a
+                // later indirect-target resolution.
+                for &reg in CALLER_SAVED {
+                    out.set(reg, ValueSet::Top);
+                }
+            }
             // For all other instructions, kill any written destination
             _ => {
                 if inst.op0_kind() == OpKind::Register {
@@ -507,8 +531,8 @@ impl ValueSetAnalyzer {
                         let size = match inst.memory_size() {
                             MemorySize::UInt8 | MemorySize::Int8 => 1,
                             MemorySize::UInt16 | MemorySize::Int16 => 2,
-                            MemorySize::UInt32 | MemorySize::Int32 => 4,
-                            MemorySize::UInt64 | MemorySize::Int64 => 8,
+                            MemorySize::UInt32 | MemorySize::Int32 | MemorySize::DwordOffset => 4,
+                            MemorySize::UInt64 | MemorySize::Int64 | MemorySize::QwordOffset => 8,
                             _ => return ValueSet::Top,
                         };
 
@@ -565,24 +589,101 @@ impl ValueSetAnalyzer {
         }
     }
 
-    /// Given an indirect-jump instruction (`JMP reg` or `JMP [mem]`), return the
-    /// set of possible target addresses if it can be resolved, or `None` if not.
+    /// Given an indirect-jump instruction (`JMP reg`), return the set of possible
+    /// target addresses if it can be resolved, or `None` if not.
+    ///
+    /// Retained for backward compatibility; [`Self::indirect_targets`] is the
+    /// general form (it also resolves `JMP [mem]` and indirect `CALL`).
     pub fn indirect_jump_targets(&self, instruction: &Instruction) -> Option<Vec<u64>> {
         if instruction.mnemonic() != Mnemonic::Jmp {
             return None;
         }
         if instruction.op0_kind() != OpKind::Register {
-            return None; // Memory indirect - not handled yet
+            return None; // Memory indirect - use `indirect_targets`.
         }
-        let reg = instruction.op0_register();
+        self.indirect_targets(instruction)
+    }
+
+    /// Resolve the possible targets of an indirect `JMP`/`CALL` whose operand is
+    /// a register (`JMP rax`, `CALL rax`) or a memory reference (`JMP [mem]`,
+    /// `CALL [rip+off]`). Returns `None` for direct transfers, non-transfer
+    /// instructions, or when the target cannot be narrowed to a finite set.
+    ///
+    /// For a memory operand the resolved value is the *contents* of the pointed-to
+    /// location (read from a non-writable [`MemorySegment`]); for a register
+    /// operand it is the register's value set at the transfer.
+    pub fn indirect_targets(&self, instruction: &Instruction) -> Option<Vec<u64>> {
+        match instruction.mnemonic() {
+            Mnemonic::Jmp | Mnemonic::Call => {}
+            _ => return None,
+        }
         let pre_state = self.value_sets.get(&instruction.ip())?;
-        let vs = pre_state.get(reg);
-        if vs.is_resolvable() {
-            Some(vs.targets())
-        } else {
-            None
+        let vs = match instruction.op0_kind() {
+            OpKind::Register => pre_state.get(instruction.op0_register()),
+            OpKind::Memory => self.eval_operand(pre_state, instruction, 0),
+            // Anything else (a near-branch immediate) is a *direct* transfer.
+            _ => return None,
+        };
+        vs.is_resolvable().then(|| vs.targets())
+    }
+}
+
+/// Whether `inst` transfers control through a register or memory operand (an
+/// *indirect* `JMP`/`CALL`), as opposed to a direct near-branch immediate.
+fn is_indirect_transfer(inst: &Instruction) -> bool {
+    matches!(inst.op0_kind(), OpKind::Register | OpKind::Memory)
+}
+
+/// Run VSA over a region of raw x86-64 code (mapped at `base`) and resolve the
+/// targets of every indirect `JMP`/`CALL` it contains.
+///
+/// This is the region-level convenience behind
+/// [`crate::cfg::resolved_indirect_targets`]: it linearly decodes `bytes`,
+/// exposes the region itself as a read-only segment (so in-region jump tables and
+/// RIP-relative constant loads resolve), and additionally consults any
+/// caller-supplied `segments` (e.g. a binary's `.rodata`/import sections) for
+/// reads that leave the region.
+pub fn resolved_indirect_targets(
+    bytes: &[u8],
+    base: u64,
+    segments: &[MemorySegment],
+) -> ResolvedTargets {
+    let mut decoder = Decoder::with_ip(64, bytes, base, DecoderOptions::NONE);
+    let mut instructions = Vec::new();
+    while decoder.can_decode() {
+        instructions.push(decoder.decode());
+    }
+
+    // The region is itself readable, non-writable backing store.
+    let mut all_segments = Vec::with_capacity(segments.len() + 1);
+    all_segments.push(MemorySegment::new(base, bytes.to_vec(), false));
+    all_segments.extend(segments.iter().cloned());
+
+    let mut vsa = ValueSetAnalyzer::with_segments(all_segments);
+    vsa.analyze(&instructions);
+
+    let mut out = ResolvedTargets::default();
+    for inst in &instructions {
+        if !is_indirect_transfer(inst) {
+            continue;
+        }
+        let Some(targets) = vsa.indirect_targets(inst) else {
+            continue;
+        };
+        if targets.is_empty() {
+            continue;
+        }
+        match inst.mnemonic() {
+            Mnemonic::Jmp => {
+                out.jumps.insert(inst.ip(), targets);
+            }
+            Mnemonic::Call => {
+                out.calls.insert(inst.ip(), targets);
+            }
+            _ => {}
         }
     }
+    out
 }
 
 impl Default for ValueSetAnalyzer {

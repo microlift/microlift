@@ -79,6 +79,21 @@ pub trait GuestArch: Sized {
         None
     }
 
+    /// Resolve indirect `JMP`/`CALL` targets in the region `bytes` (mapped at
+    /// `base`) via value-set analysis, consulting `segments` for memory reads
+    /// that leave the region.
+    ///
+    /// Defaults to an empty result; guest frontends override it where a value-set
+    /// analyzer exists (x86-64 does, via [`crate::vsa`]). Surfaced through
+    /// [`crate::cfg::resolved_indirect_targets`].
+    fn resolved_indirect_targets(
+        _bytes: &[u8],
+        _base: u64,
+        _segments: &[crate::context::MemorySegment],
+    ) -> crate::cfg::ResolvedTargets {
+        crate::cfg::ResolvedTargets::default()
+    }
+
     // --- per-instruction lift + state sync (delegate to inherent methods) ---
     fn lift_instruction(lifter: &mut LiftEngine<'_, Self>, i: &Self::Instr) -> crate::Result<()>;
     fn load_state_from_context(lifter: &mut LiftEngine<'_, Self>) -> crate::Result<()>;

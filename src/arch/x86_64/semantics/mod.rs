@@ -210,6 +210,8 @@ impl<'a> Lifter<'a> {
             // Traps / faults
             Mnemonic::Ud2 => self.handle_ud2(instruction),
             Mnemonic::Int3 => self.handle_int3(instruction),
+            Mnemonic::Int => self.handle_int(instruction),
+            Mnemonic::Int1 => self.handle_int1(instruction),
 
             // System
             Mnemonic::Syscall => self.handle_syscall(instruction),

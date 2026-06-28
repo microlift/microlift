@@ -71,6 +71,48 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
+    /// Compute the absolute address of the instruction *following* `instruction`
+    /// as a Cranelift value (`image_base + region offset`). This is the resume
+    /// point a software interrupt would push as its return address.
+    fn rip_after(&mut self, instruction: &Instruction) -> Value {
+        let next_ip = instruction.next_ip();
+        let offset = next_ip.wrapping_sub(self.lift_base);
+        let image_base = self.builder.use_var(self.state.image_base);
+        self.builder.ins().iadd_imm(image_base, offset as i64)
+    }
+
+    /// Emit an `Interrupt` VM exit for vector `vector`, syncing guest state and
+    /// pointing RIP at the instruction after `instruction` (the resume point).
+    fn emit_interrupt_exit(
+        &mut self,
+        instruction: &Instruction,
+        vector: u32,
+    ) -> crate::Result<()> {
+        let rip_after = self.rip_after(instruction);
+        self.sync_to_context(Some(rip_after), ExitReason::Interrupt)?;
+        self.write_exit_code(vector);
+        self.builder.ins().return_(&[]);
+        self.block_terminated = true;
+        Ok(())
+    }
+
+    /// Handle `INT imm8` - raise a software interrupt for the immediate vector.
+    /// The vector is reported in `exit_code`; RIP points past the `INT` so the
+    /// host can service the vector and resume.
+    pub(super) fn handle_int(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let vector = instruction.immediate8() as u32;
+        self.emit_interrupt_exit(instruction, vector)
+    }
+
+    /// Handle `INT1`/`ICEBP` (`0xF1`) - raise the debug-exception vector (1).
+    ///
+    /// (`INTO`, the legacy `0xCE` overflow trap, is intentionally not handled:
+    /// it is not a valid instruction in 64-bit mode and the decoder rejects it
+    /// as `InvalidInstruction`.)
+    pub(super) fn handle_int1(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.emit_interrupt_exit(instruction, 1)
+    }
+
     pub(super) fn handle_cpuid(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let next_ip = instruction.next_ip();
         let offset = next_ip.wrapping_sub(self.lift_base);

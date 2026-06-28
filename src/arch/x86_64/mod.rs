@@ -80,6 +80,14 @@ impl GuestArch for X86_64 {
         Some(decode::instruction_effects(i))
     }
 
+    fn resolved_indirect_targets(
+        bytes: &[u8],
+        base: u64,
+        segments: &[crate::context::MemorySegment],
+    ) -> crate::cfg::ResolvedTargets {
+        crate::vsa::resolved_indirect_targets(bytes, base, segments)
+    }
+
     fn lift_instruction(lifter: &mut LiftEngine<'_, Self>, i: &Self::Instr) -> crate::Result<()> {
         lifter.handle_instruction(i)
     }
