@@ -102,6 +102,26 @@ pub enum ExitReason {
     /// [`ExitReason::Breakpoint`] instead, so debuggers can distinguish it from
     /// a general software interrupt.
     Interrupt = 12,
+
+    /// An I/O port *input* string instruction (`INSB`/`INSW`/`INSD`) was
+    /// executed. Port I/O cannot be performed from the lifted code, so this is
+    /// a VM exit and the host must emulate the access in full. The PC points
+    /// *at* the instruction; `exit_code` holds the element size in bytes (1, 2,
+    /// or 4). The source port number is in `DX`, the destination is `ES:[RDI]`,
+    /// and the host must honour `DF` (and `RCX` when the instruction carried a
+    /// `REP` prefix) when advancing `RDI`/`RCX`. After servicing the access the
+    /// host advances the PC past the instruction and re-enters the guest.
+    PortInput = 13,
+
+    /// An I/O port *output* string instruction (`OUTSB`/`OUTSW`/`OUTSD`) was
+    /// executed. As with [`ExitReason::PortInput`], port I/O cannot be performed
+    /// from the lifted code, so the host must emulate the access in full. The PC
+    /// points *at* the instruction; `exit_code` holds the element size in bytes
+    /// (1, 2, or 4). The destination port number is in `DX`, the source is
+    /// `DS:[RSI]`, and the host must honour `DF` (and `RCX` when the instruction
+    /// carried a `REP` prefix) when advancing `RSI`/`RCX`. After servicing the
+    /// access the host advances the PC past the instruction and re-enters.
+    PortOutput = 14,
 }
 
 impl TryFrom<u32> for ExitReason {
@@ -134,6 +154,10 @@ impl TryFrom<u32> for ExitReason {
             Ok(Self::Xgetbv)
         } else if value == Self::Interrupt as u32 {
             Ok(Self::Interrupt)
+        } else if value == Self::PortInput as u32 {
+            Ok(Self::PortInput)
+        } else if value == Self::PortOutput as u32 {
+            Ok(Self::PortOutput)
         } else {
             Err(())
         }
@@ -156,6 +180,8 @@ impl std::fmt::Display for ExitReason {
             ExitReason::Cpuid => "cpuid",
             ExitReason::Xgetbv => "xgetbv",
             ExitReason::Interrupt => "interrupt",
+            ExitReason::PortInput => "port-input",
+            ExitReason::PortOutput => "port-output",
         })
     }
 }
@@ -267,7 +293,7 @@ mod tests {
     fn exit_reason_display_and_roundtrip() {
         assert_eq!(ExitReason::ImportedFunctionCall.to_string(), "imported-function-call");
         // try_from is the inverse of the discriminant.
-        for r in [ExitReason::None, ExitReason::Return, ExitReason::IndirectCall, ExitReason::Xgetbv, ExitReason::Interrupt] {
+        for r in [ExitReason::None, ExitReason::Return, ExitReason::IndirectCall, ExitReason::Xgetbv, ExitReason::Interrupt, ExitReason::PortInput, ExitReason::PortOutput] {
             assert_eq!(ExitReason::try_from(r as u32), Ok(r));
             assert!(!r.to_string().is_empty());
         }

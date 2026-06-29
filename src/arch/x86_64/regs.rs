@@ -17,6 +17,8 @@ pub enum X86Flag {
     Zero,
     Sign,
     Overflow,
+    /// Direction flag - controls string-operation pointer direction.
+    Direction,
 }
 
 /// Mapping of x86 registers to Cranelift variables, plus dirty-bit tracking.
@@ -83,6 +85,7 @@ impl RegisterState {
             X86Flag::Zero,
             X86Flag::Sign,
             X86Flag::Overflow,
+            X86Flag::Direction,
         ];
 
         for &flag in &flag_types {
@@ -164,6 +167,7 @@ impl RegisterState {
             X86Flag::Zero => Ok(std::mem::offset_of!(RegisterContext, zf) as i32),
             X86Flag::Sign => Ok(std::mem::offset_of!(RegisterContext, sf) as i32),
             X86Flag::Overflow => Ok(std::mem::offset_of!(RegisterContext, of) as i32),
+            X86Flag::Direction => Ok(std::mem::offset_of!(RegisterContext, df) as i32),
         }
     }
 

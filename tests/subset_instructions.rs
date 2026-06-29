@@ -80,6 +80,132 @@ fn test_shifts_rotates() {
 }
 
 #[test]
+fn test_rcr() {
+    // RCR rax, 1 with rax=1, CF=0:
+    // the 65-bit value CF:rax = 0:...0001 rotated right by 1 puts the LSB into
+    // CF and the old CF into bit 63 -> rax=0, CF=1.
+    let bytes = [
+        0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00, // mov rax, 1
+        0x48, 0xD1, 0xD8, // rcr rax, 1
+        0xC3, // ret
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rax, 0);
+    assert_eq!(ctx.cf, 1);
+
+    // RCR rax, 1 with rax=0, CF=1: the carry rotates into bit 63, LSB (0) -> CF.
+    let bytes = [
+        0x48, 0xC7, 0xC0, 0x00, 0x00, 0x00, 0x00, // mov rax, 0
+        0x48, 0xD1, 0xD8, // rcr rax, 1
+        0xC3, // ret
+    ];
+    let mut ctx_in = RegisterContext::default();
+    ctx_in.cf = 1;
+    let ctx = run_test(&bytes, ctx_in);
+    assert_eq!(ctx.rax, 1u64 << 63);
+    assert_eq!(ctx.cf, 0);
+
+    // RCR rax, CL (CL=4) with rax=0xF0, CF=0:
+    // 65-bit value 0:...0xF0 rotated right by 4 -> the low nibble (0) lands in
+    // bits [63:60] is empty; 0xF0 >> 4 = 0x0F, CF = bit 3 of 0xF0 = 0.
+    let bytes = [
+        0x48, 0xC7, 0xC0, 0xF0, 0x00, 0x00, 0x00, // mov rax, 0xF0
+        0x48, 0xC7, 0xC1, 0x04, 0x00, 0x00, 0x00, // mov rcx, 4
+        0x48, 0xD3, 0xD8, // rcr rax, cl
+        0xC3, // ret
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rax, 0x0F);
+    assert_eq!(ctx.cf, 0);
+
+    // 8-bit RCR al, 2 with al=1, CF=0 exercises the modulo-(N+1) narrow path:
+    // bit 0 of al rotates to bit 7 -> al=0x80, CF=0.
+    let bytes = [
+        0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00, // mov rax, 1
+        0xC0, 0xD8, 0x02, // rcr al, 2
+        0xC3, // ret
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rax & 0xFF, 0x80);
+    assert_eq!(ctx.cf, 0);
+}
+
+#[test]
+fn test_pushfq() {
+    // CLC clears CF; PUSHFQ then pushes RFLAGS. With every tracked flag clear,
+    // only the reserved bit 1 is set -> 0x2. POP RAX reads it back.
+    let bytes = [
+        0xF8, // clc
+        0x9C, // pushfq
+        0x58, // pop rax
+        0xC3, // ret
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rax, 0x2, "only the always-set reserved bit should be present");
+
+    // STC sets CF; PUSHFQ should then report CF (bit 0) alongside the reserved
+    // bit -> 0x3.
+    let bytes = [
+        0xF9, // stc
+        0x9C, // pushfq
+        0x58, // pop rax
+        0xC3, // ret
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rax, 0x3, "CF (bit 0) and the reserved bit (bit 1) should be set");
+
+    // A subtraction that yields zero sets ZF (bit 6) and PF (bit 2); the result
+    // is non-negative so SF/OF/CF stay clear. RFLAGS = reserved | ZF | PF.
+    let bytes = [
+        0x48, 0xC7, 0xC0, 0x05, 0x00, 0x00, 0x00, // mov rax, 5
+        0x48, 0x2B, 0xC0,                         // sub rax, rax  (-> 0, ZF=1, PF=1)
+        0x9C,                                     // pushfq
+        0x58,                                     // pop rax
+        0xC3,                                     // ret
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rax & (1 << 6), 1 << 6, "ZF should be set");
+    assert_eq!(ctx.rax & (1 << 2), 1 << 2, "PF should be set");
+    assert_eq!(ctx.rax & 1, 0, "CF should be clear");
+    assert_eq!(ctx.rax & (1 << 7), 0, "SF should be clear");
+    assert_eq!(ctx.rax & (1 << 11), 0, "OF should be clear");
+}
+
+#[test]
+fn test_popfq() {
+    // PUSH a crafted RFLAGS image, POPFQ it, then read flags back via PUSHFQ.
+    // Source bits: CF(0) | reserved(1) | ZF(6) | SF(7) = 0xC3. POPFQ must load
+    // CF/ZF/SF (the tracked bits); PUSHFQ then reproduces them (plus the
+    // always-set reserved bit) -> 0xC3.
+    let bytes = [
+        0x48, 0xC7, 0xC0, 0xC3, 0x00, 0x00, 0x00, // mov rax, 0xC3
+        0x50,                                      // push rax
+        0x9D,                                      // popfq
+        0x9C,                                      // pushfq
+        0x58,                                      // pop rax
+        0xC3,                                      // ret
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rax, 0xC3, "POPFQ should load CF/ZF/SF and PUSHFQ reproduce them");
+
+    // POPFQ must also clear flags whose bit is 0 in the popped image. Start with
+    // CF preset, pop a value with CF clear (only reserved bit, 0x2), and confirm
+    // CF reads back as 0.
+    let bytes = [
+        0x48, 0xC7, 0xC0, 0x02, 0x00, 0x00, 0x00, // mov rax, 0x2
+        0x50,                                      // push rax
+        0x9D,                                      // popfq
+        0x9C,                                      // pushfq
+        0x58,                                      // pop rax
+        0xC3,                                      // ret
+    ];
+    let mut ctx_in = RegisterContext::default();
+    ctx_in.cf = 1;
+    let ctx = run_test(&bytes, ctx_in);
+    assert_eq!(ctx.rax, 0x2, "POPFQ should clear CF when its source bit is 0");
+}
+
+#[test]
 fn test_bit_ops() {
     // BTS rax, 3 (rax = 0)
     let bytes = [
@@ -207,6 +333,87 @@ fn test_string_ops() {
     let ctx_out = run_test(&bytes, ctx);
     assert_eq!(ctx_out.rax & 0xFF, 0x77);
     assert_eq!(ctx_out.rsi, mem_ptr + 33);
+}
+
+#[test]
+fn test_direction_flag() {
+    let mut mem = [0u8; 256];
+    let mem_ptr = mem.as_mut_ptr() as u64;
+
+    // STD makes string ops decrement: STOSB at [rdi] then rdi -= 1.
+    let mut ctx = RegisterContext::default();
+    ctx.rax = 0x42;
+    ctx.rdi = mem_ptr + 16;
+    let bytes = [
+        0xFD, // std
+        0xAA, // stosb
+        0xC3, // ret
+    ];
+    let ctx_out = run_test(&bytes, ctx);
+    assert_eq!(mem[16], 0x42, "stosb should still write [rdi]");
+    assert_eq!(ctx_out.rdi, mem_ptr + 15, "DF=1 should decrement rdi");
+
+    // CLD makes string ops increment again, even if DF was set on entry.
+    let mut ctx = RegisterContext::default();
+    ctx.df = 1; // start with DF set
+    ctx.rax = 0x99;
+    ctx.rdi = mem_ptr + 16;
+    let bytes = [
+        0xFC, // cld
+        0xAA, // stosb
+        0xC3, // ret
+    ];
+    let ctx_out = run_test(&bytes, ctx);
+    assert_eq!(mem[16], 0x99);
+    assert_eq!(ctx_out.rdi, mem_ptr + 17, "DF=0 should increment rdi");
+
+    // MOVSB with DF=1 set via the incoming context decrements both pointers.
+    let mut ctx = RegisterContext::default();
+    ctx.df = 1;
+    mem[64] = 0xAB;
+    ctx.rsi = mem_ptr + 64;
+    ctx.rdi = mem_ptr + 128;
+    let bytes = [
+        0xA4, // movsb
+        0xC3, // ret
+    ];
+    let ctx_out = run_test(&bytes, ctx);
+    assert_eq!(mem[128], 0xAB);
+    assert_eq!(ctx_out.rsi, mem_ptr + 63, "DF=1 should decrement rsi");
+    assert_eq!(ctx_out.rdi, mem_ptr + 127, "DF=1 should decrement rdi");
+}
+
+#[test]
+fn test_direction_flag_in_rflags() {
+    // STD sets DF; PUSHFQ must report it at bit 10 (0x400), plus the reserved
+    // bit 1 -> 0x402.
+    let bytes = [
+        0xFD, // std
+        0x9C, // pushfq
+        0x58, // pop rax
+        0xC3, // ret
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rax, 0x402, "PUSHFQ should report DF at bit 10");
+
+    // POPFQ must load DF from the popped image: push 0x400 (DF set), popfq,
+    // then a STOSB should decrement rdi.
+    let mut mem = [0u8; 64];
+    let mem_ptr = mem.as_mut_ptr() as u64;
+    let mut ctx = RegisterContext::default();
+    ctx.rax = 0x400; // value to load into RFLAGS (DF set)
+    ctx.rdi = mem_ptr + 8;
+    let bytes = [
+        0x50, // push rax (RFLAGS image)
+        0x9D, // popfq
+        0xB0, 0x7E, // mov al, 0x7E
+        0xAA, // stosb
+        0xC3, // ret
+    ];
+    let ctx_out = run_test(&bytes, ctx);
+    assert_eq!(mem[8], 0x7E);
+    assert_eq!(ctx_out.rdi, mem_ptr + 7, "POPFQ should have set DF -> rdi decremented");
+    assert_eq!(ctx_out.df, 1, "DF should be synced back to the context");
 }
 
 #[test]

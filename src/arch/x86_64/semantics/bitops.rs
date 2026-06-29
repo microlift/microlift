@@ -378,6 +378,101 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
+    /// Build a constant of width `ty` from a (non-negative, <= 64-bit) value.
+    /// `iconst` only supports integer types up to I64, so I128 constants are
+    /// materialised by zero-extending an I64 constant.
+    fn wide_const(&mut self, ty: Type, value: i64) -> Value {
+        if ty == types::I128 {
+            let lo = self.builder.ins().iconst(types::I64, value);
+            self.builder.ins().uextend(types::I128, lo)
+        } else {
+            self.builder.ins().iconst(ty, value)
+        }
+    }
+
+    /// RCR - Rotate through Carry Right.
+    ///
+    /// Treats `CF:dst` as a single `(N+1)`-bit value (CF is the most-significant
+    /// bit) and rotates it right by the masked count. To avoid Cranelift's
+    /// shift-amount-modulo-width semantics ever clobbering a rotate that crosses
+    /// the operand boundary, the whole computation is performed in a working
+    /// type at least two bits wider than the operand:
+    ///
+    /// ```text
+    ///   x          = (cf << N) | dst                (the N+1-bit value)
+    ///   rotated     = (x >> c) | (cf << (N-c)) | (x << (N+1-c))
+    ///   dst'        = rotated[N-1:0]
+    ///   CF'         = rotated[N]
+    /// ```
+    ///
+    /// The count is masked to 5 bits (6 for 64-bit operands) and then reduced
+    /// modulo `N+1`, exactly as the hardware does. OF is only architecturally
+    /// defined for single-bit rotates; like the other rotates here it is left
+    /// unmodelled.
+    pub(super) fn handle_rcr(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let size = self.operand_size(instruction, 0)?;
+        let ty = size_to_type(size);
+        let n = (size * 8) as i64;
+
+        // Working type, at least N+2 bits wide so no shift reaches its width.
+        let work_ty = match size {
+            1 => types::I16,
+            2 => types::I32,
+            4 => types::I64,
+            8 => types::I128,
+            _ => {
+                return Err(MicroliftError::UnsupportedInstruction {
+                    mnemonic: format!("rcr-size-{}", size),
+                });
+            }
+        };
+
+        let val = self.read_operand(instruction, 0, size)?;
+        let cf = self.builder.use_var(self.state.flags[&X86Flag::Carry]);
+        // Masked count (5/6 bits) in the operand type.
+        let count = self.shift_count(instruction, ty)?;
+
+        // Promote everything into the wider working type.
+        let xval = self.builder.ins().uextend(work_ty, val);
+        let cfw = self.builder.ins().uextend(work_ty, cf);
+        let count_w = self.builder.ins().uextend(work_ty, count);
+
+        // c = count mod (N+1)  (in [0, N]). For 32/64-bit operands the 5/6-bit
+        // mask already guarantees count < N+1, so the modulo is a no-op there -
+        // which is fortunate, since the backend has no `urem.i128`.
+        let np1 = self.wide_const(work_ty, n + 1);
+        let c = if size <= 2 {
+            self.builder.ins().urem(count_w, np1)
+        } else {
+            count_w
+        };
+
+        // rotated = (x >> c) | (cf << (N - c)) | (x << (N + 1 - c))
+        let n_w = self.wide_const(work_ty, n);
+        let n_minus_c = self.builder.ins().isub(n_w, c);
+        let np1_minus_c = self.builder.ins().isub(np1, c);
+
+        let t_right = self.builder.ins().ushr(xval, c);
+        let t_cf = self.builder.ins().ishl(cfw, n_minus_c);
+        let t_left = self.builder.ins().ishl(xval, np1_minus_c);
+        let rotated = {
+            let lo = self.builder.ins().bor(t_right, t_cf);
+            self.builder.ins().bor(lo, t_left)
+        };
+
+        // dst' = low N bits of the rotated value.
+        let result = self.builder.ins().ireduce(ty, rotated);
+        self.write_operand(instruction, 0, result)?;
+
+        // CF' = bit N of the rotated value. This is also correct for c == 0
+        // (a masked count of 0), where bit N still holds the original CF.
+        let cf_shifted = self.builder.ins().ushr(rotated, n_w);
+        let one_w = self.wide_const(work_ty, 1);
+        let cf_bit = self.builder.ins().band(cf_shifted, one_w);
+        self.set_flag(X86Flag::Carry, cf_bit)?;
+        Ok(())
+    }
+
     /// Resolve the shift count for a double-shift instruction (SHLD/SHRD).
     ///
     /// The count is op2: either an `imm8` or the `CL` register, masked to

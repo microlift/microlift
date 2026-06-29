@@ -1,8 +1,22 @@
 use crate::MicroliftError;
-use crate::lifter::Lifter;
+use crate::context::ExitReason;
+use crate::lifter::{Lifter, X86Flag};
 use crate::arch::x86_64::semantics::helpers::size_to_type;
 use cranelift::prelude::*;
 use iced_x86::{Instruction, OpKind, Register};
+
+/// Tracked flags and their RFLAGS bit positions, shared by PUSHFQ/POPFQ.
+/// Covers the six arithmetic status flags plus DF; other RFLAGS bits are not
+/// modelled.
+const RFLAGS_FLAG_BITS: [(X86Flag, u8); 7] = [
+    (X86Flag::Carry, 0),
+    (X86Flag::Parity, 2),
+    (X86Flag::Auxiliary, 4),
+    (X86Flag::Zero, 6),
+    (X86Flag::Sign, 7),
+    (X86Flag::Direction, 10),
+    (X86Flag::Overflow, 11),
+];
 
 impl<'a> Lifter<'a> {
     pub(super) fn handle_nop(&mut self, _instruction: &Instruction) -> crate::Result<()> {
@@ -184,15 +198,26 @@ impl<'a> Lifter<'a> {
         self.emit_movs(8)
     }
 
+    /// Signed pointer delta applied by a string op for one element of `size`
+    /// bytes: `+size` when `DF=0`, `-size` when `DF=1`.
+    fn string_delta(&mut self, size: usize) -> Value {
+        let df = self.builder.use_var(self.state.flags[&X86Flag::Direction]);
+        let pos = self.builder.ins().iconst(types::I64, size as i64);
+        let neg = self.builder.ins().iconst(types::I64, -(size as i64));
+        let df_set = self.builder.ins().icmp_imm(IntCC::NotEqual, df, 0);
+        self.builder.ins().select(df_set, neg, pos)
+    }
+
     fn emit_movs(&mut self, size: usize) -> crate::Result<()> {
         let ty = size_to_type(size);
         let rsi = self.get_reg_val(Register::RSI)?;
         let rdi = self.get_reg_val(Register::RDI)?;
         let val = self.builder.ins().load(ty, MemFlags::new(), rsi, 0);
         self.builder.ins().store(MemFlags::new(), val, rdi, 0);
-        // DF=0: increment; DF=1: decrement. We don't track DF, assume DF=0.
-        let new_rsi = self.builder.ins().iadd_imm(rsi, size as i64);
-        let new_rdi = self.builder.ins().iadd_imm(rdi, size as i64);
+        // DF=0: increment both pointers; DF=1: decrement.
+        let delta = self.string_delta(size);
+        let new_rsi = self.builder.ins().iadd(rsi, delta);
+        let new_rdi = self.builder.ins().iadd(rdi, delta);
         self.set_reg_val(Register::RSI, new_rsi)?;
         self.set_reg_val(Register::RDI, new_rdi)?;
         Ok(())
@@ -222,7 +247,8 @@ impl<'a> Lifter<'a> {
         let rdi = self.get_reg_val(Register::RDI)?;
         let val = self.get_reg_val(src_reg)?;
         self.builder.ins().store(MemFlags::new(), val, rdi, 0);
-        let new_rdi = self.builder.ins().iadd_imm(rdi, size as i64);
+        let delta = self.string_delta(size);
+        let new_rdi = self.builder.ins().iadd(rdi, delta);
         self.set_reg_val(Register::RDI, new_rdi)?;
         Ok(())
     }
@@ -246,8 +272,113 @@ impl<'a> Lifter<'a> {
         let rsi = self.get_reg_val(Register::RSI)?;
         let val = self.builder.ins().load(ty, MemFlags::new(), rsi, 0);
         self.set_reg_val(dst_reg, val)?;
-        let new_rsi = self.builder.ins().iadd_imm(rsi, size as i64);
+        let delta = self.string_delta(size);
+        let new_rsi = self.builder.ins().iadd(rsi, delta);
         self.set_reg_val(Register::RSI, new_rsi)?;
+        Ok(())
+    }
+
+    /// INSB/INSW/INSD - input from the I/O port in `DX` into `ES:[RDI]`.
+    pub(super) fn handle_insb(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.emit_ins(instruction, 1)
+    }
+    pub(super) fn handle_insw(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.emit_ins(instruction, 2)
+    }
+    pub(super) fn handle_insd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.emit_ins(instruction, 4)
+    }
+
+    /// `INS` reads from an I/O port, which cannot be done from lifted userspace
+    /// code. Emit a [`ExitReason::PortInput`] VM exit so the host can emulate the
+    /// access: RIP points *at* the instruction and `exit_code` carries the
+    /// element size. The port (`DX`), destination (`ES:[RDI]`), `DF`, and `RCX`
+    /// (for `REP INS`) are all available in the synced register context.
+    fn emit_ins(&mut self, instruction: &Instruction, size: usize) -> crate::Result<()> {
+        self.emit_io_string_exit(instruction, size, ExitReason::PortInput)
+    }
+
+    /// OUTSB/OUTSW/OUTSD - output from `DS:[RSI]` to the I/O port in `DX`.
+    pub(super) fn handle_outsb(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.emit_outs(instruction, 1)
+    }
+    pub(super) fn handle_outsw(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.emit_outs(instruction, 2)
+    }
+    pub(super) fn handle_outsd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.emit_outs(instruction, 4)
+    }
+
+    /// `OUTS` writes to an I/O port - the mirror of `INS`. Emit a
+    /// [`ExitReason::PortOutput`] VM exit so the host can emulate the access. The
+    /// port (`DX`), source (`DS:[RSI]`), `DF`, and `RCX` (for `REP OUTS`) are all
+    /// available in the synced register context.
+    fn emit_outs(&mut self, instruction: &Instruction, size: usize) -> crate::Result<()> {
+        self.emit_io_string_exit(instruction, size, ExitReason::PortOutput)
+    }
+
+    /// Shared exit emitter for the port I/O string instructions (`INS`/`OUTS`):
+    /// RIP points *at* the instruction and `exit_code` carries the element size
+    /// so the host can emulate the access and resume past it.
+    fn emit_io_string_exit(
+        &mut self,
+        instruction: &Instruction,
+        size: usize,
+        reason: ExitReason,
+    ) -> crate::Result<()> {
+        // RIP at the instruction itself, computed relative to the image base so
+        // it stays correct under relocation.
+        let offset = instruction.ip().wrapping_sub(self.lift_base);
+        let image_base = self.builder.use_var(self.state.image_base);
+        let rip_at = self.builder.ins().iadd_imm(image_base, offset as i64);
+
+        self.sync_to_context(Some(rip_at), reason)?;
+        self.write_exit_code(size as u32);
+        self.builder.ins().return_(&[]);
+        self.block_terminated = true;
+        Ok(())
+    }
+
+    /// PUSHFQ - assemble RFLAGS from the tracked status flags and push the
+    /// 64-bit value onto the stack.
+    ///
+    /// The tracked flags are CF/PF/AF/ZF/SF/OF and DF; any other RFLAGS bit
+    /// reads back as 0 except bit 1, which is architecturally always set.
+    pub(super) fn handle_pushfq(&mut self, _instruction: &Instruction) -> crate::Result<()> {
+        // Bit 1 of RFLAGS is reserved and always reads as 1.
+        let mut rflags = self.builder.ins().iconst(types::I64, 0x2);
+        for (flag, bit) in RFLAGS_FLAG_BITS {
+            let raw = self.builder.use_var(self.state.flags[&flag]);
+            let wide = self.builder.ins().uextend(types::I64, raw);
+            // Flags are logically 1-bit; mask defensively before positioning.
+            let one_bit = self.builder.ins().band_imm(wide, 1);
+            let positioned = self.builder.ins().ishl_imm(one_bit, bit as i64);
+            rflags = self.builder.ins().bor(rflags, positioned);
+        }
+
+        let rsp = self.get_reg_val(Register::RSP)?;
+        let new_rsp = self.builder.ins().iadd_imm(rsp, -8);
+        self.set_reg_val(Register::RSP, new_rsp)?;
+        self.builder.ins().store(MemFlags::new(), rflags, new_rsp, 0);
+        Ok(())
+    }
+
+    /// POPFQ - pop a 64-bit value off the stack and distribute its bits into the
+    /// tracked status flags. Bits for untracked flags (DF, IF, etc.) and the
+    /// reserved/system bits are simply discarded.
+    pub(super) fn handle_popfq(&mut self, _instruction: &Instruction) -> crate::Result<()> {
+        let rsp = self.get_reg_val(Register::RSP)?;
+        let rflags = self.builder.ins().load(types::I64, MemFlags::new(), rsp, 0);
+        let new_rsp = self.builder.ins().iadd_imm(rsp, 8);
+        self.set_reg_val(Register::RSP, new_rsp)?;
+
+        for (flag, bit) in RFLAGS_FLAG_BITS {
+            // bit value = (rflags >> bit) & 1, narrowed to the I8 flag storage.
+            let shifted = self.builder.ins().ushr_imm(rflags, bit as i64);
+            let one_bit = self.builder.ins().band_imm(shifted, 1);
+            let val = self.builder.ins().ireduce(types::I8, one_bit);
+            self.set_flag(flag, val)?;
+        }
         Ok(())
     }
 

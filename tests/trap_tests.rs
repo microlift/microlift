@@ -284,3 +284,70 @@ fn test_into_is_invalid_in_64bit() {
 fn test_int_family_exit_reasons_are_distinct() {
     assert_ne!(ExitReason::Breakpoint as u32, ExitReason::Interrupt as u32);
 }
+
+/// `INSD` (`0x6D`) must exit with `ExitReason::PortInput`, report the element
+/// size (4 bytes) in `exit_code`, and point RIP *at* the instruction so the
+/// host can emulate the port access.
+#[test]
+fn test_insd_exit_reason_and_size() {
+    #[rustfmt::skip]
+    let bytes = [
+        0x6D, // insd  @ 0x1000 (1 byte)
+    ];
+    let ctx = compile_and_run(&bytes, RegisterContext::default());
+    assert_eq!(ctx.exit_reason, ExitReason::PortInput as u32);
+    assert_eq!(ctx.exit_code, 4, "exit_code should hold the element size in bytes");
+    assert_eq!(ctx.rip, 0x1000, "rip should point at the insd instruction");
+}
+
+/// `INSB` (`0x6C`) reports an element size of 1; side-effects before it remain
+/// visible on exit (DX/RDI are synced for the host to emulate the access).
+#[test]
+fn test_insb_size_and_state_synced() {
+    #[rustfmt::skip]
+    let bytes = [
+        0x48, 0xC7, 0xC2, 0x60, 0x00, 0x00, 0x00, // mov rdx, 0x60  @ 0x1000 (port)
+        0x6C,                                      // insb            @ 0x1007
+    ];
+    let ctx = compile_and_run(&bytes, RegisterContext::default());
+    assert_eq!(ctx.exit_reason, ExitReason::PortInput as u32);
+    assert_eq!(ctx.exit_code, 1);
+    assert_eq!(ctx.rdx, 0x60, "port number in DX must be synced for the host");
+    assert_eq!(ctx.rip, 0x1007, "rip should point at the insb instruction");
+}
+
+/// `OUTSD` (`0x6F`) must exit with `ExitReason::PortOutput`, report the element
+/// size (4), and point RIP *at* the instruction.
+#[test]
+fn test_outsd_exit_reason_and_size() {
+    #[rustfmt::skip]
+    let bytes = [
+        0x6F, // outsd  @ 0x1000 (1 byte)
+    ];
+    let ctx = compile_and_run(&bytes, RegisterContext::default());
+    assert_eq!(ctx.exit_reason, ExitReason::PortOutput as u32);
+    assert_eq!(ctx.exit_code, 4, "exit_code should hold the element size in bytes");
+    assert_eq!(ctx.rip, 0x1000, "rip should point at the outsd instruction");
+}
+
+/// `OUTSB` (`0x6E`) reports size 1; the source pointer (RSI) and port (DX) are
+/// synced so the host can emulate the access.
+#[test]
+fn test_outsb_size_and_state_synced() {
+    #[rustfmt::skip]
+    let bytes = [
+        0x48, 0xC7, 0xC2, 0x70, 0x00, 0x00, 0x00, // mov rdx, 0x70  @ 0x1000 (port)
+        0x6E,                                      // outsb           @ 0x1007
+    ];
+    let ctx = compile_and_run(&bytes, RegisterContext::default());
+    assert_eq!(ctx.exit_reason, ExitReason::PortOutput as u32);
+    assert_eq!(ctx.exit_code, 1);
+    assert_eq!(ctx.rdx, 0x70, "port number in DX must be synced for the host");
+    assert_eq!(ctx.rip, 0x1007, "rip should point at the outsb instruction");
+}
+
+/// Port input and output must be distinguishable by the host.
+#[test]
+fn test_port_io_exit_reasons_are_distinct() {
+    assert_ne!(ExitReason::PortInput as u32, ExitReason::PortOutput as u32);
+}

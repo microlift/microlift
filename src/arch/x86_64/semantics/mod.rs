@@ -36,6 +36,8 @@ impl<'a> Lifter<'a> {
             Mnemonic::Lea => self.handle_lea(instruction),
             Mnemonic::Push => self.handle_push(instruction),
             Mnemonic::Pop => self.handle_pop(instruction),
+            Mnemonic::Pushfq => self.handle_pushfq(instruction),
+            Mnemonic::Popfq => self.handle_popfq(instruction),
             Mnemonic::Leave => self.handle_leave(instruction),
             Mnemonic::Xchg => self.handle_xchg(instruction),
             Mnemonic::Nop | Mnemonic::Reservednop => self.handle_nop(instruction),
@@ -92,6 +94,12 @@ impl<'a> Lifter<'a> {
             Mnemonic::Lodsw => self.handle_lodsw(instruction),
             Mnemonic::Lodsd => self.handle_lodsd(instruction),
             Mnemonic::Lodsq => self.handle_lodsq(instruction),
+            Mnemonic::Insb => self.handle_insb(instruction),
+            Mnemonic::Insw => self.handle_insw(instruction),
+            Mnemonic::Insd => self.handle_insd(instruction),
+            Mnemonic::Outsb => self.handle_outsb(instruction),
+            Mnemonic::Outsw => self.handle_outsw(instruction),
+            Mnemonic::Outsd => self.handle_outsd(instruction),
 
             // Arithmetic
             Mnemonic::Add => self.handle_add(instruction),
@@ -128,6 +136,7 @@ impl<'a> Lifter<'a> {
             Mnemonic::Sar => self.handle_sar(instruction),
             Mnemonic::Rol => self.handle_rol(instruction),
             Mnemonic::Ror => self.handle_ror(instruction),
+            Mnemonic::Rcr => self.handle_rcr(instruction),
             Mnemonic::Shld => self.handle_shld(instruction),
             Mnemonic::Shrd => self.handle_shrd(instruction),
 
@@ -227,6 +236,8 @@ impl<'a> Lifter<'a> {
             Mnemonic::Stc => self.handle_stc(instruction),
             Mnemonic::Clc => self.handle_clc(instruction),
             Mnemonic::Cmc => self.handle_cmc(instruction),
+            Mnemonic::Std => self.handle_std(instruction),
+            Mnemonic::Cld => self.handle_cld(instruction),
 
             _ => {
                 if self.config.interpreter_fallback {

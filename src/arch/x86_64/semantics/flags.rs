@@ -23,6 +23,18 @@ impl<'a> Lifter<'a> {
         self.set_flag(X86Flag::Carry, toggled)
     }
 
+    /// STD - set direction flag (string ops decrement RSI/RDI).
+    pub(super) fn handle_std(&mut self, _instruction: &Instruction) -> crate::Result<()> {
+        let one = self.builder.ins().iconst(types::I8, 1);
+        self.set_flag(X86Flag::Direction, one)
+    }
+
+    /// CLD - clear direction flag (string ops increment RSI/RDI).
+    pub(super) fn handle_cld(&mut self, _instruction: &Instruction) -> crate::Result<()> {
+        let zero = self.builder.ins().iconst(types::I8, 0);
+        self.set_flag(X86Flag::Direction, zero)
+    }
+
 
     pub fn update_flags_add(
         &mut self,

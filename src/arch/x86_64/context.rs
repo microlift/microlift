@@ -40,6 +40,9 @@ pub struct RegisterContext {
     pub zf: u8,
     pub sf: u8,
     pub of: u8,
+    /// Direction flag (DF, RFLAGS bit 10). Controls whether string operations
+    /// advance their pointers upward (`DF=0`) or downward (`DF=1`).
+    pub df: u8,
     pub exit_reason: u32,
     pub exit_code: u32,
     /// On `ImportedFunctionCall` exits, the virtual address of the imported
