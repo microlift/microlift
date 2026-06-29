@@ -62,6 +62,10 @@ impl<'a> Lifter<'a> {
             | Mnemonic::Movdqu => self.handle_movaps(instruction),
             Mnemonic::Movq => self.handle_movq_sse(instruction),
             Mnemonic::Movss => self.handle_movss(instruction),
+            Mnemonic::Movd => self.handle_movd(instruction),
+            Mnemonic::Movhps | Mnemonic::Movhpd => self.handle_movhps(instruction),
+            Mnemonic::Psrlq => self.handle_psrlq(instruction),
+            Mnemonic::Pshufd => self.handle_pshufd(instruction),
 
             // SSE / SSE2 - XMM logic
             Mnemonic::Xorps | Mnemonic::Xorpd => self.handle_xorps(instruction),
@@ -154,6 +158,8 @@ impl<'a> Lifter<'a> {
             Mnemonic::Call => self.handle_call(instruction),
             Mnemonic::Ret => self.handle_ret(instruction),
             Mnemonic::Loop => self.handle_loop(instruction),
+            Mnemonic::Loope => self.handle_loope(instruction),
+            Mnemonic::Loopne => self.handle_loopne(instruction),
 
             // Conditional Jumps (unsigned)
             Mnemonic::Jb => self.handle_jb(instruction), // JB / JNAE / JC
@@ -226,6 +232,7 @@ impl<'a> Lifter<'a> {
             Mnemonic::Syscall => self.handle_syscall(instruction),
             Mnemonic::Cpuid => self.handle_cpuid(instruction),
             Mnemonic::Xgetbv => self.handle_xgetbv(instruction),
+            Mnemonic::Rdtsc => self.handle_rdtsc(instruction),
 
             // FS/GS base (FSGSBASE extension)
             Mnemonic::Rdfsbase => self.handle_rdfsbase(instruction),

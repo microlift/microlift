@@ -122,6 +122,12 @@ pub enum ExitReason {
     /// carried a `REP` prefix) when advancing `RSI`/`RCX`. After servicing the
     /// access the host advances the PC past the instruction and re-enters.
     PortOutput = 14,
+
+    /// An `RDTSC` instruction was executed. This is a resumable VM exit: the PC
+    /// points to the instruction *after* `RDTSC` (the resume point). The runtime
+    /// should populate `rax` (bits 31:0) and `rdx` (bits 63:32) with the desired
+    /// timestamp-counter value and re-enter the guest at the PC.
+    Rdtsc = 15,
 }
 
 impl TryFrom<u32> for ExitReason {
@@ -158,6 +164,8 @@ impl TryFrom<u32> for ExitReason {
             Ok(Self::PortInput)
         } else if value == Self::PortOutput as u32 {
             Ok(Self::PortOutput)
+        } else if value == Self::Rdtsc as u32 {
+            Ok(Self::Rdtsc)
         } else {
             Err(())
         }
@@ -182,6 +190,7 @@ impl std::fmt::Display for ExitReason {
             ExitReason::Interrupt => "interrupt",
             ExitReason::PortInput => "port-input",
             ExitReason::PortOutput => "port-output",
+            ExitReason::Rdtsc => "rdtsc",
         })
     }
 }
@@ -293,7 +302,7 @@ mod tests {
     fn exit_reason_display_and_roundtrip() {
         assert_eq!(ExitReason::ImportedFunctionCall.to_string(), "imported-function-call");
         // try_from is the inverse of the discriminant.
-        for r in [ExitReason::None, ExitReason::Return, ExitReason::IndirectCall, ExitReason::Xgetbv, ExitReason::Interrupt, ExitReason::PortInput, ExitReason::PortOutput] {
+        for r in [ExitReason::None, ExitReason::Return, ExitReason::IndirectCall, ExitReason::Xgetbv, ExitReason::Interrupt, ExitReason::PortInput, ExitReason::PortOutput, ExitReason::Rdtsc] {
             assert_eq!(ExitReason::try_from(r as u32), Ok(r));
             assert!(!r.to_string().is_empty());
         }

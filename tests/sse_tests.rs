@@ -595,3 +595,163 @@ fn test_vec_movq_roundtrip_gpr_xmm() {
     assert_eq!(ctx.rcx, 0xCAFE_BABE_1234_5678);
     assert_eq!(ctx.xmm[0][1], 0, "movq must zero high lane");
 }
+
+//  MOVD
+
+#[test]
+fn test_movd_gpr_to_xmm() {
+    // movd xmm0, eax; ret  ->  66 0F 6E C0  C3
+    let bytes = [0x66, 0x0F, 0x6E, 0xC0, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.rax = 0xFFFF_FFFF_DEAD_BEEF; // only eax (0xDEADBEEF) participates
+    ctx.xmm[0] = [0x1111_1111_1111_1111, 0x2222_2222_2222_2222];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.xmm[0], [0xDEAD_BEEF, 0], "movd must load low dword and zero the rest");
+}
+
+#[test]
+fn test_movd_xmm_to_gpr() {
+    // movd eax, xmm0; ret  ->  66 0F 7E C0  C3
+    let bytes = [0x66, 0x0F, 0x7E, 0xC0, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.rax = 0xAAAA_AAAA_AAAA_AAAA;
+    ctx.xmm[0] = [0x1122_3344_5566_7788, 0x9999_9999_9999_9999];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.rax, 0x5566_7788, "movd r32,xmm extracts low dword and zero-extends");
+}
+
+//  MOVHPS
+
+#[test]
+fn test_movhps_load_high() {
+    // movhps xmm0, [rdi]; ret  ->  0F 16 07  C3
+    let bytes = [0x0F, 0x16, 0x07, 0xC3];
+    let mut buf = [0u64; 2];
+    buf[0] = 0xCAFE_BABE_DEAD_BEEF;
+    let mut ctx = RegisterContext::default();
+    ctx.rdi = buf.as_ptr() as u64;
+    ctx.xmm[0] = [0x1111_1111_1111_1111, 0x2222_2222_2222_2222];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(
+        ctx.xmm[0],
+        [0x1111_1111_1111_1111, 0xCAFE_BABE_DEAD_BEEF],
+        "movhps load must replace the high quadword and preserve the low"
+    );
+}
+
+#[test]
+fn test_movhps_store_high() {
+    // movhps [rdi], xmm0; ret  ->  0F 17 07  C3
+    let bytes = [0x0F, 0x17, 0x07, 0xC3];
+    let mut buf = [0u64; 2];
+    let mut ctx = RegisterContext::default();
+    ctx.rdi = buf.as_mut_ptr() as u64;
+    ctx.xmm[0] = [0x1234_5678_9ABC_DEF0, 0xFEED_FACE_CAFE_F00D];
+    let _ = run_test(&bytes, ctx);
+    assert_eq!(buf[0], 0xFEED_FACE_CAFE_F00D, "movhps store must write the high quadword");
+}
+
+//  PSRLQ
+
+#[test]
+fn test_psrlq_imm() {
+    // psrlq xmm0, 4; ret  ->  66 0F 73 D0 04  C3
+    let bytes = [0x66, 0x0F, 0x73, 0xD0, 0x04, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [0x0000_0000_0000_FF00, 0xF000_0000_0000_0000];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(
+        ctx.xmm[0],
+        [0x0000_0000_0000_0FF0, 0x0F00_0000_0000_0000],
+        "psrlq imm must shift each 64-bit lane right"
+    );
+}
+
+#[test]
+fn test_psrlq_imm_ge_64_zeroes() {
+    // psrlq xmm0, 64; ret  ->  66 0F 73 D0 40  C3
+    let bytes = [0x66, 0x0F, 0x73, 0xD0, 0x40, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [0xDEAD_BEEF_CAFE_BABE, 0x1234_5678_9ABC_DEF0];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.xmm[0], [0, 0], "psrlq by >=64 must zero both lanes");
+}
+
+#[test]
+fn test_psrlq_xmm_count() {
+    // psrlq xmm0, xmm1; ret  ->  66 0F D3 C1  C3  (count = low 64 bits of xmm1)
+    let bytes = [0x66, 0x0F, 0xD3, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [0x0000_0000_0000_FF00, 0xF000_0000_0000_0000];
+    ctx.xmm[1] = [8, 0]; // shift by 8
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(
+        ctx.xmm[0],
+        [0x0000_0000_0000_00FF, 0x00F0_0000_0000_0000],
+        "psrlq by register count must shift both lanes"
+    );
+
+    // A count >= 64 from the register form must also zero the lanes.
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [0xDEAD_BEEF_CAFE_BABE, 0x1234_5678_9ABC_DEF0];
+    ctx.xmm[1] = [100, 0];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.xmm[0], [0, 0], "psrlq by >=64 (register) must zero both lanes");
+}
+
+//  PSHUFD
+
+#[test]
+fn test_pshufd_reverse() {
+    // pshufd xmm0, xmm1, 0x1B; ret  ->  66 0F 70 C1 1B  C3
+    // imm 0x1B = 00_01_10_11 -> dst dwords [d3, d2, d1, d0] (reverse).
+    let bytes = [0x66, 0x0F, 0x70, 0xC1, 0x1B, 0xC3];
+    let mut ctx = RegisterContext::default();
+    // src dwords: d0=0, d1=0x11111111, d2=0x22222222, d3=0x33333333
+    ctx.xmm[1] = [0x1111_1111_0000_0000, 0x3333_3333_2222_2222];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(
+        ctx.xmm[0],
+        [0x2222_2222_3333_3333, 0x0000_0000_1111_1111],
+        "pshufd 0x1B must reverse the four dwords"
+    );
+}
+
+#[test]
+fn test_pshufd_identity() {
+    // pshufd xmm0, xmm1, 0xE4 (11_10_01_00) is the identity permutation.
+    let bytes = [0x66, 0x0F, 0x70, 0xC1, 0xE4, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[1] = [0x1111_1111_0000_0000, 0x3333_3333_2222_2222];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.xmm[0], [0x1111_1111_0000_0000, 0x3333_3333_2222_2222]);
+}
+
+#[test]
+fn test_pshufd_broadcast_dword2() {
+    // pshufd xmm0, xmm1, 0xAA (10_10_10_10) broadcasts source dword 2.
+    let bytes = [0x66, 0x0F, 0x70, 0xC1, 0xAA, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[1] = [0x1111_1111_0000_0000, 0x3333_3333_2222_2222]; // d2 = 0x22222222
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.xmm[0], [0x2222_2222_2222_2222, 0x2222_2222_2222_2222]);
+}
+
+#[test]
+fn test_vec_pshufd_and_psrlq() {
+    // Same ops as the scalar tests, but in vector-xmm mode, to exercise the
+    // lo/hi accessors' insertlane/extractlane paths.
+    // pshufd xmm0, xmm1, 0x1B; ret
+    let bytes = [0x66, 0x0F, 0x70, 0xC1, 0x1B, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[1] = [0x1111_1111_0000_0000, 0x3333_3333_2222_2222];
+    let ctx = run_test_vec(&bytes, ctx);
+    assert_eq!(ctx.xmm[0], [0x2222_2222_3333_3333, 0x0000_0000_1111_1111]);
+
+    // psrlq xmm0, 4; ret
+    let bytes = [0x66, 0x0F, 0x73, 0xD0, 0x04, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [0x0000_0000_0000_FF00, 0xF000_0000_0000_0000];
+    let ctx = run_test_vec(&bytes, ctx);
+    assert_eq!(ctx.xmm[0], [0x0000_0000_0000_0FF0, 0x0F00_0000_0000_0000]);
+}

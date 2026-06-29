@@ -417,6 +417,201 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
+    /// MOVD - move a 32-bit value between a GPR/memory operand and an XMM
+    /// register's low dword.
+    ///
+    /// - `MOVD xmm, r/m32`: low 32 bits = src; upper 96 bits zeroed.
+    /// - `MOVD r/m32, xmm`: dst = xmm[31:0].
+    ///
+    /// (The 64-bit `r/m64` forms decode as `MOVQ`, handled separately.)
+    pub(super) fn handle_movd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        match self.operand_kind(instruction, 0) {
+            OpKind::Register => {
+                let dst_reg = self.operand_register(instruction, 0);
+                if let Some(dst_idx) = xmm_register_index(dst_reg) {
+                    // MOVD xmm, r/m32 - load low dword, zero the upper 96 bits.
+                    let val32 = match self.operand_kind(instruction, 1) {
+                        OpKind::Register => {
+                            let src = self.operand_register(instruction, 1);
+                            self.get_reg_val(src)?
+                        }
+                        OpKind::Memory => {
+                            let ptr = self.get_mem_ptr(instruction, 1)?;
+                            self.builder.ins().load(types::I32, MemFlags::new(), ptr, 0)
+                        }
+                        other => {
+                            return Err(MicroliftError::UnsupportedInstruction {
+                                mnemonic: format!("movd-src-{:?}", other),
+                            });
+                        }
+                    };
+                    let lo = self.builder.ins().uextend(types::I64, val32);
+                    let zero = self.builder.ins().iconst(types::I64, 0);
+                    self.set_xmm_lo(dst_idx, lo);
+                    self.set_xmm_hi(dst_idx, zero);
+                } else {
+                    // MOVD r32, xmm - extract low dword into a GPR (zero-extended).
+                    let src_idx = self.xmm_operand_index(instruction, 1, "movd")?;
+                    let lo = self.get_xmm_lo(src_idx);
+                    let val32 = self.builder.ins().ireduce(types::I32, lo);
+                    self.set_reg_val(dst_reg, val32)?;
+                }
+            }
+            OpKind::Memory => {
+                // MOVD m32, xmm - store the low dword.
+                let src_idx = self.xmm_operand_index(instruction, 1, "movd")?;
+                let lo = self.get_xmm_lo(src_idx);
+                let val32 = self.builder.ins().ireduce(types::I32, lo);
+                let ptr = self.get_mem_ptr(instruction, 0)?;
+                self.builder.ins().store(MemFlags::new(), val32, ptr, 0);
+            }
+            other => {
+                return Err(MicroliftError::UnsupportedInstruction {
+                    mnemonic: format!("movd-dst-{:?}", other),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// MOVHPS / MOVHPD - move 64 bits to/from the high quadword of an XMM.
+    ///
+    /// - `MOVHPS xmm, m64`: high 64 bits = `[mem]`; low 64 bits preserved.
+    /// - `MOVHPS m64, xmm`: store the high 64 bits of `xmm` to memory.
+    pub(super) fn handle_movhps(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        match self.operand_kind(instruction, 0) {
+            OpKind::Register => {
+                // Load form: dst is XMM, src must be m64.
+                let dst_idx = self.xmm_operand_index(instruction, 0, "movhps")?;
+                if self.operand_kind(instruction, 1) != OpKind::Memory {
+                    return Err(MicroliftError::UnsupportedInstruction {
+                        mnemonic: "movhps-reg-src (use movlhps)".into(),
+                    });
+                }
+                let ptr = self.get_mem_ptr(instruction, 1)?;
+                let hi = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0);
+                self.set_xmm_hi(dst_idx, hi);
+            }
+            OpKind::Memory => {
+                // Store form: dst is m64, src is XMM.
+                let src_idx = self.xmm_operand_index(instruction, 1, "movhps")?;
+                let hi = self.get_xmm_hi(src_idx);
+                let ptr = self.get_mem_ptr(instruction, 0)?;
+                self.builder.ins().store(MemFlags::new(), hi, ptr, 0);
+            }
+            other => {
+                return Err(MicroliftError::UnsupportedInstruction {
+                    mnemonic: format!("movhps-dst-{:?}", other),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// PSRLQ - packed shift right logical of the two 64-bit lanes.
+    ///
+    /// - `PSRLQ xmm, imm8`: shift both lanes right by the immediate.
+    /// - `PSRLQ xmm, xmm/m128`: the shift count is the low 64 bits of the source.
+    ///
+    /// In both cases a count of 64 or more produces all-zero lanes (rather than
+    /// the modulo-width behaviour of a raw shift).
+    pub(super) fn handle_psrlq(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, "psrlq")?;
+        let dst_lo = self.get_xmm_lo(dst_idx);
+        let dst_hi = self.get_xmm_hi(dst_idx);
+
+        let (res_lo, res_hi) = match self.operand_kind(instruction, 1) {
+            OpKind::Immediate8 => {
+                let count = instruction.immediate8() as i64;
+                if count >= 64 {
+                    let zero = self.builder.ins().iconst(types::I64, 0);
+                    (zero, zero)
+                } else {
+                    (
+                        self.builder.ins().ushr_imm(dst_lo, count),
+                        self.builder.ins().ushr_imm(dst_hi, count),
+                    )
+                }
+            }
+            _ => {
+                // Count = low 64 bits of the xmm/m128 source.
+                let count = match self.operand_kind(instruction, 1) {
+                    OpKind::Register => {
+                        let src_idx = self.xmm_operand_index(instruction, 1, "psrlq")?;
+                        self.get_xmm_lo(src_idx)
+                    }
+                    OpKind::Memory => {
+                        let ptr = self.get_mem_ptr(instruction, 1)?;
+                        self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0)
+                    }
+                    other => {
+                        return Err(MicroliftError::UnsupportedInstruction {
+                            mnemonic: format!("psrlq-src-{:?}", other),
+                        });
+                    }
+                };
+                let shifted_lo = self.builder.ins().ushr(dst_lo, count);
+                let shifted_hi = self.builder.ins().ushr(dst_hi, count);
+                let zero = self.builder.ins().iconst(types::I64, 0);
+                // A count > 63 zeroes the lane (the raw shift would wrap mod 64).
+                let too_big = self
+                    .builder
+                    .ins()
+                    .icmp_imm(IntCC::UnsignedGreaterThan, count, 63);
+                (
+                    self.builder.ins().select(too_big, zero, shifted_lo),
+                    self.builder.ins().select(too_big, zero, shifted_hi),
+                )
+            }
+        };
+
+        self.set_xmm_lo(dst_idx, res_lo);
+        self.set_xmm_hi(dst_idx, res_hi);
+        Ok(())
+    }
+
+    /// PSHUFD - shuffle the four 32-bit dwords of `xmm2/m128` into `xmm1`
+    /// according to `imm8` (2 bits per destination dword select a source dword).
+    pub(super) fn handle_pshufd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, "pshufd")?;
+        let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
+
+        // The four source dwords, each isolated into the low 32 bits of an I64.
+        let dwords = [
+            self.builder.ins().band_imm(src_lo, 0xFFFF_FFFF),
+            self.builder.ins().ushr_imm(src_lo, 32),
+            self.builder.ins().band_imm(src_hi, 0xFFFF_FFFF),
+            self.builder.ins().ushr_imm(src_hi, 32),
+        ];
+
+        let imm = instruction.immediate8();
+        let pick = |j: u32| dwords[((imm >> (2 * j)) & 0b11) as usize];
+        let (r0, r1, r2, r3) = (pick(0), pick(1), pick(2), pick(3));
+
+        let r1_hi = self.builder.ins().ishl_imm(r1, 32);
+        let res_lo = self.builder.ins().bor(r0, r1_hi);
+        let r3_hi = self.builder.ins().ishl_imm(r3, 32);
+        let res_hi = self.builder.ins().bor(r2, r3_hi);
+
+        self.set_xmm_lo(dst_idx, res_lo);
+        self.set_xmm_hi(dst_idx, res_hi);
+        Ok(())
+    }
+
+    /// Resolve operand `op_index` to an XMM register index, or error with a
+    /// handler-specific mnemonic tag.
+    fn xmm_operand_index(
+        &self,
+        instruction: &Instruction,
+        op_index: u32,
+        who: &str,
+    ) -> crate::Result<u8> {
+        let reg = self.operand_register(instruction, op_index);
+        xmm_register_index(reg).ok_or_else(|| MicroliftError::UnsupportedInstruction {
+            mnemonic: format!("{}-op{}-not-xmm-{:?}", who, op_index, reg),
+        })
+    }
+
     /// MOVSD (SSE2 form) - move scalar double-precision float (low 64 bits of XMM).
     ///
     /// - `MOVSD xmm1, xmm2`: replace lo of dst with lo of src;

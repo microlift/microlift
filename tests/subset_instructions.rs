@@ -206,6 +206,54 @@ fn test_popfq() {
 }
 
 #[test]
+fn test_loopne() {
+    // LOOPNE runs the body while RCX != 0 AND ZF == 0. Here the body keeps ZF=0
+    // (INC RAX always yields a nonzero result), so it runs the full count.
+    let bytes = [
+        0x48, 0xC7, 0xC1, 0x04, 0x00, 0x00, 0x00, // mov rcx, 4
+        0x48, 0xC7, 0xC0, 0x00, 0x00, 0x00, 0x00, // mov rax, 0
+        0x48, 0xFF, 0xC0,                         // inc rax   <- loop target
+        0xE0, 0xFB,                               // loopne -5
+        0xC3,                                     // ret
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rax, 4, "loopne should run the full count when ZF stays 0");
+    assert_eq!(ctx.rcx, 0);
+
+    // LOOPNE must exit early when ZF becomes 1, even with RCX still nonzero.
+    // DEC RAX sets ZF when RAX reaches 0; starting at 3 it hits zero on the
+    // third iteration while RCX is still 2.
+    let bytes = [
+        0x48, 0xC7, 0xC1, 0x05, 0x00, 0x00, 0x00, // mov rcx, 5
+        0x48, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00, // mov rax, 3
+        0x48, 0xFF, 0xC8,                         // dec rax   <- loop target
+        0xE0, 0xFB,                               // loopne -5
+        0xC3,                                     // ret
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rax, 0, "loopne should stop once dec rax sets ZF");
+    assert_eq!(ctx.rcx, 2, "loopne should exit early with RCX still nonzero");
+}
+
+#[test]
+fn test_loope() {
+    // LOOPE runs the body while RCX != 0 AND ZF == 1. DEC RAX from 1 yields 0
+    // (ZF=1) on the first iteration, then nonzero (ZF=0) afterwards, so it stops
+    // as soon as ZF clears.
+    let bytes = [
+        0x48, 0xC7, 0xC1, 0x05, 0x00, 0x00, 0x00, // mov rcx, 5
+        0x48, 0xC7, 0xC0, 0x02, 0x00, 0x00, 0x00, // mov rax, 2
+        0x48, 0xFF, 0xC8,                         // dec rax   <- loop target
+        0xE1, 0xFB,                               // loope -5
+        0xC3,                                     // ret
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    // iter1: rax=1 (ZF=0) -> loope: rcx=4, ZF=0 -> stop.
+    assert_eq!(ctx.rax, 1);
+    assert_eq!(ctx.rcx, 4, "loope should exit as soon as ZF clears");
+}
+
+#[test]
 fn test_bit_ops() {
     // BTS rax, 3 (rax = 0)
     let bytes = [

@@ -65,7 +65,10 @@ pub fn control_flow(instruction: &Instruction) -> ControlFlow {
         | Mnemonic::Jno
         | Mnemonic::Jp
         | Mnemonic::Jnp
-        | Mnemonic::Loop => ControlFlow::cond_branch(instruction.near_branch_target()),
+        | Mnemonic::Jrcxz
+        | Mnemonic::Loop
+        | Mnemonic::Loope
+        | Mnemonic::Loopne => ControlFlow::cond_branch(instruction.near_branch_target()),
         Mnemonic::Call => {
             // Only direct (near-branch) calls have a statically known target.
             if matches!(

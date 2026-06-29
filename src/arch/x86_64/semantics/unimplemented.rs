@@ -135,6 +135,21 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
+    /// RDTSC - read the timestamp counter. The lifted code can't read the host
+    /// TSC meaningfully, so this is a resumable VM exit: the PC points at the
+    /// instruction *after* `RDTSC` and the host populates `rax`/`rdx` with the
+    /// 64-bit counter (low 32 bits in `rax`, high 32 in `rdx`) before resuming.
+    pub(super) fn handle_rdtsc(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let next_ip = instruction.next_ip();
+        let offset = next_ip.wrapping_sub(self.lift_base);
+        let image_base = self.builder.use_var(self.state.image_base);
+        let rip_after = self.builder.ins().iadd_imm(image_base, offset as i64);
+        self.sync_to_context(Some(rip_after), ExitReason::Rdtsc)?;
+        self.builder.ins().return_(&[]);
+        self.block_terminated = true;
+        Ok(())
+    }
+
     /// Helper to set a placeholder in the resume_function field.
     fn set_resume_placeholder(&mut self) -> crate::Result<()> {
         let ctx_ptr = self.builder.use_var(self.state.context_ptr);

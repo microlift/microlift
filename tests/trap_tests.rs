@@ -351,3 +351,31 @@ fn test_outsb_size_and_state_synced() {
 fn test_port_io_exit_reasons_are_distinct() {
     assert_ne!(ExitReason::PortInput as u32, ExitReason::PortOutput as u32);
 }
+
+/// `RDTSC` (`0F 31`) must exit with `ExitReason::Rdtsc` and point RIP *past* the
+/// instruction (the resume point) so the host can supply the counter in RAX/RDX.
+#[test]
+fn test_rdtsc_exit_reason() {
+    #[rustfmt::skip]
+    let bytes = [
+        0x0F, 0x31, // rdtsc  @ 0x1000 (2 bytes)
+    ];
+    let ctx = compile_and_run(&bytes, RegisterContext::default());
+    assert_eq!(ctx.exit_reason, ExitReason::Rdtsc as u32);
+    assert_eq!(ctx.rip, 0x1002, "rip should point past rdtsc (resume point)");
+}
+
+/// State preceding `RDTSC` must be synced on exit so the host sees current
+/// registers before populating the timestamp.
+#[test]
+fn test_rdtsc_state_synced() {
+    #[rustfmt::skip]
+    let bytes = [
+        0x48, 0xC7, 0xC3, 0x63, 0x00, 0x00, 0x00, // mov rbx, 99  @ 0x1000
+        0x0F, 0x31,                                // rdtsc         @ 0x1007
+    ];
+    let ctx = compile_and_run(&bytes, RegisterContext::default());
+    assert_eq!(ctx.exit_reason, ExitReason::Rdtsc as u32);
+    assert_eq!(ctx.rbx, 99);
+    assert_eq!(ctx.rip, 0x1009);
+}

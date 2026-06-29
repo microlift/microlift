@@ -763,12 +763,23 @@ impl<'a> Lifter<'a> {
         self.handle_conditional_branch(instruction, cond)
     }
 
-    pub(super) fn handle_loop(&mut self, instruction: &Instruction) -> crate::Result<()> {
+    /// Decrement the LOOP counter register (CX/ECX/RCX, chosen by encoding) and
+    /// return an I8 boolean that is true when the decremented counter is nonzero.
+    fn decrement_loop_counter(&mut self, instruction: &Instruction) -> crate::Result<Value> {
         let counter_reg = match instruction.code() {
-            Code::Loop_rel8_16_CX | Code::Loop_rel8_16_ECX | Code::Loop_rel8_16_RCX => Register::CX,
-            Code::Loop_rel8_32_CX | Code::Loop_rel8_32_ECX => Register::ECX,
+            Code::Loop_rel8_16_CX
+            | Code::Loope_rel8_16_CX
+            | Code::Loopne_rel8_16_CX
+            | Code::Loop_rel8_16_ECX
+            | Code::Loop_rel8_16_RCX => Register::CX,
+            Code::Loop_rel8_32_CX
+            | Code::Loop_rel8_32_ECX
+            | Code::Loope_rel8_32_ECX
+            | Code::Loopne_rel8_32_ECX => Register::ECX,
             Code::Loop_rel8_64_ECX => Register::ECX,
-            Code::Loop_rel8_64_RCX => Register::RCX,
+            Code::Loop_rel8_64_RCX
+            | Code::Loope_rel8_64_RCX
+            | Code::Loopne_rel8_64_RCX => Register::RCX,
             _ => match instruction.code_size() {
                 CodeSize::Code16 => Register::CX,
                 CodeSize::Code32 => Register::ECX,
@@ -783,7 +794,34 @@ impl<'a> Lifter<'a> {
             .iconst(size_to_type(counter_reg.size()), 1);
         let decremented = self.builder.ins().isub(counter, one);
         self.set_reg_val(counter_reg, decremented)?;
-        self.handle_conditional_branch(instruction, decremented)
+        Ok(self.builder.ins().icmp_imm(IntCC::NotEqual, decremented, 0))
+    }
+
+    /// LOOP - decrement the counter; branch while it is nonzero.
+    pub(super) fn handle_loop(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let nonzero = self.decrement_loop_counter(instruction)?;
+        self.handle_conditional_branch(instruction, nonzero)
+    }
+
+    /// LOOPE / LOOPZ - decrement the counter; branch while it is nonzero AND ZF=1.
+    pub(super) fn handle_loope(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let nonzero = self.decrement_loop_counter(instruction)?;
+        let zf = self
+            .builder
+            .use_var(self.state.flags[&crate::lifter::X86Flag::Zero]);
+        let cond = self.builder.ins().band(nonzero, zf);
+        self.handle_conditional_branch(instruction, cond)
+    }
+
+    /// LOOPNE / LOOPNZ - decrement the counter; branch while it is nonzero AND ZF=0.
+    pub(super) fn handle_loopne(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let nonzero = self.decrement_loop_counter(instruction)?;
+        let zf = self
+            .builder
+            .use_var(self.state.flags[&crate::lifter::X86Flag::Zero]);
+        let zf_clear = self.builder.ins().icmp_imm(IntCC::Equal, zf, 0);
+        let cond = self.builder.ins().band(nonzero, zf_clear);
+        self.handle_conditional_branch(instruction, cond)
     }
 
     // CMOV family
