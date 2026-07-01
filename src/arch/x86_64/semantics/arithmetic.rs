@@ -1,4 +1,5 @@
 use crate::MicroliftError;
+use crate::context::ExitReason;
 use crate::lifter::{Lifter, X86Flag};
 use crate::arch::x86_64::semantics::helpers::size_to_type;
 use cranelift::prelude::*;
@@ -548,108 +549,272 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// IDIV - signed divide.
+    /// Assemble the full double-width dividend `high:low` for DIV/IDIV in
+    /// `work_ty` (twice the operand width). The concatenation is purely
+    /// bitwise, so the same routine serves both the signed and unsigned forms -
+    /// `sdiv`/`srem` reinterpret the assembled bits as a signed 2N-bit value.
+    fn assemble_dividend(
+        &mut self,
+        low: Register,
+        high: Register,
+        work_ty: Type,
+    ) -> crate::Result<Value> {
+        let shift = (low.size() * 8) as i64;
+        let lo = self.get_reg_val(low)?;
+        let hi = self.get_reg_val(high)?;
+        let lo_w = self.builder.ins().uextend(work_ty, lo);
+        let hi_w = self.builder.ins().uextend(work_ty, hi);
+        let hi_shifted = self.builder.ins().ishl_imm(hi_w, shift);
+        Ok(self.builder.ins().bor(hi_shifted, lo_w))
+    }
+
+    /// The `(low_acc, high_acc, working_type)` triple for a DIV/IDIV of the
+    /// given operand `size`: the dividend is `high:low` (e.g. `DX:AX`) and the
+    /// division is carried out in `working_type`, twice the operand width.
+    fn div_regs(size: usize) -> Option<(Register, Register, Type)> {
+        match size {
+            1 => Some((Register::AL, Register::AH, types::I16)),
+            2 => Some((Register::AX, Register::DX, types::I32)),
+            4 => Some((Register::EAX, Register::EDX, types::I64)),
+            8 => Some((Register::RAX, Register::RDX, types::I128)),
+            _ => None,
+        }
+    }
+
+    /// A zero constant of width `ty` (`iconst` only builds up to `I64`, so `I128`
+    /// is materialised by zero-extending an `I64` zero).
+    fn wide_zero(&mut self, ty: Type) -> Value {
+        if ty == types::I128 {
+            let z = self.builder.ins().iconst(types::I64, 0);
+            self.builder.ins().uextend(types::I128, z)
+        } else {
+            self.builder.ins().iconst(ty, 0)
+        }
+    }
+
+    /// Unsigned `dividend / divisor` in `work_ty`, returning `(quot, rem)`.
+    /// Uses native `udiv`/`urem` where the backend supports it, falling back to
+    /// the portable long-division loop for the unsupported `I128` case. The
+    /// caller must have already excluded a zero divisor.
+    fn emit_udivmod(&mut self, dividend: Value, divisor: Value, work_ty: Type) -> (Value, Value) {
+        if work_ty == types::I128 {
+            self.emit_udivmod128(dividend, divisor)
+        } else {
+            let q = self.builder.ins().udiv(dividend, divisor);
+            let r = self.builder.ins().urem(dividend, divisor);
+            (q, r)
+        }
+    }
+
+    /// IDIV - signed divide, full `high:low` dividend.
     /// 8-bit:  AL = AX / r/m8, AH = AX % r/m8
     /// 16-bit: AX = DX:AX / r/m16, DX = DX:AX % r/m16
-    /// 32/64:  similar for EAX/EDX and RAX/RDX
-    /// Note: we emit `sdiv`/`srem` on the low half only (no 128-bit dividend).
-    /// Full 128-bit divide would require a runtime helper; this is a pragmatic approximation.
+    /// 32/64:  EDX:EAX / r/m32 and RDX:RAX / r/m64 respectively.
     pub(super) fn handle_idiv(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.emit_division(instruction, true)
+    }
+
+    /// DIV - unsigned divide (same `high:low` dividend layout as IDIV).
+    pub(super) fn handle_div(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.emit_division(instruction, false)
+    }
+
+    /// Shared DIV/IDIV lowering with architectural divide-error (#DE) checks.
+    ///
+    /// x86 raises #DE when the divisor is zero or the quotient does not fit in
+    /// the destination width. Both are checked *before* any result is committed
+    /// (a fault leaves all registers unchanged), and either one branches to a
+    /// [`ExitReason::DivideError`] VM exit whose PC points at the faulting
+    /// instruction. Because the guards run first, the division itself never sees
+    /// a zero divisor, so the emitted `udiv`/`urem` (or the I128 loop) can't trap.
+    fn emit_division(&mut self, instruction: &Instruction, signed: bool) -> crate::Result<()> {
         let size = self.operand_size(instruction, 0)?;
-        let divisor = self.read_operand(instruction, 0, size)?;
+        let (low, high, work_ty) =
+            Self::div_regs(size).ok_or_else(|| MicroliftError::UnsupportedInstruction {
+                mnemonic: format!("div-size-{}", size),
+            })?;
+        let ty = size_to_type(size);
+        let n = (size * 8) as i64;
 
-        // Special case: 8-bit IDIV uses AX (signed 16-bit) as the dividend,
-        // not AL. We must widen the divisor to I16 and divide in I16, then
-        // truncate the quotient/remainder back into AL/AH.
-        if size == 1 {
-            let dividend = self.get_reg_val(Register::AX)?; // I16
-            let div16 = self.builder.ins().sextend(types::I16, divisor);
-            let quot = self.builder.ins().sdiv(dividend, div16);
-            let rem = self.builder.ins().srem(dividend, div16);
-            let quot8 = self.builder.ins().ireduce(types::I8, quot);
-            let rem8 = self.builder.ins().ireduce(types::I8, rem);
-            self.set_reg_val(Register::AL, quot8)?;
-            self.set_reg_val(Register::AH, rem8)?;
-            return Ok(());
-        }
+        let divisor_n = self.read_operand(instruction, 0, size)?;
+        let dividend = self.assemble_dividend(low, high, work_ty)?;
 
-        let (quot_reg, rem_reg, dividend) = match size {
-            1 => unreachable!("handled above"),
-            2 => {
-                let ax = self.get_reg_val(Register::AX)?;
-                let ax16 = self.builder.ins().ireduce(types::I16, ax);
-                (Register::AX, Register::DX, ax16)
-            }
-            4 => {
-                let eax = self.get_reg_val(Register::EAX)?;
-                (Register::EAX, Register::EDX, eax)
-            }
-            8 => {
-                let rax = self.get_reg_val(Register::RAX)?;
-                (Register::RAX, Register::RDX, rax)
-            }
-            _ => {
-                return Err(MicroliftError::UnsupportedInstruction {
-                    mnemonic: format!("idiv-size-{}", size),
-                });
-            }
+        // Fault path, shared by the divide-by-zero and overflow guards.
+        let de_block = self.builder.create_block();
+
+        // Guard 1: divide by zero.
+        let div0 = self.builder.ins().icmp_imm(IntCC::Equal, divisor_n, 0);
+        let after_div0 = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(div0, de_block, &[], after_div0, &[]);
+        self.builder.switch_to_block(after_div0);
+        self.builder.seal_block(after_div0);
+
+        // Divisor is now known non-zero; compute the full-width quotient/remainder.
+        let (quot, rem) = if signed {
+            let divisor_w = self.builder.ins().sextend(work_ty, divisor_n);
+            let zero = self.wide_zero(work_ty);
+            let n_neg = self
+                .builder
+                .ins()
+                .icmp(IntCC::SignedLessThan, dividend, zero);
+            let d_neg = self
+                .builder
+                .ins()
+                .icmp(IntCC::SignedLessThan, divisor_w, zero);
+            // Divide magnitudes, then reapply signs (x86 truncates toward zero;
+            // the remainder takes the dividend's sign). Working on magnitudes
+            // also keeps the division away from the `INT_MIN / -1` trap case.
+            let neg_n = self.builder.ins().isub(zero, dividend);
+            let abs_n = self.builder.ins().select(n_neg, neg_n, dividend);
+            let neg_d = self.builder.ins().isub(zero, divisor_w);
+            let abs_d = self.builder.ins().select(d_neg, neg_d, divisor_w);
+
+            let (uq, ur) = self.emit_udivmod(abs_n, abs_d, work_ty);
+
+            let q_neg = self.builder.ins().bxor(n_neg, d_neg);
+            let neg_uq = self.builder.ins().isub(zero, uq);
+            let quot = self.builder.ins().select(q_neg, neg_uq, uq);
+            let neg_ur = self.builder.ins().isub(zero, ur);
+            let rem = self.builder.ins().select(n_neg, neg_ur, ur);
+            (quot, rem)
+        } else {
+            let divisor_w = self.builder.ins().uextend(work_ty, divisor_n);
+            self.emit_udivmod(dividend, divisor_w, work_ty)
         };
 
-        let quot = self.builder.ins().sdiv(dividend, divisor);
-        let rem = self.builder.ins().srem(dividend, divisor);
-        self.set_reg_val(quot_reg, quot)?;
-        self.set_reg_val(rem_reg, rem)?;
-        // IDIV leaves flags undefined per x86 manual - we don't update them.
+        // Guard 2: quotient overflow.
+        //   signed:   the low N bits, sign-extended, must reproduce the quotient.
+        //   unsigned: the bits above N must all be zero.
+        let overflow = if signed {
+            let q_trunc = self.builder.ins().ireduce(ty, quot);
+            let q_back = self.builder.ins().sextend(work_ty, q_trunc);
+            self.builder.ins().icmp(IntCC::NotEqual, q_back, quot)
+        } else {
+            let hi = self.builder.ins().ushr_imm(quot, n);
+            self.builder.ins().icmp_imm(IntCC::NotEqual, hi, 0)
+        };
+        let after_ovf = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(overflow, de_block, &[], after_ovf, &[]);
+
+        // Fault path first: emit the #DE exit so `de_block` is terminated before
+        // we switch away to the continuation (the frontend forbids leaving an
+        // unfilled block).
+        self.builder.switch_to_block(de_block);
+        self.builder.seal_block(de_block);
+        self.emit_divide_error(instruction)?;
+
+        // Non-faulting path: commit quotient and remainder, then leave the
+        // builder here so the engine keeps lifting from the continuation.
+        self.builder.switch_to_block(after_ovf);
+        self.builder.seal_block(after_ovf);
+        let quot_n = self.builder.ins().ireduce(ty, quot);
+        let rem_n = self.builder.ins().ireduce(ty, rem);
+        self.set_reg_val(low, quot_n)?;
+        self.set_reg_val(high, rem_n)?;
+        // DIV/IDIV leave the arithmetic flags undefined per the x86 manual.
+        self.block_terminated = false;
         Ok(())
     }
 
-    /// DIV - unsigned divide (same layout as IDIV but unsigned).
-    pub(super) fn handle_div(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let size = self.operand_size(instruction, 0)?;
-        let divisor = self.read_operand(instruction, 0, size)?;
+    /// Emit a divide-error (#DE) VM exit: sync guest state with the PC pointing
+    /// *at* the faulting `DIV`/`IDIV` (faults re-execute) and return to the host.
+    fn emit_divide_error(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let offset = instruction.ip().wrapping_sub(self.lift_base);
+        let image_base = self.builder.use_var(self.state.image_base);
+        let rip_at = self.builder.ins().iadd_imm(image_base, offset as i64);
+        self.sync_to_context(Some(rip_at), ExitReason::DivideError)?;
+        self.builder.ins().return_(&[]);
+        self.block_terminated = true;
+        Ok(())
+    }
 
-        // Special case: 8-bit DIV uses AX (unsigned 16-bit) as the dividend,
-        // not AL. Widen divisor to I16, divide in I16, truncate back.
-        if size == 1 {
-            let dividend = self.get_reg_val(Register::AX)?; // I16
-            let div16 = self.builder.ins().uextend(types::I16, divisor);
-            let quot = self.builder.ins().udiv(dividend, div16);
-            let rem = self.builder.ins().urem(dividend, div16);
-            let quot8 = self.builder.ins().ireduce(types::I8, quot);
-            let rem8 = self.builder.ins().ireduce(types::I8, rem);
-            self.set_reg_val(Register::AL, quot8)?;
-            self.set_reg_val(Register::AH, rem8)?;
-            return Ok(());
-        }
-
-        let (quot_reg, rem_reg, dividend) = match size {
-            1 => unreachable!("handled above"),
-            2 => {
-                let ax = self.get_reg_val(Register::AX)?;
-                let ax16 = self.builder.ins().ireduce(types::I16, ax);
-                (Register::AX, Register::DX, ax16)
-            }
-            4 => {
-                let eax = self.get_reg_val(Register::EAX)?;
-                (Register::EAX, Register::EDX, eax)
-            }
-            8 => {
-                let rax = self.get_reg_val(Register::RAX)?;
-                (Register::RAX, Register::RDX, rax)
-            }
-            _ => {
-                return Err(MicroliftError::UnsupportedInstruction {
-                    mnemonic: format!("div-size-{}", size),
-                });
-            }
+    /// Unsigned 128-bit / 128-bit division via restoring shift/subtract long
+    /// division, returning `(quotient, remainder)` as `I128`.
+    ///
+    /// The backend lacks native `udiv.i128`/`urem.i128`, but it does support
+    /// i128 shifts, adds, subtracts and comparisons, which is all this needs.
+    /// It emits a 128-iteration runtime loop; 64-bit division is not on the hot
+    /// path for typical lifted code, so the simplicity is worth the cost.
+    ///
+    /// Blocks use explicit parameters (not `Variable`s) to carry the loop state,
+    /// so they need no manual sealing beyond the engine's final `seal_all_blocks`.
+    fn emit_udivmod128(&mut self, n: Value, d: Value) -> (Value, Value) {
+        let i128 = types::I128;
+        let zero = {
+            let z = self.builder.ins().iconst(types::I64, 0);
+            self.builder.ins().uextend(i128, z)
+        };
+        let one = {
+            let o = self.builder.ins().iconst(types::I64, 1);
+            self.builder.ins().uextend(i128, o)
         };
 
-        let quot = self.builder.ins().udiv(dividend, divisor);
-        let rem = self.builder.ins().urem(dividend, divisor);
-        self.set_reg_val(quot_reg, quot)?;
-        self.set_reg_val(rem_reg, rem)?;
-        // DIV leaves flags undefined per x86 manual.
-        Ok(())
+        let loop_b = self.builder.create_block();
+        self.builder.append_block_param(loop_b, types::I64); // k: bit counter 0..=128
+        self.builder.append_block_param(loop_b, i128); // q: quotient so far
+        self.builder.append_block_param(loop_b, i128); // r: remainder so far
+        let body = self.builder.create_block();
+        self.builder.append_block_param(body, types::I64);
+        self.builder.append_block_param(body, i128);
+        self.builder.append_block_param(body, i128);
+        let exit = self.builder.create_block();
+        self.builder.append_block_param(exit, i128); // final q
+        self.builder.append_block_param(exit, i128); // final r
+
+        let k0 = self.builder.ins().iconst(types::I64, 0);
+        self.builder
+            .ins()
+            .jump(loop_b, &[k0.into(), zero.into(), zero.into()]);
+
+        // loop_b(k, q, r): stop after 128 bits, else fall through to `body`.
+        self.builder.switch_to_block(loop_b);
+        let k = self.builder.block_params(loop_b)[0];
+        let q = self.builder.block_params(loop_b)[1];
+        let r = self.builder.block_params(loop_b)[2];
+        let done = self.builder.ins().icmp_imm(IntCC::Equal, k, 128);
+        self.builder.ins().brif(
+            done,
+            exit,
+            &[q.into(), r.into()],
+            body,
+            &[k.into(), q.into(), r.into()],
+        );
+
+        // body(k, q, r): process bit (127 - k), MSB first.
+        self.builder.switch_to_block(body);
+        let k = self.builder.block_params(body)[0];
+        let q = self.builder.block_params(body)[1];
+        let r = self.builder.block_params(body)[2];
+        let bit_pos = self.builder.ins().irsub_imm(k, 127); // 127 - k
+        // r = (r << 1) | ((n >> bit_pos) & 1)
+        let r_shifted = self.builder.ins().ishl_imm(r, 1);
+        let n_bit_raw = self.builder.ins().ushr(n, bit_pos);
+        let n_bit = self.builder.ins().band(n_bit_raw, one);
+        let r_new = self.builder.ins().bor(r_shifted, n_bit);
+        // if r >= d: r -= d; set quotient bit.
+        let ge = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, r_new, d);
+        let r_sub = self.builder.ins().isub(r_new, d);
+        let r_out = self.builder.ins().select(ge, r_sub, r_new);
+        let q_bit = self.builder.ins().ishl(one, bit_pos);
+        let q_set = self.builder.ins().bor(q, q_bit);
+        let q_out = self.builder.ins().select(ge, q_set, q);
+        let k_next = self.builder.ins().iadd_imm(k, 1);
+        self.builder
+            .ins()
+            .jump(loop_b, &[k_next.into(), q_out.into(), r_out.into()]);
+
+        // exit(q, r): division complete.
+        self.builder.switch_to_block(exit);
+        let quot = self.builder.block_params(exit)[0];
+        let rem = self.builder.block_params(exit)[1];
+        (quot, rem)
     }
 
     // Sign-extension conversions (implicit operand form)

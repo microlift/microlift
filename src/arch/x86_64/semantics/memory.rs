@@ -90,7 +90,17 @@ impl<'a> Lifter<'a> {
 
     pub(super) fn handle_push(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let op0 = instruction.op0_kind();
-        let push_size = 8; // x86-64 PUSH is always 8 bytes
+
+        // In x86-64 the PUSH operand size is 8 by default, or 2 under a 0x66
+        // operand-size prefix (a 16-bit push). 32-bit pushes are not encodable
+        // in long mode. The slot decrement must match the value width.
+        let push_size: usize = match op0 {
+            OpKind::Register => instruction.op0_register().size(),
+            OpKind::Memory => instruction.memory_size().size(),
+            OpKind::Immediate16 => 2,
+            _ => 8,
+        };
+        let ty = size_to_type(push_size);
 
         let val = match op0 {
             OpKind::Register => self.get_reg_val(instruction.op0_register())?,
@@ -101,8 +111,11 @@ impl<'a> Lifter<'a> {
                     .ins()
                     .iconst(types::I64, instruction.immediate8to64())
             }
+            OpKind::Immediate16 => self
+                .builder
+                .ins()
+                .iconst(types::I16, instruction.immediate16() as i64),
             OpKind::Immediate8
-            | OpKind::Immediate16
             | OpKind::Immediate32
             | OpKind::Immediate64
             | OpKind::Immediate8to16
@@ -113,7 +126,7 @@ impl<'a> Lifter<'a> {
             }
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 0)?;
-                self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0)
+                self.builder.ins().load(ty, MemFlags::new(), ptr, 0)
             }
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -131,10 +144,17 @@ impl<'a> Lifter<'a> {
 
     pub(super) fn handle_pop(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let op0 = instruction.op0_kind();
-        let pop_size = 8;
+
+        // Match the operand size: 8 by default, 2 for a 0x66-prefixed pop.
+        let pop_size: usize = match op0 {
+            OpKind::Register => instruction.op0_register().size(),
+            OpKind::Memory => instruction.memory_size().size(),
+            _ => 8,
+        };
+        let ty = size_to_type(pop_size);
 
         let rsp = self.get_reg_val(Register::RSP)?;
-        let val = self.builder.ins().load(types::I64, MemFlags::new(), rsp, 0);
+        let val = self.builder.ins().load(ty, MemFlags::new(), rsp, 0);
 
         let new_rsp = self.builder.ins().iadd_imm(rsp, pop_size as i64);
         self.set_reg_val(Register::RSP, new_rsp)?;
@@ -170,6 +190,13 @@ impl<'a> Lifter<'a> {
     }
 
     pub(super) fn handle_xchg(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        // XCHG with a memory operand asserts LOCK implicitly on x86 (no prefix
+        // byte required), so it must be atomic. Route it through the same
+        // atomic-swap path used for `LOCK XCHG`.
+        if instruction.op0_kind() == OpKind::Memory || instruction.op1_kind() == OpKind::Memory {
+            return self.handle_lock_xchg(instruction);
+        }
+
         let size = self.operand_size(instruction, 0)?;
         let a = self.read_operand(instruction, 0, size)?;
         let b = self.read_operand(instruction, 1, size)?;
@@ -178,24 +205,87 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
+    /// Is this string instruction carrying a `REP`/`REPE`/`REPNE` prefix?
+    ///
+    /// For `MOVS`/`STOS`/`LODS` only the plain `REP` (F3) form is
+    /// architecturally meaningful; iced reports it through any of these
+    /// accessors depending on how it classifies the F2/F3 byte, so accept all.
+    fn has_rep_prefix(instruction: &Instruction) -> bool {
+        instruction.has_rep_prefix()
+            || instruction.has_repe_prefix()
+            || instruction.has_repne_prefix()
+    }
+
+    /// Wrap a single string-operation body in an `RCX`-driven `REP` loop when
+    /// the instruction has a repeat prefix; otherwise emit the body once.
+    ///
+    /// The emitted shape for a repeated op is:
+    /// ```text
+    ///   header:  if RCX == 0 { goto done }        (RCX is unsigned)
+    ///   body:    <one element>; RCX -= 1
+    ///            if RCX != 0 { goto body } else { goto done }
+    ///   done:    ...
+    /// ```
+    /// which matches `REP`'s "execute RCX times, testing the count *before*
+    /// each iteration" semantics (RCX == 0 performs zero iterations). The
+    /// address size is assumed 64-bit (RCX/RSI/RDI), consistent with the rest
+    /// of the string-op lowering.
+    fn emit_string_op(
+        &mut self,
+        instruction: &Instruction,
+        size: usize,
+        body: fn(&mut Self, usize) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        if !Self::has_rep_prefix(instruction) {
+            return body(self, size);
+        }
+
+        let body_block = self.builder.create_block();
+        let done_block = self.builder.create_block();
+
+        // header: skip the whole loop when the count is already zero.
+        let count = self.get_reg_val(Register::RCX)?;
+        let is_zero = self.builder.ins().icmp_imm(IntCC::Equal, count, 0);
+        self.builder
+            .ins()
+            .brif(is_zero, done_block, &[], body_block, &[]);
+
+        // body: one element, decrement RCX, loop while it stays nonzero.
+        self.builder.switch_to_block(body_block);
+        body(self, size)?;
+        let cur = self.get_reg_val(Register::RCX)?;
+        let dec = self.builder.ins().iadd_imm(cur, -1);
+        self.set_reg_val(Register::RCX, dec)?;
+        let nonzero = self.builder.ins().icmp_imm(IntCC::NotEqual, dec, 0);
+        self.builder
+            .ins()
+            .brif(nonzero, body_block, &[], done_block, &[]);
+        self.builder.seal_block(body_block);
+
+        self.builder.switch_to_block(done_block);
+        self.builder.seal_block(done_block);
+        self.block_terminated = false;
+        Ok(())
+    }
+
     /// MOVSB - move byte from [RSI] to [RDI], advance both by ±1.
-    pub(super) fn handle_movsb(&mut self, _instruction: &Instruction) -> crate::Result<()> {
-        self.emit_movs(1)
+    pub(super) fn handle_movsb(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.emit_string_op(instruction, 1, Self::emit_movs)
     }
 
     /// MOVSW - move word (2 bytes) from [RSI] to [RDI].
-    pub(super) fn handle_movsw(&mut self, _instruction: &Instruction) -> crate::Result<()> {
-        self.emit_movs(2)
+    pub(super) fn handle_movsw(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.emit_string_op(instruction, 2, Self::emit_movs)
     }
 
     /// MOVSD - move dword (4 bytes) from [RSI] to [RDI].
-    pub(super) fn handle_movsd_mem(&mut self, _instruction: &Instruction) -> crate::Result<()> {
-        self.emit_movs(4)
+    pub(super) fn handle_movsd_mem(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.emit_string_op(instruction, 4, Self::emit_movs)
     }
 
     /// MOVSQ - move qword (8 bytes) from [RSI] to [RDI].
-    pub(super) fn handle_movsq(&mut self, _instruction: &Instruction) -> crate::Result<()> {
-        self.emit_movs(8)
+    pub(super) fn handle_movsq(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.emit_string_op(instruction, 8, Self::emit_movs)
     }
 
     /// Signed pointer delta applied by a string op for one element of `size`
@@ -223,29 +313,40 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
+    /// The accumulator register (AL/AX/EAX/RAX) implied by a string element
+    /// `size`, used by STOS (source) and LODS (destination).
+    fn string_acc_reg(size: usize) -> Register {
+        match size {
+            1 => Register::AL,
+            2 => Register::AX,
+            4 => Register::EAX,
+            _ => Register::RAX,
+        }
+    }
+
     /// STOSB - store AL to [RDI], advance RDI by ±1.
-    pub(super) fn handle_stosb(&mut self, _instruction: &Instruction) -> crate::Result<()> {
-        self.emit_stos(Register::AL, 1)
+    pub(super) fn handle_stosb(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.emit_string_op(instruction, 1, Self::emit_stos)
     }
 
     /// STOSW - store AX to [RDI], advance RDI by ±2.
-    pub(super) fn handle_stosw(&mut self, _instruction: &Instruction) -> crate::Result<()> {
-        self.emit_stos(Register::AX, 2)
+    pub(super) fn handle_stosw(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.emit_string_op(instruction, 2, Self::emit_stos)
     }
 
     /// STOSD - store EAX to [RDI], advance RDI by ±4.
-    pub(super) fn handle_stosd(&mut self, _instruction: &Instruction) -> crate::Result<()> {
-        self.emit_stos(Register::EAX, 4)
+    pub(super) fn handle_stosd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.emit_string_op(instruction, 4, Self::emit_stos)
     }
 
     /// STOSQ - store RAX to [RDI], advance RDI by ±8.
-    pub(super) fn handle_stosq(&mut self, _instruction: &Instruction) -> crate::Result<()> {
-        self.emit_stos(Register::RAX, 8)
+    pub(super) fn handle_stosq(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.emit_string_op(instruction, 8, Self::emit_stos)
     }
 
-    fn emit_stos(&mut self, src_reg: Register, size: usize) -> crate::Result<()> {
+    fn emit_stos(&mut self, size: usize) -> crate::Result<()> {
         let rdi = self.get_reg_val(Register::RDI)?;
-        let val = self.get_reg_val(src_reg)?;
+        let val = self.get_reg_val(Self::string_acc_reg(size))?;
         self.builder.ins().store(MemFlags::new(), val, rdi, 0);
         let delta = self.string_delta(size);
         let new_rdi = self.builder.ins().iadd(rdi, delta);
@@ -254,24 +355,24 @@ impl<'a> Lifter<'a> {
     }
 
     /// LODSB/W/D/Q - load from [RSI] into AL/AX/EAX/RAX, advance RSI.
-    pub(super) fn handle_lodsb(&mut self, _instruction: &Instruction) -> crate::Result<()> {
-        self.emit_lods(Register::AL, 1)
+    pub(super) fn handle_lodsb(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.emit_string_op(instruction, 1, Self::emit_lods)
     }
-    pub(super) fn handle_lodsw(&mut self, _instruction: &Instruction) -> crate::Result<()> {
-        self.emit_lods(Register::AX, 2)
+    pub(super) fn handle_lodsw(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.emit_string_op(instruction, 2, Self::emit_lods)
     }
-    pub(super) fn handle_lodsd(&mut self, _instruction: &Instruction) -> crate::Result<()> {
-        self.emit_lods(Register::EAX, 4)
+    pub(super) fn handle_lodsd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.emit_string_op(instruction, 4, Self::emit_lods)
     }
-    pub(super) fn handle_lodsq(&mut self, _instruction: &Instruction) -> crate::Result<()> {
-        self.emit_lods(Register::RAX, 8)
+    pub(super) fn handle_lodsq(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.emit_string_op(instruction, 8, Self::emit_lods)
     }
 
-    fn emit_lods(&mut self, dst_reg: Register, size: usize) -> crate::Result<()> {
+    fn emit_lods(&mut self, size: usize) -> crate::Result<()> {
         let ty = size_to_type(size);
         let rsi = self.get_reg_val(Register::RSI)?;
         let val = self.builder.ins().load(ty, MemFlags::new(), rsi, 0);
-        self.set_reg_val(dst_reg, val)?;
+        self.set_reg_val(Self::string_acc_reg(size), val)?;
         let delta = self.string_delta(size);
         let new_rsi = self.builder.ins().iadd(rsi, delta);
         self.set_reg_val(Register::RSI, new_rsi)?;

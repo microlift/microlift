@@ -350,7 +350,7 @@ impl<'a> Lifter<'a> {
         } else {
             self.builder.ins().ireduce(types::I8, new_sf_w)
         };
-        let new_cf = if size == 1 {
+        let new_cf = if self.builder.func.dfg.value_type(cf_bit) == types::I8 {
             cf_bit
         } else {
             self.builder.ins().ireduce(types::I8, cf_bit)

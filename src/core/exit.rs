@@ -128,6 +128,13 @@ pub enum ExitReason {
     /// should populate `rax` (bits 31:0) and `rdx` (bits 63:32) with the desired
     /// timestamp-counter value and re-enter the guest at the PC.
     Rdtsc = 15,
+
+    /// A `DIV`/`IDIV` raised a divide error (#DE): either the divisor was zero
+    /// or the quotient did not fit in the destination. This is a fault, so the
+    /// PC points *at* the faulting `DIV`/`IDIV` (not past it) and no guest
+    /// registers have been modified. The host delivers #DE (interrupt vector 0)
+    /// to the guest.
+    DivideError = 16,
 }
 
 impl TryFrom<u32> for ExitReason {
@@ -166,6 +173,8 @@ impl TryFrom<u32> for ExitReason {
             Ok(Self::PortOutput)
         } else if value == Self::Rdtsc as u32 {
             Ok(Self::Rdtsc)
+        } else if value == Self::DivideError as u32 {
+            Ok(Self::DivideError)
         } else {
             Err(())
         }
@@ -191,6 +200,7 @@ impl std::fmt::Display for ExitReason {
             ExitReason::PortInput => "port-input",
             ExitReason::PortOutput => "port-output",
             ExitReason::Rdtsc => "rdtsc",
+            ExitReason::DivideError => "divide-error",
         })
     }
 }
@@ -302,7 +312,7 @@ mod tests {
     fn exit_reason_display_and_roundtrip() {
         assert_eq!(ExitReason::ImportedFunctionCall.to_string(), "imported-function-call");
         // try_from is the inverse of the discriminant.
-        for r in [ExitReason::None, ExitReason::Return, ExitReason::IndirectCall, ExitReason::Xgetbv, ExitReason::Interrupt, ExitReason::PortInput, ExitReason::PortOutput, ExitReason::Rdtsc] {
+        for r in [ExitReason::None, ExitReason::Return, ExitReason::IndirectCall, ExitReason::Xgetbv, ExitReason::Interrupt, ExitReason::PortInput, ExitReason::PortOutput, ExitReason::Rdtsc, ExitReason::DivideError] {
             assert_eq!(ExitReason::try_from(r as u32), Ok(r));
             assert!(!r.to_string().is_empty());
         }

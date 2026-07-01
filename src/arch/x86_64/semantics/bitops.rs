@@ -4,6 +4,13 @@ use crate::arch::x86_64::semantics::helpers::size_to_type;
 use cranelift::prelude::*;
 use iced_x86::{Instruction, OpKind, Register};
 
+/// Which flavour of single-count shift `emit_shift` should emit.
+enum ShiftKind {
+    Left,
+    RightLogical,
+    RightArithmetic,
+}
+
 impl<'a> Lifter<'a> {
     pub(super) fn handle_xor(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let op0 = instruction.op0_kind();
@@ -292,54 +299,95 @@ impl<'a> Lifter<'a> {
     }
 
     pub(super) fn handle_shl(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let size = self.operand_size(instruction, 0)?;
-        let ty = size_to_type(size);
-        let val = self.read_operand(instruction, 0, size)?;
-        let count = self.shift_count(instruction, ty)?;
-        let result = self.builder.ins().ishl(val, count);
-        self.write_operand(instruction, 0, result)?;
-
-        // CF = last bit shifted out: (val >> (size*8 - count)) & 1
-        let bit_width = self.builder.ins().iconst(ty, (size * 8) as i64);
-        let cf_shift = self.builder.ins().isub(bit_width, count);
-        let cf_raw = self.builder.ins().ushr(val, cf_shift);
-        let one = self.builder.ins().iconst(ty, 1);
-        let cf_bit = self.builder.ins().band(cf_raw, one);
-        self.update_flags_shift(result, cf_bit, count, size)?;
-        Ok(())
+        self.emit_shift(instruction, ShiftKind::Left)
     }
 
     pub(super) fn handle_shr(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let size = self.operand_size(instruction, 0)?;
-        let ty = size_to_type(size);
-        let val = self.read_operand(instruction, 0, size)?;
-        let count = self.shift_count(instruction, ty)?;
-        let result = self.builder.ins().ushr(val, count);
-        self.write_operand(instruction, 0, result)?;
-
-        // CF = last bit shifted out: (val >> (count - 1)) & 1
-        let one_val = self.builder.ins().iconst(ty, 1);
-        let cf_shift = self.builder.ins().isub(count, one_val);
-        let cf_raw = self.builder.ins().ushr(val, cf_shift);
-        let cf_bit = self.builder.ins().band(cf_raw, one_val);
-        self.update_flags_shift(result, cf_bit, count, size)?;
-        Ok(())
+        self.emit_shift(instruction, ShiftKind::RightLogical)
     }
 
     pub(super) fn handle_sar(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.emit_shift(instruction, ShiftKind::RightArithmetic)
+    }
+
+    /// Shared SHL/SHR/SAR lowering.
+    ///
+    /// x86 masks the shift count to 5 bits (6 for 64-bit operands) and *then*
+    /// shifts, so a masked count `>=` the operand width is legal and yields 0
+    /// (SHL/SHR) or the sign fill (SAR). Cranelift's shift ops instead re-mask
+    /// the amount modulo the operand width, which would corrupt 8/16-bit shifts
+    /// whose masked count reaches 8..31. To match hardware we perform the shift
+    /// in a working type at least 32 bits wide, where the 5-bit masked count is
+    /// always `<` the width, then truncate back. (For 32/64-bit operands the
+    /// mask already guarantees `count < width`, so the working type equals the
+    /// operand type and this is a no-op widening.)
+    fn emit_shift(&mut self, instruction: &Instruction, kind: ShiftKind) -> crate::Result<()> {
         let size = self.operand_size(instruction, 0)?;
         let ty = size_to_type(size);
+        let bit_width = (size * 8) as i64;
         let val = self.read_operand(instruction, 0, size)?;
         let count = self.shift_count(instruction, ty)?;
-        let result = self.builder.ins().sshr(val, count);
-        self.write_operand(instruction, 0, result)?;
 
-        // CF = last bit shifted out
-        let one_val = self.builder.ins().iconst(ty, 1);
-        let cf_shift = self.builder.ins().isub(count, one_val);
-        let cf_raw = self.builder.ins().ushr(val, cf_shift);
-        let cf_bit = self.builder.ins().band(cf_raw, one_val);
-        self.update_flags_shift(result, cf_bit, count, size)?;
+        // Working type: widen sub-32-bit operands so the masked count fits.
+        let work_ty = if size < 4 { types::I32 } else { ty };
+        let widen = work_ty != ty;
+
+        // Extend the value into the working type. SAR needs sign extension so
+        // both the arithmetic shift and the CF (sign) bit are correct.
+        let val_w = if !widen {
+            val
+        } else if matches!(kind, ShiftKind::RightArithmetic) {
+            self.builder.ins().sextend(work_ty, val)
+        } else {
+            self.builder.ins().uextend(work_ty, val)
+        };
+        let count_w = if !widen {
+            count
+        } else {
+            self.builder.ins().uextend(work_ty, count)
+        };
+        let one_w = self.builder.ins().iconst(work_ty, 1);
+
+        let (shifted_w, cf_bit) = match kind {
+            ShiftKind::Left => {
+                let shifted = self.builder.ins().ishl(val_w, count_w);
+                // CF = last bit shifted out of the MSB = bit (width - count) of
+                // the original value. Computed in the working type: for a
+                // masked count > width, `width - count` wraps and the shift's
+                // modulo-width masking makes the read land on a zero bit, which
+                // is the correct CF (0) for an over-wide shift.
+                let bw = self.builder.ins().iconst(work_ty, bit_width);
+                let cf_shift = self.builder.ins().isub(bw, count_w);
+                let cf_raw = self.builder.ins().ushr(val_w, cf_shift);
+                let cf = self.builder.ins().band(cf_raw, one_w);
+                (shifted, cf)
+            }
+            ShiftKind::RightLogical => {
+                let shifted = self.builder.ins().ushr(val_w, count_w);
+                // CF = bit (count-1) of the original value.
+                let cf_shift = self.builder.ins().isub(count_w, one_w);
+                let cf_raw = self.builder.ins().ushr(val_w, cf_shift);
+                let cf = self.builder.ins().band(cf_raw, one_w);
+                (shifted, cf)
+            }
+            ShiftKind::RightArithmetic => {
+                let shifted = self.builder.ins().sshr(val_w, count_w);
+                // CF = bit (count-1) of the sign-extended value (so counts past
+                // the width read back the sign bit, matching hardware).
+                let cf_shift = self.builder.ins().isub(count_w, one_w);
+                let cf_raw = self.builder.ins().ushr(val_w, cf_shift);
+                let cf = self.builder.ins().band(cf_raw, one_w);
+                (shifted, cf)
+            }
+        };
+
+        let result = if widen {
+            self.builder.ins().ireduce(ty, shifted_w)
+        } else {
+            shifted_w
+        };
+        self.write_operand(instruction, 0, result)?;
+        self.update_flags_shift(result, cf_bit, count_w, size)?;
         Ok(())
     }
 
@@ -354,10 +402,10 @@ impl<'a> Lifter<'a> {
         let right = self.builder.ins().ushr(val, right_count);
         let result = self.builder.ins().bor(left, right);
         self.write_operand(instruction, 0, result)?;
-        // CF = low bit of result (the bit that rotated out of MSB)
+        // CF = low bit of result (the bit that rotated out of MSB).
         let one = self.builder.ins().iconst(ty, 1);
         let cf_bit = self.builder.ins().band(result, one);
-        self.set_flag(X86Flag::Carry, cf_bit)?;
+        self.set_rotate_cf(cf_bit, count)?;
         Ok(())
     }
 
@@ -372,10 +420,25 @@ impl<'a> Lifter<'a> {
         let left = self.builder.ins().ishl(val, left_count);
         let result = self.builder.ins().bor(right, left);
         self.write_operand(instruction, 0, result)?;
-        // CF = MSB of result (the bit that rotated out of bit 0)
+        // CF = MSB of result (the bit that rotated out of bit 0).
         let cf_bit = self.builder.ins().ushr_imm(result, (size * 8 - 1) as i64);
-        self.set_flag(X86Flag::Carry, cf_bit)?;
+        self.set_rotate_cf(cf_bit, count)?;
         Ok(())
+    }
+
+    /// Set CF from a rotate's carried-out bit, but leave CF untouched when the
+    /// masked rotate `count` is 0 (per x86: a zero masked count affects no
+    /// flags). `cf_bit` is in the operand type; `count` is the masked count.
+    fn set_rotate_cf(&mut self, cf_bit: Value, count: Value) -> crate::Result<()> {
+        let old_cf = self.builder.use_var(self.state.flags[&X86Flag::Carry]);
+        let new_cf = if self.builder.func.dfg.value_type(cf_bit) == types::I8 {
+            cf_bit
+        } else {
+            self.builder.ins().ireduce(types::I8, cf_bit)
+        };
+        let is_zero = self.builder.ins().icmp_imm(IntCC::Equal, count, 0);
+        let final_cf = self.builder.ins().select(is_zero, old_cf, new_cf);
+        self.set_flag(X86Flag::Carry, final_cf)
     }
 
     /// Build a constant of width `ty` from a (non-negative, <= 64-bit) value.

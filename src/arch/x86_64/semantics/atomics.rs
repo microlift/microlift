@@ -305,7 +305,7 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    fn handle_lock_xchg(&mut self, instruction: &Instruction) -> crate::Result<()> {
+    pub(super) fn handle_lock_xchg(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let size = self.operand_size(instruction, 0)?;
         let ty = size_to_type(size);
 
