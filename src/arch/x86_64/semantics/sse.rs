@@ -15,7 +15,7 @@
 //! representations.
 
 use crate::MicroliftError;
-use crate::lifter::Lifter;
+use crate::lifter::{Lifter, X86Flag};
 use crate::arch::x86_64::semantics::helpers::xmm_register_index;
 use cranelift::prelude::*;
 use iced_x86::{Instruction, OpKind};
@@ -674,6 +674,130 @@ impl<'a> Lifter<'a> {
                 });
             }
         }
+        Ok(())
+    }
+
+    /// Read the low 64 bits (a scalar `f64`'s raw bits) of a source operand.
+    ///
+    /// Unlike [`Self::read_xmm_src`], memory sources load only 8 bytes, which is
+    /// correct for the `m64` operands of scalar-double instructions (`ADDSD`,
+    /// `UCOMISD`, ...).
+    fn read_scalar_f64_bits(
+        &mut self,
+        instruction: &Instruction,
+        op_index: u32,
+    ) -> crate::Result<Value> {
+        match self.operand_kind(instruction, op_index) {
+            OpKind::Register => {
+                let reg = self.operand_register(instruction, op_index);
+                if let Some(idx) = xmm_register_index(reg) {
+                    Ok(self.get_xmm_lo(idx))
+                } else {
+                    self.get_reg_val(reg)
+                }
+            }
+            OpKind::Memory => {
+                let ptr = self.get_mem_ptr(instruction, op_index)?;
+                Ok(self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0))
+            }
+            other => Err(MicroliftError::UnsupportedInstruction {
+                mnemonic: format!("scalar-f64-src-op{}-{:?}", op_index, other),
+            }),
+        }
+    }
+
+    /// PUNPCKLDQ - interleave the low doublewords of dst and src.
+    ///
+    /// The result's four dwords are `[dst.d0, src.d0, dst.d1, src.d1]`, so only
+    /// the low quadword of each operand participates.
+    pub(super) fn handle_punpckldq(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, "punpckldq")?;
+        let dst_lo = self.get_xmm_lo(dst_idx);
+        let (src_lo, _src_hi) = self.read_xmm_src(instruction, 1)?;
+
+        let dst_d0 = self.builder.ins().band_imm(dst_lo, 0xFFFF_FFFF);
+        let dst_d1 = self.builder.ins().ushr_imm(dst_lo, 32);
+        let src_d0 = self.builder.ins().band_imm(src_lo, 0xFFFF_FFFF);
+        let src_d1 = self.builder.ins().ushr_imm(src_lo, 32);
+
+        let src_d0_hi = self.builder.ins().ishl_imm(src_d0, 32);
+        let res_lo = self.builder.ins().bor(dst_d0, src_d0_hi);
+        let src_d1_hi = self.builder.ins().ishl_imm(src_d1, 32);
+        let res_hi = self.builder.ins().bor(dst_d1, src_d1_hi);
+
+        self.set_xmm_lo(dst_idx, res_lo);
+        self.set_xmm_hi(dst_idx, res_hi);
+        Ok(())
+    }
+
+    /// SUBPD - packed double-precision subtract of both 64-bit lanes.
+    pub(super) fn handle_subpd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, "subpd")?;
+        let dst_lo = self.get_xmm_lo(dst_idx);
+        let dst_hi = self.get_xmm_hi(dst_idx);
+        let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
+
+        let res_lo = self.fsub_f64_bits(dst_lo, src_lo);
+        let res_hi = self.fsub_f64_bits(dst_hi, src_hi);
+
+        self.set_xmm_lo(dst_idx, res_lo);
+        self.set_xmm_hi(dst_idx, res_hi);
+        Ok(())
+    }
+
+    /// Subtract two `f64` values given as raw `I64` bit patterns, returning the
+    /// difference's bits.
+    fn fsub_f64_bits(&mut self, a_bits: Value, b_bits: Value) -> Value {
+        let a = self.builder.ins().bitcast(types::F64, MemFlags::new(), a_bits);
+        let b = self.builder.ins().bitcast(types::F64, MemFlags::new(), b_bits);
+        let r = self.builder.ins().fsub(a, b);
+        self.builder.ins().bitcast(types::I64, MemFlags::new(), r)
+    }
+
+    /// ADDSD - scalar double-precision add of the low 64 bits; the high 64 bits
+    /// of the destination are preserved.
+    pub(super) fn handle_addsd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, "addsd")?;
+        let dst_lo = self.get_xmm_lo(dst_idx);
+        let src_lo = self.read_scalar_f64_bits(instruction, 1)?;
+
+        let a = self.builder.ins().bitcast(types::F64, MemFlags::new(), dst_lo);
+        let b = self.builder.ins().bitcast(types::F64, MemFlags::new(), src_lo);
+        let sum = self.builder.ins().fadd(a, b);
+        let res_lo = self.builder.ins().bitcast(types::I64, MemFlags::new(), sum);
+
+        // hi 64 bits are preserved (no write needed).
+        self.set_xmm_lo(dst_idx, res_lo);
+        Ok(())
+    }
+
+    /// UCOMISD / COMISD - compare the low scalar doubles of two operands and set
+    /// the integer flags (ZF/PF/CF); OF/SF/AF are cleared.
+    ///
+    /// The ordered (`COMISD`) and unordered (`UCOMISD`) forms differ only in
+    /// which operands raise an invalid-operation exception, which this lifter
+    /// does not model, so both are handled identically.
+    pub(super) fn handle_ucomisd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, "ucomisd")?;
+        let a_bits = self.get_xmm_lo(dst_idx);
+        let b_bits = self.read_scalar_f64_bits(instruction, 1)?;
+
+        let a = self.builder.ins().bitcast(types::F64, MemFlags::new(), a_bits);
+        let b = self.builder.ins().bitcast(types::F64, MemFlags::new(), b_bits);
+
+        let unord = self.builder.ins().fcmp(FloatCC::Unordered, a, b);
+        let eq = self.builder.ins().fcmp(FloatCC::Equal, a, b);
+        let lt = self.builder.ins().fcmp(FloatCC::LessThan, a, b);
+
+        let zf = self.builder.ins().bor(eq, unord);
+        let cf = self.builder.ins().bor(lt, unord);
+        self.set_flag(X86Flag::Zero, zf)?;
+        self.set_flag(X86Flag::Parity, unord)?;
+        self.set_flag(X86Flag::Carry, cf)?;
+        let zero = self.builder.ins().iconst(types::I8, 0);
+        self.set_flag(X86Flag::Overflow, zero)?;
+        self.set_flag(X86Flag::Sign, zero)?;
+        self.set_flag(X86Flag::Auxiliary, zero)?;
         Ok(())
     }
 }

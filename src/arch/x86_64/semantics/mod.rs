@@ -68,6 +68,12 @@ impl<'a> Lifter<'a> {
             Mnemonic::Movhps | Mnemonic::Movhpd => self.handle_movhps(instruction),
             Mnemonic::Psrlq => self.handle_psrlq(instruction),
             Mnemonic::Pshufd => self.handle_pshufd(instruction),
+            Mnemonic::Punpckldq => self.handle_punpckldq(instruction),
+
+            // SSE2 - scalar / packed double-precision arithmetic
+            Mnemonic::Subpd => self.handle_subpd(instruction),
+            Mnemonic::Addsd => self.handle_addsd(instruction),
+            Mnemonic::Ucomisd | Mnemonic::Comisd => self.handle_ucomisd(instruction),
 
             // SSE / SSE2 - XMM logic
             Mnemonic::Xorps | Mnemonic::Xorpd => self.handle_xorps(instruction),

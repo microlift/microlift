@@ -737,6 +737,132 @@ fn test_pshufd_broadcast_dword2() {
     assert_eq!(ctx.xmm[0], [0x2222_2222_2222_2222, 0x2222_2222_2222_2222]);
 }
 
+//  PUNPCKLDQ
+
+#[test]
+fn test_punpckldq() {
+    // punpckldq xmm0, xmm1; ret  ->  66 0F 62 C1  C3
+    // result dwords = [dst.d0, src.d0, dst.d1, src.d1]
+    let bytes = [0x66, 0x0F, 0x62, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    // dst dwords: d0=0xAAAA_AAAA, d1=0xBBBB_BBBB (d2/d3 ignored)
+    ctx.xmm[0] = [0xBBBB_BBBB_AAAA_AAAA, 0x9999_9999_8888_8888];
+    // src dwords: s0=0xCCCC_CCCC, s1=0xDDDD_DDDD
+    ctx.xmm[1] = [0xDDDD_DDDD_CCCC_CCCC, 0x7777_7777_6666_6666];
+    let ctx = run_test(&bytes, ctx);
+    // lo = dst.d0 | src.d0<<32 ; hi = dst.d1 | src.d1<<32
+    assert_eq!(ctx.xmm[0][0], 0xCCCC_CCCC_AAAA_AAAA);
+    assert_eq!(ctx.xmm[0][1], 0xDDDD_DDDD_BBBB_BBBB);
+}
+
+//  SUBPD (packed double subtract)
+
+#[test]
+fn test_subpd() {
+    // subpd xmm0, xmm1; ret  ->  66 0F 5C C1  C3
+    let bytes = [0x66, 0x0F, 0x5C, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [10.0f64.to_bits(), 3.5f64.to_bits()];
+    ctx.xmm[1] = [4.0f64.to_bits(), 1.25f64.to_bits()];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(f64::from_bits(ctx.xmm[0][0]), 6.0, "lane 0: 10 - 4");
+    assert_eq!(f64::from_bits(ctx.xmm[0][1]), 2.25, "lane 1: 3.5 - 1.25");
+}
+
+//  ADDSD (scalar double add)
+
+#[test]
+fn test_addsd_reg() {
+    // addsd xmm0, xmm1; ret  ->  F2 0F 58 C1  C3
+    let bytes = [0xF2, 0x0F, 0x58, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [2.5f64.to_bits(), 0x1111_2222_3333_4444];
+    ctx.xmm[1] = [7.0f64.to_bits(), 0x9999_9999_9999_9999];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(f64::from_bits(ctx.xmm[0][0]), 9.5, "low lane: 2.5 + 7.0");
+    assert_eq!(
+        ctx.xmm[0][1], 0x1111_2222_3333_4444,
+        "high lane must be preserved by addsd"
+    );
+}
+
+#[test]
+fn test_addsd_mem() {
+    // addsd xmm0, [rax]; ret  ->  F2 0F 58 00  C3  (m64 source)
+    let bytes = [0xF2, 0x0F, 0x58, 0x00, 0xC3];
+    let src: f64 = 0.5;
+    let mut ctx = RegisterContext::default();
+    ctx.rax = &src as *const f64 as u64;
+    ctx.xmm[0] = [1.0f64.to_bits(), 0xDEAD_BEEF_CAFE_BABE];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(f64::from_bits(ctx.xmm[0][0]), 1.5);
+    assert_eq!(ctx.xmm[0][1], 0xDEAD_BEEF_CAFE_BABE);
+}
+
+//  UCOMISD (scalar double compare -> EFLAGS)
+
+#[test]
+fn test_ucomisd_less() {
+    // ucomisd xmm0, xmm1; ret  ->  66 0F 2E C1  C3
+    let bytes = [0x66, 0x0F, 0x2E, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [1.0f64.to_bits(), 0];
+    ctx.xmm[1] = [2.0f64.to_bits(), 0];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.cf, 1, "1 < 2 -> CF set");
+    assert_eq!(ctx.zf, 0);
+    assert_eq!(ctx.pf, 0, "ordered -> PF clear");
+}
+
+#[test]
+fn test_ucomisd_equal() {
+    let bytes = [0x66, 0x0F, 0x2E, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [5.0f64.to_bits(), 0];
+    ctx.xmm[1] = [5.0f64.to_bits(), 0];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.zf, 1, "equal -> ZF set");
+    assert_eq!(ctx.cf, 0);
+    assert_eq!(ctx.pf, 0);
+}
+
+#[test]
+fn test_ucomisd_greater() {
+    let bytes = [0x66, 0x0F, 0x2E, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [9.0f64.to_bits(), 0];
+    ctx.xmm[1] = [4.0f64.to_bits(), 0];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.cf, 0);
+    assert_eq!(ctx.zf, 0);
+    assert_eq!(ctx.pf, 0);
+}
+
+#[test]
+fn test_ucomisd_unordered() {
+    // NaN in xmm0 -> unordered: ZF=PF=CF=1
+    let bytes = [0x66, 0x0F, 0x2E, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [f64::NAN.to_bits(), 0];
+    ctx.xmm[1] = [1.0f64.to_bits(), 0];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.cf, 1);
+    assert_eq!(ctx.zf, 1);
+    assert_eq!(ctx.pf, 1, "unordered -> PF set");
+}
+
+//  MOVAPD (already dispatched via handle_movaps)
+
+#[test]
+fn test_movapd_reg_reg() {
+    // movapd xmm0, xmm1; ret  ->  66 0F 28 C1  C3
+    let bytes = [0x66, 0x0F, 0x28, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[1] = [0x1234_5678_9ABC_DEF0, 0xFEDC_BA98_7654_3210];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.xmm[0], [0x1234_5678_9ABC_DEF0, 0xFEDC_BA98_7654_3210]);
+}
+
 #[test]
 fn test_vec_pshufd_and_psrlq() {
     // Same ops as the scalar tests, but in vector-xmm mode, to exercise the
