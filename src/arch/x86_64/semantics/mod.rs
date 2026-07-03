@@ -8,6 +8,7 @@ pub mod atomics;
 pub mod bitops;
 pub mod control_flow;
 pub mod flags;
+pub mod fpu;
 pub mod helpers;
 pub mod memory;
 pub mod setcc;
@@ -16,6 +17,7 @@ pub mod syscall;
 pub mod unimplemented;
 
 use crate::MicroliftError;
+use crate::arch::x86_64::semantics::fpu::FpuOp;
 use crate::lifter::Lifter;
 use iced_x86::{Instruction, Mnemonic, OpKind};
 
@@ -239,6 +241,65 @@ impl<'a> Lifter<'a> {
             Mnemonic::Wrfsbase => self.handle_wrfsbase(instruction),
             Mnemonic::Rdgsbase => self.handle_rdgsbase(instruction),
             Mnemonic::Wrgsbase => self.handle_wrgsbase(instruction),
+
+            // x87 FPU - loads / stores
+            Mnemonic::Fld => self.handle_fld(instruction),
+            Mnemonic::Fild => self.handle_fild(instruction),
+            Mnemonic::Fldz => self.handle_fld_const(0.0),
+            Mnemonic::Fld1 => self.handle_fld_const(1.0),
+            Mnemonic::Fldpi => self.handle_fld_const(std::f64::consts::PI),
+            Mnemonic::Fst => self.handle_fst(instruction, false),
+            Mnemonic::Fstp => self.handle_fst(instruction, true),
+            Mnemonic::Fist => self.handle_fist(instruction, false, false),
+            Mnemonic::Fistp => self.handle_fist(instruction, true, false),
+            Mnemonic::Fisttp => self.handle_fist(instruction, true, true),
+            Mnemonic::Fxch => self.handle_fxch(instruction),
+
+            // x87 FPU - arithmetic
+            Mnemonic::Fadd => self.handle_farith(instruction, FpuOp::Add, false),
+            Mnemonic::Faddp => self.handle_farith(instruction, FpuOp::Add, true),
+            Mnemonic::Fsub => self.handle_farith(instruction, FpuOp::Sub, false),
+            Mnemonic::Fsubp => self.handle_farith(instruction, FpuOp::Sub, true),
+            Mnemonic::Fsubr => self.handle_farith(instruction, FpuOp::Subr, false),
+            Mnemonic::Fsubrp => self.handle_farith(instruction, FpuOp::Subr, true),
+            Mnemonic::Fmul => self.handle_farith(instruction, FpuOp::Mul, false),
+            Mnemonic::Fmulp => self.handle_farith(instruction, FpuOp::Mul, true),
+            Mnemonic::Fdiv => self.handle_farith(instruction, FpuOp::Div, false),
+            Mnemonic::Fdivp => self.handle_farith(instruction, FpuOp::Div, true),
+            Mnemonic::Fdivr => self.handle_farith(instruction, FpuOp::Divr, false),
+            Mnemonic::Fdivrp => self.handle_farith(instruction, FpuOp::Divr, true),
+            Mnemonic::Fabs => self.handle_fabs(instruction),
+            Mnemonic::Fchs => self.handle_fchs(instruction),
+            Mnemonic::Fsqrt => self.handle_fsqrt(instruction),
+
+            // x87 FPU - comparisons
+            Mnemonic::Fcom => self.handle_fcom(instruction, false),
+            Mnemonic::Fcomp => self.handle_fcom(instruction, true),
+            Mnemonic::Fucom => self.handle_fcom(instruction, false),
+            Mnemonic::Fucomp => self.handle_fcom(instruction, true),
+            Mnemonic::Ftst => self.handle_ftst(instruction),
+            Mnemonic::Fcomi => self.handle_fcomi(instruction, false),
+            Mnemonic::Fcomip => self.handle_fcomi(instruction, true),
+            Mnemonic::Fucomi => self.handle_fcomi(instruction, false),
+            Mnemonic::Fucomip => self.handle_fcomi(instruction, true),
+
+            // x87 FPU - conditional moves
+            Mnemonic::Fcmovb => self.handle_fcmovb(instruction),
+            Mnemonic::Fcmovnb => self.handle_fcmovnb(instruction),
+            Mnemonic::Fcmove => self.handle_fcmove(instruction),
+            Mnemonic::Fcmovne => self.handle_fcmovne(instruction),
+            Mnemonic::Fcmovbe => self.handle_fcmovbe(instruction),
+            Mnemonic::Fcmovnbe => self.handle_fcmovnbe(instruction),
+            Mnemonic::Fcmovu => self.handle_fcmovu(instruction),
+            Mnemonic::Fcmovnu => self.handle_fcmovnu(instruction),
+
+            // x87 FPU - control / misc
+            Mnemonic::Fnstsw => self.handle_fnstsw(instruction),
+            Mnemonic::Fnstcw => self.handle_fnstcw(instruction),
+            Mnemonic::Fldcw => self.handle_fldcw(instruction),
+            Mnemonic::Fincstp => self.handle_fincstp(instruction),
+            Mnemonic::Fdecstp => self.handle_fdecstp(instruction),
+            Mnemonic::Ffree | Mnemonic::Fnop => self.handle_fpu_nop(instruction),
 
             Mnemonic::Stc => self.handle_stc(instruction),
             Mnemonic::Clc => self.handle_clc(instruction),

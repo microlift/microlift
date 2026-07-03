@@ -1,0 +1,774 @@
+//! x87 FPU instruction semantics.
+//!
+//! The x87 register file is a stack of eight registers `ST(0)`-`ST(7)`. The
+//! architectural register `ST(i)` is not a fixed location: it names the slot
+//! `(TOP + i) & 7`, where `TOP` is a 3-bit pointer that decrements on a push
+//! (`FLD`, `FLDZ`, ...) and increments on a pop (`FSTP`, `FADDP`, ...).
+//!
+//! Because `TOP` is a *runtime* value, this module keeps the whole x87 state in
+//! the [`RegisterContext`] (rather than in SSA variables like the GPRs/XMMs) and
+//! accesses it through computed pointers. Each `ST(i)` reference loads `TOP`,
+//! forms the address `&fpr[(TOP + i) & 7]`, and loads/stores an `f64`. This is
+//! self-contained: no other instruction category touches the x87 fields, so no
+//! entry/exit sync integration is required.
+//!
+//! Registers are modelled in `f64` precision. `FLD`/`FSTP` of an 80-bit `m80`
+//! operand convert between the extended format and `f64` for normal values and
+//! zero; the extra range/precision of `long double` and NaN payloads are not
+//! preserved (see [`RegisterContext::fpr`]).
+
+use crate::MicroliftError;
+use crate::arch::x86_64::context::RegisterContext;
+use crate::lifter::{Lifter, X86Flag};
+use cranelift::prelude::*;
+use iced_x86::{Instruction, MemorySize, OpKind};
+
+/// The binary x87 arithmetic operations, parameterised so a single handler
+/// covers `FADD`/`FSUB`/`FSUBR`/`FMUL`/`FDIV`/`FDIVR` and their popping forms.
+#[derive(Clone, Copy)]
+pub(super) enum FpuOp {
+    Add,
+    Sub,
+    /// Reverse subtract: `dst = src - dst`.
+    Subr,
+    Mul,
+    Div,
+    /// Reverse divide: `dst = src / dst`.
+    Divr,
+}
+
+// Status-word condition-code bit positions.
+const SW_C0: i64 = 1 << 8;
+const SW_C1: i64 = 1 << 9;
+const SW_C2: i64 = 1 << 10;
+const SW_C3: i64 = 1 << 14;
+const SW_CC_MASK: i64 = SW_C0 | SW_C1 | SW_C2 | SW_C3;
+
+impl<'a> Lifter<'a> {
+    // --- low-level x87 state access -------------------------------------
+
+    fn fpu_ctx_ptr(&mut self) -> Value {
+        self.builder.use_var(self.state.context_ptr)
+    }
+
+    /// Load the top-of-stack pointer as an `I32`.
+    fn fpu_load_top(&mut self) -> Value {
+        let ctx = self.fpu_ctx_ptr();
+        let off = std::mem::offset_of!(RegisterContext, fpu_top) as i32;
+        let t = self
+            .builder
+            .ins()
+            .load(types::I16, MemFlags::trusted(), ctx, off);
+        self.builder.ins().uextend(types::I32, t)
+    }
+
+    /// Store a new top-of-stack pointer (`I32`, only the low 3 bits matter).
+    fn fpu_store_top(&mut self, top: Value) {
+        let ctx = self.fpu_ctx_ptr();
+        let off = std::mem::offset_of!(RegisterContext, fpu_top) as i32;
+        let t16 = self.builder.ins().ireduce(types::I16, top);
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), t16, ctx, off);
+    }
+
+    /// Pointer to the physical slot backing architectural `ST(i)`.
+    fn fpu_st_ptr(&mut self, i: u32) -> Value {
+        let top = self.fpu_load_top();
+        let raw = self.builder.ins().iadd_imm(top, i as i64);
+        let phys = self.builder.ins().band_imm(raw, 7);
+        let byte_off = self.builder.ins().imul_imm(phys, 8);
+        let byte_off = self.builder.ins().uextend(types::I64, byte_off);
+        let ctx = self.fpu_ctx_ptr();
+        let fpr_off = std::mem::offset_of!(RegisterContext, fpr) as i64;
+        let base = self.builder.ins().iadd_imm(ctx, fpr_off);
+        self.builder.ins().iadd(base, byte_off)
+    }
+
+    /// Read `ST(i)` as an `f64`.
+    fn fpu_read_st(&mut self, i: u32) -> Value {
+        let p = self.fpu_st_ptr(i);
+        self.builder.ins().load(types::F64, MemFlags::trusted(), p, 0)
+    }
+
+    /// Write an `f64` into `ST(i)`.
+    fn fpu_write_st(&mut self, i: u32, val: Value) {
+        let p = self.fpu_st_ptr(i);
+        self.builder.ins().store(MemFlags::trusted(), val, p, 0);
+    }
+
+    /// Decrement `TOP` and store `val` into the new `ST(0)`.
+    fn fpu_push(&mut self, val: Value) {
+        let top = self.fpu_load_top();
+        let dec = self.builder.ins().iadd_imm(top, -1);
+        let new_top = self.builder.ins().band_imm(dec, 7);
+        self.fpu_store_top(new_top);
+        self.fpu_write_st(0, val);
+    }
+
+    /// Increment `TOP` (discarding the old `ST(0)`).
+    fn fpu_pop(&mut self) {
+        let top = self.fpu_load_top();
+        let inc = self.builder.ins().iadd_imm(top, 1);
+        let new_top = self.builder.ins().band_imm(inc, 7);
+        self.fpu_store_top(new_top);
+    }
+
+    /// Resolve operand `op_index` to a stack index (`ST(n)` -> `n`).
+    fn fpu_st_index(&self, instruction: &Instruction, op_index: u32) -> crate::Result<u32> {
+        let reg = self.operand_register(instruction, op_index);
+        if reg.is_st() {
+            Ok(reg.number() as u32)
+        } else {
+            Err(MicroliftError::UnsupportedInstruction {
+                mnemonic: format!("fpu-op{}-not-st-{:?}", op_index, reg),
+            })
+        }
+    }
+
+    // --- 80-bit extended <-> f64 conversion -----------------------------
+
+    /// Load an 80-bit extended-precision value from `ptr` and convert it to an
+    /// `f64`. Exact for zero and normal values within the `f64` exponent range;
+    /// denormals are flushed to zero and out-of-range exponents saturate.
+    fn fpu_load_f80(&mut self, ptr: Value) -> Value {
+        let mant = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0);
+        let se16 = self.builder.ins().load(types::I16, MemFlags::new(), ptr, 8);
+        let se = self.builder.ins().uextend(types::I32, se16);
+
+        // sign (bit 15) and 15-bit exponent.
+        let sign_i32 = self.builder.ins().ushr_imm(se, 15);
+        let sign_i32 = self.builder.ins().band_imm(sign_i32, 1);
+        let sign = self.builder.ins().uextend(types::I64, sign_i32);
+        let sign_bit = self.builder.ins().ishl_imm(sign, 63);
+
+        let exp80 = self.builder.ins().band_imm(se, 0x7FFF);
+        // f64 bias 1023, f80 bias 16383 -> exp64 = exp80 - 15360.
+        let exp64 = self.builder.ins().iadd_imm(exp80, -15360);
+        let exp64 = self.builder.ins().uextend(types::I64, exp64);
+        let exp64 = self.builder.ins().band_imm(exp64, 0x7FF);
+        let exp_field = self.builder.ins().ishl_imm(exp64, 52);
+
+        // The 80-bit mantissa carries an explicit integer bit at position 63;
+        // the f64 fraction is the next 52 bits (bits 62..11).
+        let frac = self.builder.ins().ushr_imm(mant, 11);
+        let frac = self.builder.ins().band_imm(frac, 0x000F_FFFF_FFFF_FFFF);
+
+        let bits = self.builder.ins().bor(sign_bit, exp_field);
+        let bits = self.builder.ins().bor(bits, frac);
+
+        // Zero mantissa -> signed zero (also covers the true-zero encoding).
+        let is_zero = self.builder.ins().icmp_imm(IntCC::Equal, mant, 0);
+        let bits = self.builder.ins().select(is_zero, sign_bit, bits);
+
+        self.builder.ins().bitcast(types::F64, MemFlags::new(), bits)
+    }
+
+    /// Convert an `f64` to 80-bit extended precision and store it at `ptr`.
+    fn fpu_store_f80(&mut self, ptr: Value, val: Value) {
+        let bits = self.builder.ins().bitcast(types::I64, MemFlags::new(), val);
+
+        let sign = self.builder.ins().ushr_imm(bits, 63);
+        let sign = self.builder.ins().band_imm(sign, 1);
+        let exp64 = self.builder.ins().ushr_imm(bits, 52);
+        let exp64 = self.builder.ins().band_imm(exp64, 0x7FF);
+        let frac = self.builder.ins().band_imm(bits, 0x000F_FFFF_FFFF_FFFF);
+
+        // Normal mantissa: explicit integer bit + fraction shifted up by 11.
+        let frac_sh = self.builder.ins().ishl_imm(frac, 11);
+        let int_bit = self.builder.ins().iconst(types::I64, (1u64 << 63) as i64);
+        let mant_normal = self.builder.ins().bor(int_bit, frac_sh);
+
+        let is_exp_zero = self.builder.ins().icmp_imm(IntCC::Equal, exp64, 0);
+        let is_frac_zero = self.builder.ins().icmp_imm(IntCC::Equal, frac, 0);
+        let is_zero = self.builder.ins().band(is_exp_zero, is_frac_zero);
+        let is_special = self.builder.ins().icmp_imm(IntCC::Equal, exp64, 0x7FF);
+
+        let exp80_normal = self.builder.ins().iadd_imm(exp64, 15360);
+        let special_exp = self.builder.ins().iconst(types::I64, 0x7FFF);
+        let zero_val = self.builder.ins().iconst(types::I64, 0);
+        let exp80 = self.builder.ins().select(is_special, special_exp, exp80_normal);
+        let exp80 = self.builder.ins().select(is_zero, zero_val, exp80);
+        let mant = self.builder.ins().select(is_zero, zero_val, mant_normal);
+
+        let sign15 = self.builder.ins().ishl_imm(sign, 15);
+        let se = self.builder.ins().bor(sign15, exp80);
+        let se16 = self.builder.ins().ireduce(types::I16, se);
+
+        self.builder.ins().store(MemFlags::new(), mant, ptr, 0);
+        self.builder.ins().store(MemFlags::new(), se16, ptr, 8);
+    }
+
+    // --- memory operand helpers -----------------------------------------
+
+    /// Load a floating-point memory operand (`m32`/`m64`/`m80`) as an `f64`.
+    fn fpu_load_mem_f64(
+        &mut self,
+        instruction: &Instruction,
+        op_index: u32,
+    ) -> crate::Result<Value> {
+        let ptr = self.get_mem_ptr(instruction, op_index)?;
+        match instruction.memory_size() {
+            MemorySize::Float32 => {
+                let f32v = self.builder.ins().load(types::F32, MemFlags::new(), ptr, 0);
+                Ok(self.builder.ins().fpromote(types::F64, f32v))
+            }
+            MemorySize::Float64 => Ok(self.builder.ins().load(types::F64, MemFlags::new(), ptr, 0)),
+            MemorySize::Float80 => Ok(self.fpu_load_f80(ptr)),
+            other => Err(MicroliftError::UnsupportedInstruction {
+                mnemonic: format!("fpu-load-mem-{:?}", other),
+            }),
+        }
+    }
+
+    /// Load an integer memory operand (`m16`/`m32`/`m64`) and convert to `f64`.
+    fn fpu_load_mem_int_f64(
+        &mut self,
+        instruction: &Instruction,
+        op_index: u32,
+    ) -> crate::Result<Value> {
+        let ptr = self.get_mem_ptr(instruction, op_index)?;
+        let int64 = match instruction.memory_size() {
+            MemorySize::Int16 => {
+                let v = self.builder.ins().load(types::I16, MemFlags::new(), ptr, 0);
+                self.builder.ins().sextend(types::I64, v)
+            }
+            MemorySize::Int32 => {
+                let v = self.builder.ins().load(types::I32, MemFlags::new(), ptr, 0);
+                self.builder.ins().sextend(types::I64, v)
+            }
+            MemorySize::Int64 => self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0),
+            other => {
+                return Err(MicroliftError::UnsupportedInstruction {
+                    mnemonic: format!("fpu-load-int-{:?}", other),
+                });
+            }
+        };
+        Ok(self.builder.ins().fcvt_from_sint(types::F64, int64))
+    }
+
+    /// FLD - push a floating-point value onto the x87 stack.
+    ///
+    /// Covers `FLD m32/m64/m80` (`flds`/`fldl`/`fldt`) and `FLD ST(i)`.
+    pub(super) fn handle_fld(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let val = match self.operand_kind(instruction, 0) {
+            OpKind::Memory => self.fpu_load_mem_f64(instruction, 0)?,
+            OpKind::Register => {
+                let i = self.fpu_st_index(instruction, 0)?;
+                self.fpu_read_st(i)
+            }
+            other => {
+                return Err(MicroliftError::UnsupportedInstruction {
+                    mnemonic: format!("fld-{:?}", other),
+                });
+            }
+        };
+        self.fpu_push(val);
+        Ok(())
+    }
+
+    /// FILD - convert an integer in memory to `f64` and push it.
+    pub(super) fn handle_fild(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let val = self.fpu_load_mem_int_f64(instruction, 0)?;
+        self.fpu_push(val);
+        Ok(())
+    }
+
+    /// Push an implicit constant (`FLDZ`, `FLD1`, `FLDPI`, ...).
+    pub(super) fn handle_fld_const(&mut self, value: f64) -> crate::Result<()> {
+        let v = self.builder.ins().f64const(value);
+        self.fpu_push(v);
+        Ok(())
+    }
+
+    /// FST / FSTP - store `ST(0)`; `pop` selects the popping form.
+    ///
+    /// Covers `FST(P) m32/m64`, `FSTP m80` (`fstpt`) and `FST(P) ST(i)`.
+    pub(super) fn handle_fst(
+        &mut self,
+        instruction: &Instruction,
+        pop: bool,
+    ) -> crate::Result<()> {
+        let val = self.fpu_read_st(0);
+        match self.operand_kind(instruction, 0) {
+            OpKind::Memory => {
+                let ptr = self.get_mem_ptr(instruction, 0)?;
+                match instruction.memory_size() {
+                    MemorySize::Float32 => {
+                        let f32v = self.builder.ins().fdemote(types::F32, val);
+                        self.builder.ins().store(MemFlags::new(), f32v, ptr, 0);
+                    }
+                    MemorySize::Float64 => {
+                        self.builder.ins().store(MemFlags::new(), val, ptr, 0);
+                    }
+                    MemorySize::Float80 => self.fpu_store_f80(ptr, val),
+                    other => {
+                        return Err(MicroliftError::UnsupportedInstruction {
+                            mnemonic: format!("fst-mem-{:?}", other),
+                        });
+                    }
+                }
+            }
+            OpKind::Register => {
+                let i = self.fpu_st_index(instruction, 0)?;
+                self.fpu_write_st(i, val);
+            }
+            other => {
+                return Err(MicroliftError::UnsupportedInstruction {
+                    mnemonic: format!("fst-{:?}", other),
+                });
+            }
+        }
+        if pop {
+            self.fpu_pop();
+        }
+        Ok(())
+    }
+
+    /// FIST / FISTP / FISTTP - store `ST(0)` as an integer.
+    ///
+    /// `pop` selects the popping form; `truncate` selects `FISTTP` (round
+    /// toward zero) versus round-to-nearest for `FIST`/`FISTP`.
+    pub(super) fn handle_fist(
+        &mut self,
+        instruction: &Instruction,
+        pop: bool,
+        truncate: bool,
+    ) -> crate::Result<()> {
+        let val = self.fpu_read_st(0);
+        let rounded = if truncate {
+            val
+        } else {
+            self.builder.ins().nearest(val)
+        };
+        let int64 = self.builder.ins().fcvt_to_sint_sat(types::I64, rounded);
+
+        let ptr = self.get_mem_ptr(instruction, 0)?;
+        match instruction.memory_size() {
+            MemorySize::Int16 => {
+                let v = self.builder.ins().ireduce(types::I16, int64);
+                self.builder.ins().store(MemFlags::new(), v, ptr, 0);
+            }
+            MemorySize::Int32 => {
+                let v = self.builder.ins().ireduce(types::I32, int64);
+                self.builder.ins().store(MemFlags::new(), v, ptr, 0);
+            }
+            MemorySize::Int64 => {
+                self.builder.ins().store(MemFlags::new(), int64, ptr, 0);
+            }
+            other => {
+                return Err(MicroliftError::UnsupportedInstruction {
+                    mnemonic: format!("fist-mem-{:?}", other),
+                });
+            }
+        }
+        if pop {
+            self.fpu_pop();
+        }
+        Ok(())
+    }
+
+    /// FXCH - exchange `ST(0)` with `ST(i)` (default `ST(1)`).
+    ///
+    /// iced decodes `fxch st(i)` as two operands (`op0 = ST0`, `op1 = ST(i)`),
+    /// so the exchange partner is the *last* operand.
+    pub(super) fn handle_fxch(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let i = match instruction.op_count() {
+            0 => 1,
+            n => self.fpu_st_index(instruction, n - 1)?,
+        };
+        let a = self.fpu_read_st(0);
+        let b = self.fpu_read_st(i);
+        self.fpu_write_st(0, b);
+        self.fpu_write_st(i, a);
+        Ok(())
+    }
+
+    /// Resolve the `(dst_index, dst_value, src_value)` triple for a binary x87
+    /// arithmetic instruction across its register/register, register/memory and
+    /// implicit (no-operand `FADDP`-style) forms.
+    fn fpu_binop_operands(
+        &mut self,
+        instruction: &Instruction,
+    ) -> crate::Result<(u32, Value, Value)> {
+        match instruction.op_count() {
+            0 => {
+                // Implicit popping form, e.g. `faddp` == `faddp st(1), st(0)`.
+                let dst = self.fpu_read_st(1);
+                let src = self.fpu_read_st(0);
+                Ok((1, dst, src))
+            }
+            1 => {
+                // Single operand: `fadd m32/m64` (dst = ST0) or `fadd st(i)`
+                // (== `fadd st(0), st(i)`).
+                match self.operand_kind(instruction, 0) {
+                    OpKind::Memory => {
+                        let dst = self.fpu_read_st(0);
+                        let src = self.fpu_load_mem_f64(instruction, 0)?;
+                        Ok((0, dst, src))
+                    }
+                    OpKind::Register => {
+                        let i = self.fpu_st_index(instruction, 0)?;
+                        let dst = self.fpu_read_st(0);
+                        let src = self.fpu_read_st(i);
+                        Ok((0, dst, src))
+                    }
+                    other => Err(MicroliftError::UnsupportedInstruction {
+                        mnemonic: format!("fpu-binop-{:?}", other),
+                    }),
+                }
+            }
+            _ => {
+                let dst_idx = self.fpu_st_index(instruction, 0)?;
+                let src_idx = self.fpu_st_index(instruction, 1)?;
+                let dst = self.fpu_read_st(dst_idx);
+                let src = self.fpu_read_st(src_idx);
+                Ok((dst_idx, dst, src))
+            }
+        }
+    }
+
+    /// FADD/FSUB/FSUBR/FMUL/FDIV/FDIVR and their `...P` popping variants.
+    pub(super) fn handle_farith(
+        &mut self,
+        instruction: &Instruction,
+        op: FpuOp,
+        pop: bool,
+    ) -> crate::Result<()> {
+        let (dst_idx, dst, src) = self.fpu_binop_operands(instruction)?;
+        let result = match op {
+            FpuOp::Add => self.builder.ins().fadd(dst, src),
+            FpuOp::Sub => self.builder.ins().fsub(dst, src),
+            FpuOp::Subr => self.builder.ins().fsub(src, dst),
+            FpuOp::Mul => self.builder.ins().fmul(dst, src),
+            FpuOp::Div => self.builder.ins().fdiv(dst, src),
+            FpuOp::Divr => self.builder.ins().fdiv(src, dst),
+        };
+        self.fpu_write_st(dst_idx, result);
+        if pop {
+            self.fpu_pop();
+        }
+        Ok(())
+    }
+
+    /// FABS - clear the sign of `ST(0)`.
+    pub(super) fn handle_fabs(&mut self, _instruction: &Instruction) -> crate::Result<()> {
+        let v = self.fpu_read_st(0);
+        let r = self.builder.ins().fabs(v);
+        self.fpu_write_st(0, r);
+        Ok(())
+    }
+
+    /// FCHS - negate `ST(0)`.
+    pub(super) fn handle_fchs(&mut self, _instruction: &Instruction) -> crate::Result<()> {
+        let v = self.fpu_read_st(0);
+        let r = self.builder.ins().fneg(v);
+        self.fpu_write_st(0, r);
+        Ok(())
+    }
+
+    /// FSQRT - square root of `ST(0)`.
+    pub(super) fn handle_fsqrt(&mut self, _instruction: &Instruction) -> crate::Result<()> {
+        let v = self.fpu_read_st(0);
+        let r = self.builder.ins().sqrt(v);
+        self.fpu_write_st(0, r);
+        Ok(())
+    }
+
+    /// Compute the three ordered/equal/unordered predicates for `a <=> b`.
+    fn fpu_cmp_predicates(&mut self, a: Value, b: Value) -> (Value, Value, Value) {
+        let unord = self.builder.ins().fcmp(FloatCC::Unordered, a, b);
+        let eq = self.builder.ins().fcmp(FloatCC::Equal, a, b);
+        let lt = self.builder.ins().fcmp(FloatCC::LessThan, a, b);
+        (unord, eq, lt)
+    }
+
+    /// Resolve the source `f64` (and its stack index, if any) of a compare.
+    /// `FCOM`/`FUCOM` may take an `ST(i)` or a memory operand; the `...I`
+    /// forms always take two `ST` operands (`ST0`, `ST(i)`).
+    fn fpu_cmp_src(&mut self, instruction: &Instruction) -> crate::Result<Value> {
+        if instruction.op_count() == 0 {
+            // `fcom`/`fucom` with no operand compare against ST(1).
+            return Ok(self.fpu_read_st(1));
+        }
+        // The source is the last operand (`FCOMI ST0, ST(i)` -> op1;
+        // `FCOM ST(i)`/`FCOM m32` -> op0).
+        let op_index = instruction.op_count() - 1;
+        match self.operand_kind(instruction, op_index) {
+            OpKind::Memory => self.fpu_load_mem_f64(instruction, op_index),
+            OpKind::Register => {
+                let i = self.fpu_st_index(instruction, op_index)?;
+                Ok(self.fpu_read_st(i))
+            }
+            other => Err(MicroliftError::UnsupportedInstruction {
+                mnemonic: format!("fpu-cmp-src-{:?}", other),
+            }),
+        }
+    }
+
+    /// FCOM/FCOMP/FUCOM/FUCOMP/FTST - compare `ST(0)` and set the status-word
+    /// condition codes (C0/C2/C3). `pop` selects the popping variant.
+    ///
+    /// (Both the ordered and unordered forms are lifted identically here: the
+    /// only architectural difference is which operand classes raise an invalid
+    /// exception, and this lifter does not model x87 exception flags.)
+    pub(super) fn handle_fcom(
+        &mut self,
+        instruction: &Instruction,
+        pop: bool,
+    ) -> crate::Result<()> {
+        let a = self.fpu_read_st(0);
+        let b = self.fpu_cmp_src(instruction)?;
+        let (unord, eq, lt) = self.fpu_cmp_predicates(a, b);
+
+        // C3 = ZF-like (equal or unordered), C2 = unordered, C0 = CF-like
+        // (less-than or unordered); C1 is cleared.
+        let c3 = self.builder.ins().bor(eq, unord);
+        let c0 = self.builder.ins().bor(lt, unord);
+        let c3 = self.builder.ins().uextend(types::I32, c3);
+        let c2 = self.builder.ins().uextend(types::I32, unord);
+        let c0 = self.builder.ins().uextend(types::I32, c0);
+        let c3 = self.builder.ins().ishl_imm(c3, 14);
+        let c2 = self.builder.ins().ishl_imm(c2, 10);
+        let c0 = self.builder.ins().ishl_imm(c0, 8);
+        let cc = self.builder.ins().bor(c3, c2);
+        let cc = self.builder.ins().bor(cc, c0);
+
+        self.fpu_store_cc(cc);
+        if pop {
+            self.fpu_pop();
+        }
+        Ok(())
+    }
+
+    /// FCOMI/FCOMIP/FUCOMI/FUCOMIP - compare `ST(0)` with `ST(i)` and set the
+    /// integer flags (ZF/PF/CF); OF/SF/AF are cleared. `pop` selects the
+    /// popping variant.
+    pub(super) fn handle_fcomi(
+        &mut self,
+        instruction: &Instruction,
+        pop: bool,
+    ) -> crate::Result<()> {
+        let a = self.fpu_read_st(0);
+        let b = self.fpu_cmp_src(instruction)?;
+        let (unord, eq, lt) = self.fpu_cmp_predicates(a, b);
+
+        let zf = self.builder.ins().bor(eq, unord);
+        let cf = self.builder.ins().bor(lt, unord);
+        self.set_flag(X86Flag::Zero, zf)?;
+        self.set_flag(X86Flag::Parity, unord)?;
+        self.set_flag(X86Flag::Carry, cf)?;
+        let zero = self.builder.ins().iconst(types::I8, 0);
+        self.set_flag(X86Flag::Overflow, zero)?;
+        self.set_flag(X86Flag::Sign, zero)?;
+        self.set_flag(X86Flag::Auxiliary, zero)?;
+
+        if pop {
+            self.fpu_pop();
+        }
+        Ok(())
+    }
+
+    /// FTST - compare `ST(0)` with `+0.0`, setting the status-word codes.
+    pub(super) fn handle_ftst(&mut self, _instruction: &Instruction) -> crate::Result<()> {
+        let a = self.fpu_read_st(0);
+        let zero = self.builder.ins().f64const(0.0);
+        let (unord, eq, lt) = self.fpu_cmp_predicates(a, zero);
+        let c3 = self.builder.ins().bor(eq, unord);
+        let c0 = self.builder.ins().bor(lt, unord);
+        let c3 = self.builder.ins().uextend(types::I32, c3);
+        let c2 = self.builder.ins().uextend(types::I32, unord);
+        let c0 = self.builder.ins().uextend(types::I32, c0);
+        let c3 = self.builder.ins().ishl_imm(c3, 14);
+        let c2 = self.builder.ins().ishl_imm(c2, 10);
+        let c0 = self.builder.ins().ishl_imm(c0, 8);
+        let cc = self.builder.ins().bor(c3, c2);
+        let cc = self.builder.ins().bor(cc, c0);
+        self.fpu_store_cc(cc);
+        Ok(())
+    }
+
+    /// Merge freshly-computed condition-code bits (`cc`, an `I32` already in
+    /// status-word bit positions) into the stored status word.
+    fn fpu_store_cc(&mut self, cc: Value) {
+        let ctx = self.fpu_ctx_ptr();
+        let off = std::mem::offset_of!(RegisterContext, fpu_sw) as i32;
+        let sw = self
+            .builder
+            .ins()
+            .load(types::I16, MemFlags::trusted(), ctx, off);
+        let sw = self.builder.ins().uextend(types::I32, sw);
+        let cleared = self.builder.ins().band_imm(sw, !SW_CC_MASK);
+        let merged = self.builder.ins().bor(cleared, cc);
+        let merged16 = self.builder.ins().ireduce(types::I16, merged);
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), merged16, ctx, off);
+    }
+
+    // --- conditional moves ----------------------------------------------
+
+    /// FCMOVcc - conditionally copy `ST(i)` into `ST(0)` based on the integer
+    /// flags. `cond` is a non-zero `I8` when the move should occur.
+    fn handle_fcmov_cond(
+        &mut self,
+        instruction: &Instruction,
+        cond: Value,
+    ) -> crate::Result<()> {
+        // Source is `ST(i)` - op1 for the two-operand `FCMOVcc ST0, ST(i)`.
+        let op_index = instruction.op_count().saturating_sub(1);
+        let i = self.fpu_st_index(instruction, op_index)?;
+        let cur = self.fpu_read_st(0);
+        let new = self.fpu_read_st(i);
+        let sel = self.builder.ins().select(cond, new, cur);
+        self.fpu_write_st(0, sel);
+        Ok(())
+    }
+
+    fn fpu_flag(&mut self, flag: X86Flag) -> Value {
+        self.builder.use_var(self.state.flags[&flag])
+    }
+
+    /// FCMOVB - move if CF=1 (below).
+    pub(super) fn handle_fcmovb(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let cf = self.fpu_flag(X86Flag::Carry);
+        self.handle_fcmov_cond(instruction, cf)
+    }
+
+    /// FCMOVNB - move if CF=0 (not below).
+    pub(super) fn handle_fcmovnb(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let cf = self.fpu_flag(X86Flag::Carry);
+        let cond = self.builder.ins().icmp_imm(IntCC::Equal, cf, 0);
+        self.handle_fcmov_cond(instruction, cond)
+    }
+
+    /// FCMOVE - move if ZF=1 (equal).
+    pub(super) fn handle_fcmove(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let zf = self.fpu_flag(X86Flag::Zero);
+        self.handle_fcmov_cond(instruction, zf)
+    }
+
+    /// FCMOVNE - move if ZF=0 (not equal).
+    pub(super) fn handle_fcmovne(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let zf = self.fpu_flag(X86Flag::Zero);
+        let cond = self.builder.ins().icmp_imm(IntCC::Equal, zf, 0);
+        self.handle_fcmov_cond(instruction, cond)
+    }
+
+    /// FCMOVBE - move if CF=1 or ZF=1 (below or equal).
+    pub(super) fn handle_fcmovbe(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let cf = self.fpu_flag(X86Flag::Carry);
+        let zf = self.fpu_flag(X86Flag::Zero);
+        let cond = self.builder.ins().bor(cf, zf);
+        self.handle_fcmov_cond(instruction, cond)
+    }
+
+    /// FCMOVNBE - move if CF=0 and ZF=0 (above).
+    pub(super) fn handle_fcmovnbe(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let cf = self.fpu_flag(X86Flag::Carry);
+        let zf = self.fpu_flag(X86Flag::Zero);
+        let cf_or_zf = self.builder.ins().bor(cf, zf);
+        let cond = self.builder.ins().icmp_imm(IntCC::Equal, cf_or_zf, 0);
+        self.handle_fcmov_cond(instruction, cond)
+    }
+
+    /// FCMOVU - move if PF=1 (unordered).
+    pub(super) fn handle_fcmovu(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let pf = self.fpu_flag(X86Flag::Parity);
+        self.handle_fcmov_cond(instruction, pf)
+    }
+
+    /// FCMOVNU - move if PF=0 (not unordered).
+    pub(super) fn handle_fcmovnu(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let pf = self.fpu_flag(X86Flag::Parity);
+        let cond = self.builder.ins().icmp_imm(IntCC::Equal, pf, 0);
+        self.handle_fcmov_cond(instruction, cond)
+    }
+
+    // --- control / misc -------------------------------------------------
+
+    /// FNSTSW - store the status word (with the live `TOP` field) to `AX` or a
+    /// 16-bit memory operand.
+    pub(super) fn handle_fnstsw(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let ctx = self.fpu_ctx_ptr();
+        let sw_off = std::mem::offset_of!(RegisterContext, fpu_sw) as i32;
+        let sw = self
+            .builder
+            .ins()
+            .load(types::I16, MemFlags::trusted(), ctx, sw_off);
+        let sw = self.builder.ins().uextend(types::I32, sw);
+        // Insert TOP into bits 11-13.
+        let sw = self.builder.ins().band_imm(sw, !0x3800);
+        let top = self.fpu_load_top();
+        let top = self.builder.ins().band_imm(top, 7);
+        let top_field = self.builder.ins().ishl_imm(top, 11);
+        let sw = self.builder.ins().bor(sw, top_field);
+        let sw16 = self.builder.ins().ireduce(types::I16, sw);
+
+        match self.operand_kind(instruction, 0) {
+            OpKind::Register => {
+                let reg = self.operand_register(instruction, 0);
+                self.set_reg_val(reg, sw16)?;
+            }
+            OpKind::Memory => {
+                let ptr = self.get_mem_ptr(instruction, 0)?;
+                self.builder.ins().store(MemFlags::new(), sw16, ptr, 0);
+            }
+            other => {
+                return Err(MicroliftError::UnsupportedInstruction {
+                    mnemonic: format!("fnstsw-{:?}", other),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// FNSTCW - store the control word to a 16-bit memory operand.
+    pub(super) fn handle_fnstcw(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let ctx = self.fpu_ctx_ptr();
+        let cw_off = std::mem::offset_of!(RegisterContext, fpu_cw) as i32;
+        let cw = self
+            .builder
+            .ins()
+            .load(types::I16, MemFlags::trusted(), ctx, cw_off);
+        let ptr = self.get_mem_ptr(instruction, 0)?;
+        self.builder.ins().store(MemFlags::new(), cw, ptr, 0);
+        Ok(())
+    }
+
+    /// FLDCW - load the control word from a 16-bit memory operand.
+    pub(super) fn handle_fldcw(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let ptr = self.get_mem_ptr(instruction, 0)?;
+        let cw = self.builder.ins().load(types::I16, MemFlags::new(), ptr, 0);
+        let ctx = self.fpu_ctx_ptr();
+        let cw_off = std::mem::offset_of!(RegisterContext, fpu_cw) as i32;
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), cw, ctx, cw_off);
+        Ok(())
+    }
+
+    /// FINCSTP - increment `TOP` without touching the data registers.
+    pub(super) fn handle_fincstp(&mut self, _instruction: &Instruction) -> crate::Result<()> {
+        let top = self.fpu_load_top();
+        let inc = self.builder.ins().iadd_imm(top, 1);
+        let new_top = self.builder.ins().band_imm(inc, 7);
+        self.fpu_store_top(new_top);
+        Ok(())
+    }
+
+    /// FDECSTP - decrement `TOP` without touching the data registers.
+    pub(super) fn handle_fdecstp(&mut self, _instruction: &Instruction) -> crate::Result<()> {
+        let top = self.fpu_load_top();
+        let dec = self.builder.ins().iadd_imm(top, -1);
+        let new_top = self.builder.ins().band_imm(dec, 7);
+        self.fpu_store_top(new_top);
+        Ok(())
+    }
+
+    /// FFREE / FNOP / FWAIT - no observable effect in this `f64` FPU model
+    /// (`FFREE` only marks a register empty in the tag word).
+    pub(super) fn handle_fpu_nop(&mut self, _instruction: &Instruction) -> crate::Result<()> {
+        Ok(())
+    }
+}

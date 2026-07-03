@@ -59,6 +59,28 @@ pub struct RegisterContext {
     /// it is often used for kernel->user communication via `swapgs`.
     /// Reads/writes through `gs:` prefixed addresses add this base.
     pub gs_base: u64,
+
+    /// x87 data registers, each stored as the raw bits of
+    /// an `f64`. The architectural `ST(i)` register maps to the physical slot
+    /// `(fpu_top + i) & 7`; pushes decrement `fpu_top` and pops increment it.
+    ///
+    /// The lifter models the x87 stack in `f64` precision rather than the true
+    /// 80-bit extended format. `FLD`/`FSTP` of an 80-bit `m80` value convert to
+    /// and from `f64`, so the extra mantissa/exponent range of `long double` is
+    /// not preserved for normal values (and denormals/NaN payloads are
+    /// approximated).
+    pub fpr: [u64; 8],
+    /// Top-of-stack pointer (0-7). `ST(0)` lives in `fpr[fpu_top]`.
+    pub fpu_top: u16,
+    /// x87 status-word condition-code bits (C0-C3 in their architectural bit
+    /// positions: C0=8, C1=9, C2=10, C3=14). The `TOP` field (bits 11-13) is
+    /// materialised from `fpu_top` when `FNSTSW` reads the full status word.
+    pub fpu_sw: u16,
+    /// x87 control word (used by `FLDCW`/`FNSTCW`).
+    pub fpu_cw: u16,
+    /// x87 tag word (2 bits per physical register). Maintained loosely; kept for
+    /// `FNSTSW`/debugging completeness.
+    pub fpu_tag: u16,
 }
 
 impl RegisterContext {
