@@ -766,21 +766,48 @@ impl<'a> Lifter<'a> {
         self.builder.ins().bitcast(types::I64, MemFlags::new(), r)
     }
 
-    /// ADDSD - scalar double-precision add of the low 64 bits; the high 64 bits
-    /// of the destination are preserved.
-    pub(super) fn handle_addsd(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let dst_idx = self.xmm_operand_index(instruction, 0, "addsd")?;
+    /// Shared implementation for the scalar double-precision arithmetic
+    /// instructions (`ADDSD` / `SUBSD` / `MULSD` / `DIVSD`): apply `op` to the
+    /// low 64-bit lanes of dst and src, preserving the high 64 bits of dst.
+    ///
+    /// `op` receives the two operands as `F64` values and returns the `F64`
+    /// result.
+    fn scalar_double_arith(
+        &mut self,
+        instruction: &Instruction,
+        who: &str,
+        op: impl FnOnce(&mut FunctionBuilder<'a>, Value, Value) -> Value,
+    ) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, who)?;
         let dst_lo = self.get_xmm_lo(dst_idx);
         let src_lo = self.read_scalar_f64_bits(instruction, 1)?;
 
         let a = self.builder.ins().bitcast(types::F64, MemFlags::new(), dst_lo);
         let b = self.builder.ins().bitcast(types::F64, MemFlags::new(), src_lo);
-        let sum = self.builder.ins().fadd(a, b);
-        let res_lo = self.builder.ins().bitcast(types::I64, MemFlags::new(), sum);
+        let r = op(&mut self.builder, a, b);
+        let res_lo = self.builder.ins().bitcast(types::I64, MemFlags::new(), r);
 
         // hi 64 bits are preserved (no write needed).
         self.set_xmm_lo(dst_idx, res_lo);
         Ok(())
+    }
+
+    /// ADDSD - scalar double-precision add of the low 64 bits; the high 64 bits
+    /// of the destination are preserved.
+    pub(super) fn handle_addsd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.scalar_double_arith(instruction, "addsd", |b, x, y| b.ins().fadd(x, y))
+    }
+
+    /// MULSD - scalar double-precision multiply of the low 64 bits; the high 64
+    /// bits of the destination are preserved.
+    pub(super) fn handle_mulsd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.scalar_double_arith(instruction, "mulsd", |b, x, y| b.ins().fmul(x, y))
+    }
+
+    /// DIVSD - scalar double-precision divide of the low 64 bits (`dst / src`);
+    /// the high 64 bits of the destination are preserved.
+    pub(super) fn handle_divsd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.scalar_double_arith(instruction, "divsd", |b, x, y| b.ins().fdiv(x, y))
     }
 
     /// UCOMISD / COMISD - compare the low scalar doubles of two operands and set

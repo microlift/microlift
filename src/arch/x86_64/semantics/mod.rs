@@ -74,6 +74,8 @@ impl<'a> Lifter<'a> {
             // SSE2 - scalar / packed double-precision arithmetic
             Mnemonic::Subpd => self.handle_subpd(instruction),
             Mnemonic::Addsd => self.handle_addsd(instruction),
+            Mnemonic::Mulsd => self.handle_mulsd(instruction),
+            Mnemonic::Divsd => self.handle_divsd(instruction),
             Mnemonic::Ucomisd | Mnemonic::Comisd => self.handle_ucomisd(instruction),
 
             // SSE / SSE2 - XMM logic

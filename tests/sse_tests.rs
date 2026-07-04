@@ -827,6 +827,51 @@ fn test_addsd_mem() {
     assert_eq!(ctx.xmm[0][1], 0xDEAD_BEEF_CAFE_BABE);
 }
 
+//  MULSD / DIVSD (scalar double multiply / divide)
+
+#[test]
+fn test_mulsd_reg() {
+    // mulsd xmm0, xmm1; ret  ->  F2 0F 59 C1  C3
+    let bytes = [0xF2, 0x0F, 0x59, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [6.0f64.to_bits(), 0x1111_2222_3333_4444];
+    ctx.xmm[1] = [7.0f64.to_bits(), 0x9999_9999_9999_9999];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(f64::from_bits(ctx.xmm[0][0]), 42.0, "low lane: 6 * 7");
+    assert_eq!(
+        ctx.xmm[0][1], 0x1111_2222_3333_4444,
+        "high lane must be preserved by mulsd"
+    );
+}
+
+#[test]
+fn test_divsd_reg() {
+    // divsd xmm0, xmm1; ret  ->  F2 0F 5E C1  C3
+    let bytes = [0xF2, 0x0F, 0x5E, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [10.0f64.to_bits(), 0xAAAA_BBBB_CCCC_DDDD];
+    ctx.xmm[1] = [4.0f64.to_bits(), 0x9999_9999_9999_9999];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(f64::from_bits(ctx.xmm[0][0]), 2.5, "low lane: 10 / 4");
+    assert_eq!(
+        ctx.xmm[0][1], 0xAAAA_BBBB_CCCC_DDDD,
+        "high lane must be preserved by divsd"
+    );
+}
+
+#[test]
+fn test_divsd_mem() {
+    // divsd xmm0, [rax]; ret  ->  F2 0F 5E 00  C3  (m64 source)
+    let bytes = [0xF2, 0x0F, 0x5E, 0x00, 0xC3];
+    let src: f64 = 2.0;
+    let mut ctx = RegisterContext::default();
+    ctx.rax = &src as *const f64 as u64;
+    ctx.xmm[0] = [9.0f64.to_bits(), 0xDEAD_BEEF_CAFE_BABE];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(f64::from_bits(ctx.xmm[0][0]), 4.5);
+    assert_eq!(ctx.xmm[0][1], 0xDEAD_BEEF_CAFE_BABE);
+}
+
 //  UCOMISD (scalar double compare -> EFLAGS)
 
 #[test]
