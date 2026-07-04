@@ -755,6 +755,34 @@ fn test_punpckldq() {
     assert_eq!(ctx.xmm[0][1], 0xDDDD_DDDD_BBBB_BBBB);
 }
 
+//  UNPCKHPD
+
+#[test]
+fn test_unpckhpd() {
+    // unpckhpd xmm0, xmm1; ret  ->  66 0F 15 C1  C3
+    // result: dst[63:0] = dst[127:64], dst[127:64] = src[127:64]
+    let bytes = [0x66, 0x0F, 0x15, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [0xAAAA_AAAA_AAAA_AAAA, 0xBBBB_BBBB_BBBB_BBBB];
+    ctx.xmm[1] = [0xCCCC_CCCC_CCCC_CCCC, 0xDDDD_DDDD_DDDD_DDDD];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.xmm[0][0], 0xBBBB_BBBB_BBBB_BBBB, "lo = old dst hi");
+    assert_eq!(ctx.xmm[0][1], 0xDDDD_DDDD_DDDD_DDDD, "hi = src hi");
+}
+
+#[test]
+fn test_unpckhpd_mem() {
+    // unpckhpd xmm0, [rax]; ret  ->  66 0F 15 00  C3
+    let bytes = [0x66, 0x0F, 0x15, 0x00, 0xC3];
+    let mem: [u64; 2] = [0x1111_1111_1111_1111, 0x2222_2222_2222_2222];
+    let mut ctx = RegisterContext::default();
+    ctx.rax = mem.as_ptr() as u64;
+    ctx.xmm[0] = [0x3333_3333_3333_3333, 0x4444_4444_4444_4444];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.xmm[0][0], 0x4444_4444_4444_4444, "lo = old dst hi");
+    assert_eq!(ctx.xmm[0][1], 0x2222_2222_2222_2222, "hi = src[127:64]");
+}
+
 //  SUBPD (packed double subtract)
 
 #[test]

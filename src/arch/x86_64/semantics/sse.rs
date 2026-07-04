@@ -730,6 +730,18 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
+    /// UNPCKHPD - unpack and interleave the high 64-bit lanes:
+    /// `dst[63:0] = dst[127:64]`, `dst[127:64] = src[127:64]`.
+    pub(super) fn handle_unpckhpd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, "unpckhpd")?;
+        let dst_hi = self.get_xmm_hi(dst_idx);
+        let (_src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
+
+        self.set_xmm_lo(dst_idx, dst_hi);
+        self.set_xmm_hi(dst_idx, src_hi);
+        Ok(())
+    }
+
     /// SUBPD - packed double-precision subtract of both 64-bit lanes.
     pub(super) fn handle_subpd(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let dst_idx = self.xmm_operand_index(instruction, 0, "subpd")?;

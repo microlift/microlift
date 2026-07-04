@@ -69,6 +69,7 @@ impl<'a> Lifter<'a> {
             Mnemonic::Psrlq => self.handle_psrlq(instruction),
             Mnemonic::Pshufd => self.handle_pshufd(instruction),
             Mnemonic::Punpckldq => self.handle_punpckldq(instruction),
+            Mnemonic::Unpckhpd => self.handle_unpckhpd(instruction),
 
             // SSE2 - scalar / packed double-precision arithmetic
             Mnemonic::Subpd => self.handle_subpd(instruction),
