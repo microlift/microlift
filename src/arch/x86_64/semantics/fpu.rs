@@ -58,7 +58,7 @@ impl<'a> Lifter<'a> {
         let t = self
             .builder
             .ins()
-            .load(types::I16, MemFlags::trusted(), ctx, off);
+            .load(types::I16, MemFlagsData::trusted(), ctx, off);
         self.builder.ins().uextend(types::I32, t)
     }
 
@@ -69,7 +69,7 @@ impl<'a> Lifter<'a> {
         let t16 = self.builder.ins().ireduce(types::I16, top);
         self.builder
             .ins()
-            .store(MemFlags::trusted(), t16, ctx, off);
+            .store(MemFlagsData::trusted(), t16, ctx, off);
     }
 
     /// Pointer to the physical slot backing architectural `ST(i)`.
@@ -88,13 +88,13 @@ impl<'a> Lifter<'a> {
     /// Read `ST(i)` as an `f64`.
     fn fpu_read_st(&mut self, i: u32) -> Value {
         let p = self.fpu_st_ptr(i);
-        self.builder.ins().load(types::F64, MemFlags::trusted(), p, 0)
+        self.builder.ins().load(types::F64, MemFlagsData::trusted(), p, 0)
     }
 
     /// Write an `f64` into `ST(i)`.
     fn fpu_write_st(&mut self, i: u32, val: Value) {
         let p = self.fpu_st_ptr(i);
-        self.builder.ins().store(MemFlags::trusted(), val, p, 0);
+        self.builder.ins().store(MemFlagsData::trusted(), val, p, 0);
     }
 
     /// Decrement `TOP` and store `val` into the new `ST(0)`.
@@ -132,8 +132,8 @@ impl<'a> Lifter<'a> {
     /// `f64`. Exact for zero and normal values within the `f64` exponent range;
     /// denormals are flushed to zero and out-of-range exponents saturate.
     fn fpu_load_f80(&mut self, ptr: Value) -> Value {
-        let mant = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0);
-        let se16 = self.builder.ins().load(types::I16, MemFlags::new(), ptr, 8);
+        let mant = self.builder.ins().load(types::I64, MemFlagsData::new(), ptr, 0);
+        let se16 = self.builder.ins().load(types::I16, MemFlagsData::new(), ptr, 8);
         let se = self.builder.ins().uextend(types::I32, se16);
 
         // sign (bit 15) and 15-bit exponent.
@@ -161,12 +161,12 @@ impl<'a> Lifter<'a> {
         let is_zero = self.builder.ins().icmp_imm(IntCC::Equal, mant, 0);
         let bits = self.builder.ins().select(is_zero, sign_bit, bits);
 
-        self.builder.ins().bitcast(types::F64, MemFlags::new(), bits)
+        self.builder.ins().bitcast(types::F64, MemFlagsData::new(), bits)
     }
 
     /// Convert an `f64` to 80-bit extended precision and store it at `ptr`.
     fn fpu_store_f80(&mut self, ptr: Value, val: Value) {
-        let bits = self.builder.ins().bitcast(types::I64, MemFlags::new(), val);
+        let bits = self.builder.ins().bitcast(types::I64, MemFlagsData::new(), val);
 
         let sign = self.builder.ins().ushr_imm(bits, 63);
         let sign = self.builder.ins().band_imm(sign, 1);
@@ -195,8 +195,8 @@ impl<'a> Lifter<'a> {
         let se = self.builder.ins().bor(sign15, exp80);
         let se16 = self.builder.ins().ireduce(types::I16, se);
 
-        self.builder.ins().store(MemFlags::new(), mant, ptr, 0);
-        self.builder.ins().store(MemFlags::new(), se16, ptr, 8);
+        self.builder.ins().store(MemFlagsData::new(), mant, ptr, 0);
+        self.builder.ins().store(MemFlagsData::new(), se16, ptr, 8);
     }
 
     // --- memory operand helpers -----------------------------------------
@@ -210,10 +210,10 @@ impl<'a> Lifter<'a> {
         let ptr = self.get_mem_ptr(instruction, op_index)?;
         match instruction.memory_size() {
             MemorySize::Float32 => {
-                let f32v = self.builder.ins().load(types::F32, MemFlags::new(), ptr, 0);
+                let f32v = self.builder.ins().load(types::F32, MemFlagsData::new(), ptr, 0);
                 Ok(self.builder.ins().fpromote(types::F64, f32v))
             }
-            MemorySize::Float64 => Ok(self.builder.ins().load(types::F64, MemFlags::new(), ptr, 0)),
+            MemorySize::Float64 => Ok(self.builder.ins().load(types::F64, MemFlagsData::new(), ptr, 0)),
             MemorySize::Float80 => Ok(self.fpu_load_f80(ptr)),
             other => Err(MicroliftError::UnsupportedInstruction {
                 mnemonic: format!("fpu-load-mem-{:?}", other),
@@ -230,14 +230,14 @@ impl<'a> Lifter<'a> {
         let ptr = self.get_mem_ptr(instruction, op_index)?;
         let int64 = match instruction.memory_size() {
             MemorySize::Int16 => {
-                let v = self.builder.ins().load(types::I16, MemFlags::new(), ptr, 0);
+                let v = self.builder.ins().load(types::I16, MemFlagsData::new(), ptr, 0);
                 self.builder.ins().sextend(types::I64, v)
             }
             MemorySize::Int32 => {
-                let v = self.builder.ins().load(types::I32, MemFlags::new(), ptr, 0);
+                let v = self.builder.ins().load(types::I32, MemFlagsData::new(), ptr, 0);
                 self.builder.ins().sextend(types::I64, v)
             }
-            MemorySize::Int64 => self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0),
+            MemorySize::Int64 => self.builder.ins().load(types::I64, MemFlagsData::new(), ptr, 0),
             other => {
                 return Err(MicroliftError::UnsupportedInstruction {
                     mnemonic: format!("fpu-load-int-{:?}", other),
@@ -296,10 +296,10 @@ impl<'a> Lifter<'a> {
                 match instruction.memory_size() {
                     MemorySize::Float32 => {
                         let f32v = self.builder.ins().fdemote(types::F32, val);
-                        self.builder.ins().store(MemFlags::new(), f32v, ptr, 0);
+                        self.builder.ins().store(MemFlagsData::new(), f32v, ptr, 0);
                     }
                     MemorySize::Float64 => {
-                        self.builder.ins().store(MemFlags::new(), val, ptr, 0);
+                        self.builder.ins().store(MemFlagsData::new(), val, ptr, 0);
                     }
                     MemorySize::Float80 => self.fpu_store_f80(ptr, val),
                     other => {
@@ -347,14 +347,14 @@ impl<'a> Lifter<'a> {
         match instruction.memory_size() {
             MemorySize::Int16 => {
                 let v = self.builder.ins().ireduce(types::I16, int64);
-                self.builder.ins().store(MemFlags::new(), v, ptr, 0);
+                self.builder.ins().store(MemFlagsData::new(), v, ptr, 0);
             }
             MemorySize::Int32 => {
                 let v = self.builder.ins().ireduce(types::I32, int64);
-                self.builder.ins().store(MemFlags::new(), v, ptr, 0);
+                self.builder.ins().store(MemFlagsData::new(), v, ptr, 0);
             }
             MemorySize::Int64 => {
-                self.builder.ins().store(MemFlags::new(), int64, ptr, 0);
+                self.builder.ins().store(MemFlagsData::new(), int64, ptr, 0);
             }
             other => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -596,14 +596,14 @@ impl<'a> Lifter<'a> {
         let sw = self
             .builder
             .ins()
-            .load(types::I16, MemFlags::trusted(), ctx, off);
+            .load(types::I16, MemFlagsData::trusted(), ctx, off);
         let sw = self.builder.ins().uextend(types::I32, sw);
         let cleared = self.builder.ins().band_imm(sw, !SW_CC_MASK);
         let merged = self.builder.ins().bor(cleared, cc);
         let merged16 = self.builder.ins().ireduce(types::I16, merged);
         self.builder
             .ins()
-            .store(MemFlags::trusted(), merged16, ctx, off);
+            .store(MemFlagsData::trusted(), merged16, ctx, off);
     }
 
     // --- conditional moves ----------------------------------------------
@@ -695,7 +695,7 @@ impl<'a> Lifter<'a> {
         let sw = self
             .builder
             .ins()
-            .load(types::I16, MemFlags::trusted(), ctx, sw_off);
+            .load(types::I16, MemFlagsData::trusted(), ctx, sw_off);
         let sw = self.builder.ins().uextend(types::I32, sw);
         // Insert TOP into bits 11-13.
         let sw = self.builder.ins().band_imm(sw, !0x3800);
@@ -712,7 +712,7 @@ impl<'a> Lifter<'a> {
             }
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 0)?;
-                self.builder.ins().store(MemFlags::new(), sw16, ptr, 0);
+                self.builder.ins().store(MemFlagsData::new(), sw16, ptr, 0);
             }
             other => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -730,21 +730,21 @@ impl<'a> Lifter<'a> {
         let cw = self
             .builder
             .ins()
-            .load(types::I16, MemFlags::trusted(), ctx, cw_off);
+            .load(types::I16, MemFlagsData::trusted(), ctx, cw_off);
         let ptr = self.get_mem_ptr(instruction, 0)?;
-        self.builder.ins().store(MemFlags::new(), cw, ptr, 0);
+        self.builder.ins().store(MemFlagsData::new(), cw, ptr, 0);
         Ok(())
     }
 
     /// FLDCW - load the control word from a 16-bit memory operand.
     pub(super) fn handle_fldcw(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let ptr = self.get_mem_ptr(instruction, 0)?;
-        let cw = self.builder.ins().load(types::I16, MemFlags::new(), ptr, 0);
+        let cw = self.builder.ins().load(types::I16, MemFlagsData::new(), ptr, 0);
         let ctx = self.fpu_ctx_ptr();
         let cw_off = std::mem::offset_of!(RegisterContext, fpu_cw) as i32;
         self.builder
             .ins()
-            .store(MemFlags::trusted(), cw, ctx, cw_off);
+            .store(MemFlagsData::trusted(), cw, ctx, cw_off);
         Ok(())
     }
 

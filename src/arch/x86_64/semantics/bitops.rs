@@ -40,7 +40,7 @@ impl<'a> Lifter<'a> {
                 .iconst(ty, Self::read_imm64(instruction)),
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 1)?;
-                self.builder.ins().load(ty, MemFlags::new(), ptr, 0)
+                self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0)
             }
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -59,9 +59,9 @@ impl<'a> Lifter<'a> {
             }
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 0)?;
-                let dst_val = self.builder.ins().load(ty, MemFlags::new(), ptr, 0);
+                let dst_val = self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0);
                 let result = self.builder.ins().bxor(dst_val, src_val);
-                self.builder.ins().store(MemFlags::new(), result, ptr, 0);
+                self.builder.ins().store(MemFlagsData::new(), result, ptr, 0);
                 self.update_flags_logical(result, size)?;
             }
             _ => {
@@ -101,7 +101,7 @@ impl<'a> Lifter<'a> {
                 .iconst(ty, Self::read_imm64(instruction)),
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 1)?;
-                self.builder.ins().load(ty, MemFlags::new(), ptr, 0)
+                self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0)
             }
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -120,9 +120,9 @@ impl<'a> Lifter<'a> {
             }
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 0)?;
-                let dst_val = self.builder.ins().load(ty, MemFlags::new(), ptr, 0);
+                let dst_val = self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0);
                 let result = self.builder.ins().band(dst_val, src_val);
-                self.builder.ins().store(MemFlags::new(), result, ptr, 0);
+                self.builder.ins().store(MemFlagsData::new(), result, ptr, 0);
                 self.update_flags_logical(result, size)?;
             }
             _ => {
@@ -162,7 +162,7 @@ impl<'a> Lifter<'a> {
                 .iconst(ty, Self::read_imm64(instruction)),
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 1)?;
-                self.builder.ins().load(ty, MemFlags::new(), ptr, 0)
+                self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0)
             }
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -181,9 +181,9 @@ impl<'a> Lifter<'a> {
             }
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 0)?;
-                let dst_val = self.builder.ins().load(ty, MemFlags::new(), ptr, 0);
+                let dst_val = self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0);
                 let result = self.builder.ins().bor(dst_val, src_val);
-                self.builder.ins().store(MemFlags::new(), result, ptr, 0);
+                self.builder.ins().store(MemFlagsData::new(), result, ptr, 0);
                 self.update_flags_logical(result, size)?;
             }
             _ => {
@@ -234,7 +234,7 @@ impl<'a> Lifter<'a> {
                 .iconst(ty, Self::read_imm64(instruction)),
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 1)?;
-                self.builder.ins().load(ty, MemFlags::new(), ptr, 0)
+                self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0)
             }
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -247,7 +247,7 @@ impl<'a> Lifter<'a> {
             OpKind::Register => self.get_reg_val(instruction.op0_register())?,
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 0)?;
-                self.builder.ins().load(ty, MemFlags::new(), ptr, 0)
+                self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0)
             }
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {

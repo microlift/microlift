@@ -21,7 +21,7 @@ impl<'a> Lifter<'a> {
                     std::mem::offset_of!(crate::context::RegisterContext, syscall_handler) as i32;
                 let handler_ptr = self.builder.ins().load(
                     types::I64,
-                    MemFlags::trusted(),
+                    MemFlagsData::trusted(),
                     ctx_ptr,
                     handler_offset,
                 );

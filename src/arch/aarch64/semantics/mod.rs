@@ -624,7 +624,7 @@ impl<'a> Lifter64<'a> {
         let (t, sz, _) = decode_reg(op0).ok_or_else(|| Self::bad_operand("ldr", op0))?;
         let ty = size_ty(sz);
         let (addr, wb) = self.mem_address(op1)?;
-        let val = self.builder.ins().load(ty, MemFlags::new(), addr, 0);
+        let val = self.builder.ins().load(ty, MemFlagsData::new(), addr, 0);
         self.write_reg_val(t, false, ty, val);
         self.apply_writeback(wb);
         Ok(())
@@ -635,7 +635,7 @@ impl<'a> Lifter64<'a> {
         let ty = size_ty(sz);
         let val = self.read_reg_val(t, false, ty);
         let (addr, wb) = self.mem_address(op1)?;
-        self.builder.ins().store(MemFlags::new(), val, addr, 0);
+        self.builder.ins().store(MemFlagsData::new(), val, addr, 0);
         self.apply_writeback(wb);
         Ok(())
     }
@@ -651,8 +651,8 @@ impl<'a> Lifter64<'a> {
         let v1 = self.read_reg_val(t1, false, ty);
         let v2 = self.read_reg_val(t2, false, ty);
         let (addr, wb) = self.mem_address(op2)?;
-        self.builder.ins().store(MemFlags::new(), v1, addr, 0);
-        self.builder.ins().store(MemFlags::new(), v2, addr, elem);
+        self.builder.ins().store(MemFlagsData::new(), v1, addr, 0);
+        self.builder.ins().store(MemFlagsData::new(), v2, addr, elem);
         self.apply_writeback(wb);
         Ok(())
     }
@@ -666,8 +666,8 @@ impl<'a> Lifter64<'a> {
         let ty = size_ty(sz);
         let elem = ty.bytes() as i32;
         let (addr, wb) = self.mem_address(op2)?;
-        let v1 = self.builder.ins().load(ty, MemFlags::new(), addr, 0);
-        let v2 = self.builder.ins().load(ty, MemFlags::new(), addr, elem);
+        let v1 = self.builder.ins().load(ty, MemFlagsData::new(), addr, 0);
+        let v2 = self.builder.ins().load(ty, MemFlagsData::new(), addr, elem);
         self.write_reg_val(t1, false, ty, v1);
         self.write_reg_val(t2, false, ty, v2);
         self.apply_writeback(wb);
@@ -801,7 +801,7 @@ impl<'a> Lifter64<'a> {
         let va_offset = std::mem::offset_of!(Aarch64RegisterContext, imported_function_va) as i32;
         self.builder
             .ins()
-            .store(MemFlags::trusted(), target, ctx_ptr, va_offset);
+            .store(MemFlagsData::trusted(), target, ctx_ptr, va_offset);
 
         self.sync_to_context_selective(None, ExitReason::IndirectCall)?;
         self.builder.ins().return_(&[]);

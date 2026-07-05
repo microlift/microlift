@@ -70,7 +70,7 @@ impl<'a> Lifter<'a> {
                 let old = self
                     .builder
                     .ins()
-                    .atomic_cas(MemFlags::new(), ptr, acc_narrow, src_val);
+                    .atomic_cas(MemFlagsData::new(), ptr, acc_narrow, src_val);
 
                 // Update flags as CMP acc, old  (acc - old)
                 let cmp_result = self.builder.ins().isub(acc_narrow, old);
@@ -134,7 +134,7 @@ impl<'a> Lifter<'a> {
         let old = self
             .builder
             .ins()
-            .atomic_cas(MemFlags::new(), ptr, expected, replacement);
+            .atomic_cas(MemFlagsData::new(), ptr, expected, replacement);
 
         let succeeded = self.builder.ins().icmp(IntCC::Equal, old, expected);
         self.set_flag(X86Flag::Zero, succeeded)?;
@@ -191,7 +191,7 @@ impl<'a> Lifter<'a> {
         let old = self
             .builder
             .ins()
-            .atomic_rmw(ty, MemFlags::new(), AtomicRmwOp::Add, ptr, src);
+            .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::Add, ptr, src);
         let result = self.builder.ins().iadd(old, src);
         self.update_flags_add(old, src, result, size)?;
         Ok(())
@@ -205,7 +205,7 @@ impl<'a> Lifter<'a> {
         let old = self
             .builder
             .ins()
-            .atomic_rmw(ty, MemFlags::new(), AtomicRmwOp::Sub, ptr, src);
+            .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::Sub, ptr, src);
         let result = self.builder.ins().isub(old, src);
         self.update_flags_sub(old, src, result, size)?;
         Ok(())
@@ -219,7 +219,7 @@ impl<'a> Lifter<'a> {
         let old = self
             .builder
             .ins()
-            .atomic_rmw(ty, MemFlags::new(), AtomicRmwOp::And, ptr, src);
+            .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::And, ptr, src);
         let result = self.builder.ins().band(old, src);
         self.update_flags_logical(result, size)?;
         Ok(())
@@ -233,7 +233,7 @@ impl<'a> Lifter<'a> {
         let old = self
             .builder
             .ins()
-            .atomic_rmw(ty, MemFlags::new(), AtomicRmwOp::Or, ptr, src);
+            .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::Or, ptr, src);
         let result = self.builder.ins().bor(old, src);
         self.update_flags_logical(result, size)?;
         Ok(())
@@ -247,7 +247,7 @@ impl<'a> Lifter<'a> {
         let old = self
             .builder
             .ins()
-            .atomic_rmw(ty, MemFlags::new(), AtomicRmwOp::Xor, ptr, src);
+            .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::Xor, ptr, src);
         let result = self.builder.ins().bxor(old, src);
         self.update_flags_logical(result, size)?;
         Ok(())
@@ -261,7 +261,7 @@ impl<'a> Lifter<'a> {
         let old = self
             .builder
             .ins()
-            .atomic_rmw(ty, MemFlags::new(), AtomicRmwOp::Add, ptr, one);
+            .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::Add, ptr, one);
         let result = self.builder.ins().iadd(old, one);
         self.update_flags_inc_dec(old, one, result, true, size)?;
         Ok(())
@@ -275,7 +275,7 @@ impl<'a> Lifter<'a> {
         let old = self
             .builder
             .ins()
-            .atomic_rmw(ty, MemFlags::new(), AtomicRmwOp::Sub, ptr, one);
+            .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::Sub, ptr, one);
         let result = self.builder.ins().isub(old, one);
         self.update_flags_inc_dec(old, one, result, false, size)?;
         Ok(())
@@ -297,7 +297,7 @@ impl<'a> Lifter<'a> {
         let old = self
             .builder
             .ins()
-            .atomic_rmw(ty, MemFlags::new(), AtomicRmwOp::Add, ptr, src);
+            .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::Add, ptr, src);
         // src register gets the pre-add memory value
         self.set_reg_val(src_reg, old)?;
         let result = self.builder.ins().iadd(old, src);
@@ -328,7 +328,7 @@ impl<'a> Lifter<'a> {
         let old =
             self.builder
                 .ins()
-                .atomic_rmw(ty, MemFlags::new(), AtomicRmwOp::Xchg, ptr, reg_narrow);
+                .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::Xchg, ptr, reg_narrow);
         self.set_reg_val(reg, old)?;
         // XCHG does not modify flags.
         Ok(())
@@ -345,12 +345,12 @@ impl<'a> Lifter<'a> {
         let size = self.operand_size(instruction, 0)?;
         let ty = size_to_type(size);
         let ptr = self.get_mem_ptr(instruction, 0)?;
-        let old = self.builder.ins().atomic_load(ty, MemFlags::new(), ptr);
+        let old = self.builder.ins().atomic_load(ty, MemFlagsData::new(), ptr);
         let zero = self.builder.ins().iconst(ty, 0);
         let result = self.builder.ins().isub(zero, old);
         self.builder
             .ins()
-            .atomic_store(MemFlags::new(), result, ptr);
+            .atomic_store(MemFlagsData::new(), result, ptr);
         self.update_flags_sub(zero, old, result, size)?;
         Ok(())
     }
@@ -360,12 +360,12 @@ impl<'a> Lifter<'a> {
         let size = self.operand_size(instruction, 0)?;
         let ty = size_to_type(size);
         let ptr = self.get_mem_ptr(instruction, 0)?;
-        let old = self.builder.ins().atomic_load(ty, MemFlags::new(), ptr);
+        let old = self.builder.ins().atomic_load(ty, MemFlagsData::new(), ptr);
         let all_ones = self.builder.ins().iconst(ty, -1);
         let result = self.builder.ins().bxor(old, all_ones);
         self.builder
             .ins()
-            .atomic_store(MemFlags::new(), result, ptr);
+            .atomic_store(MemFlagsData::new(), result, ptr);
         // NOT does not affect flags.
         Ok(())
     }
@@ -401,19 +401,19 @@ impl<'a> Lifter<'a> {
             BitOp::Set => {
                 self.builder
                     .ins()
-                    .atomic_rmw(ty, MemFlags::new(), AtomicRmwOp::Or, ptr, mask)
+                    .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::Or, ptr, mask)
             }
             BitOp::Reset => {
                 let all_ones = self.builder.ins().iconst(ty, -1);
                 let inv_mask = self.builder.ins().bxor(mask, all_ones);
                 self.builder
                     .ins()
-                    .atomic_rmw(ty, MemFlags::new(), AtomicRmwOp::And, ptr, inv_mask)
+                    .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::And, ptr, inv_mask)
             }
             BitOp::Complement => {
                 self.builder
                     .ins()
-                    .atomic_rmw(ty, MemFlags::new(), AtomicRmwOp::Xor, ptr, mask)
+                    .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::Xor, ptr, mask)
             }
         };
 

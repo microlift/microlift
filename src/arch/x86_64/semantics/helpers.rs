@@ -220,7 +220,7 @@ impl<'a> Lifter<'a> {
             OpKind::Register => self.get_reg_val(self.operand_register(instruction, op_index)),
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, op_index)?;
-                Ok(self.builder.ins().load(ty, MemFlags::new(), ptr, 0))
+                Ok(self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0))
             }
             OpKind::Immediate32to64 => {
                 Ok(self.builder.ins().iconst(ty, instruction.immediate32to64()))
@@ -252,7 +252,7 @@ impl<'a> Lifter<'a> {
             OpKind::Register => self.set_reg_val(self.operand_register(instruction, op_index), val),
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, op_index)?;
-                self.builder.ins().store(MemFlags::new(), val, ptr, 0);
+                self.builder.ins().store(MemFlagsData::new(), val, ptr, 0);
                 Ok(())
             }
             _ => Err(MicroliftError::UnsupportedInstruction {

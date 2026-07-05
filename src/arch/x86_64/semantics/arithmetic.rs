@@ -34,7 +34,7 @@ impl<'a> Lifter<'a> {
                 .iconst(ty, Self::read_imm64(instruction)),
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 1)?;
-                self.builder.ins().load(ty, MemFlags::new(), ptr, 0)
+                self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0)
             }
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -53,9 +53,9 @@ impl<'a> Lifter<'a> {
             }
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 0)?;
-                let dst_val = self.builder.ins().load(ty, MemFlags::new(), ptr, 0);
+                let dst_val = self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0);
                 let result = self.builder.ins().iadd(dst_val, src_val);
-                self.builder.ins().store(MemFlags::new(), result, ptr, 0);
+                self.builder.ins().store(MemFlagsData::new(), result, ptr, 0);
                 self.update_flags_add(dst_val, src_val, result, size)?;
             }
             _ => {
@@ -95,7 +95,7 @@ impl<'a> Lifter<'a> {
                 .iconst(ty, Self::read_imm64(instruction)),
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 1)?;
-                self.builder.ins().load(ty, MemFlags::new(), ptr, 0)
+                self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0)
             }
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -114,9 +114,9 @@ impl<'a> Lifter<'a> {
             }
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 0)?;
-                let dst_val = self.builder.ins().load(ty, MemFlags::new(), ptr, 0);
+                let dst_val = self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0);
                 let result = self.builder.ins().isub(dst_val, src_val);
-                self.builder.ins().store(MemFlags::new(), result, ptr, 0);
+                self.builder.ins().store(MemFlagsData::new(), result, ptr, 0);
                 self.update_flags_sub(dst_val, src_val, result, size)?;
             }
             _ => {
@@ -164,7 +164,7 @@ impl<'a> Lifter<'a> {
                 .iconst(ty, Self::read_imm64(instruction)),
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 1)?;
-                self.builder.ins().load(ty, MemFlags::new(), ptr, 0)
+                self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0)
             }
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -188,13 +188,13 @@ impl<'a> Lifter<'a> {
             }
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 0)?;
-                let dst_val = self.builder.ins().load(ty, MemFlags::new(), ptr, 0);
+                let dst_val = self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0);
                 let tmp = self.builder.ins().iadd(dst_val, src_val);
                 let cf1 = self.builder.ins().icmp(IntCC::UnsignedLessThan, tmp, dst_val);
                 let result = self.builder.ins().iadd(tmp, cf_ext);
                 let cf2 = self.builder.ins().icmp(IntCC::UnsignedLessThan, result, tmp);
                 let cf_out = self.builder.ins().bor(cf1, cf2);
-                self.builder.ins().store(MemFlags::new(), result, ptr, 0);
+                self.builder.ins().store(MemFlagsData::new(), result, ptr, 0);
                 self.update_flags_adc(dst_val, src_val, result, cf_out, size)?;
             }
             _ => {
@@ -242,7 +242,7 @@ impl<'a> Lifter<'a> {
                 .iconst(ty, Self::read_imm64(instruction)),
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 1)?;
-                self.builder.ins().load(ty, MemFlags::new(), ptr, 0)
+                self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0)
             }
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -269,7 +269,7 @@ impl<'a> Lifter<'a> {
             }
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 0)?;
-                let dst_val = self.builder.ins().load(ty, MemFlags::new(), ptr, 0);
+                let dst_val = self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0);
                 let tmp = self.builder.ins().isub(dst_val, src_val);
                 let borrow1 =
                     self.builder
@@ -278,7 +278,7 @@ impl<'a> Lifter<'a> {
                 let result = self.builder.ins().isub(tmp, cf_ext);
                 let borrow2 = self.builder.ins().icmp(IntCC::UnsignedLessThan, tmp, cf_ext);
                 let cf_out = self.builder.ins().bor(borrow1, borrow2);
-                self.builder.ins().store(MemFlags::new(), result, ptr, 0);
+                self.builder.ins().store(MemFlagsData::new(), result, ptr, 0);
                 self.update_flags_sbb(dst_val, src_val, result, cf_out, size)?;
             }
             _ => {
@@ -331,7 +331,7 @@ impl<'a> Lifter<'a> {
                 .iconst(ty, Self::read_imm64(instruction)),
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 1)?;
-                self.builder.ins().load(ty, MemFlags::new(), ptr, 0)
+                self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0)
             }
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -344,7 +344,7 @@ impl<'a> Lifter<'a> {
             OpKind::Register => self.get_reg_val(instruction.op0_register())?,
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 0)?;
-                self.builder.ins().load(ty, MemFlags::new(), ptr, 0)
+                self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0)
             }
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -789,7 +789,8 @@ impl<'a> Lifter<'a> {
         let k = self.builder.block_params(body)[0];
         let q = self.builder.block_params(body)[1];
         let r = self.builder.block_params(body)[2];
-        let bit_pos = self.builder.ins().irsub_imm(k, 127); // 127 - k
+        let onetwentyseven = self.builder.ins().iconst(types::I64, 127);
+        let bit_pos = self.builder.ins().isub(onetwentyseven, k); // 127 - k
         // r = (r << 1) | ((n >> bit_pos) & 1)
         let r_shifted = self.builder.ins().ishl_imm(r, 1);
         let n_bit_raw = self.builder.ins().ushr(n, bit_pos);

@@ -477,7 +477,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         let val = self.builder.ins().iconst(types::I32, code as i64);
         self.builder
             .ins()
-            .store(MemFlags::trusted(), val, ctx_ptr, A::exit_code_offset());
+            .store(MemFlagsData::trusted(), val, ctx_ptr, A::exit_code_offset());
     }
 
     /// Write the PC and exit_reason to the context. Shared by all sync paths.
@@ -497,12 +497,12 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         };
         self.builder
             .ins()
-            .store(MemFlags::trusted(), pc_val, ctx_ptr, A::pc_offset());
+            .store(MemFlagsData::trusted(), pc_val, ctx_ptr, A::pc_offset());
 
         let reason_val = self.builder.ins().iconst(types::I32, reason as i64);
         self.builder
             .ins()
-            .store(MemFlags::trusted(), reason_val, ctx_ptr, A::exit_reason_offset());
+            .store(MemFlagsData::trusted(), reason_val, ctx_ptr, A::exit_reason_offset());
         Ok(())
     }
 
@@ -579,7 +579,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             // Resumable dispatch: jump to the block matching the context PC.
             let pc_val = self.builder.ins().load(
                 types::I64,
-                MemFlags::trusted(),
+                MemFlagsData::trusted(),
                 ctx_ptr_val,
                 A::pc_offset(),
             );

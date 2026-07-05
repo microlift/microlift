@@ -23,7 +23,7 @@ impl<'a> Lifter<'a> {
             .iconst(types::I32, instruction.code() as i64);
         let exit_code_offset = std::mem::offset_of!(RegisterContext, exit_code) as i32;
         self.builder.ins().store(
-            MemFlags::trusted(),
+            MemFlagsData::trusted(),
             exit_code_val,
             ctx_ptr,
             exit_code_offset,
@@ -159,7 +159,7 @@ impl<'a> Lifter<'a> {
         let resume_offset = std::mem::offset_of!(RegisterContext, resume_function) as i32;
         self.builder
             .ins()
-            .store(MemFlags::trusted(), resume_addr, ctx_ptr, resume_offset);
+            .store(MemFlagsData::trusted(), resume_addr, ctx_ptr, resume_offset);
 
         Ok(())
     }

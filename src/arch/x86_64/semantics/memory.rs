@@ -126,7 +126,7 @@ impl<'a> Lifter<'a> {
             }
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 0)?;
-                self.builder.ins().load(ty, MemFlags::new(), ptr, 0)
+                self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0)
             }
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -138,7 +138,7 @@ impl<'a> Lifter<'a> {
         let rsp = self.get_reg_val(Register::RSP)?;
         let new_rsp = self.builder.ins().iadd_imm(rsp, -(push_size as i64));
         self.set_reg_val(Register::RSP, new_rsp)?;
-        self.builder.ins().store(MemFlags::new(), val, new_rsp, 0);
+        self.builder.ins().store(MemFlagsData::new(), val, new_rsp, 0);
         Ok(())
     }
 
@@ -154,7 +154,7 @@ impl<'a> Lifter<'a> {
         let ty = size_to_type(pop_size);
 
         let rsp = self.get_reg_val(Register::RSP)?;
-        let val = self.builder.ins().load(ty, MemFlags::new(), rsp, 0);
+        let val = self.builder.ins().load(ty, MemFlagsData::new(), rsp, 0);
 
         let new_rsp = self.builder.ins().iadd_imm(rsp, pop_size as i64);
         self.set_reg_val(Register::RSP, new_rsp)?;
@@ -165,7 +165,7 @@ impl<'a> Lifter<'a> {
             }
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 0)?;
-                self.builder.ins().store(MemFlags::new(), val, ptr, 0);
+                self.builder.ins().store(MemFlagsData::new(), val, ptr, 0);
             }
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -182,7 +182,7 @@ impl<'a> Lifter<'a> {
         // RSP <- RBP
         self.set_reg_val(Register::RSP, rbp)?;
         // POP RBP: RBP <- [RSP]; RSP += 8
-        let old_rbp = self.builder.ins().load(types::I64, MemFlags::new(), rbp, 0);
+        let old_rbp = self.builder.ins().load(types::I64, MemFlagsData::new(), rbp, 0);
         self.set_reg_val(Register::RBP, old_rbp)?;
         let new_rsp = self.builder.ins().iadd_imm(rbp, 8);
         self.set_reg_val(Register::RSP, new_rsp)?;
@@ -302,8 +302,8 @@ impl<'a> Lifter<'a> {
         let ty = size_to_type(size);
         let rsi = self.get_reg_val(Register::RSI)?;
         let rdi = self.get_reg_val(Register::RDI)?;
-        let val = self.builder.ins().load(ty, MemFlags::new(), rsi, 0);
-        self.builder.ins().store(MemFlags::new(), val, rdi, 0);
+        let val = self.builder.ins().load(ty, MemFlagsData::new(), rsi, 0);
+        self.builder.ins().store(MemFlagsData::new(), val, rdi, 0);
         // DF=0: increment both pointers; DF=1: decrement.
         let delta = self.string_delta(size);
         let new_rsi = self.builder.ins().iadd(rsi, delta);
@@ -347,7 +347,7 @@ impl<'a> Lifter<'a> {
     fn emit_stos(&mut self, size: usize) -> crate::Result<()> {
         let rdi = self.get_reg_val(Register::RDI)?;
         let val = self.get_reg_val(Self::string_acc_reg(size))?;
-        self.builder.ins().store(MemFlags::new(), val, rdi, 0);
+        self.builder.ins().store(MemFlagsData::new(), val, rdi, 0);
         let delta = self.string_delta(size);
         let new_rdi = self.builder.ins().iadd(rdi, delta);
         self.set_reg_val(Register::RDI, new_rdi)?;
@@ -371,7 +371,7 @@ impl<'a> Lifter<'a> {
     fn emit_lods(&mut self, size: usize) -> crate::Result<()> {
         let ty = size_to_type(size);
         let rsi = self.get_reg_val(Register::RSI)?;
-        let val = self.builder.ins().load(ty, MemFlags::new(), rsi, 0);
+        let val = self.builder.ins().load(ty, MemFlagsData::new(), rsi, 0);
         self.set_reg_val(Self::string_acc_reg(size), val)?;
         let delta = self.string_delta(size);
         let new_rsi = self.builder.ins().iadd(rsi, delta);
@@ -460,7 +460,7 @@ impl<'a> Lifter<'a> {
         let rsp = self.get_reg_val(Register::RSP)?;
         let new_rsp = self.builder.ins().iadd_imm(rsp, -8);
         self.set_reg_val(Register::RSP, new_rsp)?;
-        self.builder.ins().store(MemFlags::new(), rflags, new_rsp, 0);
+        self.builder.ins().store(MemFlagsData::new(), rflags, new_rsp, 0);
         Ok(())
     }
 
@@ -469,7 +469,7 @@ impl<'a> Lifter<'a> {
     /// reserved/system bits are simply discarded.
     pub(super) fn handle_popfq(&mut self, _instruction: &Instruction) -> crate::Result<()> {
         let rsp = self.get_reg_val(Register::RSP)?;
-        let rflags = self.builder.ins().load(types::I64, MemFlags::new(), rsp, 0);
+        let rflags = self.builder.ins().load(types::I64, MemFlagsData::new(), rsp, 0);
         let new_rsp = self.builder.ins().iadd_imm(rsp, 8);
         self.set_reg_val(Register::RSP, new_rsp)?;
 

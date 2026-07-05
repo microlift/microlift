@@ -24,12 +24,12 @@ impl<'a> Lifter64<'a> {
             let offset = Aarch64RegState::get_gpr_offset(reg);
             self.builder
                 .ins()
-                .store(MemFlags::trusted(), val, ctx_ptr, offset);
+                .store(MemFlagsData::trusted(), val, ctx_ptr, offset);
         }
 
         let sp_val = self.builder.use_var(self.state.sp);
         self.builder.ins().store(
-            MemFlags::trusted(),
+            MemFlagsData::trusted(),
             sp_val,
             ctx_ptr,
             Aarch64RegState::get_sp_offset(),
@@ -40,12 +40,12 @@ impl<'a> Lifter64<'a> {
             let offset = Aarch64RegState::get_flag_offset(flag);
             self.builder
                 .ins()
-                .store(MemFlags::trusted(), val, ctx_ptr, offset);
+                .store(MemFlagsData::trusted(), val, ctx_ptr, offset);
         }
 
         let tpidr_val = self.builder.use_var(self.state.tpidr_el0);
         self.builder.ins().store(
-            MemFlags::trusted(),
+            MemFlagsData::trusted(),
             tpidr_val,
             ctx_ptr,
             Aarch64RegState::get_tpidr_offset(),
@@ -74,14 +74,14 @@ impl<'a> Lifter64<'a> {
                 let offset = Aarch64RegState::get_gpr_offset(reg);
                 self.builder
                     .ins()
-                    .store(MemFlags::trusted(), val, ctx_ptr, offset);
+                    .store(MemFlagsData::trusted(), val, ctx_ptr, offset);
             }
         }
 
         if self.state.dirty_sp {
             let sp_val = self.builder.use_var(self.state.sp);
             self.builder.ins().store(
-                MemFlags::trusted(),
+                MemFlagsData::trusted(),
                 sp_val,
                 ctx_ptr,
                 Aarch64RegState::get_sp_offset(),
@@ -95,14 +95,14 @@ impl<'a> Lifter64<'a> {
                 let offset = Aarch64RegState::get_flag_offset(flag);
                 self.builder
                     .ins()
-                    .store(MemFlags::trusted(), val, ctx_ptr, offset);
+                    .store(MemFlagsData::trusted(), val, ctx_ptr, offset);
             }
         }
 
         if self.state.dirty_tpidr {
             let tpidr_val = self.builder.use_var(self.state.tpidr_el0);
             self.builder.ins().store(
-                MemFlags::trusted(),
+                MemFlagsData::trusted(),
                 tpidr_val,
                 ctx_ptr,
                 Aarch64RegState::get_tpidr_offset(),
@@ -121,13 +121,13 @@ impl<'a> Lifter64<'a> {
             let val = self
                 .builder
                 .ins()
-                .load(types::I64, MemFlags::trusted(), ctx_ptr, offset);
+                .load(types::I64, MemFlagsData::trusted(), ctx_ptr, offset);
             self.builder.def_var(var, val);
         }
 
         let sp_val = self.builder.ins().load(
             types::I64,
-            MemFlags::trusted(),
+            MemFlagsData::trusted(),
             ctx_ptr,
             Aarch64RegState::get_sp_offset(),
         );
@@ -138,13 +138,13 @@ impl<'a> Lifter64<'a> {
             let val = self
                 .builder
                 .ins()
-                .load(types::I8, MemFlags::trusted(), ctx_ptr, offset);
+                .load(types::I8, MemFlagsData::trusted(), ctx_ptr, offset);
             self.builder.def_var(var, val);
         }
 
         let tpidr_val = self.builder.ins().load(
             types::I64,
-            MemFlags::trusted(),
+            MemFlagsData::trusted(),
             ctx_ptr,
             Aarch64RegState::get_tpidr_offset(),
         );
@@ -154,7 +154,7 @@ impl<'a> Lifter64<'a> {
         let image_base_val =
             self.builder
                 .ins()
-                .load(types::I64, MemFlags::trusted(), ctx_ptr, image_base_offset);
+                .load(types::I64, MemFlagsData::trusted(), ctx_ptr, image_base_offset);
         self.builder.def_var(self.state.image_base, image_base_val);
 
         self.state.dirty_gprs.clear();

@@ -24,7 +24,7 @@ impl<'a> Lifter<'a> {
             OpKind::Memory => {
                 // Indirect jump via memory - load the target then dispatch
                 let ptr = self.get_mem_ptr(instruction, 0)?;
-                let target_val = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0);
+                let target_val = self.builder.ins().load(types::I64, MemFlagsData::new(), ptr, 0);
                 self.emit_runtime_indirect_jump(target_val)?;
             }
             other => {
@@ -74,7 +74,7 @@ impl<'a> Lifter<'a> {
         let imm = instruction.immediate16(); // for RET n
 
         let rsp = self.get_reg_val(Register::RSP)?;
-        let target_ip = self.builder.ins().load(types::I64, MemFlags::new(), rsp, 0);
+        let target_ip = self.builder.ins().load(types::I64, MemFlagsData::new(), rsp, 0);
 
         let mut new_rsp = self.builder.ins().iadd_imm(rsp, 8);
         if imm > 0 {
@@ -161,7 +161,7 @@ impl<'a> Lifter<'a> {
                     let va_offset =
                         std::mem::offset_of!(RegisterContext, imported_function_va) as i32;
                     self.builder.ins().store(
-                        MemFlags::trusted(),
+                        MemFlagsData::trusted(),
                         rebased_callee,
                         ctx_ptr,
                         va_offset,
@@ -174,7 +174,7 @@ impl<'a> Lifter<'a> {
                     let rsp = self.get_reg_val(Register::RSP)?;
                     let new_rsp = self.builder.ins().iadd_imm(rsp, -8);
                     self.set_reg_val(Register::RSP, new_rsp)?;
-                    self.builder.ins().store(MemFlags::new(), ret_addr, new_rsp, 0);
+                    self.builder.ins().store(MemFlagsData::new(), ret_addr, new_rsp, 0);
 
                     self.sync_to_context_selective(None, ExitReason::UnknownJump)?;
                     self.write_exit_code(TransferKind::DirectCall as u32);
@@ -196,7 +196,7 @@ impl<'a> Lifter<'a> {
                 self.set_reg_val(Register::RSP, new_rsp)?;
                 self.builder
                     .ins()
-                    .store(MemFlags::new(), ret_addr, new_rsp, 0);
+                    .store(MemFlagsData::new(), ret_addr, new_rsp, 0);
 
                 let target_block = self.get_block_with_kind(target, TransferKind::DirectCall);
                 self.builder.ins().jump(target_block, &[]);
@@ -209,7 +209,7 @@ impl<'a> Lifter<'a> {
             }
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 0)?;
-                let target_val = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0);
+                let target_val = self.builder.ins().load(types::I64, MemFlagsData::new(), ptr, 0);
                 self.emit_indirect_call_exit(target_val)
             }
             other => Err(MicroliftError::UnsupportedInstruction {
@@ -241,7 +241,7 @@ impl<'a> Lifter<'a> {
             }
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 0)?;
-                let target_val = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0);
+                let target_val = self.builder.ins().load(types::I64, MemFlagsData::new(), ptr, 0);
                 let sig = self.analysis_call_sig();
                 self.builder.ins().call_indirect(sig, target_val, &[]);
             }
@@ -291,7 +291,7 @@ impl<'a> Lifter<'a> {
         let va_offset = std::mem::offset_of!(RegisterContext, imported_function_va) as i32;
         self.builder
             .ins()
-            .store(MemFlags::trusted(), va_val, ctx_ptr, va_offset);
+            .store(MemFlagsData::trusted(), va_val, ctx_ptr, va_offset);
 
         self.sync_to_context_selective(None, ExitReason::ImportedFunctionCall)?;
         self.builder.ins().return_(&[]);
@@ -314,7 +314,7 @@ impl<'a> Lifter<'a> {
         let va_offset = std::mem::offset_of!(RegisterContext, imported_function_va) as i32;
         self.builder
             .ins()
-            .store(MemFlags::trusted(), target_val, ctx_ptr, va_offset);
+            .store(MemFlagsData::trusted(), target_val, ctx_ptr, va_offset);
 
         self.sync_to_context_selective(None, ExitReason::IndirectCall)?;
         self.builder.ins().return_(&[]);
@@ -361,14 +361,14 @@ impl<'a> Lifter<'a> {
                     let f32_val = self
                         .builder
                         .ins()
-                        .bitcast(types::F32, MemFlags::new(), i32_val);
+                        .bitcast(types::F32, MemFlagsData::new(), i32_val);
                     call_args.push(f32_val);
                     xmm_idx += 1;
                 }
                 FunctionArgumentType::DoublePrecisionFp => {
                     // XMM lo (I64) -> bitcast to F64.
                     let lo = self.get_xmm_lo(xmm_idx);
-                    let f64_val = self.builder.ins().bitcast(types::F64, MemFlags::new(), lo);
+                    let f64_val = self.builder.ins().bitcast(types::F64, MemFlagsData::new(), lo);
                     call_args.push(f64_val);
                     xmm_idx += 1;
                 }
@@ -415,7 +415,7 @@ impl<'a> Lifter<'a> {
                     let i32_val = self
                         .builder
                         .ins()
-                        .bitcast(types::I32, MemFlags::new(), ret_val);
+                        .bitcast(types::I32, MemFlagsData::new(), ret_val);
                     let i64_val = self.builder.ins().uextend(types::I64, i32_val);
                     let zero = self.builder.ins().iconst(types::I64, 0);
                     self.set_xmm_lo(0, i64_val);
@@ -426,7 +426,7 @@ impl<'a> Lifter<'a> {
                     let i64_val = self
                         .builder
                         .ins()
-                        .bitcast(types::I64, MemFlags::new(), ret_val);
+                        .bitcast(types::I64, MemFlagsData::new(), ret_val);
                     let zero = self.builder.ins().iconst(types::I64, 0);
                     self.set_xmm_lo(0, i64_val);
                     self.set_xmm_hi(0, zero);
@@ -497,13 +497,13 @@ impl<'a> Lifter<'a> {
                     let f32_val = self
                         .builder
                         .ins()
-                        .bitcast(types::F32, MemFlags::new(), i32_val);
+                        .bitcast(types::F32, MemFlagsData::new(), i32_val);
                     call_args.push(f32_val);
                     xmm_idx += 1;
                 }
                 FunctionArgumentType::DoublePrecisionFp => {
                     let lo = self.get_xmm_lo(xmm_idx);
-                    let f64_val = self.builder.ins().bitcast(types::F64, MemFlags::new(), lo);
+                    let f64_val = self.builder.ins().bitcast(types::F64, MemFlagsData::new(), lo);
                     call_args.push(f64_val);
                     xmm_idx += 1;
                 }
@@ -544,7 +544,7 @@ impl<'a> Lifter<'a> {
                     let i32_val = self
                         .builder
                         .ins()
-                        .bitcast(types::I32, MemFlags::new(), ret_val);
+                        .bitcast(types::I32, MemFlagsData::new(), ret_val);
                     let i64_val = self.builder.ins().uextend(types::I64, i32_val);
                     let zero = self.builder.ins().iconst(types::I64, 0);
                     self.set_xmm_lo(0, i64_val);
@@ -554,7 +554,7 @@ impl<'a> Lifter<'a> {
                     let i64_val = self
                         .builder
                         .ins()
-                        .bitcast(types::I64, MemFlags::new(), ret_val);
+                        .bitcast(types::I64, MemFlagsData::new(), ret_val);
                     let zero = self.builder.ins().iconst(types::I64, 0);
                     self.set_xmm_lo(0, i64_val);
                     self.set_xmm_hi(0, zero);
