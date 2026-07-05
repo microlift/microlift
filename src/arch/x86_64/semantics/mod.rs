@@ -308,7 +308,8 @@ impl<'a> Lifter<'a> {
             Mnemonic::Fldcw => self.handle_fldcw(instruction),
             Mnemonic::Fincstp => self.handle_fincstp(instruction),
             Mnemonic::Fdecstp => self.handle_fdecstp(instruction),
-            Mnemonic::Ffree | Mnemonic::Fnop => self.handle_fpu_nop(instruction),
+            Mnemonic::Ffree => self.handle_ffree(instruction),
+            Mnemonic::Fnop => self.handle_fpu_nop(instruction),
 
             Mnemonic::Stc => self.handle_stc(instruction),
             Mnemonic::Clc => self.handle_clc(instruction),

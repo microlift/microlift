@@ -88,3 +88,51 @@ impl RegisterContext {
         Self::default()
     }
 }
+
+/// Convert an 80-bit x87 extended-precision value to the raw bits of an `f64`.
+/// This is the pure-Rust twin of the IR emitted by the lifter's `FLD m80`
+/// ([`crate::arch::x86_64::Lifter::fpu_load_f80`]); the two are kept bit-for-bit
+/// identical so a host runtime that materialises guest x87 state links against
+/// exactly the same conversion the lifted code uses. Exact for zero and normal
+/// values within the `f64` exponent range; denormals flush to zero and
+/// out-of-range exponents wrap (the extra range/precision of 80-bit
+/// `long double` is not representable in `f64`).
+#[inline]
+pub fn f80_to_f64_bits(mantissa: u64, sign_exp: u16) -> u64 {
+    let sign = ((sign_exp >> 15) & 1) as u64;
+    if mantissa == 0 {
+        // ±0 (also the encoding produced for flushed/true zeros).
+        return sign << 63;
+    }
+    let exp80 = (sign_exp & 0x7FFF) as u64;
+    // f80 bias 16383, f64 bias 1023 -> exp64 = exp80 - 15360.
+    let exp64 = exp80.wrapping_sub(15360) & 0x7FF;
+    // Drop the explicit integer bit; the f64 fraction is the next 52 bits.
+    let frac = (mantissa >> 11) & 0x000F_FFFF_FFFF_FFFF;
+    (sign << 63) | (exp64 << 52) | frac
+}
+
+/// Convert the raw bits of an `f64` to an 80-bit x87 extended-precision value,
+/// returning `(mantissa, sign_exp)` in the same layout [`f80_to_f64_bits`]
+/// consumes.
+///
+/// Pure-Rust twin of the lifter's `FSTP m80`
+/// ([`crate::arch::x86_64::Lifter::fpu_store_f80`]); kept bit-for-bit identical.
+#[inline]
+pub fn f64_bits_to_f80(bits: u64) -> (u64, u16) {
+    let sign = (bits >> 63) & 1;
+    let exp64 = (bits >> 52) & 0x7FF;
+    let frac = bits & 0x000F_FFFF_FFFF_FFFF;
+    if exp64 == 0 && frac == 0 {
+        // ±0 (denormals are flushed to zero, matching the lifter).
+        return (0, (sign as u16) << 15);
+    }
+    // Explicit integer bit set + fraction shifted up by 11.
+    let mantissa = (1u64 << 63) | (frac << 11);
+    let exp80 = if exp64 == 0x7FF {
+        0x7FFF // Inf / NaN
+    } else {
+        exp64 + 15360
+    };
+    (mantissa, ((sign as u16) << 15) | exp80 as u16)
+}

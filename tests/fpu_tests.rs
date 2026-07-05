@@ -418,3 +418,73 @@ fn test_fincstp_fdecstp() {
     let ctx = run_test(&[0xD9, 0xF6, 0xC3], RegisterContext::default());
     assert_eq!(ctx.fpu_top, 7);
 }
+
+#[test]
+fn test_tag_word_push_marks_valid() {
+    // Two pushes: TOP goes 0 -> 7 -> 6, marking physical regs 7 and 6 valid.
+    // fld1; fld1; ret
+    let bytes = [0xD9, 0xE8, 0xD9, 0xE8, 0xC3];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.fpu_top, 6);
+    // Abridged tag: bit i = physical register i valid.
+    assert_eq!(ctx.fpu_tag & (1 << 7), 1 << 7, "phys 7 valid");
+    assert_eq!(ctx.fpu_tag & (1 << 6), 1 << 6, "phys 6 valid");
+    assert_eq!(ctx.fpu_tag & !(1 << 7 | 1 << 6), 0, "no other regs valid");
+}
+
+#[test]
+fn test_tag_word_pop_marks_empty() {
+    // fld1; fld1; fstp st(0); ret  -> push,push then pop ST0.
+    // After 2 pushes: TOP=6, phys 6 & 7 valid. fstp st(0) (DD D8) pops ST0
+    // (phys 6) -> phys 6 empty, TOP=7.
+    let bytes = [0xD9, 0xE8, 0xD9, 0xE8, 0xDD, 0xD8, 0xC3];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.fpu_top, 7);
+    assert_eq!(ctx.fpu_tag & (1 << 6), 0, "popped phys 6 must be empty");
+    assert_eq!(ctx.fpu_tag & (1 << 7), 1 << 7, "phys 7 still valid");
+}
+
+#[test]
+fn test_ffree_marks_empty() {
+    // fld1; fld1; ffree st(1); ret  -> ST1 is phys 7; mark it empty.
+    // ffree st(1) = DD C1
+    let bytes = [0xD9, 0xE8, 0xD9, 0xE8, 0xDD, 0xC1, 0xC3];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.fpu_top, 6, "ffree must not change TOP");
+    assert_eq!(ctx.fpu_tag & (1 << 7), 0, "ST1 (phys 7) freed");
+    assert_eq!(ctx.fpu_tag & (1 << 6), 1 << 6, "ST0 (phys 6) still valid");
+}
+
+#[test]
+fn test_f80_conversion_roundtrip() {
+    use microlift::context::{f64_bits_to_f80, f80_to_f64_bits};
+    for &v in &[0.0f64, -0.0, 1.0, -1.0, 2.5, 1234.5, -7.25, 1e300, 1e-300] {
+        let (mant, se) = f64_bits_to_f80(v.to_bits());
+        let back = f80_to_f64_bits(mant, se);
+        assert_eq!(
+            f64::from_bits(back),
+            v,
+            "round-trip failed for {v}: mant={mant:#x} se={se:#x}"
+        );
+    }
+}
+
+#[test]
+fn test_f80_conversion_matches_lifter() {
+    // The pure-Rust f64->f80 must produce the same 80-bit encoding the lifter's
+    // FSTP m80 emits (verified via a lift round-trip of the same value).
+    use microlift::context::f64_bits_to_f80;
+    // fld qword[rax]; fstp tbyte[rcx]; ret
+    let bytes = [0xDD, 0x00, 0xDB, 0x39, 0xC3];
+    let v: f64 = -7.25;
+    let mut dst = [0u8; 16];
+    let mut ctx = RegisterContext::default();
+    ctx.rax = &v as *const f64 as u64;
+    ctx.rcx = dst.as_mut_ptr() as u64;
+    run_test(&bytes, ctx);
+    let lifted_mant = u64::from_le_bytes(dst[0..8].try_into().unwrap());
+    let lifted_se = u16::from_le_bytes(dst[8..10].try_into().unwrap());
+    let (mant, se) = f64_bits_to_f80(v.to_bits());
+    assert_eq!(mant, lifted_mant, "mantissa must match lifter");
+    assert_eq!(se, lifted_se, "sign+exp must match lifter");
+}

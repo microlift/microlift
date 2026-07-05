@@ -97,21 +97,61 @@ impl<'a> Lifter<'a> {
         self.builder.ins().store(MemFlagsData::trusted(), val, p, 0);
     }
 
-    /// Decrement `TOP` and store `val` into the new `ST(0)`.
+    /// Decrement `TOP`, store `val` into the new `ST(0)`, and mark that physical
+    /// register valid in the tag word.
     fn fpu_push(&mut self, val: Value) {
         let top = self.fpu_load_top();
         let dec = self.builder.ins().iadd_imm(top, -1);
         let new_top = self.builder.ins().band_imm(dec, 7);
         self.fpu_store_top(new_top);
         self.fpu_write_st(0, val);
+        self.fpu_set_tag_phys(new_top, true);
     }
 
-    /// Increment `TOP` (discarding the old `ST(0)`).
+    /// Mark the current `ST(0)` empty in the tag word and increment `TOP`
+    /// (discarding it).
     fn fpu_pop(&mut self) {
         let top = self.fpu_load_top();
+        self.fpu_set_tag_phys(top, false);
         let inc = self.builder.ins().iadd_imm(top, 1);
         let new_top = self.builder.ins().band_imm(inc, 7);
         self.fpu_store_top(new_top);
+    }
+
+    /// Load the abridged tag word as an `I32` (bit `i` = physical register `i`
+    /// is valid; matches the FXSAVE `ftw` encoding, `1` = valid, `0` = empty).
+    fn fpu_load_tag(&mut self) -> Value {
+        let ctx = self.fpu_ctx_ptr();
+        let off = std::mem::offset_of!(RegisterContext, fpu_tag) as i32;
+        let t = self
+            .builder
+            .ins()
+            .load(types::I16, MemFlagsData::trusted(), ctx, off);
+        self.builder.ins().uextend(types::I32, t)
+    }
+
+    /// Store the abridged tag word (`I32`, low 8 bits significant).
+    fn fpu_store_tag(&mut self, tag: Value) {
+        let ctx = self.fpu_ctx_ptr();
+        let off = std::mem::offset_of!(RegisterContext, fpu_tag) as i32;
+        let t16 = self.builder.ins().ireduce(types::I16, tag);
+        self.builder
+            .ins()
+            .store(MemFlagsData::trusted(), t16, ctx, off);
+    }
+
+    /// Set physical register `phys` (an `I32` value, 0-7) valid or empty in the
+    /// tag word.
+    fn fpu_set_tag_phys(&mut self, phys: Value, valid: bool) {
+        let one = self.builder.ins().iconst(types::I32, 1);
+        let bit = self.builder.ins().ishl(one, phys);
+        let tag = self.fpu_load_tag();
+        let new = if valid {
+            self.builder.ins().bor(tag, bit)
+        } else {
+            self.builder.ins().band_not(tag, bit)
+        };
+        self.fpu_store_tag(new);
     }
 
     /// Resolve operand `op_index` to a stack index (`ST(n)` -> `n`).
@@ -766,8 +806,18 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// FFREE / FNOP / FWAIT - no observable effect in this `f64` FPU model
-    /// (`FFREE` only marks a register empty in the tag word).
+    /// FFREE - mark `ST(i)` empty in the tag word without changing `TOP` or the
+    /// register data.
+    pub(super) fn handle_ffree(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let i = self.fpu_st_index(instruction, 0)?;
+        let top = self.fpu_load_top();
+        let raw = self.builder.ins().iadd_imm(top, i as i64);
+        let phys = self.builder.ins().band_imm(raw, 7);
+        self.fpu_set_tag_phys(phys, false);
+        Ok(())
+    }
+
+    /// FNOP / FWAIT - no observable effect in this FPU model.
     pub(super) fn handle_fpu_nop(&mut self, _instruction: &Instruction) -> crate::Result<()> {
         Ok(())
     }
