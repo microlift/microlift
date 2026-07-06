@@ -1035,3 +1035,116 @@ fn test_resolved_indirect_targets_empty_when_unresolvable() {
     let resolved = resolved_indirect_targets::<X86_64>(&bytes, 0x1000, &[]);
     assert!(resolved.is_empty());
 }
+
+// Regression: transfer-function soundness (wrong-constant resolution)
+//
+// These exercise cases where VSA must NOT hand back a stale/over-narrow concrete
+// target for an indirect transfer. A wrong `Constant`/`Multiple` here is not
+// conservative imprecision - a consumer that devirtualizes on it miscompiles the
+// guest (a data-dependent branch collapsed to a constant/incorrect condition).
+
+#[test]
+fn test_subregister_write_updates_full_register() {
+    // mov rax, 0x1111 ; mov eax, 0x2222 ; jmp rax
+    // Writing EAX zero-extends into RAX, so the real target is 0x2222 - never the
+    // stale 0x1111 left in the full register.
+    let bytes = [
+        0x48u8, 0xC7, 0xC0, 0x11, 0x11, 0x00, 0x00, // mov rax, 0x1111 (ip 0x1000)
+        0xB8, 0x22, 0x22, 0x00, 0x00, // mov eax, 0x2222 (ip 0x1007)
+        0xFF, 0xE0, // jmp rax (ip 0x100C)
+    ];
+    let insts = decode_at(&bytes, 0x1000);
+    let mut vsa = ValueSetAnalyzer::new();
+    vsa.analyze(&insts);
+    let jmp = &insts[2];
+    let targets = vsa.indirect_targets(jmp);
+    assert!(
+        !targets.as_deref().is_some_and(|t| t.contains(&0x1111)),
+        "resolved to the stale pre-`mov eax` value: {targets:?}"
+    );
+    assert_eq!(targets, Some(vec![0x2222]));
+}
+
+#[test]
+fn test_subregister_read_is_masked_to_operand_width() {
+    // mov rax, 0x1_0000_2222 ; mov ecx, eax ; jmp rcx
+    // `mov ecx, eax` copies only the low 32 bits (0x2222) and zero-extends, so
+    // rcx = 0x2222 - not the full 64-bit 0x1_0000_2222.
+    let bytes = [
+        0x48u8, 0xB8, 0x22, 0x22, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, // movabs rax, 0x100002222 (0x1000)
+        0x89, 0xC1, // mov ecx, eax (0x100A)
+        0xFF, 0xE1, // jmp rcx (0x100C)
+    ];
+    let insts = decode_at(&bytes, 0x1000);
+    let mut vsa = ValueSetAnalyzer::new();
+    vsa.analyze(&insts);
+    let targets = vsa.indirect_targets(&insts[2]);
+    assert_eq!(targets, Some(vec![0x2222]));
+}
+
+#[test]
+fn test_implicit_output_kills_stale_destination() {
+    // mov rax, 0x1111 ; mul rbx ; jmp rax
+    // `mul rbx` writes RAX (and RDX) implicitly; the old 0x1111 must not survive.
+    let bytes = [
+        0x48u8, 0xC7, 0xC0, 0x11, 0x11, 0x00, 0x00, // mov rax, 0x1111 (0x1000)
+        0x48, 0xF7, 0xE3, // mul rbx (0x1007)
+        0xFF, 0xE0, // jmp rax (0x100A)
+    ];
+    let insts = decode_at(&bytes, 0x1000);
+    let mut vsa = ValueSetAnalyzer::new();
+    vsa.analyze(&insts);
+    assert_eq!(
+        vsa.indirect_targets(&insts[2]),
+        None,
+        "mul left a stale RAX that resolved the indirect jump"
+    );
+}
+
+#[test]
+fn test_rdtsc_kills_stale_rax() {
+    // mov rax, 0x1111 ; rdtsc ; jmp rax  -> rdtsc clobbers RAX/RDX.
+    let bytes = [
+        0x48u8, 0xC7, 0xC0, 0x11, 0x11, 0x00, 0x00, // mov rax, 0x1111 (0x1000)
+        0x0F, 0x31, // rdtsc (0x1007)
+        0xFF, 0xE0, // jmp rax (0x1009)
+    ];
+    let insts = decode_at(&bytes, 0x1000);
+    let mut vsa = ValueSetAnalyzer::new();
+    vsa.analyze(&insts);
+    assert_eq!(vsa.indirect_targets(&insts[2]), None);
+}
+
+#[test]
+fn test_merge_widens_value_across_join_point() {
+    // Diamond: two predecessors reach `mov rcx, rax ; jmp rcx` with rax = 0x1111
+    // (branch taken) or 0x2222 (fallthrough). The analysis must widen rcx to both
+    // targets, not fix it at whichever predecessor was visited first.
+    //
+    // 0x1000: mov rax, 0x1111
+    // 0x1007: je   0x1010
+    // 0x1009: mov rax, 0x2222
+    // 0x1010: mov rcx, rax
+    // 0x1013: jmp rcx
+    let bytes = [
+        0x48u8, 0xC7, 0xC0, 0x11, 0x11, 0x00, 0x00, // mov rax, 0x1111 (0x1000)
+        0x74, 0x07, // je 0x1010 (0x1007)
+        0x48, 0xC7, 0xC0, 0x22, 0x22, 0x00, 0x00, // mov rax, 0x2222 (0x1009)
+        0x48, 0x89, 0xC1, // mov rcx, rax (0x1010)
+        0xFF, 0xE1, // jmp rcx (0x1013)
+    ];
+    let insts = decode_at(&bytes, 0x1000);
+    let mut vsa = ValueSetAnalyzer::new();
+    vsa.analyze(&insts);
+    let jmp = insts.iter().find(|i| i.ip() == 0x1013).unwrap();
+    let targets = vsa.indirect_targets(jmp);
+    match targets {
+        Some(t) => {
+            assert!(
+                t.contains(&0x1111) && t.contains(&0x2222),
+                "join dropped a target: {t:?}"
+            );
+        }
+        None => panic!("expected both targets to be resolved, got None"),
+    }
+}

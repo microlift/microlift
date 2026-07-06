@@ -21,7 +21,10 @@
 
 use crate::cfg::ResolvedTargets;
 use crate::context::MemorySegment;
-use iced_x86::{Decoder, DecoderOptions, Instruction, MemorySize, Mnemonic, OpKind, Register};
+use iced_x86::{
+    Decoder, DecoderOptions, Instruction, InstructionInfoFactory, MemorySize, Mnemonic, OpAccess,
+    OpKind, Register,
+};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 /// Caller-saved (volatile) general-purpose registers. The union of the System V
@@ -181,6 +184,64 @@ impl ValueSet {
         }
     }
 
+    /// Keep only the low `bits` bits of every concrete value, zero-extending the
+    /// result. Models a narrow (sub-register) read/zero-extending write: e.g. the
+    /// low 32 bits of a value for `mov ecx, eax` or `mov eax, imm32`.
+    ///
+    /// Only `Constant`/`Multiple` can be truncated exactly; an `Interval`'s low
+    /// bits are not an interval in general, so we conservatively fall to `Top`.
+    pub fn low_bits(&self, bits: u32) -> ValueSet {
+        if bits >= 64 {
+            return self.clone();
+        }
+        let mask = (1u64 << bits) - 1;
+        match self {
+            ValueSet::Empty => ValueSet::Empty,
+            ValueSet::Constant(c) => ValueSet::Constant((*c as u64 & mask) as i64),
+            ValueSet::Multiple(s) => {
+                let m: BTreeSet<i64> = s.iter().map(|v| (*v as u64 & mask) as i64).collect();
+                // Masking can collapse the set to a single value.
+                if m.len() == 1 {
+                    ValueSet::Constant(*m.iter().next().unwrap())
+                } else {
+                    ValueSet::Multiple(m)
+                }
+            }
+            _ => ValueSet::Top,
+        }
+    }
+
+    /// Widening operator used at control-flow merges to guarantee the worklist
+    /// reaches a fixpoint in finite time. It behaves like [`join`](Self::join)
+    /// except that an `Interval` whose bounds would grow jumps straight to `Top`,
+    /// bounding the otherwise-unbounded ascending chain of intervals across a
+    /// loop back-edge. `self` is the existing (accumulated) value; `other` is the
+    /// newly arriving one.
+    pub fn widen(&self, other: &ValueSet) -> ValueSet {
+        match (self, other) {
+            (
+                ValueSet::Interval {
+                    min: a_min,
+                    max: a_max,
+                },
+                ValueSet::Interval {
+                    min: b_min,
+                    max: b_max,
+                },
+            ) => {
+                if b_min < a_min || b_max > a_max {
+                    ValueSet::Top
+                } else {
+                    ValueSet::Interval {
+                        min: *a_min,
+                        max: *a_max,
+                    }
+                }
+            }
+            _ => self.join(other),
+        }
+    }
+
     /// True if this value set has a bounded set of concrete targets.
     pub fn is_resolvable(&self) -> bool {
         matches!(self, ValueSet::Constant(_) | ValueSet::Multiple(_))
@@ -225,6 +286,44 @@ impl RegisterValueSet {
         }
         result
     }
+
+    /// Per-register [widening](ValueSet::widen) of two register states; used at
+    /// merges to keep the fixpoint iteration terminating.
+    pub fn widen(&self, other: &RegisterValueSet) -> RegisterValueSet {
+        let mut result = self.clone();
+        for (reg, vs) in &other.values {
+            let widened = result.get(*reg).widen(vs);
+            result.set(*reg, widened);
+        }
+        result
+    }
+}
+
+/// Read a (possibly sub-width) register, canonicalizing to its 64-bit container
+/// and masking to the operand's width. Sub-register state is tracked on the full
+/// register, so `mov ecx, eax` must read the *low 32 bits* of RAX - not the whole
+/// 64-bit value.
+fn read_reg(state: &RegisterValueSet, reg: Register) -> ValueSet {
+    let vs = state.get(reg.full_register());
+    match reg.size() {
+        0 | 8 => vs,
+        n => vs.low_bits(n as u32 * 8),
+    }
+}
+
+/// Write a (possibly sub-width) register, updating its 64-bit container so a
+/// later full-width read observes the write. x86-64 semantics:
+/// * a 64-bit write replaces the register outright;
+/// * a 32-bit write zero-extends into the full register (upper 32 bits cleared);
+/// * an 8/16-bit write preserves the untracked upper bits, so the combined
+///   64-bit value is unknown (`Top`).
+fn write_reg(out: &mut RegisterValueSet, reg: Register, vs: ValueSet) {
+    let full = reg.full_register();
+    match reg.size() {
+        8 => out.set(full, vs),
+        4 => out.set(full, vs.low_bits(32)),
+        _ => out.set(full, ValueSet::Top),
+    }
 }
 
 // Analyzer
@@ -249,7 +348,6 @@ pub struct ValueSetAnalyzer {
     /// `JMP [GOT+off]` or `CALL [GOT+off]` targets address 0.
     pub relocation_addresses: HashSet<u64>,
     worklist: VecDeque<usize>,
-    visited: HashSet<usize>,
 }
 
 impl ValueSetAnalyzer {
@@ -263,7 +361,6 @@ impl ValueSetAnalyzer {
             segments,
             relocation_addresses: HashSet::new(),
             worklist: VecDeque::new(),
-            visited: HashSet::new(),
         }
     }
 
@@ -280,8 +377,11 @@ impl ValueSetAnalyzer {
     /// Run the analysis over a decoded instruction stream.
     ///
     /// The instructions should already be topologically sorted (i.e. the normal
-    /// decode order). This is a single-pass forward analysis; for loops / back-
-    /// edges it is conservative (widening to `Top` on re-visit).
+    /// decode order). This is an iterative worklist analysis that runs to a
+    /// fixpoint: a block is re-processed whenever a predecessor changes its entry
+    /// state, so values are correctly widened across control-flow merges. The
+    /// widening operator ([`RegisterValueSet::widen`]) bounds the ascending chain
+    /// (intervals that grow jump to `Top`), guaranteeing termination.
     pub fn analyze(&mut self, instructions: &[Instruction]) {
         if instructions.is_empty() {
             return;
@@ -354,15 +454,12 @@ impl ValueSetAnalyzer {
                     if idx + 1 < instructions.len() {
                         let next_idx = idx + 1;
                         let next_inst_ip = instructions[next_idx].ip();
-                        let changed = self.merge(next_inst_ip, &post_state);
-                        if changed && !self.visited.contains(&next_idx) {
+                        if self.merge(next_inst_ip, &post_state) {
                             self.worklist.push_back(next_idx);
                         }
                     }
                 }
             }
-
-            self.visited.insert(idx);
         }
     }
 
@@ -376,7 +473,7 @@ impl ValueSetAnalyzer {
                 if inst.op0_kind() == OpKind::Register {
                     let dst = inst.op0_register();
                     let src_vs = self.eval_operand(state, inst, 1);
-                    out.set(dst, src_vs);
+                    write_reg(&mut out, dst, src_vs);
                 }
             }
             Mnemonic::Xor => {
@@ -385,38 +482,38 @@ impl ValueSetAnalyzer {
                     && inst.op0_register() == inst.op1_register()
                 {
                     // `xor rax, rax` -> 0
-                    out.set(inst.op0_register(), ValueSet::Constant(0));
+                    write_reg(&mut out, inst.op0_register(), ValueSet::Constant(0));
                 } else if inst.op0_kind() == OpKind::Register {
                     let a = self.eval_operand(state, inst, 0);
                     let b = self.eval_operand(state, inst, 1);
-                    out.set(inst.op0_register(), a.abstract_xor(&b));
+                    write_reg(&mut out, inst.op0_register(), a.abstract_xor(&b));
                 }
             }
             Mnemonic::Add => {
                 if inst.op0_kind() == OpKind::Register {
                     let a = self.eval_operand(state, inst, 0);
                     let b = self.eval_operand(state, inst, 1);
-                    out.set(inst.op0_register(), a.abstract_add(&b));
+                    write_reg(&mut out, inst.op0_register(), a.abstract_add(&b));
                 }
             }
             Mnemonic::Sub => {
                 if inst.op0_kind() == OpKind::Register {
                     let a = self.eval_operand(state, inst, 0);
                     let b = self.eval_operand(state, inst, 1);
-                    out.set(inst.op0_register(), a.abstract_sub(&b));
+                    write_reg(&mut out, inst.op0_register(), a.abstract_sub(&b));
                 }
             }
             Mnemonic::And => {
                 if inst.op0_kind() == OpKind::Register {
                     let a = self.eval_operand(state, inst, 0);
                     let b = self.eval_operand(state, inst, 1);
-                    out.set(inst.op0_register(), a.abstract_and(&b));
+                    write_reg(&mut out, inst.op0_register(), a.abstract_and(&b));
                 }
             }
             Mnemonic::Or => {
                 if inst.op0_kind() == OpKind::Register {
                     // Conservative - don't try to track OR precisely
-                    out.set(inst.op0_register(), ValueSet::Top);
+                    write_reg(&mut out, inst.op0_register(), ValueSet::Top);
                 }
             }
             Mnemonic::Lea => {
@@ -424,13 +521,16 @@ impl ValueSetAnalyzer {
                     // LEA with a constant displacement can propagate
                     let base_reg = inst.memory_base();
                     let disp = inst.memory_displacement64() as i64;
-                    if inst.memory_index() == Register::None && base_reg != Register::None {
-                        let base_vs = state.get(base_reg);
+                    let addr_vs = if inst.memory_index() == Register::None
+                        && base_reg != Register::None
+                    {
+                        let base_vs = read_reg(state, base_reg);
                         let disp_vs = ValueSet::Constant(disp);
-                        out.set(inst.op0_register(), base_vs.abstract_add(&disp_vs));
+                        base_vs.abstract_add(&disp_vs)
                     } else {
-                        out.set(inst.op0_register(), ValueSet::Top);
-                    }
+                        ValueSet::Top
+                    };
+                    write_reg(&mut out, inst.op0_register(), addr_vs);
                 }
             }
             Mnemonic::Call => {
@@ -441,10 +541,29 @@ impl ValueSetAnalyzer {
                     out.set(reg, ValueSet::Top);
                 }
             }
-            // For all other instructions, kill any written destination
+            // For all other instructions, kill *every* register the instruction
+            // writes - not just the first operand. Instructions like `mul`/`div`/
+            // `cpuid`/`rdtsc` write RAX/RDX implicitly, and `xchg` writes both
+            // operands; consulting iced's instruction-info database ensures none
+            // of those destinations keep a stale pre-instruction value that could
+            // later resolve an indirect transfer to the wrong target.
             _ => {
-                if inst.op0_kind() == OpKind::Register {
-                    out.set(inst.op0_register(), ValueSet::Top);
+                let mut factory = InstructionInfoFactory::new();
+                let info = factory.info(inst);
+                for used in info.used_registers() {
+                    let reg = used.register();
+                    if reg == Register::None {
+                        continue;
+                    }
+                    if matches!(
+                        used.access(),
+                        OpAccess::Write
+                            | OpAccess::CondWrite
+                            | OpAccess::ReadWrite
+                            | OpAccess::ReadCondWrite
+                    ) {
+                        out.set(reg.full_register(), ValueSet::Top);
+                    }
                 }
             }
         }
@@ -473,7 +592,7 @@ impl ValueSetAnalyzer {
                     2 => inst.op2_register(),
                     _ => return ValueSet::Top,
                 };
-                state.get(reg)
+                read_reg(state, reg)
             }
             OpKind::Immediate8 => ValueSet::Constant(inst.immediate8() as i64),
             OpKind::Immediate16 => ValueSet::Constant(inst.immediate16() as i64),
@@ -494,7 +613,7 @@ impl ValueSetAnalyzer {
                 let mut addr = disp;
 
                 if base_reg != Register::None {
-                    let base_vs = state.get(base_reg);
+                    let base_vs = read_reg(state, base_reg);
                     if let ValueSet::Constant(c) = base_vs {
                         addr = addr.wrapping_add(c as u64);
                     } else if base_reg == Register::RIP {
@@ -507,7 +626,7 @@ impl ValueSetAnalyzer {
                 }
 
                 if index_reg != Register::None {
-                    let index_vs = state.get(index_reg);
+                    let index_vs = read_reg(state, index_reg);
                     if let ValueSet::Constant(c) = index_vs {
                         addr = addr.wrapping_add((c as u64).wrapping_mul(scale as u64));
                     } else {
@@ -567,9 +686,7 @@ impl ValueSetAnalyzer {
         let changed = self.merge(target_ip, state);
         if changed {
             if let Some(idx) = instructions.iter().position(|i| i.ip() == target_ip) {
-                if !self.visited.contains(&idx) {
-                    self.worklist.push_back(idx);
-                }
+                self.worklist.push_back(idx);
             }
         }
     }
@@ -577,9 +694,11 @@ impl ValueSetAnalyzer {
     /// Merge `state` into the stored state at `ip`. Returns `true` if anything changed.
     fn merge(&mut self, ip: u64, state: &RegisterValueSet) -> bool {
         if let Some(existing) = self.value_sets.get_mut(&ip) {
-            let joined = existing.join(state);
-            if joined.values != existing.values {
-                *existing = joined;
+            // Widen (not just join) so the iteration terminates even when a loop
+            // back-edge keeps nudging an interval outward.
+            let widened = existing.widen(state);
+            if widened.values != existing.values {
+                *existing = widened;
                 return true;
             }
             false
