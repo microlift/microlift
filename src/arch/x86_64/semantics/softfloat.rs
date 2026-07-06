@@ -554,11 +554,14 @@ pub fn emit_f80_add(
     };
 
     // ---- effective subtraction ----
+    // Select the (non-negative) difference directly rather than max/min of the
+    // operands: `select(uge(a,b), a, b)` would be folded by the mid-end into
+    // `umax.i128`, which the x86 backend cannot lower.
     let hi_ge = b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, hi128, lo_aligned);
-    let big = b.ins().select(hi_ge, hi128, lo_aligned);
-    let small = b.ins().select(hi_ge, lo_aligned, hi128);
+    let d_hilo = b.ins().isub(hi128, lo_aligned);
+    let d_lohi = b.ins().isub(lo_aligned, hi128);
+    let diff = b.ins().select(hi_ge, d_hilo, d_lohi);
     let sub_sign = b.ins().select(hi_ge, hi_sign, lo_sign);
-    let diff = b.ins().isub(big, small);
     let diff_zero = b.ins().icmp(IntCC::Equal, diff, zero128);
     let cz = clz128(b, diff);
     let cz128 = b.ins().uextend(types::I128, cz);

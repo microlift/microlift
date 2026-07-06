@@ -184,6 +184,67 @@ fn rand_normal(rng: &mut Rng) -> u128 {
     bits(mant, (sign << 15) | exp)
 }
 
+/// Regression: every kernel must lower under the optimizing mid-end. The
+/// egraph pass (enabled at `opt_level=speed`, as the object/AOT backend uses)
+/// once folded a 128-bit `select(uge(a,b), a, b)` into `umax.i128`, which the
+/// x86 backend cannot lower. `opt_level=none` (the plain JIT tests) skips the
+/// egraph and so did not catch it.
+#[test]
+fn test_kernels_lower_under_optimization() {
+    use cranelift_codegen::settings::{self, Configurable};
+
+    let mut func = Function::with_name_signature(
+        UserFuncName::user(0, 0),
+        Signature::new(get_host_calling_conv()),
+    );
+    for _ in 0..5 {
+        func.signature.params.push(AbiParam::new(types::I64));
+    }
+    let mut fctx = FunctionBuilderContext::new();
+    let mut builder = FunctionBuilder::new(&mut func, &mut fctx);
+    let blk = builder.create_block();
+    builder.append_block_params_for_function_params(blk);
+    builder.switch_to_block(blk);
+    builder.seal_block(blk);
+    let p = builder.block_params(blk).to_vec();
+    let (am, a_se64, bm, b_se64, out) = (p[0], p[1], p[2], p[3], p[4]);
+    let ase = builder.ins().ireduce(types::I32, a_se64);
+    let bse = builder.ins().ireduce(types::I32, b_se64);
+
+    // Exercise every kernel and combine outputs so none are dead-code eliminated.
+    let mut acc_m = builder.ins().iconst(types::I64, 0);
+    let mut acc_s = builder.ins().iconst(types::I32, 0);
+    for (m, s) in [
+        softfloat::emit_f80_add(&mut builder, am, ase, bm, bse),
+        softfloat::emit_f80_sub(&mut builder, am, ase, bm, bse),
+        softfloat::emit_f80_mul(&mut builder, am, ase, bm, bse),
+        softfloat::emit_f80_div(&mut builder, am, ase, bm, bse),
+        softfloat::emit_f80_sqrt(&mut builder, am, ase),
+    ] {
+        acc_m = builder.ins().bxor(acc_m, m);
+        acc_s = builder.ins().bxor(acc_s, s);
+    }
+    let (unord, eq, lt) = softfloat::emit_f80_cmp(&mut builder, am, ase, bm, bse);
+    let cmp = builder.ins().bor(unord, eq);
+    let cmp = builder.ins().bor(cmp, lt);
+    let cmp = builder.ins().uextend(types::I32, cmp);
+    acc_s = builder.ins().bxor(acc_s, cmp);
+
+    let acc_s64 = builder.ins().uextend(types::I64, acc_s);
+    builder.ins().store(MemFlagsData::new(), acc_m, out, 0);
+    builder.ins().store(MemFlagsData::new(), acc_s64, out, 8);
+    builder.ins().return_(&[]);
+    builder.finalize();
+
+    let mut fb = settings::builder();
+    fb.set("opt_level", "speed").unwrap();
+    let flags = settings::Flags::new(fb);
+    let mut backend = CraneliftBackend::with_flags(flags).expect("backend");
+    backend
+        .compile(func)
+        .expect("all kernels must lower at opt_level=speed");
+}
+
 #[test]
 fn test_add_matches_apfloat() {
     let mut rng = Rng(0xa11c_e50f_7734_2201);
