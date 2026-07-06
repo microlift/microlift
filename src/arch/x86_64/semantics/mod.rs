@@ -12,6 +12,7 @@ pub mod fpu;
 pub mod helpers;
 pub mod memory;
 pub mod setcc;
+pub mod softfloat;
 pub mod sse;
 pub mod syscall;
 pub mod unimplemented;

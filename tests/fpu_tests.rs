@@ -52,14 +52,18 @@ fn run_test(bytes: &[u8], ctx: RegisterContext) -> RegisterContext {
 
 /// Read architectural `ST(i)` (physical slot `(top + i) & 7`) as an `f64`.
 fn st(ctx: &RegisterContext, i: usize) -> f64 {
+    use microlift::context::f80_to_f64_bits;
     let phys = (ctx.fpu_top as usize + i) & 7;
-    f64::from_bits(ctx.fpr[phys])
+    let [mant, se] = ctx.fpr[phys];
+    f64::from_bits(f80_to_f64_bits(mant, se as u16))
 }
 
 /// Store an `f64` into physical `fpr` slot `phys` (helper for setting up input
 /// stacks with a known `fpu_top`).
 fn set_phys(ctx: &mut RegisterContext, phys: usize, v: f64) {
-    ctx.fpr[phys] = v.to_bits();
+    use microlift::context::f64_bits_to_f80;
+    let (mant, se) = f64_bits_to_f80(v.to_bits());
+    ctx.fpr[phys] = [mant, se as u64];
 }
 
 #[test]
@@ -192,6 +196,53 @@ fn decode_f80(buf: &[u8; 16]) -> f64 {
     let exp64 = exp80.wrapping_sub(15360) & 0x7FF;
     let frac = (mant >> 11) & 0x000F_FFFF_FFFF_FFFF;
     f64::from_bits((sign << 63) | (exp64 << 52) | frac)
+}
+
+#[test]
+fn test_fldt_fstpt_full_precision() {
+    // An 80-bit value whose 64-bit significand has low bits set that would be
+    // lost if it round-tripped through f64. fld tbyte[rax]; fstp tbyte[rcx].
+    let bytes = [0xDB, 0x28, 0xDB, 0x39, 0xC3];
+    // 1.0 + 2^-63 style significand: integer bit + lowest bit set, exp for 1.0.
+    let mant: u64 = 0x8000_0000_0000_0001;
+    let se: u16 = 0x3FFF; // exponent for value in [1,2)
+    let mut src = [0u8; 16];
+    src[0..8].copy_from_slice(&mant.to_le_bytes());
+    src[8..10].copy_from_slice(&se.to_le_bytes());
+    let mut dst = [0u8; 16];
+    let mut ctx = RegisterContext::default();
+    ctx.rax = src.as_ptr() as u64;
+    ctx.rcx = dst.as_mut_ptr() as u64;
+    run_test(&bytes, ctx);
+    // The low significand bit must survive - it can't be represented in f64.
+    assert_eq!(u64::from_le_bytes(dst[0..8].try_into().unwrap()), mant);
+    assert_eq!(u16::from_le_bytes(dst[8..10].try_into().unwrap()), se);
+}
+
+#[test]
+fn test_fild_large_i64_exact() {
+    // A 64-bit integer with more than 53 significant bits: exact in 80-bit,
+    // would round if it passed through f64. fild qword[rax]; fistp qword[rcx].
+    let bytes = [0xDF, 0x28, 0xDF, 0x39, 0xC3]; // fild qword[rax]; fistp qword[rcx]
+    let val: i64 = 0x0123_4567_89AB_CDEF; // 57 significant bits
+    let mut out: i64 = 0;
+    let mut ctx = RegisterContext::default();
+    ctx.rax = &val as *const i64 as u64;
+    ctx.rcx = &mut out as *mut i64 as u64;
+    run_test(&bytes, ctx);
+    assert_eq!(out, val, "fild/fistp of a >53-bit integer must be exact");
+}
+
+#[test]
+fn test_fild_negative_i64_exact() {
+    let bytes = [0xDF, 0x28, 0xDF, 0x39, 0xC3];
+    let val: i64 = -0x0123_4567_89AB_CDEF;
+    let mut out: i64 = 0;
+    let mut ctx = RegisterContext::default();
+    ctx.rax = &val as *const i64 as u64;
+    ctx.rcx = &mut out as *mut i64 as u64;
+    run_test(&bytes, ctx);
+    assert_eq!(out, val);
 }
 
 // --- FILD / FISTP / FISTTP (integer conversions) -----------------------

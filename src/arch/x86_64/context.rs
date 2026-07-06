@@ -60,16 +60,18 @@ pub struct RegisterContext {
     /// Reads/writes through `gs:` prefixed addresses add this base.
     pub gs_base: u64,
 
-    /// x87 data registers, each stored as the raw bits of
-    /// an `f64`. The architectural `ST(i)` register maps to the physical slot
-    /// `(fpu_top + i) & 7`; pushes decrement `fpu_top` and pops increment it.
+    /// x87 data registers in true 80-bit extended precision, one physical
+    /// register per 16-byte slot laid out as `[mantissa, sign_exp]`:
+    ///  - `[0]` = the 64-bit significand (explicit integer bit at position 63);
+    ///  - `[1]` = the sign bit (15) and 15-bit biased exponent in the low 16
+    ///    bits (upper 48 bits unused/zero).
     ///
-    /// The lifter models the x87 stack in `f64` precision rather than the true
-    /// 80-bit extended format. `FLD`/`FSTP` of an 80-bit `m80` value convert to
-    /// and from `f64`, so the extra mantissa/exponent range of `long double` is
-    /// not preserved for normal values (and denormals/NaN payloads are
-    /// approximated).
-    pub fpr: [u64; 8],
+    /// This matches the FXSAVE `_st[i]` layout (10 bytes used, 16-byte slot), so
+    /// a host runtime can copy each register to/from the native x87 save area
+    /// without any format conversion. The architectural `ST(i)` register maps to
+    /// the physical slot `(fpu_top + i) & 7`; pushes decrement `fpu_top` and
+    /// pops increment it.
+    pub fpr: [[u64; 2]; 8],
     /// Top-of-stack pointer (0-7). `ST(0)` lives in `fpr[fpu_top]`.
     pub fpu_top: u16,
     /// x87 status-word condition-code bits (C0-C3 in their architectural bit

@@ -24,3 +24,6 @@ cranelift-codegen = { version = "0.133", features = ["all-arch"] }
 yaxpeax-arm = "0.4.0"
 yaxpeax-arch = "0.3.2"
 function_traits = { git = "https://github.com/microlift/function_traits.git", version = "0.1.0" }
+
+[dev-dependencies]
+rustc_apfloat = "0.2"

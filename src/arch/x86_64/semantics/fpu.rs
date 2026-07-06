@@ -8,17 +8,23 @@
 //! Because `TOP` is a *runtime* value, this module keeps the whole x87 state in
 //! the [`RegisterContext`] (rather than in SSA variables like the GPRs/XMMs) and
 //! accesses it through computed pointers. Each `ST(i)` reference loads `TOP`,
-//! forms the address `&fpr[(TOP + i) & 7]`, and loads/stores an `f64`. This is
-//! self-contained: no other instruction category touches the x87 fields, so no
-//! entry/exit sync integration is required.
+//! forms the address `&fpr[(TOP + i) & 7]`, and loads/stores a 16-byte 80-bit
+//! slot. This is self-contained: no other instruction category touches the x87
+//! fields, so no entry/exit sync integration is required.
 //!
-//! Registers are modelled in `f64` precision. `FLD`/`FSTP` of an 80-bit `m80`
-//! operand convert between the extended format and `f64` for normal values and
-//! zero; the extra range/precision of `long double` and NaN payloads are not
-//! preserved (see [`RegisterContext::fpr`]).
+//! Registers are stored in true 80-bit extended precision, carried in IR as a
+//! `(mant: i64, se: i32)` pair (64-bit significand with explicit integer bit +
+//! sign/15-bit-exponent). Data movement (`FLD`/`FST`/`FSTP`/`FXCH`/`FCMOVcc`),
+//! the `m80` memory forms, and the integer conversions (`FILD`/`FIST`) are exact
+//! 80-bit. The arithmetic (`FADD`/`FSUB`/`FMUL`/`FDIV`/`FSQRT`) and comparisons
+//! are computed by the bit-exact software kernels in
+//! [`crate::arch::x86_64::semantics::softfloat`] (verified against LLVM's
+//! APFloat / the host x87 unit). `f64` is used only for the `m32`/`m64` memory
+//! narrowing/widening in `FLD`/`FST`, where it is the correct storage width.
 
 use crate::MicroliftError;
 use crate::arch::x86_64::context::RegisterContext;
+use crate::arch::x86_64::semantics::softfloat;
 use crate::lifter::{Lifter, X86Flag};
 use cranelift::prelude::*;
 use iced_x86::{Instruction, MemorySize, OpKind};
@@ -36,6 +42,9 @@ pub(super) enum FpuOp {
     /// Reverse divide: `dst = src / dst`.
     Divr,
 }
+
+/// A raw 80-bit x87 value in IR: `(mantissa: i64, sign_exp: i32)`.
+type F80 = (Value, Value);
 
 // Status-word condition-code bit positions.
 const SW_C0: i64 = 1 << 8;
@@ -72,12 +81,12 @@ impl<'a> Lifter<'a> {
             .store(MemFlagsData::trusted(), t16, ctx, off);
     }
 
-    /// Pointer to the physical slot backing architectural `ST(i)`.
+    /// Pointer to the physical 16-byte slot backing architectural `ST(i)`.
     fn fpu_st_ptr(&mut self, i: u32) -> Value {
         let top = self.fpu_load_top();
         let raw = self.builder.ins().iadd_imm(top, i as i64);
         let phys = self.builder.ins().band_imm(raw, 7);
-        let byte_off = self.builder.ins().imul_imm(phys, 8);
+        let byte_off = self.builder.ins().imul_imm(phys, 16);
         let byte_off = self.builder.ins().uextend(types::I64, byte_off);
         let ctx = self.fpu_ctx_ptr();
         let fpr_off = std::mem::offset_of!(RegisterContext, fpr) as i64;
@@ -85,26 +94,41 @@ impl<'a> Lifter<'a> {
         self.builder.ins().iadd(base, byte_off)
     }
 
-    /// Read `ST(i)` as an `f64`.
-    fn fpu_read_st(&mut self, i: u32) -> Value {
+    /// Read `ST(i)` as a raw 80-bit `(mant: i64, se: i32)` pair.
+    fn fpu_read_st_raw(&mut self, i: u32) -> (Value, Value) {
         let p = self.fpu_st_ptr(i);
-        self.builder.ins().load(types::F64, MemFlagsData::trusted(), p, 0)
+        let mant = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::trusted(), p, 0);
+        let se16 = self
+            .builder
+            .ins()
+            .load(types::I16, MemFlagsData::trusted(), p, 8);
+        let se = self.builder.ins().uextend(types::I32, se16);
+        (mant, se)
     }
 
-    /// Write an `f64` into `ST(i)`.
-    fn fpu_write_st(&mut self, i: u32, val: Value) {
+    /// Write a raw 80-bit `(mant, se)` pair into `ST(i)`.
+    fn fpu_write_st_raw(&mut self, i: u32, mant: Value, se: Value) {
         let p = self.fpu_st_ptr(i);
-        self.builder.ins().store(MemFlagsData::trusted(), val, p, 0);
+        let se16 = self.builder.ins().ireduce(types::I16, se);
+        self.builder
+            .ins()
+            .store(MemFlagsData::trusted(), mant, p, 0);
+        self.builder
+            .ins()
+            .store(MemFlagsData::trusted(), se16, p, 8);
     }
 
-    /// Decrement `TOP`, store `val` into the new `ST(0)`, and mark that physical
-    /// register valid in the tag word.
-    fn fpu_push(&mut self, val: Value) {
+    /// Decrement `TOP`, store a raw `(mant, se)` pair into the new `ST(0)`, and
+    /// mark that physical register valid in the tag word.
+    fn fpu_push_raw(&mut self, mant: Value, se: Value) {
         let top = self.fpu_load_top();
         let dec = self.builder.ins().iadd_imm(top, -1);
         let new_top = self.builder.ins().band_imm(dec, 7);
         self.fpu_store_top(new_top);
-        self.fpu_write_st(0, val);
+        self.fpu_write_st_raw(0, mant, se);
         self.fpu_set_tag_phys(new_top, true);
     }
 
@@ -166,17 +190,12 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    // --- 80-bit extended <-> f64 conversion -----------------------------
+    // --- 80-bit extended conversions ------------------------------------
 
-    /// Load an 80-bit extended-precision value from `ptr` and convert it to an
-    /// `f64`. Exact for zero and normal values within the `f64` exponent range;
-    /// denormals are flushed to zero and out-of-range exponents saturate.
-    fn fpu_load_f80(&mut self, ptr: Value) -> Value {
-        let mant = self.builder.ins().load(types::I64, MemFlagsData::new(), ptr, 0);
-        let se16 = self.builder.ins().load(types::I16, MemFlagsData::new(), ptr, 8);
-        let se = self.builder.ins().uextend(types::I32, se16);
-
-        // sign (bit 15) and 15-bit exponent.
+    /// Convert a raw 80-bit `(mant, se)` value to an `f64` (truncating the
+    /// significand; exact for values already representable in `f64`). Used only
+    /// by the temporary arithmetic/compare bridge.
+    fn f80_to_f64(&mut self, mant: Value, se: Value) -> Value {
         let sign_i32 = self.builder.ins().ushr_imm(se, 15);
         let sign_i32 = self.builder.ins().band_imm(sign_i32, 1);
         let sign = self.builder.ins().uextend(types::I64, sign_i32);
@@ -201,12 +220,18 @@ impl<'a> Lifter<'a> {
         let is_zero = self.builder.ins().icmp_imm(IntCC::Equal, mant, 0);
         let bits = self.builder.ins().select(is_zero, sign_bit, bits);
 
-        self.builder.ins().bitcast(types::F64, MemFlagsData::new(), bits)
+        self.builder
+            .ins()
+            .bitcast(types::F64, MemFlagsData::new(), bits)
     }
 
-    /// Convert an `f64` to 80-bit extended precision and store it at `ptr`.
-    fn fpu_store_f80(&mut self, ptr: Value, val: Value) {
-        let bits = self.builder.ins().bitcast(types::I64, MemFlagsData::new(), val);
+    /// Convert an `f64` to a raw 80-bit `(mant, se)` value. Exact (`f64` is a
+    /// subset of the 80-bit format).
+    fn f64_to_f80(&mut self, val: Value) -> (Value, Value) {
+        let bits = self
+            .builder
+            .ins()
+            .bitcast(types::I64, MemFlagsData::new(), val);
 
         let sign = self.builder.ins().ushr_imm(bits, 63);
         let sign = self.builder.ins().band_imm(sign, 1);
@@ -227,46 +252,161 @@ impl<'a> Lifter<'a> {
         let exp80_normal = self.builder.ins().iadd_imm(exp64, 15360);
         let special_exp = self.builder.ins().iconst(types::I64, 0x7FFF);
         let zero_val = self.builder.ins().iconst(types::I64, 0);
-        let exp80 = self.builder.ins().select(is_special, special_exp, exp80_normal);
+        let exp80 = self
+            .builder
+            .ins()
+            .select(is_special, special_exp, exp80_normal);
         let exp80 = self.builder.ins().select(is_zero, zero_val, exp80);
         let mant = self.builder.ins().select(is_zero, zero_val, mant_normal);
 
         let sign15 = self.builder.ins().ishl_imm(sign, 15);
         let se = self.builder.ins().bor(sign15, exp80);
-        let se16 = self.builder.ins().ireduce(types::I16, se);
+        let se = self.builder.ins().ireduce(types::I32, se);
+        (mant, se)
+    }
 
-        self.builder.ins().store(MemFlagsData::new(), mant, ptr, 0);
-        self.builder.ins().store(MemFlagsData::new(), se16, ptr, 8);
+    /// Convert a signed 64-bit integer to a raw 80-bit `(mant, se)` value.
+    /// Exact - a 64-bit integer fits in the 64-bit significand.
+    fn i64_to_f80(&mut self, v: Value) -> (Value, Value) {
+        let is_zero = self.builder.ins().icmp_imm(IntCC::Equal, v, 0);
+        let neg = self.builder.ins().icmp_imm(IntCC::SignedLessThan, v, 0);
+        // Magnitude (|i64::MIN| wraps to 0x8000_0000_0000_0000, the correct
+        // unsigned magnitude 2^63).
+        let negated = self.builder.ins().ineg(v);
+        let mag = self.builder.ins().select(neg, negated, v);
+
+        // Normalise so the most-significant set bit lands at bit 63.
+        let lz = self.builder.ins().clz(mag);
+        let mant_norm = self.builder.ins().ishl(mag, lz);
+        // Unbiased exponent of the integer bit = 63 - lz; biased += 16383.
+        let bias = self.builder.ins().iconst(types::I64, 16383 + 63);
+        let exp = self.builder.ins().isub(bias, lz);
+
+        let sign_i64 = self.builder.ins().uextend(types::I64, neg);
+        let sign15 = self.builder.ins().ishl_imm(sign_i64, 15);
+        let se = self.builder.ins().bor(sign15, exp);
+        let se = self.builder.ins().ireduce(types::I32, se);
+
+        let zero = self.builder.ins().iconst(types::I64, 0);
+        let mant = self.builder.ins().select(is_zero, zero, mant_norm);
+        let se = {
+            let se_zero = self.builder.ins().iconst(types::I32, 0);
+            self.builder.ins().select(is_zero, se_zero, se)
+        };
+        (mant, se)
+    }
+
+    /// Convert a raw 80-bit `(mant, se)` value to a signed 64-bit integer.
+    /// `truncate` selects round-toward-zero (`FISTTP`); otherwise
+    /// round-to-nearest-even (`FIST`/`FISTP`). Out-of-range magnitudes saturate
+    /// to the x87 integer indefinite (`0x8000_0000_0000_0000`).
+    fn f80_to_i64(&mut self, mant: Value, se: Value, truncate: bool) -> Value {
+        let sign_sh = self.builder.ins().ushr_imm(se, 15);
+        let sign = self.builder.ins().band_imm(sign_sh, 1);
+        let exp80 = self.builder.ins().band_imm(se, 0x7FFF);
+        // Unbiased exponent of the integer bit.
+        let e = self.builder.ins().iadd_imm(exp80, -16383);
+        let e = self.builder.ins().sextend(types::I64, e);
+
+        // shift = 63 - e : right-shift applied to `mant` to drop the fraction.
+        let c63 = self.builder.ins().iconst(types::I64, 63);
+        let shift = self.builder.ins().isub(c63, e);
+
+        // Truncated magnitude for the in-range case (0 <= shift <= 63).
+        let shift_clamped = {
+            // Cap shift at 63 so the shift is well-defined; the >=64 case is
+            // selected away below.
+            let sixty3 = self.builder.ins().iconst(types::I64, 63);
+            let too_small = self.builder.ins().icmp(IntCC::SignedGreaterThan, shift, sixty3);
+            self.builder.ins().select(too_small, sixty3, shift)
+        };
+        let trunc_mag = self.builder.ins().ushr(mant, shift_clamped);
+
+        let mag = if truncate {
+            trunc_mag
+        } else {
+            // Round-to-nearest-even using the shifted-out bits.
+            // rem = mant & ((1<<shift)-1); half = 1<<(shift-1).
+            let one = self.builder.ins().iconst(types::I64, 1);
+            let mask = {
+                let m = self.builder.ins().ishl(one, shift_clamped);
+                self.builder.ins().iadd_imm(m, -1)
+            };
+            let rem = self.builder.ins().band(mant, mask);
+            let half = {
+                let sh = self.builder.ins().iadd_imm(shift_clamped, -1);
+                self.builder.ins().ishl(one, sh)
+            };
+            let gt = self.builder.ins().icmp(IntCC::UnsignedGreaterThan, rem, half);
+            let eq = self.builder.ins().icmp(IntCC::Equal, rem, half);
+            let odd = self.builder.ins().band_imm(trunc_mag, 1);
+            let odd = self.builder.ins().icmp_imm(IntCC::NotEqual, odd, 0);
+            let tie_up = self.builder.ins().band(eq, odd);
+            let round_up = self.builder.ins().bor(gt, tie_up);
+            let inc = self.builder.ins().uextend(types::I64, round_up);
+            // No shift (shift==0) -> already integral, don't round.
+            let no_frac = self.builder.ins().icmp_imm(IntCC::Equal, shift_clamped, 0);
+            let inc = {
+                let zero = self.builder.ins().iconst(types::I64, 0);
+                self.builder.ins().select(no_frac, zero, inc)
+            };
+            self.builder.ins().iadd(trunc_mag, inc)
+        };
+
+        // Apply the sign.
+        let neg_mag = self.builder.ins().ineg(mag);
+        let is_neg = self.builder.ins().icmp_imm(IntCC::NotEqual, sign, 0);
+        let signed = self.builder.ins().select(is_neg, neg_mag, mag);
+
+        // Out-of-range: value < 1 (shift >= 64) -> 0; magnitude too large
+        // (shift < 0, i.e. exponent >= 63) -> integer indefinite.
+        let value_lt_one = self.builder.ins().icmp_imm(IntCC::SignedGreaterThanOrEqual, shift, 64);
+        let too_large = self.builder.ins().icmp_imm(IntCC::SignedLessThan, shift, 0);
+        let zero = self.builder.ins().iconst(types::I64, 0);
+        let indef = self.builder.ins().iconst(types::I64, i64::MIN);
+        let r = self.builder.ins().select(value_lt_one, zero, signed);
+        self.builder.ins().select(too_large, indef, r)
     }
 
     // --- memory operand helpers -----------------------------------------
 
-    /// Load a floating-point memory operand (`m32`/`m64`/`m80`) as an `f64`.
-    fn fpu_load_mem_f64(
+    /// Load a floating-point memory operand (`m32`/`m64`/`m80`) as a raw 80-bit
+    /// `(mant, se)` pair. All widths convert exactly (each is a subset of the
+    /// 80-bit format).
+    fn fpu_load_mem_f80(
         &mut self,
         instruction: &Instruction,
         op_index: u32,
-    ) -> crate::Result<Value> {
+    ) -> crate::Result<(Value, Value)> {
         let ptr = self.get_mem_ptr(instruction, op_index)?;
         match instruction.memory_size() {
             MemorySize::Float32 => {
                 let f32v = self.builder.ins().load(types::F32, MemFlagsData::new(), ptr, 0);
-                Ok(self.builder.ins().fpromote(types::F64, f32v))
+                let f64v = self.builder.ins().fpromote(types::F64, f32v);
+                Ok(self.f64_to_f80(f64v))
             }
-            MemorySize::Float64 => Ok(self.builder.ins().load(types::F64, MemFlagsData::new(), ptr, 0)),
-            MemorySize::Float80 => Ok(self.fpu_load_f80(ptr)),
+            MemorySize::Float64 => {
+                let f64v = self.builder.ins().load(types::F64, MemFlagsData::new(), ptr, 0);
+                Ok(self.f64_to_f80(f64v))
+            }
+            MemorySize::Float80 => {
+                let mant = self.builder.ins().load(types::I64, MemFlagsData::new(), ptr, 0);
+                let se16 = self.builder.ins().load(types::I16, MemFlagsData::new(), ptr, 8);
+                let se = self.builder.ins().uextend(types::I32, se16);
+                Ok((mant, se))
+            }
             other => Err(MicroliftError::UnsupportedInstruction {
                 mnemonic: format!("fpu-load-mem-{:?}", other),
             }),
         }
     }
 
-    /// Load an integer memory operand (`m16`/`m32`/`m64`) and convert to `f64`.
-    fn fpu_load_mem_int_f64(
+    /// Load an integer memory operand (`m16`/`m32`/`m64`) as a raw 80-bit value.
+    fn fpu_load_mem_int_f80(
         &mut self,
         instruction: &Instruction,
         op_index: u32,
-    ) -> crate::Result<Value> {
+    ) -> crate::Result<(Value, Value)> {
         let ptr = self.get_mem_ptr(instruction, op_index)?;
         let int64 = match instruction.memory_size() {
             MemorySize::Int16 => {
@@ -284,18 +424,19 @@ impl<'a> Lifter<'a> {
                 });
             }
         };
-        Ok(self.builder.ins().fcvt_from_sint(types::F64, int64))
+        Ok(self.i64_to_f80(int64))
     }
 
     /// FLD - push a floating-point value onto the x87 stack.
     ///
-    /// Covers `FLD m32/m64/m80` (`flds`/`fldl`/`fldt`) and `FLD ST(i)`.
+    /// Covers `FLD m32/m64/m80` (`flds`/`fldl`/`fldt`) and `FLD ST(i)`, all
+    /// exact in 80-bit precision.
     pub(super) fn handle_fld(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let val = match self.operand_kind(instruction, 0) {
-            OpKind::Memory => self.fpu_load_mem_f64(instruction, 0)?,
+        let (mant, se) = match self.operand_kind(instruction, 0) {
+            OpKind::Memory => self.fpu_load_mem_f80(instruction, 0)?,
             OpKind::Register => {
                 let i = self.fpu_st_index(instruction, 0)?;
-                self.fpu_read_st(i)
+                self.fpu_read_st_raw(i)
             }
             other => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -303,21 +444,25 @@ impl<'a> Lifter<'a> {
                 });
             }
         };
-        self.fpu_push(val);
+        self.fpu_push_raw(mant, se);
         Ok(())
     }
 
-    /// FILD - convert an integer in memory to `f64` and push it.
+    /// FILD - convert an integer in memory to 80-bit and push it (exact).
     pub(super) fn handle_fild(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let val = self.fpu_load_mem_int_f64(instruction, 0)?;
-        self.fpu_push(val);
+        let (mant, se) = self.fpu_load_mem_int_f80(instruction, 0)?;
+        self.fpu_push_raw(mant, se);
         Ok(())
     }
 
-    /// Push an implicit constant (`FLDZ`, `FLD1`, `FLDPI`, ...).
+    /// Push an implicit constant (`FLDZ`, `FLD1`, `FLDPI`, ...). The constant is
+    /// converted to its exact 80-bit encoding at lift time.
     pub(super) fn handle_fld_const(&mut self, value: f64) -> crate::Result<()> {
-        let v = self.builder.ins().f64const(value);
-        self.fpu_push(v);
+        let (mant_bits, se_bits) =
+            crate::arch::x86_64::context::f64_bits_to_f80(value.to_bits());
+        let mant = self.builder.ins().iconst(types::I64, mant_bits as i64);
+        let se = self.builder.ins().iconst(types::I32, se_bits as i64);
+        self.fpu_push_raw(mant, se);
         Ok(())
     }
 
@@ -329,19 +474,28 @@ impl<'a> Lifter<'a> {
         instruction: &Instruction,
         pop: bool,
     ) -> crate::Result<()> {
-        let val = self.fpu_read_st(0);
+        let (mant, se) = self.fpu_read_st_raw(0);
         match self.operand_kind(instruction, 0) {
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 0)?;
                 match instruction.memory_size() {
                     MemorySize::Float32 => {
-                        let f32v = self.builder.ins().fdemote(types::F32, val);
+                        // Narrow via f64 (double-rounding is possible only for
+                        // values with >53 significant bits; refined with the
+                        // softfloat kernels).
+                        let f64v = self.f80_to_f64(mant, se);
+                        let f32v = self.builder.ins().fdemote(types::F32, f64v);
                         self.builder.ins().store(MemFlagsData::new(), f32v, ptr, 0);
                     }
                     MemorySize::Float64 => {
-                        self.builder.ins().store(MemFlagsData::new(), val, ptr, 0);
+                        let f64v = self.f80_to_f64(mant, se);
+                        self.builder.ins().store(MemFlagsData::new(), f64v, ptr, 0);
                     }
-                    MemorySize::Float80 => self.fpu_store_f80(ptr, val),
+                    MemorySize::Float80 => {
+                        let se16 = self.builder.ins().ireduce(types::I16, se);
+                        self.builder.ins().store(MemFlagsData::new(), mant, ptr, 0);
+                        self.builder.ins().store(MemFlagsData::new(), se16, ptr, 8);
+                    }
                     other => {
                         return Err(MicroliftError::UnsupportedInstruction {
                             mnemonic: format!("fst-mem-{:?}", other),
@@ -351,7 +505,7 @@ impl<'a> Lifter<'a> {
             }
             OpKind::Register => {
                 let i = self.fpu_st_index(instruction, 0)?;
-                self.fpu_write_st(i, val);
+                self.fpu_write_st_raw(i, mant, se);
             }
             other => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -375,13 +529,8 @@ impl<'a> Lifter<'a> {
         pop: bool,
         truncate: bool,
     ) -> crate::Result<()> {
-        let val = self.fpu_read_st(0);
-        let rounded = if truncate {
-            val
-        } else {
-            self.builder.ins().nearest(val)
-        };
-        let int64 = self.builder.ins().fcvt_to_sint_sat(types::I64, rounded);
+        let (mant, se) = self.fpu_read_st_raw(0);
+        let int64 = self.f80_to_i64(mant, se, truncate);
 
         let ptr = self.get_mem_ptr(instruction, 0)?;
         match instruction.memory_size() {
@@ -417,25 +566,26 @@ impl<'a> Lifter<'a> {
             0 => 1,
             n => self.fpu_st_index(instruction, n - 1)?,
         };
-        let a = self.fpu_read_st(0);
-        let b = self.fpu_read_st(i);
-        self.fpu_write_st(0, b);
-        self.fpu_write_st(i, a);
+        let (a_mant, a_se) = self.fpu_read_st_raw(0);
+        let (b_mant, b_se) = self.fpu_read_st_raw(i);
+        self.fpu_write_st_raw(0, b_mant, b_se);
+        self.fpu_write_st_raw(i, a_mant, a_se);
         Ok(())
     }
 
-    /// Resolve the `(dst_index, dst_value, src_value)` triple for a binary x87
-    /// arithmetic instruction across its register/register, register/memory and
-    /// implicit (no-operand `FADDP`-style) forms.
-    fn fpu_binop_operands(
+    /// Resolve the `(dst_index, dst, src)` triple for a binary x87 arithmetic
+    /// instruction across its register/register, register/memory and implicit
+    /// (no-operand `FADDP`-style) forms. Operands are raw 80-bit `(mant, se)`
+    /// pairs.
+    fn fpu_binop_operands_raw(
         &mut self,
         instruction: &Instruction,
-    ) -> crate::Result<(u32, Value, Value)> {
+    ) -> crate::Result<(u32, F80, F80)> {
         match instruction.op_count() {
             0 => {
                 // Implicit popping form, e.g. `faddp` == `faddp st(1), st(0)`.
-                let dst = self.fpu_read_st(1);
-                let src = self.fpu_read_st(0);
+                let dst = self.fpu_read_st_raw(1);
+                let src = self.fpu_read_st_raw(0);
                 Ok((1, dst, src))
             }
             1 => {
@@ -443,14 +593,14 @@ impl<'a> Lifter<'a> {
                 // (== `fadd st(0), st(i)`).
                 match self.operand_kind(instruction, 0) {
                     OpKind::Memory => {
-                        let dst = self.fpu_read_st(0);
-                        let src = self.fpu_load_mem_f64(instruction, 0)?;
+                        let dst = self.fpu_read_st_raw(0);
+                        let src = self.fpu_load_mem_f80(instruction, 0)?;
                         Ok((0, dst, src))
                     }
                     OpKind::Register => {
                         let i = self.fpu_st_index(instruction, 0)?;
-                        let dst = self.fpu_read_st(0);
-                        let src = self.fpu_read_st(i);
+                        let dst = self.fpu_read_st_raw(0);
+                        let src = self.fpu_read_st_raw(i);
                         Ok((0, dst, src))
                     }
                     other => Err(MicroliftError::UnsupportedInstruction {
@@ -461,84 +611,89 @@ impl<'a> Lifter<'a> {
             _ => {
                 let dst_idx = self.fpu_st_index(instruction, 0)?;
                 let src_idx = self.fpu_st_index(instruction, 1)?;
-                let dst = self.fpu_read_st(dst_idx);
-                let src = self.fpu_read_st(src_idx);
+                let dst = self.fpu_read_st_raw(dst_idx);
+                let src = self.fpu_read_st_raw(src_idx);
                 Ok((dst_idx, dst, src))
             }
         }
     }
 
-    /// FADD/FSUB/FSUBR/FMUL/FDIV/FDIVR and their `...P` popping variants.
+    /// FADD/FSUB/FSUBR/FMUL/FDIV/FDIVR and their `...P` popping variants, all via
+    /// the bit-exact 80-bit software kernels.
     pub(super) fn handle_farith(
         &mut self,
         instruction: &Instruction,
         op: FpuOp,
         pop: bool,
     ) -> crate::Result<()> {
-        let (dst_idx, dst, src) = self.fpu_binop_operands(instruction)?;
-        let result = match op {
-            FpuOp::Add => self.builder.ins().fadd(dst, src),
-            FpuOp::Sub => self.builder.ins().fsub(dst, src),
-            FpuOp::Subr => self.builder.ins().fsub(src, dst),
-            FpuOp::Mul => self.builder.ins().fmul(dst, src),
-            FpuOp::Div => self.builder.ins().fdiv(dst, src),
-            FpuOp::Divr => self.builder.ins().fdiv(src, dst),
+        let (dst_idx, (dm, dse), (sm, sse)) = self.fpu_binop_operands_raw(instruction)?;
+        let bld = &mut self.builder;
+        let (rm, rse) = match op {
+            FpuOp::Add => softfloat::emit_f80_add(bld, dm, dse, sm, sse),
+            FpuOp::Sub => softfloat::emit_f80_sub(bld, dm, dse, sm, sse),
+            FpuOp::Subr => softfloat::emit_f80_sub(bld, sm, sse, dm, dse),
+            FpuOp::Mul => softfloat::emit_f80_mul(bld, dm, dse, sm, sse),
+            FpuOp::Div => softfloat::emit_f80_div(bld, dm, dse, sm, sse),
+            FpuOp::Divr => softfloat::emit_f80_div(bld, sm, sse, dm, dse),
         };
-        self.fpu_write_st(dst_idx, result);
+        self.fpu_write_st_raw(dst_idx, rm, rse);
         if pop {
             self.fpu_pop();
         }
         Ok(())
     }
 
-    /// FABS - clear the sign of `ST(0)`.
+    /// FABS - clear the sign bit of `ST(0)` (exact).
     pub(super) fn handle_fabs(&mut self, _instruction: &Instruction) -> crate::Result<()> {
-        let v = self.fpu_read_st(0);
-        let r = self.builder.ins().fabs(v);
-        self.fpu_write_st(0, r);
+        let (mant, se) = self.fpu_read_st_raw(0);
+        let se = self.builder.ins().band_imm(se, 0x7FFF);
+        self.fpu_write_st_raw(0, mant, se);
         Ok(())
     }
 
-    /// FCHS - negate `ST(0)`.
+    /// FCHS - flip the sign bit of `ST(0)` (exact).
     pub(super) fn handle_fchs(&mut self, _instruction: &Instruction) -> crate::Result<()> {
-        let v = self.fpu_read_st(0);
-        let r = self.builder.ins().fneg(v);
-        self.fpu_write_st(0, r);
+        let (mant, se) = self.fpu_read_st_raw(0);
+        let se = self.builder.ins().bxor_imm(se, 0x8000);
+        self.fpu_write_st_raw(0, mant, se);
         Ok(())
     }
 
-    /// FSQRT - square root of `ST(0)`.
+    /// FSQRT - square root of `ST(0)` (bit-exact 80-bit).
     pub(super) fn handle_fsqrt(&mut self, _instruction: &Instruction) -> crate::Result<()> {
-        let v = self.fpu_read_st(0);
-        let r = self.builder.ins().sqrt(v);
-        self.fpu_write_st(0, r);
+        let (m, se) = self.fpu_read_st_raw(0);
+        let (rm, rse) = softfloat::emit_f80_sqrt(&mut self.builder, m, se);
+        self.fpu_write_st_raw(0, rm, rse);
         Ok(())
     }
 
-    /// Compute the three ordered/equal/unordered predicates for `a <=> b`.
-    fn fpu_cmp_predicates(&mut self, a: Value, b: Value) -> (Value, Value, Value) {
-        let unord = self.builder.ins().fcmp(FloatCC::Unordered, a, b);
-        let eq = self.builder.ins().fcmp(FloatCC::Equal, a, b);
-        let lt = self.builder.ins().fcmp(FloatCC::LessThan, a, b);
-        (unord, eq, lt)
+    /// Compute the three ordered/equal/unordered predicates for `a <=> b`,
+    /// where each operand is a raw 80-bit `(mant, se)` pair. Exact (no `f64`
+    /// rounding).
+    fn fpu_cmp_predicates(
+        &mut self,
+        a: (Value, Value),
+        b: (Value, Value),
+    ) -> (Value, Value, Value) {
+        softfloat::emit_f80_cmp(&mut self.builder, a.0, a.1, b.0, b.1)
     }
 
-    /// Resolve the source `f64` (and its stack index, if any) of a compare.
+    /// Resolve the raw 80-bit source (and its stack index, if any) of a compare.
     /// `FCOM`/`FUCOM` may take an `ST(i)` or a memory operand; the `...I`
     /// forms always take two `ST` operands (`ST0`, `ST(i)`).
-    fn fpu_cmp_src(&mut self, instruction: &Instruction) -> crate::Result<Value> {
+    fn fpu_cmp_src(&mut self, instruction: &Instruction) -> crate::Result<(Value, Value)> {
         if instruction.op_count() == 0 {
             // `fcom`/`fucom` with no operand compare against ST(1).
-            return Ok(self.fpu_read_st(1));
+            return Ok(self.fpu_read_st_raw(1));
         }
         // The source is the last operand (`FCOMI ST0, ST(i)` -> op1;
         // `FCOM ST(i)`/`FCOM m32` -> op0).
         let op_index = instruction.op_count() - 1;
         match self.operand_kind(instruction, op_index) {
-            OpKind::Memory => self.fpu_load_mem_f64(instruction, op_index),
+            OpKind::Memory => self.fpu_load_mem_f80(instruction, op_index),
             OpKind::Register => {
                 let i = self.fpu_st_index(instruction, op_index)?;
-                Ok(self.fpu_read_st(i))
+                Ok(self.fpu_read_st_raw(i))
             }
             other => Err(MicroliftError::UnsupportedInstruction {
                 mnemonic: format!("fpu-cmp-src-{:?}", other),
@@ -557,7 +712,7 @@ impl<'a> Lifter<'a> {
         instruction: &Instruction,
         pop: bool,
     ) -> crate::Result<()> {
-        let a = self.fpu_read_st(0);
+        let a = self.fpu_read_st_raw(0);
         let b = self.fpu_cmp_src(instruction)?;
         let (unord, eq, lt) = self.fpu_cmp_predicates(a, b);
 
@@ -589,7 +744,7 @@ impl<'a> Lifter<'a> {
         instruction: &Instruction,
         pop: bool,
     ) -> crate::Result<()> {
-        let a = self.fpu_read_st(0);
+        let a = self.fpu_read_st_raw(0);
         let b = self.fpu_cmp_src(instruction)?;
         let (unord, eq, lt) = self.fpu_cmp_predicates(a, b);
 
@@ -611,9 +766,10 @@ impl<'a> Lifter<'a> {
 
     /// FTST - compare `ST(0)` with `+0.0`, setting the status-word codes.
     pub(super) fn handle_ftst(&mut self, _instruction: &Instruction) -> crate::Result<()> {
-        let a = self.fpu_read_st(0);
-        let zero = self.builder.ins().f64const(0.0);
-        let (unord, eq, lt) = self.fpu_cmp_predicates(a, zero);
+        let a = self.fpu_read_st_raw(0);
+        let zero_mant = self.builder.ins().iconst(types::I64, 0);
+        let zero_se = self.builder.ins().iconst(types::I32, 0);
+        let (unord, eq, lt) = self.fpu_cmp_predicates(a, (zero_mant, zero_se));
         let c3 = self.builder.ins().bor(eq, unord);
         let c0 = self.builder.ins().bor(lt, unord);
         let c3 = self.builder.ins().uextend(types::I32, c3);
@@ -658,10 +814,11 @@ impl<'a> Lifter<'a> {
         // Source is `ST(i)` - op1 for the two-operand `FCMOVcc ST0, ST(i)`.
         let op_index = instruction.op_count().saturating_sub(1);
         let i = self.fpu_st_index(instruction, op_index)?;
-        let cur = self.fpu_read_st(0);
-        let new = self.fpu_read_st(i);
-        let sel = self.builder.ins().select(cond, new, cur);
-        self.fpu_write_st(0, sel);
+        let (cur_mant, cur_se) = self.fpu_read_st_raw(0);
+        let (new_mant, new_se) = self.fpu_read_st_raw(i);
+        let sel_mant = self.builder.ins().select(cond, new_mant, cur_mant);
+        let sel_se = self.builder.ins().select(cond, new_se, cur_se);
+        self.fpu_write_st_raw(0, sel_mant, sel_se);
         Ok(())
     }
 
