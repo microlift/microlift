@@ -297,8 +297,19 @@ impl<'a> Lifter<'a> {
         let src_val = self.get_reg_val(src_reg)?;
 
         let result = self.builder.ins().iadd(dst_val, src_val);
-        self.write_operand(instruction, 0, result)?;
-        self.set_reg_val(src_reg, dst_val)?;
+        // Hardware order: TEMP <- SRC + DEST; SRC <- DEST; DEST <- TEMP. The
+        // destination write must come last so `xadd r, r` (same register both
+        // ways) ends up holding the sum, not the old value. For a memory
+        // destination the store goes first instead: its effective address must
+        // be computed from the pre-instruction value of the source register
+        // (which may be a base/index of the address).
+        if instruction.op0_kind() == OpKind::Register {
+            self.set_reg_val(src_reg, dst_val)?;
+            self.write_operand(instruction, 0, result)?;
+        } else {
+            self.write_operand(instruction, 0, result)?;
+            self.set_reg_val(src_reg, dst_val)?;
+        }
         self.update_flags_add(dst_val, src_val, result, size)?;
         Ok(())
     }
