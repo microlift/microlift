@@ -48,10 +48,7 @@ impl<'a> Lifter<'a> {
     /// the `UD2` itself (matching real hardware behaviour where #UD points at
     /// the faulting instruction).
     pub(super) fn handle_ud2(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let rip_at = self
-            .builder
-            .ins()
-            .iconst(types::I64, instruction.ip() as i64);
+        let rip_at = self.rip_at(instruction);
         self.sync_to_context(Some(rip_at), ExitReason::Ud2)?;
         self.builder.ins().return_(&[]);
         self.block_terminated = true;
@@ -61,14 +58,20 @@ impl<'a> Lifter<'a> {
     /// Handle an `INT3` breakpoint - emit a `Breakpoint` VM exit with RIP
     /// pointing at the `INT3` itself so the host can inspect or skip it.
     pub(super) fn handle_int3(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let rip_at = self
-            .builder
-            .ins()
-            .iconst(types::I64, instruction.ip() as i64);
+        let rip_at = self.rip_at(instruction);
         self.sync_to_context(Some(rip_at), ExitReason::Breakpoint)?;
         self.builder.ins().return_(&[]);
         self.block_terminated = true;
         Ok(())
+    }
+
+    /// Compute the absolute address of `instruction` itself as a Cranelift
+    /// value (`image_base + region offset`), so the reported PC stays correct
+    /// when the guest image is relocated.
+    fn rip_at(&mut self, instruction: &Instruction) -> Value {
+        let offset = instruction.ip().wrapping_sub(self.lift_base);
+        let image_base = self.builder.use_var(self.state.image_base);
+        self.builder.ins().iadd_imm(image_base, offset as i64)
     }
 
     /// Compute the absolute address of the instruction *following* `instruction`

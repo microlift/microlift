@@ -388,13 +388,39 @@ impl<'a> Lifter<'a> {
     fn emit_lock_bit_op(&mut self, instruction: &Instruction, op: BitOp) -> crate::Result<()> {
         let size = self.operand_size(instruction, 0)?;
         let ty = size_to_type(size);
-        let ptr = self.get_mem_ptr(instruction, 0)?;
-        let bit_idx = self.read_operand(instruction, 1, size)?;
+        let bits = (size * 8) as i64;
+        let mut ptr = self.get_mem_ptr(instruction, 0)?;
+
+        // A register bit index selects a bit *string* position: the word
+        // actually accessed is `EA + (signed_index div width) * size`, and the
+        // in-word bit is `index mod width` (matching the non-locked BT family).
+        // An immediate index is simply masked to the operand width.
+        let shift = match instruction.op1_kind() {
+            OpKind::Register => {
+                let idx = self.get_reg_val(instruction.op1_register())?;
+                let idx64 = if size == 8 {
+                    idx
+                } else {
+                    self.builder.ins().sextend(types::I64, idx)
+                };
+                let word = self.builder.ins().sshr_imm(idx64, bits.trailing_zeros() as i64);
+                let byte_off = self.builder.ins().imul_imm(word, size as i64);
+                ptr = self.builder.ins().iadd(ptr, byte_off);
+                self.builder.ins().band_imm(idx, bits - 1)
+            }
+            OpKind::Immediate8 => self
+                .builder
+                .ins()
+                .iconst(ty, (instruction.immediate8() as i64) & (bits - 1)),
+            other => {
+                return Err(MicroliftError::UnsupportedInstruction {
+                    mnemonic: format!("lock-bt-idx-{:?}", other),
+                });
+            }
+        };
 
         // mask = 1 << (bit_idx % bit_width)
         let one = self.builder.ins().iconst(ty, 1);
-        let width_mask = (size * 8 - 1) as i64;
-        let shift = self.builder.ins().band_imm(bit_idx, width_mask);
         let mask = self.builder.ins().ishl(one, shift);
 
         let old = match op {

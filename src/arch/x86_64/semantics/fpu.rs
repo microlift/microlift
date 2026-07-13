@@ -192,9 +192,17 @@ impl<'a> Lifter<'a> {
 
     // --- 80-bit extended conversions ------------------------------------
 
-    /// Convert a raw 80-bit `(mant, se)` value to an `f64` (truncating the
-    /// significand; exact for values already representable in `f64`). Used only
-    /// by the temporary arithmetic/compare bridge.
+    /// Convert a raw 80-bit `(mant, se)` value to an `f64`, rounding the
+    /// significand to nearest-even (the x87 default; the control-word rounding
+    /// mode is not modelled). Handles the full exponent range:
+    ///
+    /// - `exp80 == 0x7FFF` (inf / NaN) maps to the f64 special exponent with
+    ///   the top 52 payload bits preserved (the quiet bit survives).
+    /// - Exponents above the f64 range overflow to infinity; the `0x7FE`
+    ///   round-up case is produced naturally by the rounding carry.
+    /// - Exponents at or below the f64 normal range produce denormals (or
+    ///   zero), again with correct rounding; a denormal that rounds up past
+    ///   the fraction becomes the smallest normal via the same carry.
     fn f80_to_f64(&mut self, mant: Value, se: Value) -> Value {
         let sign_i32 = self.builder.ins().ushr_imm(se, 15);
         let sign_i32 = self.builder.ins().band_imm(sign_i32, 1);
@@ -202,24 +210,88 @@ impl<'a> Lifter<'a> {
         let sign_bit = self.builder.ins().ishl_imm(sign, 63);
 
         let exp80 = self.builder.ins().band_imm(se, 0x7FFF);
-        // f64 bias 1023, f80 bias 16383 -> exp64 = exp80 - 15360.
-        let exp64 = self.builder.ins().iadd_imm(exp80, -15360);
-        let exp64 = self.builder.ins().uextend(types::I64, exp64);
-        let exp64 = self.builder.ins().band_imm(exp64, 0x7FF);
-        let exp_field = self.builder.ins().ishl_imm(exp64, 52);
+        let exp80_64 = self.builder.ins().uextend(types::I64, exp80);
+        // Biased f64 exponent of the integer bit: exp80 - 16383 + 1023.
+        let e = self.builder.ins().iadd_imm(exp80_64, -15360);
 
-        // The 80-bit mantissa carries an explicit integer bit at position 63;
-        // the f64 fraction is the next 52 bits (bits 62..11).
+        let is_special = self
+            .builder
+            .ins()
+            .icmp_imm(IntCC::Equal, exp80_64, 0x7FFF);
+        let is_zero_mant = self.builder.ins().icmp_imm(IntCC::Equal, mant, 0);
+        let overflow = self
+            .builder
+            .ins()
+            .icmp_imm(IntCC::SignedGreaterThanOrEqual, e, 0x7FF);
+        let subnormal = self
+            .builder
+            .ins()
+            .icmp_imm(IntCC::SignedLessThanOrEqual, e, 0);
+
+        // The 80-bit significand keeps 53 bits after the shift (explicit
+        // integer bit at position 52 + 52 fraction bits). Normal values drop
+        // 11 bits; a subnormal result drops 11 + (1 - e) so the value lines up
+        // against the fixed 2^-1022 scale.
+        let c11 = self.builder.ins().iconst(types::I64, 11);
+        let shift_sub = {
+            let twelve = self.builder.ins().iconst(types::I64, 12);
+            self.builder.ins().isub(twelve, e)
+        };
+        let shift = self.builder.ins().select(subnormal, shift_sub, c11);
+        // Shifts of 64+ would be UB-ish in the IR; the value rounds to zero.
+        let too_small = self
+            .builder
+            .ins()
+            .icmp_imm(IntCC::SignedGreaterThan, shift, 63);
+        let c63 = self.builder.ins().iconst(types::I64, 63);
+        let sh = self.builder.ins().select(too_small, c63, shift);
+
+        let keep = self.builder.ins().ushr(mant, sh);
+        // Round to nearest, ties to even, on the dropped bits.
+        let one = self.builder.ins().iconst(types::I64, 1);
+        let mask = {
+            let m = self.builder.ins().ishl(one, sh);
+            self.builder.ins().iadd_imm(m, -1)
+        };
+        let rem = self.builder.ins().band(mant, mask);
+        let half = {
+            let shm1 = self.builder.ins().iadd_imm(sh, -1);
+            self.builder.ins().ishl(one, shm1)
+        };
+        let gt = self.builder.ins().icmp(IntCC::UnsignedGreaterThan, rem, half);
+        let eq = self.builder.ins().icmp(IntCC::Equal, rem, half);
+        let odd = self.builder.ins().band(keep, one);
+        let odd = self.builder.ins().icmp_imm(IntCC::NotEqual, odd, 0);
+        let tie_up = self.builder.ins().band(eq, odd);
+        let round_up = self.builder.ins().bor(gt, tie_up);
+        let inc = self.builder.ins().uextend(types::I64, round_up);
+        let keep_r = self.builder.ins().iadd(keep, inc);
+        let zero64 = self.builder.ins().iconst(types::I64, 0);
+        let keep_final = self.builder.ins().select(too_small, zero64, keep_r);
+
+        // combined = (base_exp << 52) + significand. For normals base_exp is
+        // e - 1 because the significand still contains the integer bit at
+        // position 52 (adding 1 << 52 bumps the field to e). A rounding carry
+        // out of the significand increments the exponent field - exactly the
+        // IEEE behaviour, including 0x7FE rounding up to infinity and the
+        // largest denormal rounding up to the smallest normal.
+        let e_minus_1 = self.builder.ins().iadd_imm(e, -1);
+        let base_exp = self.builder.ins().select(subnormal, zero64, e_minus_1);
+        let exp_field = self.builder.ins().ishl_imm(base_exp, 52);
+        let combined = self.builder.ins().iadd(exp_field, keep_final);
+
+        // Specials: exponent 0x7FF, top 52 significand bits as the payload.
+        let inf_bits = self.builder.ins().iconst(types::I64, 0x7FFi64 << 52);
         let frac = self.builder.ins().ushr_imm(mant, 11);
         let frac = self.builder.ins().band_imm(frac, 0x000F_FFFF_FFFF_FFFF);
+        let special_bits = self.builder.ins().bor(inf_bits, frac);
 
-        let bits = self.builder.ins().bor(sign_bit, exp_field);
-        let bits = self.builder.ins().bor(bits, frac);
-
+        let magnitude = self.builder.ins().select(overflow, inf_bits, combined);
+        let magnitude = self.builder.ins().select(is_special, special_bits, magnitude);
         // Zero mantissa -> signed zero (also covers the true-zero encoding).
-        let is_zero = self.builder.ins().icmp_imm(IntCC::Equal, mant, 0);
-        let bits = self.builder.ins().select(is_zero, sign_bit, bits);
+        let magnitude = self.builder.ins().select(is_zero_mant, zero64, magnitude);
 
+        let bits = self.builder.ins().bor(sign_bit, magnitude);
         self.builder
             .ins()
             .bitcast(types::F64, MemFlagsData::new(), bits)
@@ -247,7 +319,19 @@ impl<'a> Lifter<'a> {
         let is_exp_zero = self.builder.ins().icmp_imm(IntCC::Equal, exp64, 0);
         let is_frac_zero = self.builder.ins().icmp_imm(IntCC::Equal, frac, 0);
         let is_zero = self.builder.ins().band(is_exp_zero, is_frac_zero);
+        let is_subnormal = self.builder.ins().band_not(is_exp_zero, is_frac_zero);
         let is_special = self.builder.ins().icmp_imm(IntCC::Equal, exp64, 0x7FF);
+
+        // Subnormal f64: no implicit integer bit. Normalise the fraction so its
+        // top set bit lands at bit 63; the 80-bit format has room to represent
+        // it as a normal value. value = frac * 2^-1074, and after shifting left
+        // by clz(frac) the integer-bit exponent is 15372 - clz (biased).
+        let clz = self.builder.ins().clz(frac);
+        let mant_sub = self.builder.ins().ishl(frac, clz);
+        let exp80_sub = {
+            let base = self.builder.ins().iconst(types::I64, 15372);
+            self.builder.ins().isub(base, clz)
+        };
 
         let exp80_normal = self.builder.ins().iadd_imm(exp64, 15360);
         let special_exp = self.builder.ins().iconst(types::I64, 0x7FFF);
@@ -256,8 +340,10 @@ impl<'a> Lifter<'a> {
             .builder
             .ins()
             .select(is_special, special_exp, exp80_normal);
+        let exp80 = self.builder.ins().select(is_subnormal, exp80_sub, exp80);
         let exp80 = self.builder.ins().select(is_zero, zero_val, exp80);
-        let mant = self.builder.ins().select(is_zero, zero_val, mant_normal);
+        let mant = self.builder.ins().select(is_subnormal, mant_sub, mant_normal);
+        let mant = self.builder.ins().select(is_zero, zero_val, mant);
 
         let sign15 = self.builder.ins().ishl_imm(sign, 15);
         let se = self.builder.ins().bor(sign15, exp80);

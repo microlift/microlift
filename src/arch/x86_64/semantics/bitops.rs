@@ -387,7 +387,7 @@ impl<'a> Lifter<'a> {
             shifted_w
         };
         self.write_operand(instruction, 0, result)?;
-        self.update_flags_shift(result, cf_bit, count_w, size)?;
+        self.update_flags_shift(val, result, cf_bit, count_w, size)?;
         Ok(())
     }
 
@@ -406,6 +406,10 @@ impl<'a> Lifter<'a> {
         let one = self.builder.ins().iconst(ty, 1);
         let cf_bit = self.builder.ins().band(result, one);
         self.set_rotate_cf(cf_bit, count)?;
+        // OF (defined only for count == 1): MSB(result) ^ CF.
+        let msb = self.builder.ins().ushr_imm(result, (size * 8 - 1) as i64);
+        let of1 = self.builder.ins().bxor(msb, cf_bit);
+        self.set_rotate_of(of1, count)?;
         Ok(())
     }
 
@@ -423,6 +427,12 @@ impl<'a> Lifter<'a> {
         // CF = MSB of result (the bit that rotated out of bit 0).
         let cf_bit = self.builder.ins().ushr_imm(result, (size * 8 - 1) as i64);
         self.set_rotate_cf(cf_bit, count)?;
+        // OF (defined only for count == 1): XOR of the two top bits of result.
+        let next = self.builder.ins().ushr_imm(result, (size * 8 - 2) as i64);
+        let one = self.builder.ins().iconst(ty, 1);
+        let next = self.builder.ins().band(next, one);
+        let of1 = self.builder.ins().bxor(cf_bit, next);
+        self.set_rotate_of(of1, count)?;
         Ok(())
     }
 
@@ -439,6 +449,22 @@ impl<'a> Lifter<'a> {
         let is_zero = self.builder.ins().icmp_imm(IntCC::Equal, count, 0);
         let final_cf = self.builder.ins().select(is_zero, old_cf, new_cf);
         self.set_flag(X86Flag::Carry, final_cf)
+    }
+
+    /// Set OF from a rotate's single-bit-rotate value when the masked `count`
+    /// is 1; otherwise leave OF untouched (a zero count affects no flags, and
+    /// OF is architecturally undefined for counts > 1). `of_bit` is in the
+    /// operand type; `count` is the masked count.
+    fn set_rotate_of(&mut self, of_bit: Value, count: Value) -> crate::Result<()> {
+        let old_of = self.builder.use_var(self.state.flags[&X86Flag::Overflow]);
+        let new_of = if self.builder.func.dfg.value_type(of_bit) == types::I8 {
+            of_bit
+        } else {
+            self.builder.ins().ireduce(types::I8, of_bit)
+        };
+        let is_one = self.builder.ins().icmp_imm(IntCC::Equal, count, 1);
+        let final_of = self.builder.ins().select(is_one, new_of, old_of);
+        self.set_flag(X86Flag::Overflow, final_of)
     }
 
     /// Build a constant of width `ty` from a (non-negative, <= 64-bit) value.
@@ -587,7 +613,13 @@ impl<'a> Lifter<'a> {
         let right_count = self.builder.ins().isub(bits, count);
         let shifted_dst = self.builder.ins().ishl(dst, count);
         let shifted_src = self.builder.ins().ushr(src, right_count);
-        let result = self.builder.ins().bor(shifted_dst, shifted_src);
+        let combined = self.builder.ins().bor(shifted_dst, shifted_src);
+
+        // A masked count of 0 leaves the destination unchanged. The formula
+        // above would compute `dst | src` there, because `src >> N` re-masks
+        // the shift amount modulo the operand width and becomes `src >> 0`.
+        let is_zero = self.builder.ins().icmp_imm(IntCC::Equal, count, 0);
+        let result = self.builder.ins().select(is_zero, dst, combined);
 
         self.write_operand(instruction, 0, result)?;
 
@@ -595,7 +627,7 @@ impl<'a> Lifter<'a> {
         let cf_raw = self.builder.ins().ushr(dst, right_count);
         let one = self.builder.ins().iconst(ty, 1);
         let cf_bit = self.builder.ins().band(cf_raw, one);
-        self.update_flags_shift(result, cf_bit, count, size)?;
+        self.update_flags_shift(dst, result, cf_bit, count, size)?;
         Ok(())
     }
 
@@ -617,7 +649,11 @@ impl<'a> Lifter<'a> {
         let left_count = self.builder.ins().isub(bits, count);
         let shifted_src = self.builder.ins().ishl(src, left_count);
         let shifted_dst = self.builder.ins().ushr(dst, count);
-        let result = self.builder.ins().bor(shifted_src, shifted_dst);
+        let combined = self.builder.ins().bor(shifted_src, shifted_dst);
+
+        // A masked count of 0 leaves the destination unchanged (see SHLD).
+        let is_zero = self.builder.ins().icmp_imm(IntCC::Equal, count, 0);
+        let result = self.builder.ins().select(is_zero, dst, combined);
 
         self.write_operand(instruction, 0, result)?;
 
@@ -626,41 +662,126 @@ impl<'a> Lifter<'a> {
         let cf_shift = self.builder.ins().isub(count, one);
         let cf_raw = self.builder.ins().ushr(dst, cf_shift);
         let cf_bit = self.builder.ins().band(cf_raw, one);
-        self.update_flags_shift(result, cf_bit, count, size)?;
+        self.update_flags_shift(dst, result, cf_bit, count, size)?;
         Ok(())
     }
 
     // Bit test instructions
 
-    fn bt_common(&mut self, instruction: &Instruction) -> crate::Result<(Value, Value, usize)> {
+    /// Compute the `(loaded value, in-word bit index, effective pointer)`
+    /// triple for a BT-family instruction, handling the *bit string* form.
+    ///
+    /// For a register destination the bit index is simply masked to the
+    /// operand width. For a memory destination with a **register** bit index,
+    /// hardware treats the operand as the base of a bit string: the accessed
+    /// word lives at `EA + (signed_bit_index div width) * size` and the tested
+    /// bit is `bit_index mod width`. An **immediate** bit index is masked to
+    /// the operand width with no extra addressing.
+    ///
+    /// The returned pointer is `Some` for memory destinations (already
+    /// adjusted by the word offset) so the read-modify-write handlers store to
+    /// the same word that was tested.
+    fn bt_operand(
+        &mut self,
+        instruction: &Instruction,
+    ) -> crate::Result<(Value, Value, usize, Option<Value>)> {
         let size = self.operand_size(instruction, 0)?;
         let ty = size_to_type(size);
-        let base = self.read_operand(instruction, 0, size)?;
+        let bits = (size * 8) as i64;
+
         let bit_idx = match instruction.op1_kind() {
             OpKind::Register => {
                 // get_reg_val returns the natural type of the register, which for BT
                 // always matches the operand size - no reduction needed.
-                self.get_reg_val(instruction.op1_register())?
+                Some(self.get_reg_val(instruction.op1_register())?)
             }
-            OpKind::Immediate8 => self
-                .builder
-                .ins()
-                .iconst(ty, instruction.immediate8() as i64),
+            OpKind::Immediate8 => None,
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
                     mnemonic: "bt-bit-idx".into(),
                 });
             }
         };
-        // Mask bit index to operand size
-        let mask = self.builder.ins().iconst(ty, (size * 8 - 1) as i64);
-        let masked = self.builder.ins().band(bit_idx, mask);
+
+        match instruction.op0_kind() {
+            OpKind::Register => {
+                let base = self.get_reg_val(instruction.op0_register())?;
+                let masked = match bit_idx {
+                    Some(idx) => {
+                        let mask = self.builder.ins().iconst(ty, bits - 1);
+                        self.builder.ins().band(idx, mask)
+                    }
+                    None => self
+                        .builder
+                        .ins()
+                        .iconst(ty, (instruction.immediate8() as i64) & (bits - 1)),
+                };
+                Ok((base, masked, size, None))
+            }
+            OpKind::Memory => {
+                let mut ptr = self.get_mem_ptr(instruction, 0)?;
+                let masked = match bit_idx {
+                    Some(idx) => {
+                        // Word offset = floor(signed_index / width) words. An
+                        // arithmetic shift by log2(width) is exactly the
+                        // floored signed division, and also handles negative
+                        // indices (which address below the base).
+                        let idx64 = if size == 8 {
+                            idx
+                        } else {
+                            self.builder.ins().sextend(types::I64, idx)
+                        };
+                        let word = self.builder.ins().sshr_imm(idx64, bits.trailing_zeros() as i64);
+                        let byte_off = self.builder.ins().imul_imm(word, size as i64);
+                        ptr = self.builder.ins().iadd(ptr, byte_off);
+                        let mask = self.builder.ins().iconst(ty, bits - 1);
+                        self.builder.ins().band(idx, mask)
+                    }
+                    None => self
+                        .builder
+                        .ins()
+                        .iconst(ty, (instruction.immediate8() as i64) & (bits - 1)),
+                };
+                let base = self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0);
+                Ok((base, masked, size, Some(ptr)))
+            }
+            other => Err(MicroliftError::UnsupportedInstruction {
+                mnemonic: format!("bt-dst-{:?}", other),
+            }),
+        }
+    }
+
+    /// Shared front half of BT/BTS/BTR/BTC: resolve the operand, set CF from
+    /// the addressed bit, and hand back what the write-back needs.
+    fn bt_common(
+        &mut self,
+        instruction: &Instruction,
+    ) -> crate::Result<(Value, Value, usize, Option<Value>)> {
+        let (base, masked, size, ptr) = self.bt_operand(instruction)?;
+        let ty = size_to_type(size);
         // CF = (base >> bit_idx) & 1
         let shifted = self.builder.ins().ushr(base, masked);
         let one = self.builder.ins().iconst(ty, 1);
         let cf_bit = self.builder.ins().band(shifted, one);
         self.set_flag(X86Flag::Carry, cf_bit)?;
-        Ok((base, masked, size))
+        Ok((base, masked, size, ptr))
+    }
+
+    /// Write a BT-family result either to the adjusted memory word or back to
+    /// the register destination.
+    fn bt_write_result(
+        &mut self,
+        instruction: &Instruction,
+        result: Value,
+        ptr: Option<Value>,
+    ) -> crate::Result<()> {
+        match ptr {
+            Some(ptr) => {
+                self.builder.ins().store(MemFlagsData::new(), result, ptr, 0);
+                Ok(())
+            }
+            None => self.set_reg_val(instruction.op0_register(), result),
+        }
     }
 
     pub(super) fn handle_bt(&mut self, instruction: &Instruction) -> crate::Result<()> {
@@ -669,35 +790,32 @@ impl<'a> Lifter<'a> {
     }
 
     pub(super) fn handle_bts(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let (base, bit_idx, size) = self.bt_common(instruction)?;
+        let (base, bit_idx, size, ptr) = self.bt_common(instruction)?;
         let ty = size_to_type(size);
         let one = self.builder.ins().iconst(ty, 1);
         let bit_mask = self.builder.ins().ishl(one, bit_idx);
         let result = self.builder.ins().bor(base, bit_mask);
-        self.write_operand(instruction, 0, result)?;
-        Ok(())
+        self.bt_write_result(instruction, result, ptr)
     }
 
     pub(super) fn handle_btr(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let (base, bit_idx, size) = self.bt_common(instruction)?;
+        let (base, bit_idx, size, ptr) = self.bt_common(instruction)?;
         let ty = size_to_type(size);
         let one = self.builder.ins().iconst(ty, 1);
         let bit_mask = self.builder.ins().ishl(one, bit_idx);
         let inv_mask = self.builder.ins().iconst(ty, -1i64);
         let cleared_mask = self.builder.ins().bxor(bit_mask, inv_mask);
         let result = self.builder.ins().band(base, cleared_mask);
-        self.write_operand(instruction, 0, result)?;
-        Ok(())
+        self.bt_write_result(instruction, result, ptr)
     }
 
     pub(super) fn handle_btc(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let (base, bit_idx, size) = self.bt_common(instruction)?;
+        let (base, bit_idx, size, ptr) = self.bt_common(instruction)?;
         let ty = size_to_type(size);
         let one = self.builder.ins().iconst(ty, 1);
         let bit_mask = self.builder.ins().ishl(one, bit_idx);
         let result = self.builder.ins().bxor(base, bit_mask);
-        self.write_operand(instruction, 0, result)?;
-        Ok(())
+        self.bt_write_result(instruction, result, ptr)
     }
 
     pub(super) fn handle_bsf(&mut self, instruction: &Instruction) -> crate::Result<()> {
@@ -706,8 +824,13 @@ impl<'a> Lifter<'a> {
         // ZF = 1 if src == 0
         let zf = self.builder.ins().icmp_imm(IntCC::Equal, src, 0);
         self.set_flag(X86Flag::Zero, zf)?;
-        // Result: count trailing zeros (undefined if src==0, but we emit it anyway)
-        let result = self.builder.ins().ctz(src);
+        // Result: count trailing zeros. For src == 0 the destination is
+        // architecturally undefined on Intel but left unchanged on AMD (and,
+        // in practice, on modern Intel too); code in the wild relies on the
+        // dest-unchanged behaviour, so model that.
+        let dst_orig = self.read_operand(instruction, 0, size)?;
+        let ctz = self.builder.ins().ctz(src);
+        let result = self.builder.ins().select(zf, dst_orig, ctz);
         self.write_operand(instruction, 0, result)?;
         Ok(())
     }
@@ -745,13 +868,16 @@ impl<'a> Lifter<'a> {
         // ZF = 1 if src == 0
         let zf = self.builder.ins().icmp_imm(IntCC::Equal, src, 0);
         self.set_flag(X86Flag::Zero, zf)?;
-        // BSR: index of highest set bit = (size*8-1) - clz(src)
+        // BSR: index of highest set bit = (size*8-1) - clz(src). For src == 0
+        // leave the destination unchanged (see handle_bsf).
+        let dst_orig = self.read_operand(instruction, 0, size)?;
         let clz = self.builder.ins().clz(src);
         let bit_width = self
             .builder
             .ins()
             .iconst(size_to_type(size), (size * 8 - 1) as i64);
-        let result = self.builder.ins().isub(bit_width, clz);
+        let idx = self.builder.ins().isub(bit_width, clz);
+        let result = self.builder.ins().select(zf, dst_orig, idx);
         self.write_operand(instruction, 0, result)?;
         Ok(())
     }

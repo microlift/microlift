@@ -183,6 +183,26 @@ pub(crate) fn fat_to_cl_type(ty: FunctionArgumentType) -> Option<types::Type> {
     }
 }
 
+/// Whether an import's arguments all fit in the SysV AMD64 argument registers
+/// (6 integer + 8 XMM). The inline fast-call path marshals arguments from the
+/// guest register file only; anything that would spill to the stack must take
+/// the slow `ImportedFunctionCall` exit instead - otherwise the emitted call
+/// would carry fewer arguments than its signature and fail the IR verifier.
+pub(crate) fn fits_in_fast_call_regs(arg_types: &[FunctionArgumentType]) -> bool {
+    let mut ints = 0usize;
+    let mut fps = 0usize;
+    for &ty in arg_types.iter().skip(1) {
+        match ty {
+            FunctionArgumentType::VariadicList | FunctionArgumentType::None => break,
+            FunctionArgumentType::SinglePrecisionFp | FunctionArgumentType::DoublePrecisionFp => {
+                fps += 1
+            }
+            _ => ints += 1,
+        }
+    }
+    ints <= 6 && fps <= 8
+}
+
 /// Build a Cranelift `Signature` from a `DynamicSymbol`'s `arg_types` slice.
 ///
 /// `arg_types[0]` is the return type; `arg_types[1..]` are parameter types.
@@ -357,7 +377,9 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         for (&va, opt_sym) in &config.imports {
             import_vas.insert(va);
             if let Some(sym) = opt_sym {
-                if !sym.is_ellipsis_function {
+                // Variadic functions and functions whose arguments spill past
+                // the SysV argument registers are demoted to slow calls.
+                if !sym.is_ellipsis_function && fits_in_fast_call_regs(&sym.arg_types) {
                     match config.execution_mode {
                         ExecutionMode::Jit => {
                             let sig = build_import_sig(&sym.arg_types, host_cc);

@@ -272,6 +272,22 @@ impl<'a> Lifter<'a> {
         let disp = instruction.memory_displacement64();
         let segment = instruction.memory_segment();
 
+        // A 0x67 prefix selects 32-bit addressing: iced reports 32-bit base and
+        // index registers. Compute in I64 (widening each component) and
+        // truncate the final sum to 32 bits, matching hardware's wrap-around,
+        // so the load/store below always sees a 64-bit address.
+        let addr32 = (base_reg != Register::None
+            && base_reg != Register::RIP
+            && base_reg.size() == 4)
+            || (index_reg != Register::None && index_reg.size() == 4);
+        let widen64 = |lifter: &mut Self, v: Value| {
+            if lifter.builder.func.dfg.value_type(v) == types::I64 {
+                v
+            } else {
+                lifter.builder.ins().uextend(types::I64, v)
+            }
+        };
+
         let mut ptr = if base_reg == Register::RIP {
             // RIP-relative: iced-x86 sets 'disp' to the absolute target address (as decoded).
             // We reconcile this target address to our dynamic 'image_base'.
@@ -280,13 +296,15 @@ impl<'a> Lifter<'a> {
             let image_base = self.builder.use_var(self.state.image_base);
             self.builder.ins().iadd_imm(image_base, offset as i64)
         } else if base_reg != Register::None {
-            self.get_reg_val(base_reg)?
+            let v = self.get_reg_val(base_reg)?;
+            widen64(self, v)
         } else {
             self.builder.ins().iconst(types::I64, 0)
         };
 
         if index_reg != Register::None {
             let index_val = self.get_reg_val(index_reg)?;
+            let index_val = widen64(self, index_val);
             let scaled_index = if scale > 1 {
                 self.builder.ins().imul_imm(index_val, scale as i64)
             } else {
@@ -299,6 +317,12 @@ impl<'a> Lifter<'a> {
         // For RIP-relative, the target address is already our 'ptr'.
         if base_reg != Register::RIP && disp != 0 {
             ptr = self.builder.ins().iadd_imm(ptr, disp as i64);
+        }
+
+        // 32-bit addressing truncates the effective address to 32 bits (then
+        // zero-extends) before any segment base is applied.
+        if addr32 {
+            ptr = self.builder.ins().band_imm(ptr, 0xFFFF_FFFF);
         }
 
         // Add FS or GS segment base. In x86-64 long mode DS/ES/SS/CS have

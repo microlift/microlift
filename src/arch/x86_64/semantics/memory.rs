@@ -97,7 +97,8 @@ impl<'a> Lifter<'a> {
         let push_size: usize = match op0 {
             OpKind::Register => instruction.op0_register().size(),
             OpKind::Memory => instruction.memory_size().size(),
-            OpKind::Immediate16 => 2,
+            // 16-bit pushes: `push imm16` and 0x66-prefixed `push imm8`.
+            OpKind::Immediate16 | OpKind::Immediate8to16 => 2,
             _ => 8,
         };
         let ty = size_to_type(push_size);
@@ -115,10 +116,14 @@ impl<'a> Lifter<'a> {
                 .builder
                 .ins()
                 .iconst(types::I16, instruction.immediate16() as i64),
+            // 0x66-prefixed `push imm8`: sign-extend to 16 bits, 2-byte slot.
+            OpKind::Immediate8to16 => self
+                .builder
+                .ins()
+                .iconst(types::I16, instruction.immediate8to16() as i64),
             OpKind::Immediate8
             | OpKind::Immediate32
             | OpKind::Immediate64
-            | OpKind::Immediate8to16
             | OpKind::Immediate8to32
             | OpKind::Immediate32to64 => {
                 let imm = instruction.immediate32to64();
@@ -464,9 +469,9 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// POPFQ - pop a 64-bit value off the stack and distribute its bits into the
-    /// tracked status flags. Bits for untracked flags (DF, IF, etc.) and the
-    /// reserved/system bits are simply discarded.
+    /// POPFQ - pop a 64-bit value off the stack and distribute its bits into
+    /// the tracked flags (the six status flags plus DF). Bits for untracked
+    /// flags (IF, TF, etc.) and the reserved/system bits are simply discarded.
     pub(super) fn handle_popfq(&mut self, _instruction: &Instruction) -> crate::Result<()> {
         let rsp = self.get_reg_val(Register::RSP)?;
         let rflags = self.builder.ins().load(types::I64, MemFlagsData::new(), rsp, 0);

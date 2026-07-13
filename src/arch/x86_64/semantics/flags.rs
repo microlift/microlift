@@ -318,16 +318,24 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Update flags for a shift operation (SHL/SHR/SAR).
-    /// `res` is the result, `cf_bit` is the last bit shifted out (for CF),
-    /// `count` is the masked shift count (in operand type), `size` is the operand size in bytes.
+    /// Update flags for a shift operation (SHL/SHR/SAR/SHLD/SHRD).
+    /// `orig` is the pre-shift destination value, `res` the result (both in the
+    /// operand type), `cf_bit` the last bit shifted out (for CF), `count` the
+    /// masked shift count, `size` the operand size in bytes.
     ///
     /// Per x86 semantics: if the masked shift count is 0, **no flags are
-    /// affected** - including CF/ZF/SF/OF. We must preserve the prior flag
+    /// affected** - including CF/ZF/SF/OF/PF. We must preserve the prior flag
     /// values in that case rather than clobbering them with the (garbage)
     /// values that fall out of the shift formula for count=0.
+    ///
+    /// OF is architecturally defined only for count == 1, where for every shift
+    /// flavour it equals "the sign changed": SHL's `MSB(res) ^ CF` and SHRD's
+    /// documented definition both reduce to `MSB(orig) ^ MSB(res)`, SHR's
+    /// `MSB(orig)` matches because `MSB(res)` is 0, and SAR's 0 matches because
+    /// the sign is preserved. For counts > 1 OF is undefined; we clear it.
     pub fn update_flags_shift(
         &mut self,
+        orig: Value,
         res: Value,
         cf_bit: Value,
         count: Value,
@@ -340,6 +348,7 @@ impl<'a> Lifter<'a> {
         let old_sf = self.builder.use_var(self.state.flags[&X86Flag::Sign]);
         let old_cf = self.builder.use_var(self.state.flags[&X86Flag::Carry]);
         let old_of = self.builder.use_var(self.state.flags[&X86Flag::Overflow]);
+        let old_pf = self.builder.use_var(self.state.flags[&X86Flag::Parity]);
 
         // Newly-computed flag values (in operand width), reduced to I8 to
         // match the flag SSA variable type that `select` requires.
@@ -355,8 +364,28 @@ impl<'a> Lifter<'a> {
         } else {
             self.builder.ins().ireduce(types::I8, cf_bit)
         };
-        // OF is undefined for shifts other than by 1; conservatively clear it.
-        let new_of = self.builder.ins().iconst(types::I8, 0);
+
+        // OF for count == 1: sign change between operand and result.
+        let sign_xor = self.builder.ins().bxor(orig, res);
+        let sign_change_w = self.builder.ins().ushr_imm(sign_xor, bit_width - 1);
+        let sign_change = if self.builder.func.dfg.value_type(sign_change_w) == types::I8 {
+            sign_change_w
+        } else {
+            self.builder.ins().ireduce(types::I8, sign_change_w)
+        };
+        let zero_i8 = self.builder.ins().iconst(types::I8, 0);
+        let is_one = self.builder.ins().icmp_imm(IntCC::Equal, count, 1);
+        let new_of = self.builder.ins().select(is_one, sign_change, zero_i8);
+
+        // PF: even popcount of the low 8 bits of the result.
+        let res_lo = if self.builder.func.dfg.value_type(res) == types::I8 {
+            res
+        } else {
+            self.builder.ins().ireduce(types::I8, res)
+        };
+        let pop = self.builder.ins().popcnt(res_lo);
+        let pop_lsb = self.builder.ins().band_imm(pop, 1);
+        let new_pf = self.builder.ins().bxor_imm(pop_lsb, 1);
 
         // is_zero is I8 (icmp_imm result); select uses any nonzero as true.
         let is_zero = self.builder.ins().icmp_imm(IntCC::Equal, count, 0);
@@ -364,11 +393,13 @@ impl<'a> Lifter<'a> {
         let final_sf = self.builder.ins().select(is_zero, old_sf, new_sf);
         let final_cf = self.builder.ins().select(is_zero, old_cf, new_cf);
         let final_of = self.builder.ins().select(is_zero, old_of, new_of);
+        let final_pf = self.builder.ins().select(is_zero, old_pf, new_pf);
 
         self.set_flag(X86Flag::Zero, final_zf)?;
         self.set_flag(X86Flag::Sign, final_sf)?;
         self.set_flag(X86Flag::Carry, final_cf)?;
         self.set_flag(X86Flag::Overflow, final_of)?;
+        self.set_flag(X86Flag::Parity, final_pf)?;
 
         Ok(())
     }

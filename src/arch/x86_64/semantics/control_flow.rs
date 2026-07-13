@@ -374,9 +374,12 @@ impl<'a> Lifter<'a> {
                 }
                 _ => {
                     if int_idx >= INT_ARG_REGS.len() {
-                        // Stack-based args are not yet supported; skip them.
-                        int_idx += 1;
-                        continue;
+                        // Registration demotes such imports to the slow path;
+                        // emitting a shorter arg list than the signature would
+                        // fail the IR verifier, so error out loudly instead.
+                        return Err(MicroliftError::UnsupportedInstruction {
+                            mnemonic: "fast-import-call with stack-passed arguments".into(),
+                        });
                     }
                     let reg = INT_ARG_REGS[int_idx];
                     let val = self.get_reg_val(reg)?;
@@ -509,8 +512,10 @@ impl<'a> Lifter<'a> {
                 }
                 _ => {
                     if int_idx >= INT_ARG_REGS.len() {
-                        int_idx += 1;
-                        continue;
+                        // See emit_fast_import_call: demoted at registration.
+                        return Err(MicroliftError::UnsupportedInstruction {
+                            mnemonic: "fast-import-call with stack-passed arguments".into(),
+                        });
                     }
                     let reg = INT_ARG_REGS[int_idx];
                     let val = self.get_reg_val(reg)?;
@@ -766,18 +771,29 @@ impl<'a> Lifter<'a> {
     /// Decrement the LOOP counter register (CX/ECX/RCX, chosen by encoding) and
     /// return an I8 boolean that is true when the decremented counter is nonzero.
     fn decrement_loop_counter(&mut self, instruction: &Instruction) -> crate::Result<Value> {
+        // In iced's Code naming the *suffix* names the counter register (the
+        // `rel8_16/32/64` part is the branch operand size, which does not
+        // affect which counter is decremented).
         let counter_reg = match instruction.code() {
             Code::Loop_rel8_16_CX
             | Code::Loope_rel8_16_CX
             | Code::Loopne_rel8_16_CX
-            | Code::Loop_rel8_16_ECX
-            | Code::Loop_rel8_16_RCX => Register::CX,
-            Code::Loop_rel8_32_CX
+            | Code::Loop_rel8_32_CX
+            | Code::Loope_rel8_32_CX
+            | Code::Loopne_rel8_32_CX => Register::CX,
+            Code::Loop_rel8_16_ECX
+            | Code::Loope_rel8_16_ECX
+            | Code::Loopne_rel8_16_ECX
             | Code::Loop_rel8_32_ECX
             | Code::Loope_rel8_32_ECX
-            | Code::Loopne_rel8_32_ECX => Register::ECX,
-            Code::Loop_rel8_64_ECX => Register::ECX,
-            Code::Loop_rel8_64_RCX
+            | Code::Loopne_rel8_32_ECX
+            | Code::Loop_rel8_64_ECX
+            | Code::Loope_rel8_64_ECX
+            | Code::Loopne_rel8_64_ECX => Register::ECX,
+            Code::Loop_rel8_16_RCX
+            | Code::Loope_rel8_16_RCX
+            | Code::Loopne_rel8_16_RCX
+            | Code::Loop_rel8_64_RCX
             | Code::Loope_rel8_64_RCX
             | Code::Loopne_rel8_64_RCX => Register::RCX,
             _ => match instruction.code_size() {
