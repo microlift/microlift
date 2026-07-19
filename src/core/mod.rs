@@ -529,44 +529,106 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
     }
 
     pub fn lift(&mut self, bytes: &[u8], ip: u64) -> crate::Result<()> {
-        let instructions = A::decode_region(bytes, ip);
-        let mut leaders = HashSet::from([ip]);
-
-        // Phase 1: discover block leaders from static control-flow facts.
-        for instruction in &instructions {
-            let cf = A::control_flow(instruction);
-            match cf.kind {
-                ControlFlowKind::Invalid => {
-                    leaders.insert(A::instr_next_ip(instruction));
-                }
-                ControlFlowKind::DirectBranch | ControlFlowKind::CondBranch => {
-                    for &t in &cf.static_targets {
-                        leaders.insert(t);
-                    }
-                }
-                ControlFlowKind::Call {
-                    static_target: Some(target),
-                } => {
-                    if self.import_vas.contains(&target) {
-                        // Import call: intercepted inline. Add the resume point
-                        // so slow-call exits can route back without resume blocks.
-                        leaders.insert(A::instr_next_ip(instruction));
-                    } else if target >= ip && target < ip + bytes.len() as u64 {
-                        // In-region call: the callee is a block leader.
-                        leaders.insert(target);
-                    } else {
-                        // Out-of-region direct call: add the resume point so the
-                        // entry dispatch switch can route back after the runtime
-                        // handles the call.
-                        leaders.insert(A::instr_next_ip(instruction));
-                    }
-                }
-                _ => {}
-            }
-        }
-
         self.lift_base = ip;
         self.lift_end = ip + bytes.len() as u64;
+
+        // Phase 1: decode + block-leader discovery.
+        //
+        // We keep an address-keyed decode map so that the same bytes can be
+        // decoded more than once at different starting offsets. This is what
+        // makes *sub-encoded* / overlapping instructions work: an obfuscator can
+        // branch into the middle of an instruction so those bytes are executed
+        // as a different instruction. A pure linear sweep never sees the second
+        // interpretation; here, decoding follows real control flow, so a branch
+        // target that lands mid-instruction is decoded fresh at that offset.
+        //
+        // The map is primed with a linear sweep (covering every natural
+        // instruction boundary, which preserves resume-block behavior and keeps
+        // the leader set a superset of the old linear-sweep result), then a
+        // worklist follows control flow from the entry and every discovered
+        // leader, decoding any address not already present. The worklist is
+        // seeded with every linearly-decoded instruction so leader discovery is
+        // identical to the old sweep for non-overlapping code, and it iterates
+        // to a fixpoint so overlapping instructions that themselves branch are
+        // handled too.
+        let mut decoded: HashMap<u64, A::Instr> = HashMap::new();
+        for inst in A::decode_region(bytes, ip) {
+            decoded.entry(A::instr_ip(&inst)).or_insert(inst);
+        }
+
+        let mut leaders: HashSet<u64> = HashSet::from([ip]);
+        let mut work: Vec<u64> = decoded.keys().copied().collect();
+        work.push(ip);
+        let mut processed: HashSet<u64> = HashSet::new();
+
+        while let Some(addr) = work.pop() {
+            if addr < self.lift_base || addr >= self.lift_end {
+                continue;
+            }
+            if !processed.insert(addr) {
+                continue;
+            }
+            // Ensure the instruction at `addr` is decoded. Overlap targets are
+            // not present in the linear prime, so decode them on demand.
+            if !decoded.contains_key(&addr) {
+                let off = (addr - self.lift_base) as usize;
+                match A::decode_one(&bytes[off..], addr) {
+                    Some(inst) => {
+                        decoded.insert(addr, inst);
+                    }
+                    None => continue,
+                }
+            }
+            let inst = &decoded[&addr];
+            let cf = A::control_flow(inst);
+            let next = A::instr_next_ip(inst);
+            match cf.kind {
+                ControlFlowKind::Invalid => {
+                    // Post-invalid bytes are a re-sync point (as in the old sweep).
+                    leaders.insert(next);
+                    work.push(next);
+                }
+                ControlFlowKind::Fallthrough => {
+                    work.push(next);
+                }
+                ControlFlowKind::DirectBranch => {
+                    for &t in &cf.static_targets {
+                        leaders.insert(t);
+                        work.push(t);
+                    }
+                }
+                ControlFlowKind::CondBranch => {
+                    for &t in &cf.static_targets {
+                        leaders.insert(t);
+                        work.push(t);
+                    }
+                    work.push(next);
+                }
+                ControlFlowKind::Call { static_target } => {
+                    match static_target {
+                        Some(target) if self.import_vas.contains(&target) => {
+                            // Import call: intercepted inline. The resume point
+                            // is a leader so slow-call exits can route back.
+                            leaders.insert(next);
+                        }
+                        Some(target) if target >= self.lift_base && target < self.lift_end => {
+                            // In-region call: the callee is a block leader.
+                            leaders.insert(target);
+                            work.push(target);
+                        }
+                        _ => {
+                            // Out-of-region / indirect direct call: the resume
+                            // point is a leader so the dispatch switch can route
+                            // back after the runtime handles the call.
+                            leaders.insert(next);
+                        }
+                    }
+                    // A call returns to the following instruction.
+                    work.push(next);
+                }
+                ControlFlowKind::Ret | ControlFlowKind::IndirectBranch => {}
+            }
+        }
 
         // Entry block receives the context pointer as its first parameter.
         let entry_block = self.builder.create_block();
@@ -581,7 +643,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         A::load_state_from_context(self)?;
 
         if self.config.emit_resume_blocks {
-            for instruction in &instructions {
+            for instruction in decoded.values() {
                 leaders.insert(A::instr_ip(instruction));
                 leaders.insert(A::instr_next_ip(instruction));
             }
@@ -617,49 +679,101 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             switch.emit(&mut self.builder, relative_pc, start_block);
         }
 
-        self.visited_blocks.insert(start_block);
-        self.block_terminated = true; // force switch to first block in loop
+        // Phase 2: emit each block by walking instructions from its leader,
+        // following `instr_next_ip` rather than linear list order. Overlapping
+        // (sub-encoded) instructions make list order and fallthrough order
+        // diverge, so a per-block walk is required for correctness.
+        //
+        // Repeatedly take the lowest-addressed in-region block that has not yet
+        // been emitted. New in-region blocks can be created *during* lifting
+        // (e.g. call resume points), so re-scan `self.blocks` each iteration
+        // until every in-region block has been visited. Out-of-region target
+        // blocks are left for `finish()` to turn into VM-exit stubs.
+        loop {
+            let next_leader = self
+                .blocks
+                .iter()
+                .filter(|(off, b)| {
+                    **off >= self.lift_base
+                        && **off < self.lift_end
+                        && !self.visited_blocks.contains(b)
+                })
+                .map(|(off, _)| *off)
+                .min();
+            let Some(leader) = next_leader else { break };
+            let block = self.blocks[&leader];
 
-        // Phase 2: lift each instruction into IR.
-        for instruction in &instructions {
-            let current_ip_dec = A::instr_ip(instruction);
+            self.builder.switch_to_block(block);
+            self.visited_blocks.insert(block);
+            self.block_terminated = false;
 
-            if let Some(&block) = self.blocks.get(&current_ip_dec) {
-                if Some(block) != self.builder.current_block() || self.block_terminated {
-                    if !self.block_terminated {
-                        self.builder.ins().jump(block, &[]);
-                    }
-                    self.builder.switch_to_block(block);
-                    self.visited_blocks.insert(block);
-                    self.block_terminated = false;
+            let mut cur = leader;
+            let mut first = true;
+            loop {
+                // Fell through past the end of the region.
+                if cur < self.lift_base || cur >= self.lift_end {
+                    self.current_ip = cur;
+                    A::sync_to_context(self, None, ExitReason::None)?;
+                    self.builder.ins().return_(&[]);
+                    self.block_terminated = true;
+                    break;
                 }
+                // Reached another block's leader. Normally we emit an explicit
+                // fallthrough jump and let that block be lifted on its own
+                // iteration. The starting leader is exempt (that is the block we
+                // are filling). Also exempt: when an instruction's semantics has
+                // already switched the builder into this exact block (e.g. a
+                // conditional branch positions us in its fallthrough block and
+                // marks it visited, expecting the caller to keep emitting into
+                // it) - jumping would target the block we are already in.
+                if !first {
+                    if let Some(&next_block) = self.blocks.get(&cur) {
+                        if self.builder.current_block() != Some(next_block) {
+                            self.builder.ins().jump(next_block, &[]);
+                            self.block_terminated = true;
+                            break;
+                        }
+                    }
+                }
+                first = false;
+
+                // Decode on demand (overlap targets may be absent from phase 1).
+                if !decoded.contains_key(&cur) {
+                    let off = (cur - self.lift_base) as usize;
+                    match A::decode_one(&bytes[off..], cur) {
+                        Some(inst) => {
+                            decoded.insert(cur, inst);
+                        }
+                        None => {
+                            self.current_ip = cur;
+                            A::sync_to_context(self, None, ExitReason::None)?;
+                            self.builder.ins().return_(&[]);
+                            self.block_terminated = true;
+                            break;
+                        }
+                    }
+                }
+                let inst = &decoded[&cur];
+
+                if A::is_invalid(inst) {
+                    // Sync PC to point AT the invalid instruction.
+                    self.current_ip = A::instr_ip(inst);
+                    A::sync_to_context(self, None, ExitReason::InvalidInstruction)?;
+                    self.builder.ins().return_(&[]);
+                    self.block_terminated = true;
+                    break;
+                }
+
+                // Advance current_ip before dispatch so a PC read inside the
+                // handler sees the post-instruction value.
+                let next_ip = A::instr_next_ip(inst);
+                self.current_ip = next_ip;
+                A::lift_instruction(self, inst)?;
+                if self.block_terminated {
+                    break;
+                }
+                cur = next_ip;
             }
-
-            if self.block_terminated {
-                // Dead code after a terminator - skip.
-                continue;
-            }
-
-            if A::is_invalid(instruction) {
-                // Sync PC to point AT the invalid instruction.
-                self.current_ip = A::instr_ip(instruction);
-                A::sync_to_context(self, None, ExitReason::InvalidInstruction)?;
-                self.builder.ins().return_(&[]);
-                self.block_terminated = true;
-                continue;
-            }
-
-            // Advance current_ip before dispatch so a PC read inside the handler
-            // sees the post-instruction value.
-            self.current_ip = A::instr_next_ip(instruction);
-            A::lift_instruction(self, instruction)?;
-        }
-
-        // Fallthrough at the end of the lifted region.
-        if !self.block_terminated {
-            A::sync_to_context(self, None, ExitReason::None)?;
-            self.builder.ins().return_(&[]);
-            self.block_terminated = true;
         }
 
         self.finish()
