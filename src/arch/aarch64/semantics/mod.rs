@@ -803,7 +803,7 @@ impl<'a> Lifter64<'a> {
             .ins()
             .store(MemFlagsData::trusted(), target, ctx_ptr, va_offset);
 
-        self.sync_to_context_selective(None, ExitReason::IndirectCall)?;
+        self.sync_to_context(None, ExitReason::IndirectCall)?;
         self.builder.ins().return_(&[]);
         self.block_terminated = true;
         Ok(())
@@ -825,7 +825,7 @@ impl<'a> Lifter64<'a> {
             _ => 30,
         };
         let target = self.read_reg_val(target_reg, false, types::I64);
-        self.sync_to_context_selective(Some(target), ExitReason::Return)?;
+        self.sync_to_context(Some(target), ExitReason::Return)?;
         self.write_exit_code(TransferKind::Return as u32);
         self.builder.ins().return_(&[]);
         self.block_terminated = true;
@@ -833,14 +833,14 @@ impl<'a> Lifter64<'a> {
     }
 
     fn handle_svc(&mut self) -> crate::Result<()> {
-        self.sync_to_context_selective(None, ExitReason::Syscall)?;
+        self.sync_to_context(None, ExitReason::Syscall)?;
         self.builder.ins().return_(&[]);
         self.block_terminated = true;
         Ok(())
     }
 
     fn exit_unimplemented(&mut self) -> crate::Result<()> {
-        self.sync_to_context_selective(None, ExitReason::UnimplementedInstruction)?;
+        self.sync_to_context(None, ExitReason::UnimplementedInstruction)?;
         self.builder.ins().return_(&[]);
         self.block_terminated = true;
         Ok(())

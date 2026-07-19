@@ -88,8 +88,34 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Selective sync - only writes registers/flags written since the last
-    /// `load_state_from_context`. The preferred sync on normal VM-exit paths.
+    /// Selective sync - only writes registers/flags/xmms marked dirty since the
+    /// last `load_state_from_context`.
+    ///
+    /// DANGEROUS - DO NOT USE. Retained for reference only; all VM-exit paths
+    /// now use the full [`Self::sync_to_context`] instead.
+    ///
+    /// The dirty set (`state.dirty_gprs` etc.) is a single, global, cumulative
+    /// set that is only ever cleared by `load_state_from_context` (once at
+    /// region entry). It is populated as a side effect of instruction emission,
+    /// which happens in block-address order. So at the point a selective sync is
+    /// *emitted*, the dirty set reflects the registers written by instructions
+    /// emitted *before it in address order* - NOT the registers actually written
+    /// along the runtime control-flow paths that reach this exit.
+    ///
+    /// That is unsound for any non-linear CFG. Concretely: a register written in
+    /// a higher-addressed block (emitted later) that reaches a lower-addressed
+    /// VM-exit via a backward edge (i.e. a loop) is missing from the dirty set
+    /// when the exit is emitted. Its store is omitted, the update never reaches
+    /// the `RegisterContext`, and on resume `load_state_from_context` reloads the
+    /// stale pre-loop value - silently corrupting a live register across the
+    /// exit. (Observed as an out-of-bounds `std::string::substr` in a guest
+    /// environ-parsing loop: a loop-carried index reverted to a stale value
+    /// across a slow import-call exit.)
+    ///
+    /// A correct selective sync would need real CFG dataflow (reaching-defs /
+    /// liveness over the block graph), not an emission-order side effect. Until
+    /// that exists, always use the full sync.
+    #[allow(dead_code)]
     pub fn sync_to_context_selective(
         &mut self,
         pc: Option<Value>,

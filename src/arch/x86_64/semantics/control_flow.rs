@@ -176,7 +176,7 @@ impl<'a> Lifter<'a> {
                     self.set_reg_val(Register::RSP, new_rsp)?;
                     self.builder.ins().store(MemFlagsData::new(), ret_addr, new_rsp, 0);
 
-                    self.sync_to_context_selective(None, ExitReason::UnknownJump)?;
+                    self.sync_to_context(None, ExitReason::UnknownJump)?;
                     self.write_exit_code(TransferKind::DirectCall as u32);
                     self.builder.ins().return_(&[]);
                     self.block_terminated = true;
@@ -293,7 +293,7 @@ impl<'a> Lifter<'a> {
             .ins()
             .store(MemFlagsData::trusted(), va_val, ctx_ptr, va_offset);
 
-        self.sync_to_context_selective(None, ExitReason::ImportedFunctionCall)?;
+        self.sync_to_context(None, ExitReason::ImportedFunctionCall)?;
         self.builder.ins().return_(&[]);
         self.block_terminated = true;
         Ok(())
@@ -316,7 +316,7 @@ impl<'a> Lifter<'a> {
             .ins()
             .store(MemFlagsData::trusted(), target_val, ctx_ptr, va_offset);
 
-        self.sync_to_context_selective(None, ExitReason::IndirectCall)?;
+        self.sync_to_context(None, ExitReason::IndirectCall)?;
         self.builder.ins().return_(&[]);
         self.block_terminated = true;
         Ok(())

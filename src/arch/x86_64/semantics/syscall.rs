@@ -11,7 +11,7 @@ impl<'a> Lifter<'a> {
                 let image_base = self.builder.use_var(self.state.image_base);
                 let rip_after = self.builder.ins().iadd_imm(image_base, offset as i64);
 
-                self.sync_to_context_selective(Some(rip_after), crate::context::ExitReason::Syscall)?;
+                self.sync_to_context(Some(rip_after), crate::context::ExitReason::Syscall)?;
                 self.builder.ins().return_(&[]);
                 self.block_terminated = true;
             }
