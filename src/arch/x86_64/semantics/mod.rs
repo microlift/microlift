@@ -152,6 +152,7 @@ impl<'a> Lifter<'a> {
             Mnemonic::Sar => self.handle_sar(instruction),
             Mnemonic::Rol => self.handle_rol(instruction),
             Mnemonic::Ror => self.handle_ror(instruction),
+            Mnemonic::Rcl => self.handle_rcl(instruction),
             Mnemonic::Rcr => self.handle_rcr(instruction),
             Mnemonic::Shld => self.handle_shld(instruction),
             Mnemonic::Shrd => self.handle_shrd(instruction),

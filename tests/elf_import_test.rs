@@ -1,13 +1,3 @@
-//! Compile a real C shared library, extract a function from
-//! the ELF using the linker map file, and lift + execute it through microlift
-//! with slow-import handling for `strlen` and `strcmp`.
-//!
-//! The C function (`process_string`) calls `strlen` to measure a string,
-//! duplicates it when length > 1, advances the first byte by one, then returns
-//! `strcmp(original, mutated)`.  Microlift intercepts both library calls as
-//! `ImportedFunctionCall` VM exits; the test handles each exit in a loop,
-//! calling host-side pure-Rust replacements.
-
 use cranelift::prelude::*;
 use cranelift_codegen::ir::{Function, UserFuncName};
 use microlift::backend::CraneliftBackend;
@@ -19,16 +9,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 
-const C_SOURCE: &str = r#"
-#include <string.h>
+const PROCESS_STRING_SOURCE: &str = r#"
+unsigned long strlen(const char *s);
+int strcmp(const char *a, const char *b);
 
-/* Called with a string `s`.
- *   len = strlen(s)
- *   if len <= 1: return 0
- *   copy = duplicate of s
- *   copy[0] = s[0] + 1 (shift the first character up by one)
- *   return strcmp(s, copy)
- */
 int process_string(const char *s) {
     int len = (int)strlen(s);
     if (len <= 1) return 0;
@@ -41,6 +25,25 @@ int process_string(const char *s) {
     copy[0] = (char)(s[0] + 1);
 
     return strcmp(s, copy);
+}
+"#;
+
+const MEMCPY_SOURCE: &str = r#"
+void *memcpy(void *dst, const void *src, unsigned long n);
+
+/* Copy n bytes src->dst with memcpy, then fold the copied bytes (read back
+ * through memcpy's returned pointer, which must equal dst) into a 64-bit
+ * FNV-1a hash. Exercises the ImportedFunctionCall argument passing
+ * (rdi=dst, rsi=src, rdx=n), memcpy's effect on caller memory, its return
+ * value in rax, and callee-saved-register preservation across the slow call. */
+unsigned long memcpy_and_checksum(unsigned char *dst, const unsigned char *src,
+                                  unsigned long n) {
+    unsigned char *ret = memcpy(dst, src, n);
+    unsigned long h = 14695981039346656037UL; /* FNV-1a 64-bit offset basis */
+    for (unsigned long i = 0; i < n; i++) {
+        h = (h ^ (unsigned long)ret[i]) * 1099511628211UL; /* FNV prime */
+    }
+    return h;
 }
 "#;
 
@@ -67,95 +70,89 @@ unsafe extern "C" fn host_strcmp(s1: *const u8, s2: *const u8) -> i32 {
     }
 }
 
-/// Directory inside the source tree used for compiled test artifacts.
-/// Listed in `.gitignore`.
+unsafe extern "C" fn host_memcpy(dst: *mut u8, src: *const u8, n: u64) -> *mut u8 {
+    unsafe { std::ptr::copy_nonoverlapping(src, dst, n as usize) };
+    dst
+}
+
+fn fnv1a_64(data: &[u8]) -> u64 {
+    let mut h: u64 = 14695981039346656037;
+    for &b in data {
+        h = (h ^ b as u64).wrapping_mul(1099511628211);
+    }
+    h
+}
+
 fn artifact_dir() -> PathBuf {
-    // CARGO_MANIFEST_DIR points to the crate root at test time.
     let root = std::env::var("CARGO_MANIFEST_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."));
     root.join("test-artifacts").join("elf_import_test")
 }
 
-/// Compile the C source to a shared library with a GNU ld map file.
-/// Returns `(elf_bytes, map_file_contents)`.
-fn compile_shared_lib() -> (Vec<u8>, String) {
+fn command_works(cmd: &str) -> bool {
+    Command::new(cmd)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn x86_64_elf_compiler() -> Option<String> {
+    if let Ok(cc) = std::env::var("MICROLIFT_X86_64_ELF_CC") {
+        return command_works(&cc).then_some(cc);
+    }
+    let mut candidates: Vec<&str> = Vec::new();
+    if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
+        candidates.extend(["gcc", "cc"]);
+    }
+    candidates.extend(["x86_64-unknown-linux-gnu-gcc", "x86_64-linux-gnu-gcc"]);
+    candidates
+        .into_iter()
+        .find(|c| command_works(c))
+        .map(String::from)
+}
+
+fn compile_x86_64_elf(source: &str, basename: &str) -> Option<Vec<u8>> {
+    let cc = x86_64_elf_compiler()?;
+
     let dir = artifact_dir();
     std::fs::create_dir_all(&dir).expect("failed to create artifact dir");
+    let c_path = dir.join(format!("{basename}.c"));
+    let so_path = dir.join(format!("lib{basename}.so"));
+    std::fs::write(&c_path, source).expect("failed to write C source");
 
-    let c_path = dir.join("process_string.c");
-    let so_path = dir.join("libprocess_string.so");
-    let map_path = dir.join("process_string.map");
-
-    std::fs::write(&c_path, C_SOURCE).expect("failed to write C source");
-
-    let map_arg = format!("-Wl,-Map={}", map_path.display());
-    let status = Command::new("gcc")
+    let status = Command::new(&cc)
         .args([
             "-shared",
             "-fPIC",
             "-O0",
             "-fno-stack-protector",
-            "-fno-builtin", // force calls to strlen/strcmp rather than builtins
+            "-fno-builtin",        // force real calls to strlen/strcmp/memcpy
             "-fcf-protection=none", // standard .plt layout (no .plt.sec / IBT)
             "-D_FORTIFY_SOURCE=0",
+            "-Wl,-z,lazy",
             c_path.to_str().unwrap(),
             "-o",
             so_path.to_str().unwrap(),
-            &map_arg,
         ])
         .status()
-        .expect("failed to spawn gcc - is gcc in PATH?");
-    assert!(status.success(), "gcc compilation failed");
+        .unwrap_or_else(|e| panic!("failed to spawn {cc}: {e}"));
+    assert!(status.success(), "{cc} failed to compile {basename}");
 
-    let elf_bytes = std::fs::read(&so_path).expect("failed to read compiled .so");
-    let map = std::fs::read_to_string(&map_path).expect("failed to read map file");
-    (elf_bytes, map)
+    Some(std::fs::read(&so_path).expect("failed to read compiled .so"))
 }
 
-/// Scan a GNU ld map file for the virtual address of `sym_name`.
-///
-/// The relevant line looks like:
-/// ```text
-///                 0x0000000000001119                process_string
-/// ```
-fn parse_map_symbol_va(map: &str, sym_name: &str) -> Option<u64> {
-    for line in map.lines() {
-        let trimmed = line.trim();
-        if !trimmed.starts_with("0x") {
-            continue;
-        }
-        let mut parts = trimmed.splitn(2, |c: char| c.is_ascii_whitespace());
-        let addr_str = parts.next()?;
-        let name = parts.next()?.trim();
-        if name == sym_name {
-            let hex = addr_str.trim_start_matches("0x");
-            return u64::from_str_radix(hex, 16).ok();
-        }
-    }
-    None
-}
-
-/// Look up `sym_name` in the ELF symbol tables and return its size in bytes.
-///
-/// Checks `.dynsym` first (exported symbols), then `.symtab`.
-fn elf_symbol_size(elf_bytes: &[u8], sym_name: &str) -> Option<u64> {
+fn elf_symbol_va_size(elf_bytes: &[u8], sym_name: &str) -> Option<(u64, u64)> {
     let file = object::File::parse(elf_bytes).ok()?;
-    for sym in file.dynamic_symbols() {
+    for sym in file.dynamic_symbols().chain(file.symbols()) {
         if sym.name() == Ok(sym_name) && sym.size() > 0 {
-            return Some(sym.size());
-        }
-    }
-    for sym in file.symbols() {
-        if sym.name() == Ok(sym_name) && sym.size() > 0 {
-            return Some(sym.size());
+            return Some((sym.address(), sym.size()));
         }
     }
     None
 }
 
-/// Return the file offset inside `elf_bytes` that corresponds to virtual
-/// address `va` in the ELF.
 fn elf_va_to_file_offset(elf_bytes: &[u8], va: u64) -> Option<usize> {
     let file = object::File::parse(elf_bytes).ok()?;
     for section in file.sections() {
@@ -169,43 +166,29 @@ fn elf_va_to_file_offset(elf_bytes: &[u8], va: u64) -> Option<usize> {
     None
 }
 
-/// Find the PLT stub virtual address for the import named `import_name`.
-///
-/// Reads `.rela.plt` to obtain the relocation order, looks up each
-/// relocation's symbol in `.dynsym`, and computes the stub address from
-/// the `.plt` section base (with the standard x86-64 layout where entry 0
-/// is the resolver and entries 1..n follow in `.rela.plt` order, each 16 B).
 fn find_plt_entry_va(elf_bytes: &[u8], import_name: &str) -> Option<u64> {
     let file = object::File::parse(elf_bytes).ok()?;
 
-    // Build index -> name map from .dynsym
     let dynsym: HashMap<usize, String> = file
         .dynamic_symbols()
         .filter_map(|sym| sym.name().ok().map(|n| (sym.index().0, n.to_string())))
         .collect();
 
-    // Locate .rela.plt
     let rela_section = file.section_by_name(".rela.plt")?;
     let rela_data = rela_section.data().ok()?;
 
-    // Find the PLT section.  With -fcf-protection=none there is no .plt.sec;
-    // calls go directly to .plt, with entry 0 being the resolver stub and
-    // entries 1..n corresponding to .rela.plt[0..n-1].
     let (plt_base, first_entry_offset): (u64, u64) =
         if let Some(sec) = file.section_by_name(".plt.sec") {
-            // IBT variant: entries start at index 0, no resolver prefix
             (sec.address(), 0)
         } else {
             let plt = file.section_by_name(".plt")?;
-            (plt.address(), 16) // skip the 16-byte resolver stub
+            (plt.address(), 16)
         };
 
-    // Parse Elf64_Rela entries: r_offset (8 B), r_info (8 B), r_addend (8 B)
     const RELA64_SIZE: usize = 24;
     for (idx, chunk) in rela_data.chunks_exact(RELA64_SIZE).enumerate() {
         let r_info = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
         let sym_idx = (r_info >> 32) as usize;
-
         if dynsym.get(&sym_idx).map(|n| n.as_str()) == Some(import_name) {
             return Some(plt_base + first_entry_offset + (idx as u64) * 16);
         }
@@ -213,39 +196,32 @@ fn find_plt_entry_va(elf_bytes: &[u8], import_name: &str) -> Option<u64> {
     None
 }
 
-#[test]
-fn test_elf_process_string() {
-    if !(cfg!(target_os = "linux") && cfg!(target_arch = "x86_64")) {
-        return;
-    }
+const EXIT_TRAMPOLINE: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 
-    let (elf_bytes, map) = compile_shared_lib();
+fn fresh_stack(stack: &mut [u64]) -> u64 {
+    let top = stack.as_mut_ptr() as u64 + (stack.len() as u64) * 8;
+    let rsp = top - 8;
+    unsafe { *(rsp as *mut u64) = EXIT_TRAMPOLINE };
+    rsp
+}
 
-    let func_va = parse_map_symbol_va(&map, "process_string")
-        .expect("process_string not found in linker map file");
-
-    let func_size = elf_symbol_size(&elf_bytes, "process_string")
-        .expect("process_string symbol not found in ELF");
-
-    let func_file_offset = elf_va_to_file_offset(&elf_bytes, func_va)
-        .expect("failed to map function VA to ELF file offset");
-    let func_bytes = &elf_bytes[func_file_offset..func_file_offset + func_size as usize];
-
-    let strlen_plt_va =
-        find_plt_entry_va(&elf_bytes, "strlen").expect("strlen PLT entry not found");
-    let strcmp_plt_va =
-        find_plt_entry_va(&elf_bytes, "strcmp").expect("strcmp PLT entry not found");
-
+fn run_guest_with_slow_imports(
+    func_bytes: &[u8],
+    func_va: u64,
+    slow_imports: &[u64],
+    mut ctx: RegisterContext,
+    mut service: impl FnMut(u64, &mut RegisterContext),
+) -> RegisterContext {
     let mut config = LifterConfig::default();
-    config.register_slow_import(strlen_plt_va);
-    config.register_slow_import(strcmp_plt_va);
+    for &va in slow_imports {
+        config.register_slow_import(va);
+    }
 
     let mut func = Function::with_name_signature(
         UserFuncName::user(0, 0),
         Signature::new(get_host_calling_conv()),
     );
     func.signature.params.push(AbiParam::new(types::I64));
-
     let mut func_ctx = cranelift_frontend::FunctionBuilderContext::new();
     let builder = cranelift_frontend::FunctionBuilder::new(&mut func, &mut func_ctx);
     let mut lifter = Lifter::with_config(builder, config);
@@ -254,92 +230,143 @@ fn test_elf_process_string() {
 
     let mut flag_builder = settings::builder();
     flag_builder.set("opt_level", "speed").unwrap();
-    let flags = settings::Flags::new(flag_builder);
-    let mut backend = CraneliftBackend::with_flags(flags).expect("backend init failed");
-    let code_ptr = backend
-        .compile(func.clone())
-        .expect("JIT compilation failed");
+    let mut backend =
+        CraneliftBackend::with_flags(settings::Flags::new(flag_builder)).expect("backend init");
+    let code_ptr = backend.compile(func).expect("JIT compilation failed");
     let f: fn(*mut RegisterContext) = unsafe { std::mem::transmute(code_ptr) };
 
-    let mut stack = vec![0u64; 256];
-    let stack_top = stack.as_mut_ptr() as u64 + (stack.len() as u64) * 8;
-    let initial_rsp = stack_top - 8;
-    // Pre-push the exit trampoline so the first RET exits cleanly.
-    unsafe { *(initial_rsp as *mut u64) = 0xFFFF_FFFF_FFFF_FFFF };
-
-    let test_string = b"hello\0";
-    let string_ptr = test_string.as_ptr() as u64;
-
-    let mut ctx = RegisterContext::default();
-    ctx.rsp = initial_rsp;
-    ctx.rdi = string_ptr; // first argument: const char *s
-    ctx.image_base = func_va;
-    ctx.rip = func_va;
-
-    eprintln!("strlen_plt_va={strlen_plt_va:#x}, strcmp_plt_va={strcmp_plt_va:#x}");
-    eprintln!("func_va={func_va:#x}, func_size={func_size}");
     loop {
         f(&mut ctx);
-        eprintln!(
-            "exit: reason={}, rip={:#x}, imported_va={:#x}",
-            ctx.exit_reason, ctx.rip, ctx.imported_function_va
-        );
-
         if ctx.exit_reason == ExitReason::Return as u32 {
             break;
         }
-
         assert_eq!(
             ctx.exit_reason,
             ExitReason::ImportedFunctionCall as u32,
-            "unexpected exit reason: {} (rip={:#x}, imported_va={:#x})",
+            "unexpected exit reason {} (rip={:#x}, imported_va={:#x})",
             ctx.exit_reason,
             ctx.rip,
-            ctx.imported_function_va
+            ctx.imported_function_va,
         );
-
         let va = ctx.imported_function_va;
-        if va == strlen_plt_va {
-            // strlen(rdi) -> rax
-            let s = ctx.rdi as *const u8;
-            ctx.rax = unsafe { host_strlen(s) };
-        } else if va == strcmp_plt_va {
-            // strcmp(rdi, rsi) -> rax  (sign-extend i32 result to u64)
-            let s1 = ctx.rdi as *const u8;
-            let s2 = ctx.rsi as *const u8;
-            ctx.rax = unsafe { host_strcmp(s1, s2) } as i64 as u64;
+        service(va, &mut ctx);
+    }
+    ctx
+}
+
+#[test]
+fn test_elf_process_string() {
+    let Some(elf) = compile_x86_64_elf(PROCESS_STRING_SOURCE, "process_string") else {
+        eprintln!("skipping test_elf_process_string: no x86-64 ELF compiler on PATH");
+        return;
+    };
+
+    let (func_va, func_size) =
+        elf_symbol_va_size(&elf, "process_string").expect("process_string symbol");
+    let off = elf_va_to_file_offset(&elf, func_va).expect("VA->file offset");
+    let func_bytes = &elf[off..off + func_size as usize];
+
+    let strlen_plt = find_plt_entry_va(&elf, "strlen").expect("strlen PLT entry");
+    let strcmp_plt = find_plt_entry_va(&elf, "strcmp").expect("strcmp PLT entry");
+    let imports = [strlen_plt, strcmp_plt];
+
+    let service = |va: u64, ctx: &mut RegisterContext| {
+        if va == strlen_plt {
+            ctx.rax = unsafe { host_strlen(ctx.rdi as *const u8) };
+        } else if va == strcmp_plt {
+            ctx.rax =
+                unsafe { host_strcmp(ctx.rdi as *const u8, ctx.rsi as *const u8) } as i64 as u64;
         } else {
             panic!("unexpected ImportedFunctionCall VA: {va:#x}");
         }
-    }
+    };
 
-    // "hello" -> strlen=5 > 1 -> copy="iello\0" -> strcmp("hello","iello") < 0
-    let result = ctx.rax as i32;
+    // "hello" -> len 5 -> copy "iello" -> strcmp("hello","iello") < 0
+    let test_string = b"hello\0";
+    let mut stack = vec![0u64; 256];
+    let rsp = fresh_stack(&mut stack);
+    let mut ctx = RegisterContext::default();
+    ctx.rsp = rsp;
+    ctx.rdi = test_string.as_ptr() as u64;
+    ctx.image_base = func_va;
+    ctx.rip = func_va;
+    let out = run_guest_with_slow_imports(func_bytes, func_va, &imports, ctx, service);
     assert!(
-        result < 0,
-        "expected strcmp(\"hello\", \"iello\") < 0, got {result}"
+        (out.rax as i32) < 0,
+        "expected strcmp(\"hello\",\"iello\") < 0, got {}",
+        out.rax as i32
     );
+    let _ = &stack;
 
-    // Sanity-check: short string branch (len <= 1) returns 0 without any import.
-    let short_string = b"x\0";
-    ctx = RegisterContext::default();
-    ctx.rsp = initial_rsp;
-    unsafe { *(initial_rsp as *mut u64) = 0xFFFF_FFFF_FFFF_FFFF };
-    ctx.rdi = short_string.as_ptr() as u64;
+    // "x" -> len 1 -> early return 0, only strlen called.
+    let short = b"x\0";
+    let mut stack2 = vec![0u64; 256];
+    let rsp2 = fresh_stack(&mut stack2);
+    let mut ctx2 = RegisterContext::default();
+    ctx2.rsp = rsp2;
+    ctx2.rdi = short.as_ptr() as u64;
+    ctx2.image_base = func_va;
+    ctx2.rip = func_va;
+    let out2 = run_guest_with_slow_imports(func_bytes, func_va, &imports, ctx2, |va, ctx| {
+        assert_eq!(va, strlen_plt, "only strlen expected for the short string");
+        ctx.rax = unsafe { host_strlen(ctx.rdi as *const u8) };
+    });
+    assert_eq!(out2.rax as i32, 0, "process_string(\"x\") should return 0");
+    let _ = &stack2;
+}
+
+#[test]
+fn test_elf_memcpy_semantics() {
+    let Some(elf) = compile_x86_64_elf(MEMCPY_SOURCE, "memcpy_checksum") else {
+        eprintln!("skipping test_elf_memcpy_semantics: no x86-64 ELF compiler on PATH");
+        return;
+    };
+
+    let (func_va, func_size) =
+        elf_symbol_va_size(&elf, "memcpy_and_checksum").expect("memcpy_and_checksum symbol");
+    let off = elf_va_to_file_offset(&elf, func_va).expect("VA->file offset");
+    let func_bytes = &elf[off..off + func_size as usize];
+
+    let memcpy_plt = find_plt_entry_va(&elf, "memcpy").expect("memcpy PLT entry");
+
+    let data: [u8; 11] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB];
+    let mut dst = [0u8; 11];
+    assert_ne!(dst, data, "destination must start different from source");
+
+    let mut stack = vec![0u64; 256];
+    let rsp = fresh_stack(&mut stack);
+
+    let mut ctx = RegisterContext::default();
+    ctx.rsp = rsp;
+    ctx.rdi = dst.as_mut_ptr() as u64; // dst
+    ctx.rsi = data.as_ptr() as u64; // src
+    ctx.rdx = data.len() as u64; // n
     ctx.image_base = func_va;
     ctx.rip = func_va;
 
-    // This call needs strlen but len==1 so it returns early (no strcmp call).
-    loop {
-        f(&mut ctx);
-        if ctx.exit_reason == ExitReason::Return as u32 {
-            break;
-        }
-        assert_eq!(ctx.exit_reason, ExitReason::ImportedFunctionCall as u32);
-        let va = ctx.imported_function_va;
-        assert_eq!(va, strlen_plt_va, "only strlen expected for short string");
-        ctx.rax = unsafe { host_strlen(ctx.rdi as *const u8) };
-    }
+    let mut memcpy_calls = 0usize;
+    let mut seen_args: Option<(u64, u64, u64)> = None;
+    let out = run_guest_with_slow_imports(func_bytes, func_va, &[memcpy_plt], ctx, |va, ctx| {
+        assert_eq!(va, memcpy_plt, "only memcpy should be imported");
+        memcpy_calls += 1;
+        seen_args = Some((ctx.rdi, ctx.rsi, ctx.rdx));
+        ctx.rax = unsafe { host_memcpy(ctx.rdi as *mut u8, ctx.rsi as *const u8, ctx.rdx) } as u64;
+    });
 
-    assert_eq!(ctx.rax as i32, 0, "process_string(\"x\") should return 0");
+    assert_eq!(memcpy_calls, 1, "memcpy must be called exactly once");
+    assert_eq!(
+        seen_args,
+        Some((dst.as_ptr() as u64, data.as_ptr() as u64, data.len() as u64)),
+        "memcpy received the wrong (rdi, rsi, rdx) arguments"
+    );
+
+    assert_eq!(dst, data, "memcpy did not copy the source bytes into dst");
+
+    assert_eq!(
+        out.rax,
+        fnv1a_64(&data),
+        "checksum mismatch: return value / callee-saved state not preserved across the call"
+    );
+
+    let _ = &stack;
 }

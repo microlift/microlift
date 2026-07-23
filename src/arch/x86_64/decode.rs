@@ -48,7 +48,20 @@ pub fn control_flow(instruction: &Instruction) -> ControlFlow {
     }
 
     match instruction.mnemonic() {
-        Mnemonic::Jmp => ControlFlow::direct_branch(instruction.near_branch_target()),
+        Mnemonic::Jmp => {
+            // Only near-branch (direct) jumps have a statically known target;
+            // register/memory-indirect jumps do not (mirrors the `Call` arm
+            // below). Classifying an indirect jump as a direct branch would
+            // report a bogus target of 0 (from `near_branch_target()`).
+            if matches!(
+                instruction.op0_kind(),
+                OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
+            ) {
+                ControlFlow::direct_branch(instruction.near_branch_target())
+            } else {
+                ControlFlow::indirect_branch()
+            }
+        }
         Mnemonic::Je
         | Mnemonic::Jne
         | Mnemonic::Jb

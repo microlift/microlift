@@ -1,14 +1,22 @@
 //! Shared exit/control state exchanged between lifted guest code and the host.
 //!
-//! Every guest architecture embeds a [`ControlHeader`] at a known offset in its
-//! `RegisterContext` so the host's exit/dispatch loop can read why a lifted
-//! region exited without knowing which guest ISA produced it. The per-arch
-//! register banks (and the architectural PC) live outside this header in the
-//! arch-specific context struct.
+//! [`ControlHeader`] is the canonical description of the control fields every
+//! guest exposes (`exit_reason`, `exit_code`, `imported_function_va`,
+//! `image_base`). A guest's `RegisterContext` may either embed this struct or,
+//! as the x86-64 context does, carry the same fields inline. Either way the
+//! generic engine reaches them only through the arch's offset accessors
+//! ([`GuestArch::exit_reason_offset`] etc.), so the host's exit/dispatch loop
+//! reads why a region exited without knowing which guest ISA produced it. The
+//! per-arch register banks (and the architectural PC) live alongside these
+//! fields in the arch-specific context struct.
+//!
+//! [`GuestArch::exit_reason_offset`]: crate::core::GuestArch::exit_reason_offset
 
 /// Architecture-neutral control fields shared by every guest's register
-/// context. Embedded `#[repr(C)]` at a fixed offset so the host reads exit
-/// state uniformly across guests.
+/// context. A guest may embed this `#[repr(C)]` struct directly or mirror its
+/// fields inline (the x86-64 context does the latter); the engine always
+/// accesses them through the arch's offset accessors, so the host reads exit
+/// state uniformly across guests regardless of which layout a guest chose.
 #[repr(C)]
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ControlHeader {

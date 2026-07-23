@@ -18,6 +18,8 @@
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
           extensions = [ "rust-src" "clippy" "rust-analyzer" ];
         };
+
+        crossGcc = pkgs.pkgsCross.gnu64.buildPackages.gcc;
       in
       {
         devShells.default = pkgs.mkShell {
@@ -28,6 +30,8 @@
           buildInputs = [
             rustToolchain
             pkgs.capstone  # required for --features disasm
+          ] ++ pkgs.lib.optionals (system != "x86_64-linux") [
+            crossGcc
           ];
 
           RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";

@@ -27,10 +27,14 @@ use iced_x86::{
 };
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
-/// Caller-saved (volatile) general-purpose registers. The union of the System V
-/// and Windows x64 volatile sets, so clobbering all of them across a `CALL` is
-/// sound under either ABI.
-const CALLER_SAVED: &[Register] = &[
+/// Default caller-saved (volatile) general-purpose registers assumed clobbered
+/// across a `CALL`: the union of the System V and Windows x64 volatile sets, so
+/// it is sound under either standard C ABI. Registers not listed here (RBX,
+/// RBP, RSP, R12-R15) are assumed preserved by the callee - which holds only if
+/// the analysed code follows one of those ABIs. See [`ValueSetAnalyzer`] for how
+/// to override this (e.g. [`ValueSetAnalyzer::all_gpr_clobbers`] for the
+/// ABI-agnostic conservative choice).
+const DEFAULT_CALL_CLOBBERS: &[Register] = &[
     Register::RAX,
     Register::RCX,
     Register::RDX,
@@ -40,6 +44,34 @@ const CALLER_SAVED: &[Register] = &[
     Register::R9,
     Register::R10,
     Register::R11,
+];
+
+/// Registers assumed clobbered by a `SYSCALL`. RCX (<- RIP) and R11 (<- RFLAGS)
+/// are written by the instruction itself on all x86-64; RAX is the syscall
+/// return register under every mainstream OS (Linux/*BSD/Windows). Every other
+/// GPR is preserved across a syscall under those conventions.
+const DEFAULT_SYSCALL_CLOBBERS: &[Register] =
+    &[Register::RAX, Register::RCX, Register::R11];
+
+/// All 16 general-purpose registers - the ABI-agnostic conservative clobber set
+/// for a `CALL` whose callee convention is unknown or untrusted.
+const ALL_GPRS: &[Register] = &[
+    Register::RAX,
+    Register::RBX,
+    Register::RCX,
+    Register::RDX,
+    Register::RSI,
+    Register::RDI,
+    Register::RBP,
+    Register::RSP,
+    Register::R8,
+    Register::R9,
+    Register::R10,
+    Register::R11,
+    Register::R12,
+    Register::R13,
+    Register::R14,
+    Register::R15,
 ];
 
 // Value Set lattice
@@ -304,6 +336,16 @@ impl RegisterValueSet {
 /// register, so `mov ecx, eax` must read the *low 32 bits* of RAX - not the whole
 /// 64-bit value.
 fn read_reg(state: &RegisterValueSet, reg: Register) -> ValueSet {
+    // High-8 registers (AH/BH/CH/DH) alias bits 8..15 of their container, not
+    // the low byte, so `low_bits(8)` would read the wrong bits (AL for AH).
+    // Sub-register-of-high-byte tracking isn't modelled, so read them
+    // conservatively as `Top` rather than returning a wrong concrete value.
+    if matches!(
+        reg,
+        Register::AH | Register::BH | Register::CH | Register::DH
+    ) {
+        return ValueSet::Top;
+    }
     let vs = state.get(reg.full_register());
     match reg.size() {
         0 | 8 => vs,
@@ -347,6 +389,29 @@ pub struct ValueSetAnalyzer {
     /// dynamic linker runs. Without this, VSA would infer that a
     /// `JMP [GOT+off]` or `CALL [GOT+off]` targets address 0.
     pub relocation_addresses: HashSet<u64>,
+    /// When `true` (the default), VSA makes no ABI assumptions whatsoever
+    /// about which registers survive a `CALL` or `SYSCALL`: every GPR is
+    /// clobbered across those boundaries, so no value set is ever carried across
+    /// a call, syscall, or (VM-exit-backed) indirect/imported call. This is the
+    /// only choice that preserves runtime semantic equivalence regardless of the
+    /// callee's calling convention or what the host does while servicing a VM
+    /// exit - a resolved indirect target can never depend on a value some callee
+    /// or the host might have changed.
+    ///
+    /// Set to `false` (see [`with_standard_abi`](Self::with_standard_abi)) to opt
+    /// into ABI-aware precision, in which case `call_clobbers` / `syscall_clobbers`
+    /// take effect. Only do this for code you know honours the configured ABI.
+    pub conservative: bool,
+    /// Registers assumed clobbered across a `CALL` when `conservative == false`
+    /// (the callee's caller-saved / volatile set). Registers **not** in this set
+    /// are assumed callee-preserved, which is sound *only if the analysed code
+    /// follows this ABI*. Ignored while `conservative` is `true`. Defaults to
+    /// [`DEFAULT_CALL_CLOBBERS`] (System V union Windows x64).
+    pub call_clobbers: Vec<Register>,
+    /// Registers assumed clobbered by a `SYSCALL` when `conservative == false`.
+    /// Ignored while `conservative` is `true`. Defaults to
+    /// [`DEFAULT_SYSCALL_CLOBBERS`] (RAX/RCX/R11).
+    pub syscall_clobbers: Vec<Register>,
     worklist: VecDeque<usize>,
 }
 
@@ -360,6 +425,11 @@ impl ValueSetAnalyzer {
             value_sets: HashMap::new(),
             segments,
             relocation_addresses: HashSet::new(),
+            // Safe by default: no ABI preservation assumptions across calls or
+            // syscalls. Opt into precision explicitly via `with_standard_abi`.
+            conservative: true,
+            call_clobbers: DEFAULT_CALL_CLOBBERS.to_vec(),
+            syscall_clobbers: DEFAULT_SYSCALL_CLOBBERS.to_vec(),
             worklist: VecDeque::new(),
         }
     }
@@ -372,6 +442,51 @@ impl ValueSetAnalyzer {
     pub fn with_relocation_addresses(mut self, addrs: HashSet<u64>) -> Self {
         self.relocation_addresses = addrs;
         self
+    }
+
+    /// Set the [`conservative`](Self::conservative) flag. `true` (the default)
+    /// clobbers every GPR across calls/syscalls; `false` enables ABI-aware
+    /// precision using `call_clobbers` / `syscall_clobbers`.
+    pub fn with_conservative(mut self, conservative: bool) -> Self {
+        self.conservative = conservative;
+        self
+    }
+
+    /// Opt into ABI-aware precision (`conservative = false`), keeping the current
+    /// `call_clobbers` / `syscall_clobbers` (the standard x86-64 C ABI by
+    /// default). Only sound for code that honours the configured ABI.
+    pub fn with_standard_abi(mut self) -> Self {
+        self.conservative = false;
+        self
+    }
+
+    /// Override the registers assumed clobbered across a `CALL`, and switch to
+    /// ABI-aware mode (`conservative = false`). Registers omitted here are
+    /// assumed callee-preserved.
+    pub fn with_call_clobbers(mut self, regs: Vec<Register>) -> Self {
+        self.conservative = false;
+        self.call_clobbers = regs;
+        self
+    }
+
+    /// Override the registers assumed clobbered by a `SYSCALL`, and switch to
+    /// ABI-aware mode (`conservative = false`).
+    pub fn with_syscall_clobbers(mut self, regs: Vec<Register>) -> Self {
+        self.conservative = false;
+        self.syscall_clobbers = regs;
+        self
+    }
+
+    /// The default `CALL` clobber set (System V union Windows x64 volatile GPRs).
+    pub fn default_call_clobbers() -> Vec<Register> {
+        DEFAULT_CALL_CLOBBERS.to_vec()
+    }
+
+    /// Every GPR: the ABI-agnostic conservative `CALL` clobber set. Using this
+    /// makes no assumption about which registers a callee preserves, so VSA
+    /// never resolves an indirect transfer using a value carried across a call.
+    pub fn all_gpr_clobbers() -> Vec<Register> {
+        ALL_GPRS.to_vec()
     }
 
     /// Run the analysis over a decoded instruction stream.
@@ -441,13 +556,20 @@ impl ValueSetAnalyzer {
                 | Mnemonic::Jno
                 | Mnemonic::Jp
                 | Mnemonic::Jnp
-                | Mnemonic::Loop => {
+                | Mnemonic::Loop
+                | Mnemonic::Loope
+                | Mnemonic::Loopne
+                | Mnemonic::Jrcxz => {
+                    // Conditional transfers: both the taken target and the
+                    // fallthrough are reachable. (Must match the cond-branch set
+                    // in `decode::control_flow`, or a back-edge is missed and the
+                    // fixpoint under-approximates the value sets - unsound.)
                     let target = instruction.near_branch_target();
                     self.propagate(target, &post_state, instructions);
                     self.propagate(next_ip, &post_state, instructions);
                 }
-                Mnemonic::Ret | Mnemonic::Syscall => {
-                    // Terminators - no fallthrough
+                Mnemonic::Ret => {
+                    // Terminator; no fallthrough.
                 }
                 _ => {
                     // Fallthrough to next instruction
@@ -534,10 +656,44 @@ impl ValueSetAnalyzer {
                 }
             }
             Mnemonic::Call => {
-                // A call clobbers the ABI's caller-saved registers. Invalidate
-                // the volatile set so a stale pre-call value can't leak into a
-                // later indirect-target resolution.
-                for &reg in CALLER_SAVED {
+                // A call (direct, indirect, or an imported call that becomes a
+                // VM exit) clobbers registers. In conservative mode every GPR is
+                // invalidated; no assumption about callee/host preservation.
+                // Otherwise only the configured caller-saved set is invalidated;
+                // registers left out are *assumed* callee-preserved, sound only
+                // if the callee follows that ABI.
+                let clobbers: &[Register] = if self.conservative {
+                    ALL_GPRS
+                } else {
+                    &self.call_clobbers
+                };
+                for &reg in clobbers {
+                    out.set(reg, ValueSet::Top);
+                }
+            }
+            Mnemonic::Syscall => {
+                // SYSCALL returns to the following instruction (it falls through
+                // in the analysis). iced does not report RAX as written, so the
+                // clobber is applied explicitly. Conservative mode invalidates
+                // every GPR (making no assumption about what the host's syscall
+                // service routine touches); otherwise only `syscall_clobbers`.
+                let clobbers: &[Register] = if self.conservative {
+                    ALL_GPRS
+                } else {
+                    &self.syscall_clobbers
+                };
+                for &reg in clobbers {
+                    out.set(reg, ValueSet::Top);
+                }
+            }
+            Mnemonic::Int | Mnemonic::Int1 | Mnemonic::Int3 if self.conservative => {
+                // A software interrupt transfers to a handler VSA does not
+                // analyse (and which becomes a host-serviced VM exit in the
+                // lifter). iced reports no GP-register writes for `INT`, but a
+                // handler may set any register (e.g. `int 0x80` returns in EAX),
+                // so in conservative mode invalidate every GPR. In ABI-aware mode
+                // this falls to the catch-all (iced's architectural write set).
+                for &reg in ALL_GPRS {
                     out.set(reg, ValueSet::Top);
                 }
             }
@@ -808,5 +964,25 @@ pub fn resolved_indirect_targets(
 impl Default for ValueSetAnalyzer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod read_reg_tests {
+    use super::*;
+
+    #[test]
+    fn low_byte_read_is_exact_but_high_byte_read_is_conservative() {
+        let mut state = RegisterValueSet::new();
+        state.set(Register::RAX, ValueSet::Constant(0x1234));
+
+        // AL aliases bits 0..7 -> exact low byte.
+        assert_eq!(read_reg(&state, Register::AL), ValueSet::Constant(0x34));
+        // EAX aliases bits 0..31 -> exact.
+        assert_eq!(read_reg(&state, Register::EAX), ValueSet::Constant(0x1234));
+        // AH aliases bits 8..15, which this analysis does not track: it must NOT
+        // report the low byte (0x34) as if it were AH. Conservative `Top`.
+        assert_eq!(read_reg(&state, Register::AH), ValueSet::Top);
+        assert_eq!(read_reg(&state, Register::BH), ValueSet::Top);
     }
 }

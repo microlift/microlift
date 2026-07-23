@@ -92,18 +92,23 @@ impl RegisterContext {
 }
 
 /// Convert an 80-bit x87 extended-precision value to the raw bits of an `f64`.
-/// This is the pure-Rust twin of the IR emitted by the lifter's `FLD m80`
-/// ([`crate::arch::x86_64::Lifter::fpu_load_f80`]); the two are kept bit-for-bit
-/// identical so a host runtime that materialises guest x87 state links against
-/// exactly the same conversion the lifted code uses. Exact for zero and normal
-/// values within the `f64` exponent range; denormals flush to zero and
-/// out-of-range exponents wrap (the extra range/precision of 80-bit
-/// `long double` is not representable in `f64`).
+///
+/// A convenience round-tripper for host runtimes that need to view a guest x87
+/// register as an `f64`. It is exact for zero and for normal values within
+/// the `f64` exponent range (and round-trips with [`f64_bits_to_f80`]), but it
+/// truncates the significand and flushes denormals to zero rather than
+/// rounding.
+///
+/// It is therefore *not* identical to the narrowing the lifter emits for
+/// `FST m32/m64`, which uses the precise softfloat path
+/// ([`crate::arch::x86_64::Lifter::f80_to_f64`]) with round-to-nearest-even and
+/// full subnormal handling. Use this only for interop/inspection, not to
+/// reproduce lifted `FST` results bit-for-bit.
 #[inline]
 pub fn f80_to_f64_bits(mantissa: u64, sign_exp: u16) -> u64 {
     let sign = ((sign_exp >> 15) & 1) as u64;
     if mantissa == 0 {
-        // ±0 (also the encoding produced for flushed/true zeros).
+        // +=0 (also the encoding produced for flushed/true zeros).
         return sign << 63;
     }
     let exp80 = (sign_exp & 0x7FFF) as u64;
@@ -118,8 +123,10 @@ pub fn f80_to_f64_bits(mantissa: u64, sign_exp: u16) -> u64 {
 /// returning `(mantissa, sign_exp)` in the same layout [`f80_to_f64_bits`]
 /// consumes.
 ///
-/// Pure-Rust twin of the lifter's `FSTP m80`
-/// ([`crate::arch::x86_64::Lifter::fpu_store_f80`]); kept bit-for-bit identical.
+/// `f64` is a strict subset of the 80-bit format, so this widening is **exact**
+/// for every finite `f64` except denormals, which are flushed to zero. It is
+/// used at lift time by `FLDZ`/`FLD1`/`FLDPI` to encode their (normal, in-range)
+/// constants, where it agrees with the lifter's general `f64_to_f80` path.
 #[inline]
 pub fn f64_bits_to_f80(bits: u64) -> (u64, u16) {
     let sign = (bits >> 63) & 1;

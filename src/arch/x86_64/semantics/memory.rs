@@ -221,46 +221,101 @@ impl<'a> Lifter<'a> {
             || instruction.has_repne_prefix()
     }
 
-    /// Wrap a single string-operation body in an `RCX`-driven `REP` loop when
+    /// Address size (in bytes: 8/4/2) selected for a string instruction, read
+    /// from the SI/DI operand kind iced assigns. A `0x67` address-size prefix
+    /// switches the pointer/counter registers from RSI/RDI/RCX to their 32- or
+    /// 16-bit sub-registers; the default in long mode is 64-bit.
+    fn string_addr_size(instruction: &Instruction) -> usize {
+        for i in 0..instruction.op_count() {
+            match instruction.op_kind(i) {
+                OpKind::MemorySegRSI | OpKind::MemoryESRDI => return 8,
+                OpKind::MemorySegESI | OpKind::MemoryESEDI => return 4,
+                OpKind::MemorySegSI | OpKind::MemoryESDI => return 2,
+                _ => {}
+            }
+        }
+        8
+    }
+
+    /// The `(counter, source-index, dest-index)` register triple for a string
+    /// op of the given address size: `(RCX, RSI, RDI)` / `(ECX, ESI, EDI)` /
+    /// `(CX, SI, DI)`.
+    fn string_addr_regs(addr_size: usize) -> (Register, Register, Register) {
+        match addr_size {
+            2 => (Register::CX, Register::SI, Register::DI),
+            4 => (Register::ECX, Register::ESI, Register::EDI),
+            _ => (Register::RCX, Register::RSI, Register::RDI),
+        }
+    }
+
+    /// Effective 64-bit linear address held in a string-op index register
+    /// (`RSI`/`ESI`/`SI`, etc.), zero-extended from a narrower address size.
+    fn string_ptr(&mut self, reg: Register) -> crate::Result<Value> {
+        let v = self.get_reg_val(reg)?;
+        Ok(if self.builder.func.dfg.value_type(v) == types::I64 {
+            v
+        } else {
+            self.builder.ins().uextend(types::I64, v)
+        })
+    }
+
+    /// Advance a string-op index register by ±`element_size` (sign per `DF`),
+    /// computed in the register's own width so it wraps within the active
+    /// address size (`set_reg_val` then zero-extends a 32-bit result).
+    fn string_advance(&mut self, reg: Register, element_size: usize) -> crate::Result<()> {
+        let cur = self.get_reg_val(reg)?;
+        let ty = self.builder.func.dfg.value_type(cur);
+        let df = self.builder.use_var(self.state.flags[&X86Flag::Direction]);
+        let pos = self.builder.ins().iconst(ty, element_size as i64);
+        let neg = self.builder.ins().iconst(ty, -(element_size as i64));
+        let df_set = self.builder.ins().icmp_imm(IntCC::NotEqual, df, 0);
+        let delta = self.builder.ins().select(df_set, neg, pos);
+        let new = self.builder.ins().iadd(cur, delta);
+        self.set_reg_val(reg, new)
+    }
+
+    /// Wrap a single string-operation body in a counter-driven `REP` loop when
     /// the instruction has a repeat prefix; otherwise emit the body once.
     ///
     /// The emitted shape for a repeated op is:
     /// ```text
-    ///   header:  if RCX == 0 { goto done }        (RCX is unsigned)
-    ///   body:    <one element>; RCX -= 1
-    ///            if RCX != 0 { goto body } else { goto done }
+    ///   header:  if count == 0 { goto done }      (count is unsigned)
+    ///   body:    <one element>; count -= 1
+    ///            if count != 0 { goto body } else { goto done }
     ///   done:    ...
     /// ```
-    /// which matches `REP`'s "execute RCX times, testing the count *before*
-    /// each iteration" semantics (RCX == 0 performs zero iterations). The
-    /// address size is assumed 64-bit (RCX/RSI/RDI), consistent with the rest
-    /// of the string-op lowering.
+    /// which matches `REP`'s "execute count times, testing the count *before*
+    /// each iteration" semantics (count == 0 performs zero iterations). The
+    /// counter register (`RCX`/`ECX`/`CX`) tracks the instruction's address size.
+    /// The body receives `(element_size, addr_size)`.
     fn emit_string_op(
         &mut self,
         instruction: &Instruction,
         size: usize,
-        body: fn(&mut Self, usize) -> crate::Result<()>,
+        body: fn(&mut Self, usize, usize) -> crate::Result<()>,
     ) -> crate::Result<()> {
+        let addr_size = Self::string_addr_size(instruction);
         if !Self::has_rep_prefix(instruction) {
-            return body(self, size);
+            return body(self, size, addr_size);
         }
+        let (count_reg, _, _) = Self::string_addr_regs(addr_size);
 
         let body_block = self.builder.create_block();
         let done_block = self.builder.create_block();
 
         // header: skip the whole loop when the count is already zero.
-        let count = self.get_reg_val(Register::RCX)?;
+        let count = self.get_reg_val(count_reg)?;
         let is_zero = self.builder.ins().icmp_imm(IntCC::Equal, count, 0);
         self.builder
             .ins()
             .brif(is_zero, done_block, &[], body_block, &[]);
 
-        // body: one element, decrement RCX, loop while it stays nonzero.
+        // body: one element, decrement the counter, loop while it stays nonzero.
         self.builder.switch_to_block(body_block);
-        body(self, size)?;
-        let cur = self.get_reg_val(Register::RCX)?;
+        body(self, size, addr_size)?;
+        let cur = self.get_reg_val(count_reg)?;
         let dec = self.builder.ins().iadd_imm(cur, -1);
-        self.set_reg_val(Register::RCX, dec)?;
+        self.set_reg_val(count_reg, dec)?;
         let nonzero = self.builder.ins().icmp_imm(IntCC::NotEqual, dec, 0);
         self.builder
             .ins()
@@ -293,28 +348,16 @@ impl<'a> Lifter<'a> {
         self.emit_string_op(instruction, 8, Self::emit_movs)
     }
 
-    /// Signed pointer delta applied by a string op for one element of `size`
-    /// bytes: `+size` when `DF=0`, `-size` when `DF=1`.
-    fn string_delta(&mut self, size: usize) -> Value {
-        let df = self.builder.use_var(self.state.flags[&X86Flag::Direction]);
-        let pos = self.builder.ins().iconst(types::I64, size as i64);
-        let neg = self.builder.ins().iconst(types::I64, -(size as i64));
-        let df_set = self.builder.ins().icmp_imm(IntCC::NotEqual, df, 0);
-        self.builder.ins().select(df_set, neg, pos)
-    }
-
-    fn emit_movs(&mut self, size: usize) -> crate::Result<()> {
+    fn emit_movs(&mut self, size: usize, addr_size: usize) -> crate::Result<()> {
         let ty = size_to_type(size);
-        let rsi = self.get_reg_val(Register::RSI)?;
-        let rdi = self.get_reg_val(Register::RDI)?;
-        let val = self.builder.ins().load(ty, MemFlagsData::new(), rsi, 0);
-        self.builder.ins().store(MemFlagsData::new(), val, rdi, 0);
+        let (_, si, di) = Self::string_addr_regs(addr_size);
+        let sptr = self.string_ptr(si)?;
+        let val = self.builder.ins().load(ty, MemFlagsData::new(), sptr, 0);
+        let dptr = self.string_ptr(di)?;
+        self.builder.ins().store(MemFlagsData::new(), val, dptr, 0);
         // DF=0: increment both pointers; DF=1: decrement.
-        let delta = self.string_delta(size);
-        let new_rsi = self.builder.ins().iadd(rsi, delta);
-        let new_rdi = self.builder.ins().iadd(rdi, delta);
-        self.set_reg_val(Register::RSI, new_rsi)?;
-        self.set_reg_val(Register::RDI, new_rdi)?;
+        self.string_advance(si, size)?;
+        self.string_advance(di, size)?;
         Ok(())
     }
 
@@ -349,13 +392,12 @@ impl<'a> Lifter<'a> {
         self.emit_string_op(instruction, 8, Self::emit_stos)
     }
 
-    fn emit_stos(&mut self, size: usize) -> crate::Result<()> {
-        let rdi = self.get_reg_val(Register::RDI)?;
+    fn emit_stos(&mut self, size: usize, addr_size: usize) -> crate::Result<()> {
+        let (_, _, di) = Self::string_addr_regs(addr_size);
+        let dptr = self.string_ptr(di)?;
         let val = self.get_reg_val(Self::string_acc_reg(size))?;
-        self.builder.ins().store(MemFlagsData::new(), val, rdi, 0);
-        let delta = self.string_delta(size);
-        let new_rdi = self.builder.ins().iadd(rdi, delta);
-        self.set_reg_val(Register::RDI, new_rdi)?;
+        self.builder.ins().store(MemFlagsData::new(), val, dptr, 0);
+        self.string_advance(di, size)?;
         Ok(())
     }
 
@@ -373,14 +415,13 @@ impl<'a> Lifter<'a> {
         self.emit_string_op(instruction, 8, Self::emit_lods)
     }
 
-    fn emit_lods(&mut self, size: usize) -> crate::Result<()> {
+    fn emit_lods(&mut self, size: usize, addr_size: usize) -> crate::Result<()> {
         let ty = size_to_type(size);
-        let rsi = self.get_reg_val(Register::RSI)?;
-        let val = self.builder.ins().load(ty, MemFlagsData::new(), rsi, 0);
+        let (_, si, _) = Self::string_addr_regs(addr_size);
+        let sptr = self.string_ptr(si)?;
+        let val = self.builder.ins().load(ty, MemFlagsData::new(), sptr, 0);
         self.set_reg_val(Self::string_acc_reg(size), val)?;
-        let delta = self.string_delta(size);
-        let new_rsi = self.builder.ins().iadd(rsi, delta);
-        self.set_reg_val(Register::RSI, new_rsi)?;
+        self.string_advance(si, size)?;
         Ok(())
     }
 

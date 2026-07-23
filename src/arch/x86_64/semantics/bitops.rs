@@ -1,6 +1,6 @@
 use crate::MicroliftError;
 use crate::lifter::{Lifter, X86Flag};
-use crate::arch::x86_64::semantics::helpers::size_to_type;
+use crate::arch::x86_64::semantics::helpers::{get_base_reg_64, size_to_type};
 use cranelift::prelude::*;
 use iced_x86::{Instruction, OpKind, Register};
 
@@ -562,6 +562,68 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
+    pub(super) fn handle_rcl(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let size = self.operand_size(instruction, 0)?;
+        let ty = size_to_type(size);
+        let n = (size * 8) as i64;
+
+        // Working type, at least N+2 bits wide so no shift reaches its width.
+        let work_ty = match size {
+            1 => types::I16,
+            2 => types::I32,
+            4 => types::I64,
+            8 => types::I128,
+            _ => {
+                return Err(MicroliftError::UnsupportedInstruction {
+                    mnemonic: format!("rcl-size-{}", size),
+                });
+            }
+        };
+
+        let val = self.read_operand(instruction, 0, size)?;
+        let cf = self.builder.use_var(self.state.flags[&X86Flag::Carry]);
+        // Masked count (5/6 bits) in the operand type.
+        let count = self.shift_count(instruction, ty)?;
+
+        // Promote everything into the wider working type.
+        let xval = {
+            let v = self.builder.ins().uextend(work_ty, val);
+            let cfw = self.builder.ins().uextend(work_ty, cf);
+            let cf_hi = self.builder.ins().ishl_imm(cfw, n);
+            self.builder.ins().bor(v, cf_hi)
+        };
+        let count_w = self.builder.ins().uextend(work_ty, count);
+
+        // c = count mod (N+1)  (in [0, N]). For 32/64-bit operands the 5/6-bit
+        // mask already guarantees count < N+1, so the modulo is a no-op there -
+        // which is fortunate, since the backend has no `urem.i128`.
+        let np1 = self.wide_const(work_ty, n + 1);
+        let c = if size <= 2 {
+            self.builder.ins().urem(count_w, np1)
+        } else {
+            count_w
+        };
+
+        // rotated = (x << c) | (x >> (N + 1 - c))
+        let np1_minus_c = self.builder.ins().isub(np1, c);
+        let t_left = self.builder.ins().ishl(xval, c);
+        let t_right = self.builder.ins().ushr(xval, np1_minus_c);
+        let rotated = self.builder.ins().bor(t_left, t_right);
+
+        // dst' = low N bits of the rotated value.
+        let result = self.builder.ins().ireduce(ty, rotated);
+        self.write_operand(instruction, 0, result)?;
+
+        // CF' = bit N of the rotated value. This is also correct for c == 0
+        // (a masked count of 0), where bit N still holds the original CF.
+        let n_w = self.wide_const(work_ty, n);
+        let cf_shifted = self.builder.ins().ushr(rotated, n_w);
+        let one_w = self.wide_const(work_ty, 1);
+        let cf_bit = self.builder.ins().band(cf_shifted, one_w);
+        self.set_flag(X86Flag::Carry, cf_bit)?;
+        Ok(())
+    }
+
     /// Resolve the shift count for a double-shift instruction (SHLD/SHRD).
     ///
     /// The count is op2: either an `imm8` or the `CL` register, masked to
@@ -828,11 +890,33 @@ impl<'a> Lifter<'a> {
         // architecturally undefined on Intel but left unchanged on AMD (and,
         // in practice, on modern Intel too); code in the wild relies on the
         // dest-unchanged behaviour, so model that.
-        let dst_orig = self.read_operand(instruction, 0, size)?;
         let ctz = self.builder.ins().ctz(src);
-        let result = self.builder.ins().select(zf, dst_orig, ctz);
+        self.write_bit_scan_result(instruction, ctz, zf)
+    }
+
+    /// Write a BSF/BSR result (`result`, in the operand type) to the register
+    /// destination, leaving the entire 64-bit register unchanged when
+    /// `keep_old` (ZF, i.e. source was zero) is set.
+    ///
+    /// A plain `select` at the operand width followed by a normal write would
+    /// zero the upper 32 bits of a 64-bit register for a 32-bit destination
+    /// (the x86-64 write rule), whereas the source-zero case must leave the
+    /// register truly untouched. Selecting at full register width preserves it.
+    fn write_bit_scan_result(
+        &mut self,
+        instruction: &Instruction,
+        result: Value,
+        keep_old: Value,
+    ) -> crate::Result<()> {
+        let dst_reg = instruction.op0_register();
+        let base_reg = get_base_reg_64(dst_reg);
+        // Snapshot the full register, apply the normal (extending) write for the
+        // computed result, then pick between the two at 64-bit width.
+        let old_full = self.get_reg_val(base_reg)?;
         self.write_operand(instruction, 0, result)?;
-        Ok(())
+        let new_full = self.get_reg_val(base_reg)?;
+        let selected = self.builder.ins().select(keep_old, old_full, new_full);
+        self.set_reg_val(base_reg, selected)
     }
 
     /// BSWAP - reverse byte order of a 32- or 64-bit register.
@@ -870,15 +954,12 @@ impl<'a> Lifter<'a> {
         self.set_flag(X86Flag::Zero, zf)?;
         // BSR: index of highest set bit = (size*8-1) - clz(src). For src == 0
         // leave the destination unchanged (see handle_bsf).
-        let dst_orig = self.read_operand(instruction, 0, size)?;
         let clz = self.builder.ins().clz(src);
         let bit_width = self
             .builder
             .ins()
             .iconst(size_to_type(size), (size * 8 - 1) as i64);
         let idx = self.builder.ins().isub(bit_width, clz);
-        let result = self.builder.ins().select(zf, dst_orig, idx);
-        self.write_operand(instruction, 0, result)?;
-        Ok(())
+        self.write_bit_scan_result(instruction, idx, zf)
     }
 }

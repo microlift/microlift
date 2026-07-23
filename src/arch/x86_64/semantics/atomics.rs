@@ -336,37 +336,61 @@ impl<'a> Lifter<'a> {
 
     /// LOCK NEG [mem]: atomically negate memory.
     ///
-    /// NEG via CAS-loop would be fully atomic but complex to express in SSA.
-    /// Instead we emit an `atomic_load` + compute + `atomic_store`, which
-    /// provides sequentially-consistent ordering even if the RMW isn't fused
-    /// into a single hardware transaction.  LOCK NEG is vanishingly rare in
-    /// real code so this is an acceptable trade-off for a JIT lifter.
+    /// `NEG` has no direct atomic-RMW opcode, so it is lowered as a
+    /// compare-and-swap retry loop: load the current value, compute `0 - value`,
+    /// and `atomic_cas` it back; on contention (the observed value changed) the
+    /// loop retries with the fresh value. The flag update uses the value that
+    /// was actually swapped, matching `NEG`'s "flags as if `0 - dst`" semantics.
     fn handle_lock_neg(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let size = self.operand_size(instruction, 0)?;
         let ty = size_to_type(size);
         let ptr = self.get_mem_ptr(instruction, 0)?;
-        let old = self.builder.ins().atomic_load(ty, MemFlagsData::new(), ptr);
+
+        // Blocks carry the loop state as explicit parameters (no `Variable`s), so
+        // they need no manual sealing beyond the engine's final `seal_all_blocks`.
+        let loop_b = self.builder.create_block();
+        self.builder.append_block_param(loop_b, ty); // observed current value
+        let done_b = self.builder.create_block();
+        self.builder.append_block_param(done_b, ty); // value that was swapped out
+
+        let init = self.builder.ins().atomic_load(ty, MemFlagsData::new(), ptr);
+        self.builder.ins().jump(loop_b, &[init.into()]);
+
+        self.builder.switch_to_block(loop_b);
+        let cur = self.builder.block_params(loop_b)[0];
         let zero = self.builder.ins().iconst(ty, 0);
-        let result = self.builder.ins().isub(zero, old);
+        let result = self.builder.ins().isub(zero, cur);
+        let observed = self
+            .builder
+            .ins()
+            .atomic_cas(MemFlagsData::new(), ptr, cur, result);
+        let swapped = self.builder.ins().icmp(IntCC::Equal, observed, cur);
         self.builder
             .ins()
-            .atomic_store(MemFlagsData::new(), result, ptr);
+            .brif(swapped, done_b, &[cur.into()], loop_b, &[observed.into()]);
+        self.builder.seal_block(loop_b);
+
+        self.builder.switch_to_block(done_b);
+        self.builder.seal_block(done_b);
+        let old = self.builder.block_params(done_b)[0];
+        let zero = self.builder.ins().iconst(ty, 0);
+        let result = self.builder.ins().isub(zero, old);
         self.update_flags_sub(zero, old, result, size)?;
         Ok(())
     }
 
     /// LOCK NOT [mem]: atomically bitwise-NOT memory.
+    ///
+    /// `~x == x ^ -1`, so this fuses into a single atomic XOR-with-all-ones.
+    /// `NOT` affects no flags, so the returned old value is discarded.
     fn handle_lock_not(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let size = self.operand_size(instruction, 0)?;
         let ty = size_to_type(size);
         let ptr = self.get_mem_ptr(instruction, 0)?;
-        let old = self.builder.ins().atomic_load(ty, MemFlagsData::new(), ptr);
         let all_ones = self.builder.ins().iconst(ty, -1);
-        let result = self.builder.ins().bxor(old, all_ones);
         self.builder
             .ins()
-            .atomic_store(MemFlagsData::new(), result, ptr);
-        // NOT does not affect flags.
+            .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::Xor, ptr, all_ones);
         Ok(())
     }
 
