@@ -497,3 +497,62 @@ fn test_lodsq() {
     assert_eq!(ctx.rax, 0xDEADBEEFCAFEBABEu64);
     assert_eq!(ctx.rsi, mem_ptr + 8);
 }
+
+/// A direct `CALL` to a callee inside the lifted region, whose `RET` must land
+/// back on the instruction after the call.
+///
+/// The return address is only reachable if it was marked a block leader during
+/// discovery: `RET` dispatches through a switch over known blocks, so a missing
+/// leader turns the return into an `UnknownJump` VM exit instead. Regression
+/// test for exactly that (guest-to-guest calls used to only register the
+/// *callee* as a leader).
+#[test]
+fn test_in_region_call_returns_to_resume_point() {
+    #[rustfmt::skip]
+    let bytes = [
+        // 0x1000: call +5 -> 0x100A
+        0xE8, 0x05, 0x00, 0x00, 0x00,
+        // 0x1005: add rax, 1   (the resume point)
+        0x48, 0x83, 0xC0, 0x01,
+        // 0x1009: ret          (back to the exit trampoline)
+        0xC3,
+        // 0x100A: mov rax, 41  (the callee)
+        0x48, 0xC7, 0xC0, 0x29, 0x00, 0x00, 0x00,
+        // 0x1011: ret          (back to 0x1005)
+        0xC3,
+    ];
+
+    let out = LiftTest::new(&bytes).run();
+    assert_eq!(out.exit, ExitReason::Return, "call/ret must halt cleanly");
+    assert_eq!(out.ctx.rax, 42, "callee ran and returned to the resume point");
+    // Both frames were popped: the guest's stack is exactly balanced.
+    assert_eq!(out.ctx.rsp, out.initial_rsp + 8);
+}
+
+/// Two levels deep, with the inner callee placed before the outer one, so the
+/// resume points are not in address order.
+#[test]
+fn test_nested_in_region_calls() {
+    #[rustfmt::skip]
+    let bytes = [
+        // 0x1000: call +10 -> 0x100F  (outer)
+        0xE8, 0x0A, 0x00, 0x00, 0x00,
+        // 0x1005: add rax, 100
+        0x48, 0x83, 0xC0, 0x64,
+        // 0x1009: ret
+        0xC3,
+        // 0x100A: inner: add rax, 3 ; ret
+        0x48, 0x83, 0xC0, 0x03,
+        0xC3,
+        // 0x100F: outer: add rax, 10 ; call -14 -> 0x100A ; add rax, 1 ; ret
+        0x48, 0x83, 0xC0, 0x0A,
+        0xE8, 0xF2, 0xFF, 0xFF, 0xFF,
+        0x48, 0x83, 0xC0, 0x01,
+        0xC3,
+    ];
+
+    let out = LiftTest::new(&bytes).run();
+    assert_eq!(out.exit, ExitReason::Return);
+    assert_eq!(out.ctx.rax, 114, "10 + 3 + 1 + 100");
+    assert_eq!(out.ctx.rsp, out.initial_rsp + 8);
+}

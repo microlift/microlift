@@ -605,25 +605,23 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                     work.push(next);
                 }
                 ControlFlowKind::Call { static_target } => {
-                    match static_target {
-                        Some(target) if self.import_vas.contains(&target) => {
-                            // Import call: intercepted inline. The resume point
-                            // is a leader so slow-call exits can route back.
-                            leaders.insert(next);
-                        }
-                        Some(target) if target >= self.lift_base && target < self.lift_end => {
+                    if let Some(target) = static_target {
+                        if !self.import_vas.contains(&target)
+                            && target >= self.lift_base
+                            && target < self.lift_end
+                        {
                             // In-region call: the callee is a block leader.
                             leaders.insert(target);
                             work.push(target);
                         }
-                        _ => {
-                            // Out-of-region / indirect direct call: the resume
-                            // point is a leader so the dispatch switch can route
-                            // back after the runtime handles the call.
-                            leaders.insert(next);
-                        }
                     }
-                    // A call returns to the following instruction.
+                    // A call returns to the following instruction, and that
+                    // resume point is always a block leader - whoever completes
+                    // the call routes back to it through a dispatch switch. For
+                    // an import or out-of-region call that is the exit/resume
+                    // path; for an in-region callee it is the `RET` dispatch,
+                    // which can only reach addresses that have a block.
+                    leaders.insert(next);
                     work.push(next);
                 }
                 ControlFlowKind::Ret | ControlFlowKind::IndirectBranch => {}
