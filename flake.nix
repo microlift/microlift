@@ -25,11 +25,16 @@
         devShells.default = pkgs.mkShell {
           nativeBuildInputs = [
             pkgs.pkg-config
+            # The `unicorn-oracle` feature builds Unicorn's vendored C core from
+            # source via its `unicorn-engine-sys` build script (cmake + ninja).
+            pkgs.cmake
+            pkgs.ninja
           ];
 
           buildInputs = [
             rustToolchain
             pkgs.capstone  # required for --features disasm
+            pkgs.unicorn   # optional: system libunicorn for --features unicorn-oracle
           ] ++ pkgs.lib.optionals (system != "x86_64-linux") [
             crossGcc
           ];
