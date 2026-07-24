@@ -23,6 +23,7 @@ use cranelift_codegen::settings::{self, Configurable};
 
 pub mod oracle;
 pub mod rng;
+pub mod trampoline;
 
 pub const EXIT_TRAMPOLINE: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 

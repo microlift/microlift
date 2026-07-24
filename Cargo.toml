@@ -44,6 +44,10 @@ name = "oracle_tests"
 required-features = ["testkit"]
 
 [[test]]
+name = "elf_import_test"
+required-features = ["testkit"]
+
+[[test]]
 name = "unicorn_oracle_tests"
 required-features = ["unicorn-oracle"]
 

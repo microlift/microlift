@@ -1,9 +1,24 @@
-use cranelift::prelude::*;
-use cranelift_codegen::ir::{Function, UserFuncName};
-use microlift::backend::CraneliftBackend;
-use microlift::context::{ExitReason, RegisterContext};
-use microlift::lifter::{Lifter, LifterConfig};
-use microlift::os::get_host_calling_conv;
+//! Real-compiler ELF functions driven through the testkit's import-trampoline
+//! system.
+//!
+//! Each case compiles a small C function to an x86-64 shared object with a real
+//! toolchain, lifts the function's bytes straight out of the `.text`, and traps
+//! its PLT entries back to host implementations of `strlen`/`strcmp`/`memcpy`
+//! through a [`ImportTable`]. That table is engine-neutral: the *same* handler
+//! services Microlift's `ImportedFunctionCall` VM exits and Unicorn's stub
+//! hooks, so under `--features unicorn-oracle` every case additionally asserts
+//! the two engines end in the same architectural state.
+//!
+//! Run: `cargo test --features testkit --test elf_import_test`
+//!      `cargo test --features unicorn-oracle --test elf_import_test`
+//!
+//! Skipped (with a note) when no x86-64 ELF compiler is on `PATH`; set
+//! `MICROLIFT_X86_64_ELF_CC` to point at one.
+
+#![cfg(feature = "testkit")]
+
+use microlift::testkit::oracle::*;
+use microlift::testkit::trampoline::*;
 use object::{Object, ObjectSection, ObjectSymbol};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -46,6 +61,16 @@ unsigned long memcpy_and_checksum(unsigned char *dst, const unsigned char *src,
     return h;
 }
 "#;
+
+/// Instruction budget for the emulated (Unicorn) side; the JIT ignores it.
+const BUDGET: u64 = 1 << 20;
+
+/// Both engines run on one shared [`HostStack`], so `rsp` itself is comparable.
+#[cfg(feature = "unicorn-oracle")]
+const DIFF: DiffOptions = DiffOptions {
+    compare_rsp: true,
+    compare_rip: false,
+};
 
 unsafe extern "C" fn host_strlen(s: *const u8) -> u64 {
     let mut n = 0u64;
@@ -128,7 +153,7 @@ fn compile_x86_64_elf(source: &str, basename: &str) -> Option<Vec<u8>> {
             "-fPIC",
             "-O0",
             "-fno-stack-protector",
-            "-fno-builtin",        // force real calls to strlen/strcmp/memcpy
+            "-fno-builtin",         // force real calls to strlen/strcmp/memcpy
             "-fcf-protection=none", // standard .plt layout (no .plt.sec / IBT)
             "-D_FORTIFY_SOURCE=0",
             "-Wl,-z,lazy",
@@ -196,177 +221,266 @@ fn find_plt_entry_va(elf_bytes: &[u8], import_name: &str) -> Option<u64> {
     None
 }
 
-const EXIT_TRAMPOLINE: u64 = 0xFFFF_FFFF_FFFF_FFFF;
-
-fn fresh_stack(stack: &mut [u64]) -> u64 {
-    let top = stack.as_mut_ptr() as u64 + (stack.len() as u64) * 8;
-    let rsp = top - 8;
-    unsafe { *(rsp as *mut u64) = EXIT_TRAMPOLINE };
-    rsp
+/// A lifted function: its bytes, the VA they were loaded at, and the PLT entries
+/// it calls.
+struct ElfFunction {
+    bytes: Vec<u8>,
+    va: u64,
 }
 
-fn run_guest_with_slow_imports(
-    func_bytes: &[u8],
-    func_va: u64,
-    slow_imports: &[u64],
-    mut ctx: RegisterContext,
-    mut service: impl FnMut(u64, &mut RegisterContext),
-) -> RegisterContext {
-    let mut config = LifterConfig::default();
-    for &va in slow_imports {
-        config.register_slow_import(va);
-    }
+fn load_function(source: &str, basename: &str, symbol: &str) -> Option<(ElfFunction, Vec<u8>)> {
+    let elf = compile_x86_64_elf(source, basename)?;
+    let (va, size) = elf_symbol_va_size(&elf, symbol).expect("function symbol");
+    let off = elf_va_to_file_offset(&elf, va).expect("VA->file offset");
+    let bytes = elf[off..off + size as usize].to_vec();
+    Some((ElfFunction { bytes, va }, elf))
+}
 
-    let mut func = Function::with_name_signature(
-        UserFuncName::user(0, 0),
-        Signature::new(get_host_calling_conv()),
+/// Run `f` on the Microlift JIT with `imports` trapped to `handler`, asserting a
+/// clean halt.
+fn run_microlift(
+    f: &ElfFunction,
+    init: &CpuState,
+    imports: &[u64],
+    handler: &mut dyn FnMut(u64, &mut CpuState),
+) -> CpuState {
+    let mut table = ImportTable::new(imports.iter().copied(), handler);
+    let out = MicroliftOracle::default().run_with_imports(
+        &f.bytes,
+        f.va,
+        init,
+        &[],
+        BUDGET,
+        &mut table,
     );
-    func.signature.params.push(AbiParam::new(types::I64));
-    let mut func_ctx = cranelift_frontend::FunctionBuilderContext::new();
-    let builder = cranelift_frontend::FunctionBuilder::new(&mut func, &mut func_ctx);
-    let mut lifter = Lifter::with_config(builder, config);
-    lifter.lift(func_bytes, func_va).expect("lifting failed");
-    drop(lifter);
+    assert!(
+        out.is_halted(),
+        "microlift did not reach a clean halt: {out:?}"
+    );
+    *out.state()
+}
 
-    let mut flag_builder = settings::builder();
-    flag_builder.set("opt_level", "speed").unwrap();
-    let mut backend =
-        CraneliftBackend::with_flags(settings::Flags::new(flag_builder)).expect("backend init");
-    let code_ptr = backend.compile(func).expect("JIT compilation failed");
-    let f: fn(*mut RegisterContext) = unsafe { std::mem::transmute(code_ptr) };
+/// Same program under Unicorn, through the stub-page trampolines.
+#[cfg(feature = "unicorn-oracle")]
+fn run_unicorn(
+    f: &ElfFunction,
+    init: &CpuState,
+    imports: &[u64],
+    handler: &mut dyn FnMut(u64, &mut CpuState),
+) -> CpuState {
+    use microlift::testkit::oracle::unicorn::UnicornOracle;
 
-    loop {
-        f(&mut ctx);
-        if ctx.exit_reason == ExitReason::Return as u32 {
-            break;
-        }
-        assert_eq!(
-            ctx.exit_reason,
-            ExitReason::ImportedFunctionCall as u32,
-            "unexpected exit reason {} (rip={:#x}, imported_va={:#x})",
-            ctx.exit_reason,
-            ctx.rip,
-            ctx.imported_function_va,
-        );
-        let va = ctx.imported_function_va;
-        service(va, &mut ctx);
-    }
-    ctx
+    let mut table = ImportTable::new(imports.iter().copied(), handler);
+    let out =
+        UnicornOracle::new().run_with_imports(&f.bytes, f.va, init, &[], BUDGET, &mut table);
+    assert!(
+        out.is_halted(),
+        "unicorn did not reach a clean halt: {out:?}"
+    );
+    *out.state()
 }
 
 #[test]
 fn test_elf_process_string() {
-    let Some(elf) = compile_x86_64_elf(PROCESS_STRING_SOURCE, "process_string") else {
+    let Some((func, elf)) = load_function(PROCESS_STRING_SOURCE, "process_string", "process_string")
+    else {
         eprintln!("skipping test_elf_process_string: no x86-64 ELF compiler on PATH");
         return;
     };
-
-    let (func_va, func_size) =
-        elf_symbol_va_size(&elf, "process_string").expect("process_string symbol");
-    let off = elf_va_to_file_offset(&elf, func_va).expect("VA->file offset");
-    let func_bytes = &elf[off..off + func_size as usize];
 
     let strlen_plt = find_plt_entry_va(&elf, "strlen").expect("strlen PLT entry");
     let strcmp_plt = find_plt_entry_va(&elf, "strcmp").expect("strcmp PLT entry");
     let imports = [strlen_plt, strcmp_plt];
 
-    let service = |va: u64, ctx: &mut RegisterContext| {
-        if va == strlen_plt {
-            ctx.rax = unsafe { host_strlen(ctx.rdi as *const u8) };
-        } else if va == strcmp_plt {
-            ctx.rax =
-                unsafe { host_strcmp(ctx.rdi as *const u8, ctx.rsi as *const u8) } as i64 as u64;
-        } else {
-            panic!("unexpected ImportedFunctionCall VA: {va:#x}");
+    // The handler is a pure function of the guest state, so both engines can be
+    // handed a freshly built copy of it.
+    let make_handler = || {
+        move |va: u64, st: &mut CpuState| {
+            if va == strlen_plt {
+                st.gpr[gpr::RAX] = unsafe { host_strlen(st.gpr[gpr::RDI] as *const u8) };
+            } else if va == strcmp_plt {
+                st.gpr[gpr::RAX] = unsafe {
+                    host_strcmp(st.gpr[gpr::RDI] as *const u8, st.gpr[gpr::RSI] as *const u8)
+                } as i64 as u64;
+            } else {
+                panic!("unexpected imported call VA: {va:#x}");
+            }
         }
     };
 
-    // "hello" -> len 5 -> copy "iello" -> strcmp("hello","iello") < 0
+    // "hello" -> len 5 -> copy "iello" -> strcmp("hello","iello") < 0.
     let test_string = b"hello\0";
-    let mut stack = vec![0u64; 256];
-    let rsp = fresh_stack(&mut stack);
-    let mut ctx = RegisterContext::default();
-    ctx.rsp = rsp;
-    ctx.rdi = test_string.as_ptr() as u64;
-    ctx.image_base = func_va;
-    ctx.rip = func_va;
-    let out = run_guest_with_slow_imports(func_bytes, func_va, &imports, ctx, service);
-    assert!(
-        (out.rax as i32) < 0,
-        "expected strcmp(\"hello\",\"iello\") < 0, got {}",
-        out.rax as i32
-    );
-    let _ = &stack;
+    let stack = HostStack::new(1024);
+    let mut init = CpuState::zeroed();
+    init.gpr[gpr::RSP] = stack.rsp();
+    init.gpr[gpr::RDI] = test_string.as_ptr() as u64;
 
-    // "x" -> len 1 -> early return 0, only strlen called.
+    let ml = run_microlift(&func, &init, &imports, &mut make_handler());
+    assert!(
+        (ml.gpr[gpr::RAX] as i32) < 0,
+        "expected strcmp(\"hello\",\"iello\") < 0, got {}",
+        ml.gpr[gpr::RAX] as i32
+    );
+
+    #[cfg(feature = "unicorn-oracle")]
+    {
+        let uc = run_unicorn(&func, &init, &imports, &mut make_handler());
+        let diff = diff_states(&ml, &uc, DIFF);
+        assert!(diff.is_empty(), "process_string diverged: {diff:?}");
+    }
+
+    // "x" -> len 1 -> early return 0; only strlen is called, on both engines.
     let short = b"x\0";
-    let mut stack2 = vec![0u64; 256];
-    let rsp2 = fresh_stack(&mut stack2);
-    let mut ctx2 = RegisterContext::default();
-    ctx2.rsp = rsp2;
-    ctx2.rdi = short.as_ptr() as u64;
-    ctx2.image_base = func_va;
-    ctx2.rip = func_va;
-    let out2 = run_guest_with_slow_imports(func_bytes, func_va, &imports, ctx2, |va, ctx| {
+    let stack2 = HostStack::new(1024);
+    let mut init2 = CpuState::zeroed();
+    init2.gpr[gpr::RSP] = stack2.rsp();
+    init2.gpr[gpr::RDI] = short.as_ptr() as u64;
+
+    let mut only_strlen = |va: u64, st: &mut CpuState| {
         assert_eq!(va, strlen_plt, "only strlen expected for the short string");
-        ctx.rax = unsafe { host_strlen(ctx.rdi as *const u8) };
-    });
-    assert_eq!(out2.rax as i32, 0, "process_string(\"x\") should return 0");
-    let _ = &stack2;
+        st.gpr[gpr::RAX] = unsafe { host_strlen(st.gpr[gpr::RDI] as *const u8) };
+    };
+    let ml2 = run_microlift(&func, &init2, &imports, &mut only_strlen);
+    assert_eq!(
+        ml2.gpr[gpr::RAX] as i32,
+        0,
+        "process_string(\"x\") should return 0"
+    );
+
+    #[cfg(feature = "unicorn-oracle")]
+    {
+        let uc2 = run_unicorn(&func, &init2, &imports, &mut only_strlen);
+        let diff = diff_states(&ml2, &uc2, DIFF);
+        assert!(diff.is_empty(), "process_string(\"x\") diverged: {diff:?}");
+    }
 }
 
 #[test]
 fn test_elf_memcpy_semantics() {
-    let Some(elf) = compile_x86_64_elf(MEMCPY_SOURCE, "memcpy_checksum") else {
+    let Some((func, elf)) = load_function(MEMCPY_SOURCE, "memcpy_checksum", "memcpy_and_checksum")
+    else {
         eprintln!("skipping test_elf_memcpy_semantics: no x86-64 ELF compiler on PATH");
         return;
     };
 
-    let (func_va, func_size) =
-        elf_symbol_va_size(&elf, "memcpy_and_checksum").expect("memcpy_and_checksum symbol");
-    let off = elf_va_to_file_offset(&elf, func_va).expect("VA->file offset");
-    let func_bytes = &elf[off..off + func_size as usize];
-
     let memcpy_plt = find_plt_entry_va(&elf, "memcpy").expect("memcpy PLT entry");
 
-    let data: [u8; 11] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB];
+    let data: [u8; 11] = [
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB,
+    ];
     let mut dst = [0u8; 11];
     assert_ne!(dst, data, "destination must start different from source");
 
-    let mut stack = vec![0u64; 256];
-    let rsp = fresh_stack(&mut stack);
+    let stack = HostStack::new(1024);
+    let mut init = CpuState::zeroed();
+    init.gpr[gpr::RSP] = stack.rsp();
+    init.gpr[gpr::RDI] = dst.as_mut_ptr() as u64; // dst
+    init.gpr[gpr::RSI] = data.as_ptr() as u64; // src
+    init.gpr[gpr::RDX] = data.len() as u64; // n
 
-    let mut ctx = RegisterContext::default();
-    ctx.rsp = rsp;
-    ctx.rdi = dst.as_mut_ptr() as u64; // dst
-    ctx.rsi = data.as_ptr() as u64; // src
-    ctx.rdx = data.len() as u64; // n
-    ctx.image_base = func_va;
-    ctx.rip = func_va;
-
-    let mut memcpy_calls = 0usize;
-    let mut seen_args: Option<(u64, u64, u64)> = None;
-    let out = run_guest_with_slow_imports(func_bytes, func_va, &[memcpy_plt], ctx, |va, ctx| {
-        assert_eq!(va, memcpy_plt, "only memcpy should be imported");
-        memcpy_calls += 1;
-        seen_args = Some((ctx.rdi, ctx.rsi, ctx.rdx));
-        ctx.rax = unsafe { host_memcpy(ctx.rdi as *mut u8, ctx.rsi as *const u8, ctx.rdx) } as u64;
-    });
-
-    assert_eq!(memcpy_calls, 1, "memcpy must be called exactly once");
-    assert_eq!(
-        seen_args,
-        Some((dst.as_ptr() as u64, data.as_ptr() as u64, data.len() as u64)),
-        "memcpy received the wrong (rdi, rsi, rdx) arguments"
+    let expected_args = (
+        dst.as_ptr() as u64,
+        data.as_ptr() as u64,
+        data.len() as u64,
     );
 
-    assert_eq!(dst, data, "memcpy did not copy the source bytes into dst");
+    // Per-engine bookkeeping: each run records its own calls, so "memcpy is
+    // called exactly once" is asserted for each engine independently.
+    let mut ml_calls: Vec<(u64, u64, u64)> = Vec::new();
+    let handler = |va: u64, st: &mut CpuState| {
+        assert_eq!(va, memcpy_plt, "only memcpy should be imported");
+        st.gpr[gpr::RAX] = unsafe {
+            host_memcpy(
+                st.gpr[gpr::RDI] as *mut u8,
+                st.gpr[gpr::RSI] as *const u8,
+                st.gpr[gpr::RDX],
+            )
+        } as u64;
+    };
 
+    let ml = {
+        let mut recording = |va: u64, st: &mut CpuState| {
+            ml_calls.push((st.gpr[gpr::RDI], st.gpr[gpr::RSI], st.gpr[gpr::RDX]));
+            handler(va, st);
+        };
+        run_microlift(&func, &init, &[memcpy_plt], &mut recording)
+    };
+
+    assert_eq!(ml_calls.len(), 1, "memcpy must be called exactly once");
     assert_eq!(
-        out.rax,
+        ml_calls[0], expected_args,
+        "memcpy received the wrong (rdi, rsi, rdx) arguments"
+    );
+    assert_eq!(dst, data, "memcpy did not copy the source bytes into dst");
+    assert_eq!(
+        ml.gpr[gpr::RAX],
         fnv1a_64(&data),
         "checksum mismatch: return value / callee-saved state not preserved across the call"
     );
 
-    let _ = &stack;
+    #[cfg(feature = "unicorn-oracle")]
+    {
+        // Clear the destination so the emulated run has to re-establish it
+        // through its own trampoline rather than reading Microlift's leftovers.
+        dst = [0u8; 11];
+
+        let mut uc_calls: Vec<(u64, u64, u64)> = Vec::new();
+        let uc = {
+            let mut recording = |va: u64, st: &mut CpuState| {
+                uc_calls.push((st.gpr[gpr::RDI], st.gpr[gpr::RSI], st.gpr[gpr::RDX]));
+                handler(va, st);
+            };
+            run_unicorn(&func, &init, &[memcpy_plt], &mut recording)
+        };
+
+        assert_eq!(uc_calls, ml_calls, "engines disagree on the import calls");
+        assert_eq!(dst, data, "unicorn run did not repopulate dst");
+
+        let diff = diff_states(&ml, &uc, DIFF);
+        assert!(diff.is_empty(), "memcpy_and_checksum diverged: {diff:?}");
+    }
+}
+
+/// The one-line form: [`differential_with_imports`] runs both engines from one
+/// seed with one handler factory and reports their state difference directly.
+#[cfg(feature = "unicorn-oracle")]
+#[test]
+fn test_elf_process_string_differential_helper() {
+    let Some((func, elf)) = load_function(PROCESS_STRING_SOURCE, "process_string", "process_string")
+    else {
+        eprintln!("skipping differential helper test: no x86-64 ELF compiler on PATH");
+        return;
+    };
+
+    let strlen_plt = find_plt_entry_va(&elf, "strlen").expect("strlen PLT entry");
+    let strcmp_plt = find_plt_entry_va(&elf, "strcmp").expect("strcmp PLT entry");
+
+    let test_string = b"microlift\0";
+    let stack = HostStack::new(1024);
+    let mut init = CpuState::zeroed();
+    init.gpr[gpr::RSP] = stack.rsp();
+    init.gpr[gpr::RDI] = test_string.as_ptr() as u64;
+
+    let diff = differential_with_imports(
+        &func.bytes,
+        func.va,
+        &init,
+        BUDGET,
+        DIFF,
+        &[strlen_plt, strcmp_plt],
+        || {
+            move |va: u64, st: &mut CpuState| {
+                if va == strlen_plt {
+                    st.gpr[gpr::RAX] = unsafe { host_strlen(st.gpr[gpr::RDI] as *const u8) };
+                } else {
+                    st.gpr[gpr::RAX] = unsafe {
+                        host_strcmp(st.gpr[gpr::RDI] as *const u8, st.gpr[gpr::RSI] as *const u8)
+                    } as i64 as u64;
+                }
+            }
+        },
+    )
+    .expect("both engines should reach a clean halt");
+
+    assert!(diff.is_empty(), "microlift vs unicorn diverged: {diff:?}");
 }

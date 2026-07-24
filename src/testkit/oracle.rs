@@ -459,8 +459,11 @@ unsafe fn munmap_raw(addr: *mut core::ffi::c_void, len: usize) -> i32 {
 #[cfg(feature = "unicorn-oracle")]
 pub mod unicorn {
     use super::{gpr, CpuOracle, CpuState, MemImage, OracleExit, OracleOutcome};
+    use crate::testkit::trampoline::{ImportOracle, ImportTable};
     use crate::testkit::{DEFAULT_STACK_WORDS, EXIT_TRAMPOLINE};
+    use core::cell::Cell;
     use core::ffi::c_void;
+    use std::rc::Rc;
     use unicorn_engine::{Arch, HookType, Mode, Prot, RegisterX86, Unicorn};
 
     const PAGE: u64 = 0x1000;
@@ -539,6 +542,29 @@ pub mod unicorn {
             Self::default()
         }
 
+        /// Seed the engine's architectural registers from `st`.
+        fn write_state(uc: &mut Unicorn<'_, ()>, st: &CpuState) -> Result<(), unicorn_engine::uc_error> {
+            for (i, &reg) in GPR_REG.iter().enumerate() {
+                uc.reg_write(reg, st.gpr[i])?;
+            }
+            uc.reg_write(RegisterX86::RIP, st.rip)?;
+            uc.reg_write(
+                RegisterX86::EFLAGS,
+                (st.rflags & RFLAGS_MASK) | RFLAGS_RESERVED,
+            )?;
+            // Segment bases, so `fs:`/`gs:`-prefixed accesses hit the same
+            // host-backed TLS buffer Microlift addresses.
+            uc.reg_write(RegisterX86::FS_BASE, st.fs_base)?;
+            uc.reg_write(RegisterX86::GS_BASE, st.gs_base)?;
+            for (i, &reg) in XMM_REG.iter().enumerate() {
+                let mut bytes = [0u8; 16];
+                bytes[0..8].copy_from_slice(&st.xmm[i][0].to_le_bytes());
+                bytes[8..16].copy_from_slice(&st.xmm[i][1].to_le_bytes());
+                uc.reg_write_long(reg, &bytes)?;
+            }
+            Ok(())
+        }
+
         /// Read the diffable architectural state back out of the engine.
         fn snapshot(uc: &Unicorn<'_, ()>) -> CpuState {
             let mut st = CpuState::zeroed();
@@ -560,14 +586,50 @@ pub mod unicorn {
         }
     }
 
-    impl CpuOracle for UnicornOracle {
-        fn run(
+    impl UnicornOracle {
+        /// The engine-side half of the [`ImportTable`] trampoline: for each
+        /// trapped VA, make sure the address is fetchable and break out of
+        /// emulation the moment control reaches it.
+        ///
+        /// The returned cell carries the VA the run stopped at (set by the hook,
+        /// read by [`UnicornOracle::run_impl`]'s service loop). Breaking out -
+        /// rather than redirecting `RIP` from inside the hook - keeps the
+        /// trampoline independent of how Unicorn sequences a code hook against
+        /// the instruction it guards: the service loop simply restarts
+        /// emulation at the address it chose.
+        fn install_import_stubs(
+            uc: &mut Unicorn<'_, ()>,
+            vas: &[u64],
+        ) -> Result<Rc<Cell<Option<u64>>>, unicorn_engine::uc_error> {
+            let pending: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
+            for &va in vas {
+                // A PLT entry usually shares a page with the lifted code, which
+                // is already mapped; only map (and fill) a page we don't have.
+                let mut probe = [0u8; 1];
+                if uc.mem_read(va, &mut probe).is_err() {
+                    uc.mem_map(page_base(va), PAGE, Prot::ALL)?;
+                    // `hlt`. The hook stops emulation before this ever runs; if
+                    // that assumption were to break we want a loud emulator
+                    // fault rather than a silent state divergence.
+                    uc.mem_write(va, &[0xF4])?;
+                }
+                let pending = Rc::clone(&pending);
+                uc.add_code_hook(va, va, move |uc, _addr, _size| {
+                    pending.set(Some(va));
+                    let _ = uc.emu_stop();
+                })?;
+            }
+            Ok(pending)
+        }
+
+        fn run_impl(
             &mut self,
             code: &[u8],
             code_va: u64,
             init: &CpuState,
             _mem: &[MemImage],
             max_insns: u64,
+            mut imports: Option<&mut ImportTable<'_>>,
         ) -> OracleOutcome {
             // A construction/mapping failure is reported as an emulator exit
             // (the state is meaningless) rather than panicking the fuzzer.
@@ -618,6 +680,15 @@ pub mod unicorn {
                 bail!(e);
             }
 
+            let import_vas: Vec<u64> = imports
+                .as_deref()
+                .map(|t| t.vas().to_vec())
+                .unwrap_or_default();
+            let pending = match Self::install_import_stubs(&mut uc, &import_vas) {
+                Ok(p) => p,
+                Err(e) => bail!(e),
+            };
+
             let mut rsp = init.gpr[gpr::RSP];
             let mut scratch_stack: Option<Vec<u64>> = None;
             if rsp == 0 {
@@ -634,41 +705,63 @@ pub mod unicorn {
                 *(rsp as *mut u64) = EXIT_TRAMPOLINE;
             }
 
-            for (i, &reg) in GPR_REG.iter().enumerate() {
-                let v = if i == gpr::RSP { rsp } else { init.gpr[i] };
-                if let Err(e) = uc.reg_write(reg, v) {
-                    let _ = scratch_stack;
-                    bail!(e);
-                }
-            }
-            if let Err(e) = uc.reg_write(RegisterX86::RIP, code_va) {
+            let mut seed = *init;
+            seed.gpr[gpr::RSP] = rsp;
+            seed.rip = code_va;
+            if let Err(e) = Self::write_state(&mut uc, &seed) {
+                let _ = scratch_stack;
                 bail!(e);
-            }
-            if let Err(e) = uc.reg_write(
-                RegisterX86::EFLAGS,
-                (init.rflags & RFLAGS_MASK) | RFLAGS_RESERVED,
-            ) {
-                bail!(e);
-            }
-            // Segment bases, so `fs:`/`gs:`-prefixed accesses hit the same
-            // host-backed TLS buffer Microlift addresses.
-            if let Err(e) = uc.reg_write(RegisterX86::FS_BASE, init.fs_base) {
-                bail!(e);
-            }
-            if let Err(e) = uc.reg_write(RegisterX86::GS_BASE, init.gs_base) {
-                bail!(e);
-            }
-            for (i, &reg) in XMM_REG.iter().enumerate() {
-                let mut bytes = [0u8; 16];
-                bytes[0..8].copy_from_slice(&init.xmm[i][0].to_le_bytes());
-                bytes[8..16].copy_from_slice(&init.xmm[i][1].to_le_bytes());
-                if let Err(e) = uc.reg_write_long(reg, &bytes) {
-                    bail!(e);
-                }
             }
 
             let count = max_insns as usize;
-            let result = uc.emu_start(code_va, EXIT_TRAMPOLINE, 0, count);
+            let mut pc = code_va;
+            let result = loop {
+                pending.set(None);
+                let result = uc.emu_start(pc, EXIT_TRAMPOLINE, 0, count);
+                if result.is_err() {
+                    break result;
+                }
+                // No pending trampoline: the run reached the exit trampoline (or
+                // exhausted its instruction budget) on its own.
+                let Some(va) = pending.get() else {
+                    break Ok(());
+                };
+                let Some(table) = imports.as_deref_mut() else {
+                    break Ok(());
+                };
+
+                // Present the handler with the same view Microlift's
+                // `ImportedFunctionCall` exit gives it: arguments in place and
+                // `rsp` already past the return address the `CALL` pushed
+                // (Microlift never pushes one).
+                let mut state = Self::snapshot(&uc);
+                let sp = state.gpr[gpr::RSP];
+                let mut ret_bytes = [0u8; 8];
+                if let Err(e) = uc.mem_read(sp, &mut ret_bytes) {
+                    bail!(e);
+                }
+                let ret = u64::from_le_bytes(ret_bytes);
+                state.gpr[gpr::RSP] = sp.wrapping_add(8);
+                state.rip = ret;
+
+                if !table.service(va, &mut state) {
+                    return OracleOutcome::Exit {
+                        state,
+                        reason: OracleExit::NonDiffable(
+                            crate::context::ExitReason::ImportedFunctionCall,
+                        ),
+                    };
+                }
+                if let Err(e) = Self::write_state(&mut uc, &state) {
+                    bail!(e);
+                }
+                // An import invoked as the outermost frame returns straight to
+                // the trampoline; there is nothing left to emulate.
+                if ret == EXIT_TRAMPOLINE {
+                    break Ok(());
+                }
+                pc = ret;
+            };
 
             let state = Self::snapshot(&uc);
             // Keep the scratch stack mapped through the read-back.
@@ -681,12 +774,38 @@ pub mod unicorn {
                 },
             }
         }
+    }
+
+    impl CpuOracle for UnicornOracle {
+        fn run(
+            &mut self,
+            code: &[u8],
+            code_va: u64,
+            init: &CpuState,
+            mem: &[MemImage],
+            max_insns: u64,
+        ) -> OracleOutcome {
+            self.run_impl(code, code_va, init, mem, max_insns, None)
+        }
 
         fn name(&self) -> &'static str {
             "unicorn"
         }
     }
 
+    impl ImportOracle for UnicornOracle {
+        fn run_with_imports(
+            &mut self,
+            code: &[u8],
+            code_va: u64,
+            init: &CpuState,
+            mem: &[MemImage],
+            max_insns: u64,
+            imports: &mut ImportTable<'_>,
+        ) -> OracleOutcome {
+            self.run_impl(code, code_va, init, mem, max_insns, Some(imports))
+        }
+    }
 
     pub fn differential_unicorn(
         code: &[u8],
