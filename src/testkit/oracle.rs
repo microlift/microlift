@@ -139,6 +139,13 @@ pub enum OracleExit {
     /// diffable instruction set - the two engines cannot be meaningfully
     /// compared past this point.
     NonDiffable(ExitReason),
+    /// The external emulator (Unicorn) stopped with an error/exception rather
+    /// than reaching the exit trampoline: an invalid opcode, an unmapped
+    /// fetch/access it could not satisfy, a `syscall`/`int` with no handler,
+    /// etc. The payload is the raw `uc_error` discriminant, kept only for
+    /// diagnostics. Like [`OracleExit::NonDiffable`], nothing past this point
+    /// is comparable, so [`differential`] declines the comparison.
+    Emulator(i32),
 }
 
 /// The result of running an oracle.
@@ -437,31 +444,240 @@ unsafe fn munmap_raw(addr: *mut core::ffi::c_void, len: usize) -> i32 {
     unsafe { munmap(addr, len) }
 }
 
-/// Unicorn Engine oracle - the external-emulator seam (implementation deferred).
-///
-/// This module marks where a `unicorn_engine`-backed [`CpuOracle`] lands. It is
-/// gated on the `unicorn-oracle` feature but does not yet depend on the
-/// `unicorn-engine` crate or the system `unicorn` library. To implement it:
-///
-/// 1. Add `dep:unicorn-engine` to the `unicorn-oracle` feature in `Cargo.toml`
-///    and `pkgs.unicorn` to `flake.nix` `buildInputs`.
-/// 2. Define `struct UnicornOracle { uc: unicorn_engine::Unicorn<'static, ()> }`
-///    implementing [`CpuOracle`]:
-///    - `uc.mem_map(code_va_page, len, PROT_ALL)` and `mem_write` the `code`
-///      plus each [`MemImage`] at its `base` - using the **same** VAs an
-///      [`IdentityArena`] hands Microlift, so guest VA == host VA on both sides.
-///    - `reg_write` the GPRs (in [`gpr`] order), rip, packed rflags, and xmm
-///      from `init`.
-///    - `emu_start(code_va, end_va, 0, max_insns)`, catching hook/errors as
-///      [`OracleOutcome::Exit`].
-///    - `reg_read` everything back into a [`CpuState`] for the return value.
-/// 3. Only feed it code from the diffable instruction set (exclude every VM-exit
-///    producer - see the module docs); a differential driver already declines to
-///    compare when either side reports [`OracleOutcome::Exit`].
-///
-/// With that in place, [`differential`] works unchanged against
-/// `MicroliftOracle` on one side and `UnicornOracle` on the other.
 #[cfg(feature = "unicorn-oracle")]
 pub mod unicorn {
-    //! Placeholder for the Unicorn-backed oracle (see the parent module docs).
+    use super::{gpr, CpuOracle, CpuState, MemImage, OracleExit, OracleOutcome};
+    use crate::testkit::{DEFAULT_STACK_WORDS, EXIT_TRAMPOLINE};
+    use core::ffi::c_void;
+    use unicorn_engine::{Arch, HookType, Mode, Prot, RegisterX86, Unicorn};
+
+    const PAGE: u64 = 0x1000;
+
+    /// GPR-index (see [`gpr`]) -> Unicorn register id, in [`CpuState::gpr`] order.
+    const GPR_REG: [RegisterX86; 16] = [
+        RegisterX86::RAX,
+        RegisterX86::RCX,
+        RegisterX86::RDX,
+        RegisterX86::RBX,
+        RegisterX86::RSP,
+        RegisterX86::RBP,
+        RegisterX86::RSI,
+        RegisterX86::RDI,
+        RegisterX86::R8,
+        RegisterX86::R9,
+        RegisterX86::R10,
+        RegisterX86::R11,
+        RegisterX86::R12,
+        RegisterX86::R13,
+        RegisterX86::R14,
+        RegisterX86::R15,
+    ];
+
+    const XMM_REG: [RegisterX86; 16] = [
+        RegisterX86::XMM0,
+        RegisterX86::XMM1,
+        RegisterX86::XMM2,
+        RegisterX86::XMM3,
+        RegisterX86::XMM4,
+        RegisterX86::XMM5,
+        RegisterX86::XMM6,
+        RegisterX86::XMM7,
+        RegisterX86::XMM8,
+        RegisterX86::XMM9,
+        RegisterX86::XMM10,
+        RegisterX86::XMM11,
+        RegisterX86::XMM12,
+        RegisterX86::XMM13,
+        RegisterX86::XMM14,
+        RegisterX86::XMM15,
+    ];
+
+    const RFLAGS_MASK: u64 = {
+        const CF: u64 = 1 << 0;
+        const PF: u64 = 1 << 2;
+        const AF: u64 = 1 << 4;
+        const ZF: u64 = 1 << 6;
+        const SF: u64 = 1 << 7;
+        const DF: u64 = 1 << 10;
+        const OF: u64 = 1 << 11;
+        CF | PF | AF | ZF | SF | DF | OF
+    };
+    // Bit 1 of EFLAGS is reserved and reads as 1 on real hardware; set it so the
+    // seeded value is architecturally well-formed.
+    const RFLAGS_RESERVED: u64 = 1 << 1;
+
+    fn page_base(addr: u64) -> u64 {
+        addr & !(PAGE - 1)
+    }
+
+    pub struct UnicornOracle {
+        pub stack_words: usize,
+    }
+
+    impl Default for UnicornOracle {
+        fn default() -> Self {
+            Self {
+                stack_words: DEFAULT_STACK_WORDS,
+            }
+        }
+    }
+
+    impl UnicornOracle {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Read the diffable architectural state back out of the engine.
+        fn snapshot(uc: &Unicorn<'_, ()>) -> CpuState {
+            let mut st = CpuState::zeroed();
+            for (i, &reg) in GPR_REG.iter().enumerate() {
+                st.gpr[i] = uc.reg_read(reg).unwrap_or(0);
+            }
+            st.rip = uc.reg_read(RegisterX86::RIP).unwrap_or(0);
+            st.rflags = uc.reg_read(RegisterX86::EFLAGS).unwrap_or(0) & RFLAGS_MASK;
+            for (i, &reg) in XMM_REG.iter().enumerate() {
+                if let Ok(bytes) = uc.reg_read_long(reg) {
+                    if bytes.len() >= 16 {
+                        let lo = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                        let hi = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+                        st.xmm[i] = [lo, hi];
+                    }
+                }
+            }
+            st
+        }
+    }
+
+    impl CpuOracle for UnicornOracle {
+        fn run(
+            &mut self,
+            code: &[u8],
+            code_va: u64,
+            init: &CpuState,
+            _mem: &[MemImage],
+            max_insns: u64,
+        ) -> OracleOutcome {
+            // A construction/mapping failure is reported as an emulator exit
+            // (the state is meaningless) rather than panicking the fuzzer.
+            let mut uc = match Unicorn::new(Arch::X86, Mode::MODE_64) {
+                Ok(uc) => uc,
+                Err(e) => {
+                    return OracleOutcome::Exit {
+                        state: CpuState::zeroed(),
+                        reason: OracleExit::Emulator(e as i32),
+                    };
+                }
+            };
+
+            macro_rules! bail {
+                ($e:expr) => {
+                    return OracleOutcome::Exit {
+                        state: Self::snapshot(&uc),
+                        reason: OracleExit::Emulator($e as i32),
+                    }
+                };
+            }
+
+            let code_page = page_base(code_va);
+            let end = code_va + code.len() as u64;
+            let code_len = (page_base(end - 1) + PAGE) - code_page;
+            if let Err(e) = uc.mem_map(code_page, code_len, Prot::ALL) {
+                bail!(e);
+            }
+            if let Err(e) = uc.mem_write(code_va, code) {
+                bail!(e);
+            }
+
+            // on first touch of any other page, map it backed by its own address so 
+            // guest VA == host VA
+            if let Err(e) = uc.add_mem_hook(HookType::MEM_UNMAPPED, 1, 0, |uc, _ty, addr, _sz, _v| {
+                let base = page_base(addr);
+                // SAFETY: The host owns this page for every address
+                // the diffable program legitimately touches (stack / arena).
+                // A bad access faults here exactly as it would under
+                // Microlift's JIT. Ignore the result: an `Err` (e.g. a race
+                // that mapped it first) simply means the retry will succeed or
+                // fault on its own.
+                let _ = unsafe {
+                    uc.mem_map_ptr(base, PAGE, Prot::ALL, base as *mut c_void)
+                };
+                true
+            }) {
+                bail!(e);
+            }
+
+            let mut rsp = init.gpr[gpr::RSP];
+            let mut scratch_stack: Option<Vec<u64>> = None;
+            if rsp == 0 {
+                let stack = vec![0u64; self.stack_words];
+                let top = stack.as_ptr() as u64 + (self.stack_words as u64) * 8;
+                rsp = top - 8;
+                scratch_stack = Some(stack);
+            }
+            // Push the exit trampoline at [rsp] directly into host memory (the
+            // identity hook backs the same bytes for Unicorn's own reads).
+            // SAFETY: `rsp` is a live host stack address (scratch `Vec` above,
+            // or a caller-provided host-backed VA per the oracle contract).
+            unsafe {
+                *(rsp as *mut u64) = EXIT_TRAMPOLINE;
+            }
+
+            for (i, &reg) in GPR_REG.iter().enumerate() {
+                let v = if i == gpr::RSP { rsp } else { init.gpr[i] };
+                if let Err(e) = uc.reg_write(reg, v) {
+                    let _ = scratch_stack;
+                    bail!(e);
+                }
+            }
+            if let Err(e) = uc.reg_write(RegisterX86::RIP, code_va) {
+                bail!(e);
+            }
+            if let Err(e) = uc.reg_write(
+                RegisterX86::EFLAGS,
+                (init.rflags & RFLAGS_MASK) | RFLAGS_RESERVED,
+            ) {
+                bail!(e);
+            }
+            for (i, &reg) in XMM_REG.iter().enumerate() {
+                let mut bytes = [0u8; 16];
+                bytes[0..8].copy_from_slice(&init.xmm[i][0].to_le_bytes());
+                bytes[8..16].copy_from_slice(&init.xmm[i][1].to_le_bytes());
+                if let Err(e) = uc.reg_write_long(reg, &bytes) {
+                    bail!(e);
+                }
+            }
+
+            let count = max_insns as usize;
+            let result = uc.emu_start(code_va, EXIT_TRAMPOLINE, 0, count);
+
+            let state = Self::snapshot(&uc);
+            // Keep the scratch stack mapped through the read-back.
+            drop(scratch_stack);
+            match result {
+                Ok(()) => OracleOutcome::Halted(state),
+                Err(e) => OracleOutcome::Exit {
+                    state,
+                    reason: OracleExit::Emulator(e as i32),
+                },
+            }
+        }
+
+        fn name(&self) -> &'static str {
+            "unicorn"
+        }
+    }
+
+
+    pub fn differential_unicorn(
+        code: &[u8],
+        code_va: u64,
+        init: &CpuState,
+        mem: &[MemImage],
+        max_insns: u64,
+        opts: super::DiffOptions,
+    ) -> Option<super::StateDiff> {
+        let mut a = super::MicroliftOracle::default();
+        let mut b = UnicornOracle::new();
+        super::differential(&mut a, &mut b, code, code_va, init, mem, max_insns, opts)
+    }
 }

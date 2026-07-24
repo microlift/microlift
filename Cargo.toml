@@ -8,7 +8,7 @@ disasm = ["dep:capstone"]
 serde = ["dep:serde"]
 testkit = []
 fuzzing = ["testkit", "dep:proptest"]
-unicorn-oracle = ["testkit"]
+unicorn-oracle = ["testkit", "dep:unicorn-engine"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"], optional = true }
@@ -42,6 +42,10 @@ required-features = ["testkit"]
 [[test]]
 name = "oracle_tests"
 required-features = ["testkit"]
+
+[[test]]
+name = "unicorn_oracle_tests"
+required-features = ["unicorn-oracle"]
 
 [[test]]
 name = "setcc_tests"

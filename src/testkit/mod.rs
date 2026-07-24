@@ -334,6 +334,42 @@ impl RunOutcome {
     }
 }
 
+/// Differential-oracle wiring: run the described program on both the Microlift
+/// JIT and the Unicorn engine from an identical initial state and compare.
+/// Available only under the `unicorn-oracle` feature.
+#[cfg(feature = "unicorn-oracle")]
+impl<'a> LiftTest<'a> {
+    /// Run this program on the Microlift JIT and on Unicorn from the same
+    /// seeded state, returning their architectural [`StateDiff`]. `None` means
+    /// one engine hit a non-diffable event (a VM exit, a fault) so there is
+    /// nothing sound to compare - see [`oracle::differential`].
+    ///
+    /// Only the register/flag/xmm seed and the lift base are carried over; the
+    /// full [`LifterConfig`] is not (the oracle path always JITs in the default
+    /// execution mode). Feed it code from the diffable subset only.
+    pub fn differential_unicorn(
+        &self,
+        opts: oracle::DiffOptions,
+    ) -> Option<oracle::StateDiff> {
+        let state = oracle::CpuState::from_ctx(&self.init);
+        oracle::unicorn::differential_unicorn(self.bytes, self.ip, &state, &[], 1 << 20, opts)
+    }
+
+    /// Like [`differential_unicorn`](Self::differential_unicorn) but asserts the
+    /// two engines agree, panicking with the offending diff otherwise. A
+    /// non-diffable outcome (returns `None`) is treated as "nothing to check"
+    /// and passes. This is a one-line hook tests use to gain Unicorn
+    /// cross-checking on top of their existing Microlift assertions.
+    pub fn assert_matches_unicorn(&self, opts: oracle::DiffOptions) {
+        if let Some(diff) = self.differential_unicorn(opts) {
+            assert!(
+                diff.is_empty(),
+                "microlift and unicorn disagree: {diff:?}"
+            );
+        }
+    }
+}
+
 /// Convenience for the common case: lift `bytes` at [`DEFAULT_LIFT_BASE`] with
 /// the default config and `Opt::None`, run against `ctx`, and return the
 /// mutated context. Mirrors the old per-file `run_test(bytes, ctx)` helpers so
