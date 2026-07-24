@@ -10,6 +10,8 @@ pub mod core;
 pub mod lifter;
 pub(crate) mod mapfile;
 pub mod os;
+#[cfg(feature = "testkit")]
+pub mod testkit;
 pub mod vsa;
 
 #[derive(Error, Debug)]

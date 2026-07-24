@@ -6,6 +6,9 @@ edition = "2024"
 [features]
 disasm = ["dep:capstone"]
 serde = ["dep:serde"]
+testkit = []
+fuzzing = ["testkit", "dep:proptest"]
+unicorn-oracle = ["testkit"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"], optional = true }
@@ -24,6 +27,108 @@ cranelift-codegen = { version = "0.133", features = ["all-arch"] }
 yaxpeax-arm = "0.4.0"
 yaxpeax-arch = "0.3.2"
 function_traits = { git = "https://github.com/microlift/function_traits.git", version = "0.1.0" }
+# Optional, test-only. Pulled in only by the `fuzzing` / `unicorn-oracle`
+# features; the default build graph is unaffected.
+proptest = { version = "1", optional = true }
+unicorn-engine = { version = "2", optional = true }
 
 [dev-dependencies]
 rustc_apfloat = "0.2"
+
+[[test]]
+name = "arithmetic_tests"
+required-features = ["testkit"]
+
+[[test]]
+name = "oracle_tests"
+required-features = ["testkit"]
+
+[[test]]
+name = "setcc_tests"
+required-features = ["testkit"]
+
+[[test]]
+name = "cmov_tests"
+required-features = ["testkit"]
+
+[[test]]
+name = "cflow_misc_tests"
+required-features = ["testkit"]
+
+[[test]]
+name = "instruction_tests"
+required-features = ["testkit"]
+
+[[test]]
+name = "size_tests"
+required-features = ["testkit"]
+
+[[test]]
+name = "subencoded_tests"
+required-features = ["testkit"]
+
+[[test]]
+name = "atomic_tests"
+required-features = ["testkit"]
+
+[[test]]
+name = "subset_instructions"
+required-features = ["testkit"]
+
+[[test]]
+name = "tls_tests"
+required-features = ["testkit"]
+
+[[test]]
+name = "review_fixes_tests"
+required-features = ["testkit"]
+
+[[test]]
+name = "basic_lift"
+required-features = ["testkit"]
+
+[[test]]
+name = "sse_tests"
+required-features = ["testkit"]
+
+[[test]]
+name = "fpu_tests"
+required-features = ["testkit"]
+
+[[test]]
+name = "trap_tests"
+required-features = ["testkit"]
+
+[[test]]
+name = "stack_tests"
+required-features = ["testkit"]
+
+[[test]]
+name = "rip_tests"
+required-features = ["testkit"]
+
+[[test]]
+name = "liveness_sync_test"
+required-features = ["testkit"]
+
+[[test]]
+name = "stack_alignment_tests"
+required-features = ["testkit"]
+
+# Differential fuzzing suite (proptest). Requires the `fuzzing` feature. The
+# shared `tests/fuzz/mod.rs` is included per-binary and is not a target itself.
+[[test]]
+name = "fuzz_semantics"
+required-features = ["fuzzing"]
+
+[[test]]
+name = "fuzz_cross_config"
+required-features = ["fuzzing"]
+
+[[test]]
+name = "fuzz_vmexit"
+required-features = ["fuzzing"]
+
+[[test]]
+name = "fuzz_vsa"
+required-features = ["fuzzing"]

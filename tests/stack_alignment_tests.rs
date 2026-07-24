@@ -42,13 +42,8 @@
 //! - **Guest code**: push `ctx.rip` onto `ctx.rsp` before re-entering the
 //!   guest so the callee's eventual `RET` finds the correct return address.
 
-use cranelift::prelude::*;
-use cranelift_codegen::ir::{Function, UserFuncName};
-use cranelift_codegen::isa::CallConv;
-use cranelift_codegen::settings;
-use microlift::backend::CraneliftBackend;
-use microlift::context::{ExitReason, RegisterContext, TransferKind};
-use microlift::lifter::Lifter;
+use microlift::context::TransferKind;
+use microlift::testkit::prelude::*;
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -59,74 +54,24 @@ use microlift::lifter::Lifter;
 ///
 /// Unlike the helpers in `stack_tests.rs` this does **not** touch `ctx.rsp`
 /// or `ctx.image_base`; the caller is responsible for setting them.
-fn compile_and_run(bytes: &[u8], mut ctx: RegisterContext) -> RegisterContext {
-    let mut flag_builder = settings::builder();
-    flag_builder.set("use_colocated_libcalls", "false").unwrap();
-    flag_builder.set("is_pic", "false").unwrap();
-
-    let mut func =
-        Function::with_name_signature(UserFuncName::user(0, 0), Signature::new(CallConv::Fast));
-    func.signature.params.push(AbiParam::new(types::I64));
-
-    let mut func_ctx = cranelift_frontend::FunctionBuilderContext::new();
-    let builder = cranelift_frontend::FunctionBuilder::new(&mut func, &mut func_ctx);
-    let mut lifter = Lifter::new(builder);
-
-    lifter.lift(bytes, 0x1000).expect("lifting failed");
-
-    let mut backend = CraneliftBackend::with_flags(settings::Flags::new(flag_builder))
-        .expect("backend init failed");
-    drop(lifter);
-    let code_ptr = backend.compile(func).expect("compilation failed");
-
-    let f: fn(*mut RegisterContext) = unsafe { std::mem::transmute(code_ptr) };
-    f(&mut ctx);
-    ctx
+fn compile_and_run(bytes: &[u8], ctx: RegisterContext) -> RegisterContext {
+    // `RetAddr::None` + a caller-provided `rsp`/`image_base` reproduce this
+    // helper's "don't touch the stack" contract (the testkit harness leaves a
+    // preset non-zero `rsp`/`image_base` alone).
+    LiftTest::new(bytes)
+        .ctx(ctx)
+        .ret_addr(RetAddr::None)
+        .run()
+        .ctx
 }
 
 /// Like `compile_and_run` but installs an automatic stack with an exit
 /// trampoline at the bottom (top-of-guest-stack) and sets `image_base = 0x1000`.
 /// Returns `(ctx_after, initial_rsp)` where `initial_rsp` is the value of
 /// `ctx.rsp` at the point the lifted function is entered.
-fn compile_and_run_with_stack(bytes: &[u8], mut ctx: RegisterContext) -> (RegisterContext, u64) {
-    let mut flag_builder = settings::builder();
-    flag_builder.set("use_colocated_libcalls", "false").unwrap();
-    flag_builder.set("is_pic", "false").unwrap();
-
-    let mut func =
-        Function::with_name_signature(UserFuncName::user(0, 0), Signature::new(CallConv::Fast));
-    func.signature.params.push(AbiParam::new(types::I64));
-
-    let mut func_ctx = cranelift_frontend::FunctionBuilderContext::new();
-    let builder = cranelift_frontend::FunctionBuilder::new(&mut func, &mut func_ctx);
-    let mut lifter = Lifter::new(builder);
-
-    let exit_trampoline = lifter.exit_trampoline_address;
-
-    let mut stack = vec![0u64; 256];
-    let stack_top = stack.as_mut_ptr() as u64 + 256 * 8;
-
-    ctx.image_base = 0x1000;
-    ctx.rsp = stack_top - 8;
-    let initial_rsp = ctx.rsp;
-    // Place the exit trampoline at the "bottom" of the used stack so that a
-    // bare `ret` in the guest will trigger the Return exit path.
-    unsafe {
-        *(ctx.rsp as *mut u64) = exit_trampoline;
-    }
-
-    lifter.lift(bytes, 0x1000).expect("lifting failed");
-
-    let mut backend = CraneliftBackend::with_flags(settings::Flags::new(flag_builder))
-        .expect("backend init failed");
-    drop(lifter);
-    let code_ptr = backend.compile(func).expect("compilation failed");
-
-    let f: fn(*mut RegisterContext) = unsafe { std::mem::transmute(code_ptr) };
-    f(&mut ctx);
-    // Keep the stack allocation alive until the function returns.
-    let _ = &stack;
-    (ctx, initial_rsp)
+fn compile_and_run_with_stack(bytes: &[u8], ctx: RegisterContext) -> (RegisterContext, u64) {
+    let out = LiftTest::new(bytes).ctx(ctx).run();
+    (out.ctx, out.initial_rsp)
 }
 
 // ---------------------------------------------------------------------------

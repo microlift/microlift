@@ -1,56 +1,17 @@
-use cranelift::prelude::*;
-use cranelift_codegen::ir::{Function, UserFuncName};
 use cranelift_codegen::isa::CallConv;
-use cranelift_codegen::settings;
-use microlift::backend::CraneliftBackend;
-use microlift::context::{ExitReason, RegisterContext};
-use microlift::lifter::{ExecutionMode, Lifter, LifterConfig};
+use microlift::core::{ExecutionMode, LifterConfig};
+use microlift::testkit::prelude::*;
 
 fn run_stack_test(bytes: &[u8], ctx: RegisterContext) -> RegisterContext {
-    run_stack_test_with_config(bytes, ctx, LifterConfig::default())
+    LiftTest::new(bytes).ctx(ctx).run().ctx
 }
 
 fn run_stack_test_with_config(
     bytes: &[u8],
-    mut ctx: RegisterContext,
+    ctx: RegisterContext,
     config: LifterConfig,
 ) -> RegisterContext {
-    let mut flag_builder = settings::builder();
-    flag_builder.set("use_colocated_libcalls", "false").unwrap();
-    flag_builder.set("is_pic", "false").unwrap();
-
-    let mut func =
-        Function::with_name_signature(UserFuncName::user(0, 0), Signature::new(CallConv::Fast));
-    func.signature.params.push(AbiParam::new(types::I64));
-
-    let mut func_ctx = cranelift_frontend::FunctionBuilderContext::new();
-    let builder = cranelift_frontend::FunctionBuilder::new(&mut func, &mut func_ctx);
-    let mut lifter = Lifter::with_config(builder, config);
-
-    let mut stack = [0u64; 1024];
-    let stack_ptr = stack.as_mut_ptr() as u64;
-    let stack_top = stack_ptr + 8192; // 1024 * 8
-
-    let exit_trampoline = lifter.exit_trampoline_address;
-    if ctx.rsp == 0 {
-        ctx.rsp = stack_top - 8;
-        // Push exit trampoline address
-        unsafe {
-            *(ctx.rsp as *mut u64) = exit_trampoline;
-        }
-    }
-
-    ctx.image_base = 0x1000;
-    lifter.lift(bytes, 0x1000).expect("lifting failed");
-
-    let mut backend = CraneliftBackend::with_flags(settings::Flags::new(flag_builder))
-        .expect("backend init failed");
-    drop(lifter);
-    let code_ptr = backend.compile(func).expect("compilation failed");
-
-    let f: fn(*mut RegisterContext) = unsafe { std::mem::transmute(code_ptr) };
-    f(&mut ctx);
-    ctx
+    LiftTest::new(bytes).config(config).ctx(ctx).run().ctx
 }
 
 unsafe extern "C" fn test_syscall_handler(ctx: *mut RegisterContext) {
