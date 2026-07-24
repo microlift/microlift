@@ -504,6 +504,14 @@ impl Harness {
 /// The result of a single (re-)entry into a [`Harness`].
 pub struct RunOutcome {
     /// Snapshot of the register context after the entry returned.
+    ///
+    /// `ctx.rsp` borrows from this outcome. It is a raw host address into
+    /// the guest stack owned by the retained [`Harness`], so copying `ctx` out
+    /// and dropping the outcome leaves `rsp` dangling. Feeding such a `ctx`
+    /// back into [`LiftTest::ctx`] is a use-after-free: the non-zero `rsp` is
+    /// honoured as-is and the exit trampoline is written through it. Keep the
+    /// `RunOutcome` alive for as long as the `rsp` is used, or clear `rsp` to
+    /// `0` so the next [`LiftTest`] allocates a fresh stack.
     pub ctx: RegisterContext,
     /// `rsp` at the point the function was first entered (see
     /// [`Harness::initial_rsp`]).

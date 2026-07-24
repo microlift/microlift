@@ -130,7 +130,14 @@ fn test_int3_resume_by_advancing_rip() {
     ];
 
     // First run: hits int3 immediately.
-    let ctx = compile_and_run(&bytes, RegisterContext::default());
+    //
+    // Bind the whole `RunOutcome` rather than just its `ctx`: the returned
+    // `rsp` points into the guest stack *owned by the outcome's harness*.
+    // Dropping the outcome here (as `compile_and_run` does) would free that
+    // stack and leave the `rsp` carried into the second run dangling - the
+    // re-entry below would then write its exit trampoline into freed memory.
+    let first = LiftTest::new(&bytes).run();
+    let ctx = first.ctx;
     assert_eq!(ctx.exit_reason, ExitReason::Breakpoint as u32);
     assert_eq!(ctx.rip, 0x1000);
 
@@ -148,6 +155,10 @@ fn test_int3_resume_by_advancing_rip() {
 
     assert_eq!(out.ctx.exit_reason, ExitReason::Return as u32);
     assert_eq!(out.ctx.rax, 99);
+
+    // Keep the first harness (and thus the shared guest stack) alive until both
+    // runs are done.
+    drop(first);
 }
 
 /// `ud2` and `int3` must produce different exit reasons so the host can
