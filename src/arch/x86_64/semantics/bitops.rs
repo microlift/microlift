@@ -496,8 +496,9 @@ impl<'a> Lifter<'a> {
     ///
     /// The count is masked to 5 bits (6 for 64-bit operands) and then reduced
     /// modulo `N+1`, exactly as the hardware does. OF is only architecturally
-    /// defined for single-bit rotates; like the other rotates here it is left
-    /// unmodelled.
+    /// defined for single-bit rotates, where it is the XOR of the two
+    /// most-significant bits of the result; for any other count it is left
+    /// unchanged.
     pub(super) fn handle_rcr(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let size = self.operand_size(instruction, 0)?;
         let ty = size_to_type(size);
@@ -559,6 +560,15 @@ impl<'a> Lifter<'a> {
         let one_w = self.wide_const(work_ty, 1);
         let cf_bit = self.builder.ins().band(cf_shifted, one_w);
         self.set_flag(X86Flag::Carry, cf_bit)?;
+
+        // OF (defined only for count == 1): XOR of the two most-significant bits
+        // of the result. set_rotate_of leaves OF unchanged for any other count.
+        let msb = self.builder.ins().ushr_imm(result, n - 1);
+        let next = self.builder.ins().ushr_imm(result, n - 2);
+        let one = self.builder.ins().iconst(ty, 1);
+        let next = self.builder.ins().band(next, one);
+        let of1 = self.builder.ins().bxor(msb, next);
+        self.set_rotate_of(of1, count)?;
         Ok(())
     }
 
@@ -621,6 +631,13 @@ impl<'a> Lifter<'a> {
         let one_w = self.wide_const(work_ty, 1);
         let cf_bit = self.builder.ins().band(cf_shifted, one_w);
         self.set_flag(X86Flag::Carry, cf_bit)?;
+
+        // OF (defined only for count == 1): MSB(result) XOR CF (the CF after the
+        // rotate). set_rotate_of leaves OF unchanged for any other count.
+        let msb = self.builder.ins().ushr_imm(result, n - 1);
+        let cf_ty = self.builder.ins().ireduce(ty, cf_bit);
+        let of1 = self.builder.ins().bxor(msb, cf_ty);
+        self.set_rotate_of(of1, count)?;
         Ok(())
     }
 
