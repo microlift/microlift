@@ -84,10 +84,6 @@ name = "tls_tests"
 required-features = ["testkit"]
 
 [[test]]
-name = "review_fixes_tests"
-required-features = ["testkit"]
-
-[[test]]
 name = "basic_lift"
 required-features = ["testkit"]
 

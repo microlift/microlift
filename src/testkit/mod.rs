@@ -102,6 +102,11 @@ pub struct LiftTest<'a> {
     stack_words: usize,
     ret_addr: RetAddr,
     init: RegisterContext,
+    /// When the `unicorn-oracle` feature is on, `run`/`try_run` automatically
+    /// re-run the same program on Unicorn and assert the two engines agree
+    /// (see [`LiftTest::no_unicorn`]). Default `true`.
+    #[cfg(feature = "unicorn-oracle")]
+    unicorn_check: bool,
 }
 
 impl<'a> LiftTest<'a> {
@@ -116,6 +121,8 @@ impl<'a> LiftTest<'a> {
             stack_words: DEFAULT_STACK_WORDS,
             ret_addr: RetAddr::Trampoline,
             init: RegisterContext::default(),
+            #[cfg(feature = "unicorn-oracle")]
+            unicorn_check: true,
         }
     }
 
@@ -192,6 +199,26 @@ impl<'a> LiftTest<'a> {
         self
     }
 
+    /// Opt this test out of the automatic Unicorn differential cross-check that
+    /// `run`/`try_run` perform under the `unicorn-oracle` feature. Use it for
+    /// programs whose architectural result legitimately cannot be diffed
+    /// against Unicorn - e.g. state Microlift models but [`oracle::CpuState`]
+    /// does not (the x87 stack), or host-specific results. A no-op when the
+    /// feature is off, so it is always safe to call.
+    #[cfg(feature = "unicorn-oracle")]
+    pub fn no_unicorn(mut self) -> Self {
+        self.unicorn_check = false;
+        self
+    }
+
+    /// No-op stand-in for [`no_unicorn`](Self::no_unicorn) when the
+    /// `unicorn-oracle` feature is disabled, so tests can call it
+    /// unconditionally.
+    #[cfg(not(feature = "unicorn-oracle"))]
+    pub fn no_unicorn(self) -> Self {
+        self
+    }
+
     /// Seed the entire initial register context at once (eases migration from
     /// the old `run_test(bytes, ctx)` helpers).
     pub fn ctx(mut self, ctx: RegisterContext) -> Self {
@@ -259,14 +286,192 @@ impl<'a> LiftTest<'a> {
     /// Like [`run`](Self::run), but returns lift/compile errors instead of
     /// panicking.
     pub fn try_run(self) -> Result<RunOutcome, TestError> {
+        // Capture everything the Unicorn cross-check needs *before* `compile`
+        // consumes `self`. Only when the feature is on, the check is enabled,
+        // and the config is a plain executable JIT (Unicorn models real
+        // execution - analysis IR and RuntimeAssisted resume flows are not
+        // comparable).
+        #[cfg(feature = "unicorn-oracle")]
+        let xcheck = (self.unicorn_check
+            && !self.config.analysis_mode
+            && self.config.execution_mode == ExecutionMode::Jit)
+            .then(|| (self.bytes.to_vec(), self.ip, oracle::CpuState::from_ctx(&self.init)));
+
         let mut harness = self.compile()?;
         let exit = harness.enter();
-        Ok(RunOutcome {
+        let outcome = RunOutcome {
             ctx: harness.ctx,
             initial_rsp: harness.initial_rsp,
             exit,
             harness,
-        })
+        };
+
+        // The harness (and thus the shared guest stack) is alive inside
+        // `outcome`, so Unicorn can be pointed at the exact same stack pages.
+        #[cfg(feature = "unicorn-oracle")]
+        if let Some((bytes, ip, init)) = xcheck {
+            cross_check_unicorn(&bytes, ip, &init, &outcome);
+        }
+
+        Ok(outcome)
+    }
+}
+
+/// Re-run a just-executed program on Unicorn from the same initial state and
+/// assert the two engines' architectural state agrees.
+///
+/// Soundness guards, all derived from a static decode of the program so no test
+/// needs hand-annotation:
+///
+/// - **Clean halt only.** Fires only when the Microlift run reached a clean halt
+///   (`Return`/`None`); any VM exit is non-diffable and skipped. Likewise if
+///   Unicorn itself faults (an instruction it lacks) the comparison is skipped.
+/// - **Shared stack.** The Microlift harness's `initial_rsp` (a live host
+///   allocation) is handed to Unicorn, which identity-maps those pages, so
+///   `rsp`-derived values and the pushed exit trampoline line up on both sides.
+///   The stack is self-healing across the two sequential runs (both re-push the
+///   same bytes), so stack reads/writes stay diffable.
+/// - **No persistent data-memory writes.** Microlift runs *first* and mutates
+///   the shared identity-mapped memory; a program that writes to non-stack
+///   memory (atomics, stores, `xchg [mem]`) would feed Unicorn already-mutated
+///   inputs, so those are skipped. Stack writes (base `RSP`) are exempt.
+/// - **x86-undefined flags masked.** Instructions like `MUL`/`IMUL` (SF/ZF/…)
+///   and variable-count shifts/rotates/`BT*` (OF) leave flags *architecturally
+///   undefined*; the two engines may pick different bits without either being
+///   wrong. Those flags (last-writer-wins across the program) are masked out of
+///   the comparison.
+#[cfg(feature = "unicorn-oracle")]
+fn cross_check_unicorn(bytes: &[u8], ip: u64, init: &oracle::CpuState, outcome: &RunOutcome) {
+    use oracle::{diff_states, CpuOracle, CpuState, DiffOptions, OracleOutcome};
+
+    // Only a clean `RET` into the exit trampoline is diffable. `ExitReason::None`
+    // means Microlift stopped at the *region boundary* (the program fell off the
+    // end of the lifted bytes, e.g. `RetAddr::None` tests with no `ret`). Unicorn
+    // has no region concept: with `until = EXIT_TRAMPOLINE` it keeps executing
+    // whatever follows the code - the zero-padding decodes as `add [rax], al`,
+    // and the `MEM_UNMAPPED` identity hook then maps an arbitrary guest address
+    // to that *host* address, faulting the host process. So `None` is excluded.
+    if outcome.exit != ExitReason::Return {
+        return;
+    }
+
+    let ProgramFacts {
+        undefined_rflags,
+        writes_data_mem,
+    } = analyze_program(bytes, ip);
+
+    // A program that persists writes to non-stack memory cannot be diffed by
+    // sequential re-execution on shared host memory (Microlift already ran and
+    // mutated it). Skip rather than report a spurious divergence.
+    if writes_data_mem {
+        return;
+    }
+
+    // Share Microlift's stack so the two engines see identical stack memory and
+    // stack-pointer values (rsp itself stays out of the diff by default).
+    let mut uinit = *init;
+    uinit.gpr[oracle::gpr::RSP] = outcome.initial_rsp;
+
+    let mut uc = oracle::unicorn::UnicornOracle::new();
+    let out = uc.run(bytes, ip, &uinit, &[], 1 << 20);
+    let OracleOutcome::Halted(ustate) = out else {
+        return;
+    };
+
+    // Drop architecturally-undefined flag bits before comparing.
+    let keep = !undefined_rflags;
+    let mut ml = CpuState::from_ctx(&outcome.ctx);
+    let mut uc_state = ustate;
+    ml.rflags &= keep;
+    uc_state.rflags &= keep;
+
+    let diff = diff_states(&ml, &uc_state, DiffOptions::default());
+    assert!(
+        diff.is_empty(),
+        "unicorn differential mismatch at ip={ip:#x}\n  code = {bytes:02x?}\n  \
+         diff (microlift vs unicorn) = {diff:?}",
+    );
+}
+
+/// Static facts about a lifted program used to keep the Unicorn cross-check
+/// sound (see [`cross_check_unicorn`]).
+#[cfg(feature = "unicorn-oracle")]
+struct ProgramFacts {
+    /// Packed-EFLAGS mask of flags left architecturally undefined at program
+    /// exit (last-writer-wins), to exclude from the state diff.
+    undefined_rflags: u64,
+    /// Whether any instruction writes to memory that is not `RSP`-relative.
+    writes_data_mem: bool,
+}
+
+/// Decode `bytes` (linear sweep from `ip`) and derive the [`ProgramFacts`] the
+/// cross-check needs. Decoding stops at the first invalid byte; that is fine as
+/// the facts only need to cover the instructions that actually executed.
+#[cfg(feature = "unicorn-oracle")]
+fn analyze_program(bytes: &[u8], ip: u64) -> ProgramFacts {
+    use iced_x86::{Decoder, DecoderOptions, InstructionInfoFactory, OpAccess, Register};
+
+    // iced's `RflagsBits` uses its own bit layout; translate to the packed
+    // EFLAGS positions `CpuState::rflags` uses.
+    fn iced_to_eflags(bits: u32) -> u64 {
+        use iced_x86::RflagsBits as R;
+        let mut out = 0u64;
+        if bits & R::CF != 0 {
+            out |= 1 << 0;
+        }
+        if bits & R::PF != 0 {
+            out |= 1 << 2;
+        }
+        if bits & R::AF != 0 {
+            out |= 1 << 4;
+        }
+        if bits & R::ZF != 0 {
+            out |= 1 << 6;
+        }
+        if bits & R::SF != 0 {
+            out |= 1 << 7;
+        }
+        if bits & R::DF != 0 {
+            out |= 1 << 10;
+        }
+        if bits & R::OF != 0 {
+            out |= 1 << 11;
+        }
+        out
+    }
+
+    let mut decoder = Decoder::with_ip(64, bytes, ip, DecoderOptions::NONE);
+    let mut factory = InstructionInfoFactory::new();
+    let mut undefined = 0u32;
+    let mut writes_data_mem = false;
+
+    while decoder.can_decode() {
+        let insn = decoder.decode();
+        if insn.is_invalid() {
+            break;
+        }
+
+        // Last-writer-wins: flags this instruction gives a defined value become
+        // defined again; flags it leaves undefined become undefined.
+        undefined = (undefined & !insn.rflags_modified()) | insn.rflags_undefined();
+
+        let info = factory.info(&insn);
+        for m in info.used_memory() {
+            let writes = matches!(
+                m.access(),
+                OpAccess::Write | OpAccess::CondWrite | OpAccess::ReadWrite | OpAccess::ReadCondWrite
+            );
+            // Stack writes self-heal across the two runs; only non-`RSP` writes
+            // corrupt the second engine's inputs.
+            if writes && m.base() != Register::RSP {
+                writes_data_mem = true;
+            }
+        }
+    }
+
+    ProgramFacts {
+        undefined_rflags: iced_to_eflags(undefined),
+        writes_data_mem,
     }
 }
 

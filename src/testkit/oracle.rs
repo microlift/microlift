@@ -36,6 +36,12 @@ pub struct CpuState {
     pub rflags: u64,
     /// XMM0..15, each `[lo64, hi64]`.
     pub xmm: [[u64; 2]; 16],
+    /// FS segment base (for `fs:`-prefixed / `rd/wrfsbase` accesses). An
+    /// *input* to a run, not part of the diff - see [`diff_states`].
+    pub fs_base: u64,
+    /// GS segment base (for `gs:`-prefixed / `rd/wrgsbase` accesses). An input,
+    /// not diffed.
+    pub gs_base: u64,
 }
 
 // RFLAGS bit positions.
@@ -55,6 +61,8 @@ impl CpuState {
             rip: 0,
             rflags: 0,
             xmm: [[0; 2]; 16],
+            fs_base: 0,
+            gs_base: 0,
         }
     }
 
@@ -90,6 +98,8 @@ impl CpuState {
             rip: c.rip,
             rflags,
             xmm: c.xmm,
+            fs_base: c.fs_base,
+            gs_base: c.gs_base,
         }
     }
 
@@ -121,6 +131,8 @@ impl CpuState {
         c.of = (self.rflags & OF != 0) as u8;
         c.df = (self.rflags & DF != 0) as u8;
         c.xmm = self.xmm;
+        c.fs_base = self.fs_base;
+        c.gs_base = self.gs_base;
     }
 }
 
@@ -636,6 +648,14 @@ pub mod unicorn {
                 RegisterX86::EFLAGS,
                 (init.rflags & RFLAGS_MASK) | RFLAGS_RESERVED,
             ) {
+                bail!(e);
+            }
+            // Segment bases, so `fs:`/`gs:`-prefixed accesses hit the same
+            // host-backed TLS buffer Microlift addresses.
+            if let Err(e) = uc.reg_write(RegisterX86::FS_BASE, init.fs_base) {
+                bail!(e);
+            }
+            if let Err(e) = uc.reg_write(RegisterX86::GS_BASE, init.gs_base) {
                 bail!(e);
             }
             for (i, &reg) in XMM_REG.iter().enumerate() {
