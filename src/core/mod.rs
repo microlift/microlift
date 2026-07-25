@@ -373,6 +373,14 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             HashMap::new();
         let mut aot_imports: Vec<(&'static str, *const u8, Signature)> = Vec::new();
         let mut import_vas: HashSet<u64> = HashSet::new();
+        // The same imported symbol may be registered at several virtual
+        // addresses (e.g. its PLT stub and its GOT slot). In `RuntimeAssisted`
+        // mode every distinct symbol becomes one `aot_imports` entry / object
+        // relocation target, so reuse a single `FuncRef` per symbol name;
+        // emitting the name twice would collide when the object backend
+        // deduplicates imports and break the `FuncId(i) == i` invariant.
+        let mut funcref_by_name: HashMap<&'static str, (FuncRef, Vec<FunctionArgumentType>)> =
+            HashMap::new();
 
         for (&va, opt_sym) in &config.imports {
             import_vas.insert(va);
@@ -388,20 +396,27 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                                 .insert(va, (sig_ref, sym.value as i64, sym.arg_types.clone()));
                         }
                         ExecutionMode::RuntimeAssisted => {
-                            let index = aot_imports.len() as u32;
-                            let sig = build_import_sig(&sym.arg_types, host_cc);
-                            let sig_ref = builder.import_signature(sig.clone());
-                            let user_name = builder.func.declare_imported_user_function(
-                                UserExternalName { namespace: 0, index },
-                            );
-                            let func_ref = builder.import_function(ExtFuncData {
-                                name: ExternalName::user(user_name),
-                                signature: sig_ref,
-                                colocated: false,
-                                patchable: false,
-                            });
-                            fast_call_funcrefs.insert(va, (func_ref, sym.arg_types.clone()));
-                            aot_imports.push((sym.name, sym.value as *const u8, sig));
+                            let entry = if let Some(existing) = funcref_by_name.get(sym.name) {
+                                existing.clone()
+                            } else {
+                                let index = aot_imports.len() as u32;
+                                let sig = build_import_sig(&sym.arg_types, host_cc);
+                                let sig_ref = builder.import_signature(sig.clone());
+                                let user_name = builder.func.declare_imported_user_function(
+                                    UserExternalName { namespace: 0, index },
+                                );
+                                let func_ref = builder.import_function(ExtFuncData {
+                                    name: ExternalName::user(user_name),
+                                    signature: sig_ref,
+                                    colocated: false,
+                                    patchable: false,
+                                });
+                                aot_imports.push((sym.name, sym.value as *const u8, sig));
+                                let entry = (func_ref, sym.arg_types.clone());
+                                funcref_by_name.insert(sym.name, entry.clone());
+                                entry
+                            };
+                            fast_call_funcrefs.insert(va, entry);
                         }
                     }
                 }
