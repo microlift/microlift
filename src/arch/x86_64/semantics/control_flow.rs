@@ -208,6 +208,14 @@ impl<'a> Lifter<'a> {
                 self.emit_indirect_call_exit(target_val)
             }
             OpKind::Memory => {
+                if instruction.memory_base() == Register::RIP
+                    && instruction.memory_index() == Register::None
+                {
+                    let slot_va = instruction.memory_displacement64();
+                    if self.import_vas.contains(&slot_va) {
+                        return self.emit_import_call(slot_va);
+                    }
+                }
                 let ptr = self.get_mem_ptr(instruction, 0)?;
                 let target_val = self.builder.ins().load(types::I64, MemFlagsData::new(), ptr, 0);
                 self.emit_indirect_call_exit(target_val)
