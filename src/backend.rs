@@ -1,6 +1,7 @@
 use crate::Result;
 use cranelift::prelude::*;
 use cranelift_codegen::ir::Function;
+use cranelift_codegen::settings::Configurable;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
 use cranelift_native::builder as native_builder;
@@ -119,9 +120,17 @@ impl CraneliftBackend {
 pub struct ArtifactBackend;
 
 impl ArtifactBackend {
+    /// Build a `TargetIsa` for `triple` with the shared `flags`.
+    ///
+    /// `isa_settings` is a list of ISA-specific `(name, value)` pairs applied to
+    /// the ISA builder before it is finished - e.g. the x86 target-feature knobs
+    /// (`has_avx`, `has_sse41`, ...) used to raise the recompiled code above the
+    /// baseline `x86-64` microarchitecture level. Each name must be valid for the
+    /// resolved architecture or an error is returned.
     fn get_isa(
         triple: Option<&str>,
         flags: Option<settings::Flags>,
+        isa_settings: &[(&str, &str)],
     ) -> Result<Arc<dyn isa::TargetIsa>> {
         let triple_obj = if let Some(t) = triple {
             t.parse::<Triple>().map_err(|_| {
@@ -131,8 +140,16 @@ impl ArtifactBackend {
             Triple::host()
         };
 
-        let isa_builder = cranelift_codegen::isa::lookup(triple_obj)
+        let mut isa_builder = cranelift_codegen::isa::lookup(triple_obj)
             .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
+
+        for (name, value) in isa_settings {
+            isa_builder.set(name, value).map_err(|e| {
+                crate::MicroliftError::CraneliftError(format!(
+                    "invalid ISA setting {name}={value}: {e}"
+                ))
+            })?;
+        }
 
         let isa = isa_builder
             .finish(if let Some(f) = flags {
@@ -159,8 +176,9 @@ impl ArtifactBackend {
         imports: &[AotImport],
         triple: Option<&str>,
         flags: Option<settings::Flags>,
+        isa_settings: &[(&str, &str)],
     ) -> Result<Vec<u8>> {
-        let isa = Self::get_isa(triple, flags)?;
+        let isa = Self::get_isa(triple, flags, isa_settings)?;
         let obj_builder =
             ObjectBuilder::new(isa, "lifted", cranelift_module::default_libcall_names())
                 .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
@@ -193,7 +211,7 @@ impl ArtifactBackend {
         triple: Option<&str>,
         flags: Option<settings::Flags>,
     ) -> Result<Vec<u8>> {
-        let isa = Self::get_isa(triple, flags)?;
+        let isa = Self::get_isa(triple, flags, &[])?;
         let obj_builder =
             ObjectBuilder::new(isa, "lifted", cranelift_module::default_libcall_names())
                 .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
