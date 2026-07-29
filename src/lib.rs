@@ -8,7 +8,6 @@ pub mod cfg;
 pub mod context;
 pub mod core;
 pub mod lifter;
-pub(crate) mod mapfile;
 pub mod os;
 #[cfg(feature = "testkit")]
 pub mod testkit;
