@@ -171,3 +171,79 @@ fn liftttest_hook_cross_checks() {
     let out = LiftTest::new(&bytes).at(CODE_VA).image_base(CODE_VA).run();
     assert_eq!(out.ctx.rax, 84);
 }
+
+/// Packed integer add/sub (`PADDB..PADDQ`, `PSUBB..PSUBQ` and the saturating
+/// forms) over adversarial lane patterns.
+///
+/// The oracle runs the default (scalar lo/hi) XMM representation, which
+/// implements these with SWAR / per-lane expansion - so this is the check that
+/// that lane math matches hardware exactly, including carry/borrow isolation at
+/// lane boundaries and the saturation clamps. The vector representation is
+/// cross-checked against the same expectations in `tests/sse_tests.rs`.
+#[test]
+fn packed_int_add_sub_agrees() {
+    // <op> xmm0, xmm1 ; ret
+    let ops: &[(&str, u8)] = &[
+        ("paddb", 0xFC),
+        ("paddw", 0xFD),
+        ("paddd", 0xFE),
+        ("paddq", 0xD4),
+        ("psubb", 0xF8),
+        ("psubw", 0xF9),
+        ("psubd", 0xFA),
+        ("psubq", 0xFB),
+        ("paddsb", 0xEC),
+        ("paddsw", 0xED),
+        ("paddusb", 0xDC),
+        ("paddusw", 0xDD),
+        ("psubsb", 0xE8),
+        ("psubsw", 0xE9),
+        ("psubusb", 0xD8),
+        ("psubusw", 0xD9),
+    ];
+    let operands: &[([u64; 2], [u64; 2])] = &[
+        ([0, 0], [0, 0]),
+        (
+            [0xFFFF_FFFF_FFFF_FFFF, 0xFFFF_FFFF_FFFF_FFFF],
+            [0x0101_0101_0101_0101, 0x0000_0000_0000_0001],
+        ),
+        (
+            [0x8080_8080_8080_8080, 0x7F7F_7F7F_7F7F_7F7F],
+            [0x8080_8080_8080_8080, 0x0101_0101_0101_0101],
+        ),
+        (
+            [0x8000_8000_8000_8000, 0x7FFF_7FFF_7FFF_7FFF],
+            [0xFFFF_0001_8000_7FFF, 0x0001_FFFF_8000_7FFF],
+        ),
+        (
+            [0x0000_0002_FFFF_FFFF, 0x8000_0000_7FFF_FFFF],
+            [0x0000_0003_0000_0001, 0x8000_0000_0000_0001],
+        ),
+        (
+            [0xDEAD_BEEF_CAFE_BABE, 0x1234_5678_9ABC_DEF0],
+            [0x1122_3344_5566_7788, 0xFEDC_BA98_7654_3210],
+        ),
+    ];
+
+    for (name, opcode) in ops {
+        for &(dst, src) in operands {
+            let code = [0x66, 0x0F, *opcode, 0xC1, 0xC3];
+            let mut init = CpuState::zeroed();
+            init.xmm[0] = dst;
+            init.xmm[1] = src;
+            let diff = differential_unicorn(
+                &code,
+                CODE_VA,
+                &init,
+                &[],
+                BUDGET,
+                DiffOptions::default(),
+            )
+            .expect("clean halt");
+            assert!(
+                diff.is_empty(),
+                "{name} {dst:#018x?},{src:#018x?} diverged: {diff:?}"
+            );
+        }
+    }
+}

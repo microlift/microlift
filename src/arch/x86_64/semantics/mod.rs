@@ -19,6 +19,7 @@ pub mod unimplemented;
 
 use crate::MicroliftError;
 use crate::arch::x86_64::semantics::fpu::FpuOp;
+use crate::arch::x86_64::semantics::sse::PackedWidth;
 use crate::lifter::Lifter;
 use iced_x86::{Instruction, Mnemonic, OpKind};
 
@@ -87,6 +88,24 @@ impl<'a> Lifter<'a> {
             Mnemonic::Andnps | Mnemonic::Andnpd | Mnemonic::Pandn => {
                 self.handle_andnps(instruction)
             }
+
+            // SSE2 - packed integer add / subtract
+            Mnemonic::Paddb => self.handle_padd(instruction, PackedWidth::Byte),
+            Mnemonic::Paddw => self.handle_padd(instruction, PackedWidth::Word),
+            Mnemonic::Paddd => self.handle_padd(instruction, PackedWidth::Dword),
+            Mnemonic::Paddq => self.handle_padd(instruction, PackedWidth::Qword),
+            Mnemonic::Psubb => self.handle_psub(instruction, PackedWidth::Byte),
+            Mnemonic::Psubw => self.handle_psub(instruction, PackedWidth::Word),
+            Mnemonic::Psubd => self.handle_psub(instruction, PackedWidth::Dword),
+            Mnemonic::Psubq => self.handle_psub(instruction, PackedWidth::Qword),
+            Mnemonic::Paddsb => self.handle_padds(instruction, PackedWidth::Byte),
+            Mnemonic::Paddsw => self.handle_padds(instruction, PackedWidth::Word),
+            Mnemonic::Paddusb => self.handle_paddus(instruction, PackedWidth::Byte),
+            Mnemonic::Paddusw => self.handle_paddus(instruction, PackedWidth::Word),
+            Mnemonic::Psubsb => self.handle_psubs(instruction, PackedWidth::Byte),
+            Mnemonic::Psubsw => self.handle_psubs(instruction, PackedWidth::Word),
+            Mnemonic::Psubusb => self.handle_psubus(instruction, PackedWidth::Byte),
+            Mnemonic::Psubusw => self.handle_psubus(instruction, PackedWidth::Word),
 
             // String Operations
             Mnemonic::Movsb => self.handle_movsb(instruction),

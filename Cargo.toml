@@ -119,6 +119,10 @@ required-features = ["testkit"]
 name = "stack_alignment_tests"
 required-features = ["testkit"]
 
+[[test]]
+name = "resume_test"
+required-features = ["testkit"]
+
 # Differential fuzzing suite (proptest). Requires the `fuzzing` feature. The
 # shared `tests/fuzz/mod.rs` is included per-binary and is not a target itself.
 [[test]]

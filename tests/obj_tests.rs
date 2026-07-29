@@ -264,6 +264,7 @@ fn test_compile_runtime_assisted_fast_import_has_relocation() {
         &aot_imports,
         None,
         None,
+        &[],
     )
     .expect("failed to compile object with fast imports");
     assert!(!obj_bytes.is_empty());
@@ -383,6 +384,7 @@ fn test_compile_runtime_assisted_two_fast_imports_have_relocations() {
         &aot_imports,
         None,
         None,
+        &[],
     )
     .expect("failed to compile object with fast imports");
 

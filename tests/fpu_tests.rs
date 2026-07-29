@@ -42,8 +42,7 @@ fn test_fldz_pushes_zero() {
 fn test_fld1_pushes_one() {
     // fld1; ret  ->  D9 E8  C3
     let bytes = [0xD9, 0xE8, 0xC3];
-    let mut ctx = RegisterContext::default();
-    let ctx = run_test(&bytes, ctx);
+    let ctx = run_test(&bytes, RegisterContext::default());
     assert_eq!(st(&ctx, 0), 1.0);
 }
 
@@ -242,7 +241,7 @@ fn test_fisttp_truncates_i64() {
     let mut ctx = RegisterContext::default();
     ctx.rax = &src as *const f64 as u64;
     ctx.rcx = &mut dst as *mut i64 as u64;
-    let ctx = run_test(&bytes, ctx);
+    run_test(&bytes, ctx);
     assert_eq!(dst, -3, "fisttp must truncate toward zero");
 }
 

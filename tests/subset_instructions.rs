@@ -335,6 +335,9 @@ fn test_string_ops() {
     let ctx_out = run_test(&bytes, ctx);
     assert_eq!(ctx_out.rax & 0xFF, 0x77);
     assert_eq!(ctx_out.rsi, mem_ptr + 33);
+    // Also proves the buffer is read back through `mem` after the lifted code
+    // wrote/read it through `mem_ptr`.
+    assert_eq!(mem[32], 0x77, "lodsb must not modify its source");
 }
 
 #[test]

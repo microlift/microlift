@@ -20,6 +20,94 @@ use crate::arch::x86_64::semantics::helpers::xmm_register_index;
 use cranelift::prelude::*;
 use iced_x86::{Instruction, OpKind};
 
+/// Lane width of a packed-integer SSE operation - the `b`/`w`/`d`/`q` suffix
+/// of mnemonics like `PADDB` / `PADDW` / `PADDD` / `PADDQ`.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub(super) enum PackedWidth {
+    Byte,
+    Word,
+    Dword,
+    Qword,
+}
+
+impl PackedWidth {
+    /// Lane width in bits.
+    fn bits(self) -> u32 {
+        match self {
+            PackedWidth::Byte => 8,
+            PackedWidth::Word => 16,
+            PackedWidth::Dword => 32,
+            PackedWidth::Qword => 64,
+        }
+    }
+
+    /// The 128-bit Cranelift vector type with these lanes.
+    fn vector_type(self) -> Type {
+        match self {
+            PackedWidth::Byte => types::I8X16,
+            PackedWidth::Word => types::I16X8,
+            PackedWidth::Dword => types::I32X4,
+            PackedWidth::Qword => types::I64X2,
+        }
+    }
+
+    /// A 64-bit mask with the most significant bit of every lane set
+    /// (`0x8080..` for byte lanes, `0x8000_8000..` for word lanes, ...).
+    ///
+    /// This is the "carry barrier" used by the SWAR add/sub in scalar mode.
+    fn lane_sign_mask(self) -> i64 {
+        let bits = self.bits();
+        let mut mask = 0u64;
+        let mut shift = 0;
+        while shift < 64 {
+            mask |= 1u64 << (shift + bits - 1);
+            shift += bits;
+        }
+        mask as i64
+    }
+
+    /// A 64-bit mask with all bits of the lowest lane set.
+    fn lane_mask(self) -> i64 {
+        match self.bits() {
+            64 => -1,
+            bits => ((1u64 << bits) - 1) as i64,
+        }
+    }
+}
+
+/// Which packed-integer add/sub variant to emit.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub(super) enum PackedIntOp {
+    /// `PADDB`/`PADDW`/`PADDD`/`PADDQ` - wrapping per-lane add.
+    Add,
+    /// `PSUBB`/`PSUBW`/`PSUBD`/`PSUBQ` - wrapping per-lane subtract.
+    Sub,
+    /// `PADDSB`/`PADDSW` - add, saturating to the signed lane range.
+    AddSatSigned,
+    /// `PADDUSB`/`PADDUSW` - add, saturating to the unsigned lane range.
+    AddSatUnsigned,
+    /// `PSUBSB`/`PSUBSW` - subtract, saturating to the signed lane range.
+    SubSatSigned,
+    /// `PSUBUSB`/`PSUBUSW` - subtract, saturating to the unsigned lane range.
+    SubSatUnsigned,
+}
+
+impl PackedIntOp {
+    /// True for the two ops that interpret lanes as signed and clamp to
+    /// `[-2^(n-1), 2^(n-1)-1]`.
+    fn is_signed(self) -> bool {
+        matches!(self, PackedIntOp::AddSatSigned | PackedIntOp::SubSatSigned)
+    }
+
+    /// True for the subtracting ops.
+    fn is_subtract(self) -> bool {
+        matches!(
+            self,
+            PackedIntOp::Sub | PackedIntOp::SubSatSigned | PackedIntOp::SubSatUnsigned
+        )
+    }
+}
+
 impl<'a> Lifter<'a> {
     /// Load a 128-bit XMM source operand as a `(lo, hi)` scalar pair.
     ///
@@ -838,5 +926,255 @@ impl<'a> Lifter<'a> {
         self.set_flag(X86Flag::Sign, zero)?;
         self.set_flag(X86Flag::Auxiliary, zero)?;
         Ok(())
+    }
+
+    //  Packed integer add / subtract (PADDB..PADDQ, PSUBB..PSUBQ and the
+    //  saturating PADDS*/PADDUS*/PSUBS*/PSUBUS* forms).
+
+    /// Shared implementation of every packed-integer add/sub form.
+    ///
+    /// In vector mode the 128-bit value is bitcast to the lane type and handed
+    /// to Cranelift's native `iadd`/`isub`/`*_sat`, which lower to a single host
+    /// SIMD instruction. In scalar mode each 64-bit half is processed
+    /// independently: wrapping ops use a SWAR sequence that blocks carries at
+    /// the lane boundaries, saturating ops are expanded per lane.
+    ///
+    /// Note that `dst` is always the XMM register operand 0; the source may be
+    /// an XMM register or `m128`.
+    fn packed_int_arith(
+        &mut self,
+        instruction: &Instruction,
+        who: &str,
+        op: PackedIntOp,
+        width: PackedWidth,
+    ) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, who)?;
+
+        if self.config.use_vector_xmm {
+            let dst = self.get_xmm_vec(dst_idx);
+            let src = self.read_xmm_src_vec(instruction, 1)?;
+            let ty = width.vector_type();
+            let a = self.vec_bitcast(dst, ty);
+            let b = self.vec_bitcast(src, ty);
+            let r = match op {
+                PackedIntOp::Add => self.builder.ins().iadd(a, b),
+                PackedIntOp::Sub => self.builder.ins().isub(a, b),
+                PackedIntOp::AddSatSigned => self.builder.ins().sadd_sat(a, b),
+                PackedIntOp::AddSatUnsigned => self.builder.ins().uadd_sat(a, b),
+                PackedIntOp::SubSatSigned => self.builder.ins().ssub_sat(a, b),
+                PackedIntOp::SubSatUnsigned => self.builder.ins().usub_sat(a, b),
+            };
+            let r = self.vec_bitcast(r, types::I64X2);
+            self.set_xmm_vec(dst_idx, r);
+            return Ok(());
+        }
+
+        let dst_lo = self.get_xmm_lo(dst_idx);
+        let dst_hi = self.get_xmm_hi(dst_idx);
+        let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
+        let res_lo = self.packed_int_arith_64(dst_lo, src_lo, op, width);
+        let res_hi = self.packed_int_arith_64(dst_hi, src_hi, op, width);
+        self.set_xmm_lo(dst_idx, res_lo);
+        self.set_xmm_hi(dst_idx, res_hi);
+        Ok(())
+    }
+
+    /// Reinterpret a 128-bit vector value as `ty` (a no-op if it already has
+    /// that type). Lane-count changes require an explicit byte order.
+    fn vec_bitcast(&mut self, v: Value, ty: Type) -> Value {
+        if self.builder.func.dfg.value_type(v) == ty {
+            return v;
+        }
+        let flags = MemFlagsData::new().with_endianness(codegen::ir::Endianness::Little);
+        self.builder.ins().bitcast(ty, flags, v)
+    }
+
+    /// Apply one packed-integer op to a single 64-bit half of an XMM register
+    /// (scalar mode).
+    fn packed_int_arith_64(
+        &mut self,
+        a: Value,
+        b: Value,
+        op: PackedIntOp,
+        width: PackedWidth,
+    ) -> Value {
+        match op {
+            PackedIntOp::Add => self.swar_add(a, b, width),
+            PackedIntOp::Sub => self.swar_sub(a, b, width),
+            _ => self.saturating_lanes(a, b, op, width),
+        }
+    }
+
+    /// Lane-wise wrapping add of two 64-bit lane packs, without cross-lane
+    /// carry propagation.
+    ///
+    /// Adds the lanes with their high bits cleared (so no carry can escape a
+    /// lane) and then re-applies each lane's high bit as `a ^ b`, which is the
+    /// correct high bit of the sum.
+    fn swar_add(&mut self, a: Value, b: Value, width: PackedWidth) -> Value {
+        if width == PackedWidth::Qword {
+            return self.builder.ins().iadd(a, b);
+        }
+        let high = width.lane_sign_mask();
+        let a_low = self.builder.ins().band_imm(a, !high);
+        let b_low = self.builder.ins().band_imm(b, !high);
+        let sum = self.builder.ins().iadd(a_low, b_low);
+        let xor = self.builder.ins().bxor(a, b);
+        let high_bits = self.builder.ins().band_imm(xor, high);
+        self.builder.ins().bxor(sum, high_bits)
+    }
+
+    /// Lane-wise wrapping subtract of two 64-bit lane packs, without cross-lane
+    /// borrow propagation.
+    ///
+    /// The mirror of [`Self::swar_add`]: setting every lane's high bit in `a`
+    /// guarantees each lane can absorb its own borrow, and the high bits are
+    /// then corrected to `~(a ^ b)`.
+    fn swar_sub(&mut self, a: Value, b: Value, width: PackedWidth) -> Value {
+        if width == PackedWidth::Qword {
+            return self.builder.ins().isub(a, b);
+        }
+        let high_imm = width.lane_sign_mask();
+        let high = self.builder.ins().iconst(types::I64, high_imm);
+        let a_high_set = self.builder.ins().bor(a, high);
+        let b_low = self.builder.ins().band_imm(b, !high_imm);
+        let diff = self.builder.ins().isub(a_high_set, b_low);
+        let xor = self.builder.ins().bxor(a, b);
+        // band_not(high, xor) = high & ~(a ^ b) = ((a ^ ~b) & high)
+        let correction = self.builder.ins().band_not(high, xor);
+        self.builder.ins().bxor(diff, correction)
+    }
+
+    /// Saturating lane-wise add/sub of two 64-bit lane packs, expanded one lane
+    /// at a time (scalar mode).
+    ///
+    /// Each lane is widened into a full `I64`, the arithmetic performed there
+    /// (which cannot overflow, since x86 only defines saturating packed add/sub
+    /// for 8- and 16-bit lanes), clamped to the lane's representable range, and
+    /// shifted back into place.
+    fn saturating_lanes(
+        &mut self,
+        a: Value,
+        b: Value,
+        op: PackedIntOp,
+        width: PackedWidth,
+    ) -> Value {
+        let lane_bits = width.bits();
+        debug_assert!(
+            lane_bits <= 16,
+            "saturating packed arithmetic is only defined for 8/16-bit lanes"
+        );
+        let lane_mask = width.lane_mask();
+        let signed = op.is_signed();
+        let (min, max) = if signed {
+            (-(1i64 << (lane_bits - 1)), (1i64 << (lane_bits - 1)) - 1)
+        } else {
+            (0, lane_mask)
+        };
+        let min = self.builder.ins().iconst(types::I64, min);
+        let max = self.builder.ins().iconst(types::I64, max);
+
+        let mut acc = self.builder.ins().iconst(types::I64, 0);
+        for lane in 0..(64 / lane_bits) {
+            let shift = (lane * lane_bits) as i64;
+            let x = self.extract_lane(a, shift, lane_bits, signed);
+            let y = self.extract_lane(b, shift, lane_bits, signed);
+            let raw = if op.is_subtract() {
+                self.builder.ins().isub(x, y)
+            } else {
+                self.builder.ins().iadd(x, y)
+            };
+            // `raw` is small enough that signed clamping is correct for the
+            // unsigned forms too (unsigned lanes widen to non-negative I64s).
+            let low_clamped = self.builder.ins().smax(raw, min);
+            let clamped = self.builder.ins().smin(low_clamped, max);
+            let lane_val = self.builder.ins().band_imm(clamped, lane_mask);
+            let placed = if shift == 0 {
+                lane_val
+            } else {
+                self.builder.ins().ishl_imm(lane_val, shift)
+            };
+            acc = self.builder.ins().bor(acc, placed);
+        }
+        acc
+    }
+
+    /// Widen the `lane_bits`-wide lane at bit offset `shift` of `v` into a full
+    /// `I64`, sign- or zero-extending as requested.
+    fn extract_lane(&mut self, v: Value, shift: i64, lane_bits: u32, signed: bool) -> Value {
+        if signed {
+            let left = 64 - shift - lane_bits as i64;
+            let aligned = if left == 0 {
+                v
+            } else {
+                self.builder.ins().ishl_imm(v, left)
+            };
+            self.builder.ins().sshr_imm(aligned, 64 - lane_bits as i64)
+        } else {
+            let shifted = if shift == 0 {
+                v
+            } else {
+                self.builder.ins().ushr_imm(v, shift)
+            };
+            let mask = match lane_bits {
+                64 => return shifted,
+                bits => ((1u64 << bits) - 1) as i64,
+            };
+            self.builder.ins().band_imm(shifted, mask)
+        }
+    }
+
+    /// PADDB / PADDW / PADDD / PADDQ - wrapping packed integer add.
+    pub(super) fn handle_padd(
+        &mut self,
+        instruction: &Instruction,
+        width: PackedWidth,
+    ) -> crate::Result<()> {
+        self.packed_int_arith(instruction, "padd", PackedIntOp::Add, width)
+    }
+
+    /// PSUBB / PSUBW / PSUBD / PSUBQ - wrapping packed integer subtract.
+    pub(super) fn handle_psub(
+        &mut self,
+        instruction: &Instruction,
+        width: PackedWidth,
+    ) -> crate::Result<()> {
+        self.packed_int_arith(instruction, "psub", PackedIntOp::Sub, width)
+    }
+
+    /// PADDSB / PADDSW - packed signed-saturating add.
+    pub(super) fn handle_padds(
+        &mut self,
+        instruction: &Instruction,
+        width: PackedWidth,
+    ) -> crate::Result<()> {
+        self.packed_int_arith(instruction, "padds", PackedIntOp::AddSatSigned, width)
+    }
+
+    /// PADDUSB / PADDUSW - packed unsigned-saturating add.
+    pub(super) fn handle_paddus(
+        &mut self,
+        instruction: &Instruction,
+        width: PackedWidth,
+    ) -> crate::Result<()> {
+        self.packed_int_arith(instruction, "paddus", PackedIntOp::AddSatUnsigned, width)
+    }
+
+    /// PSUBSB / PSUBSW - packed signed-saturating subtract.
+    pub(super) fn handle_psubs(
+        &mut self,
+        instruction: &Instruction,
+        width: PackedWidth,
+    ) -> crate::Result<()> {
+        self.packed_int_arith(instruction, "psubs", PackedIntOp::SubSatSigned, width)
+    }
+
+    /// PSUBUSB / PSUBUSW - packed unsigned-saturating subtract.
+    pub(super) fn handle_psubus(
+        &mut self,
+        instruction: &Instruction,
+        width: PackedWidth,
+    ) -> crate::Result<()> {
+        self.packed_int_arith(instruction, "psubus", PackedIntOp::SubSatUnsigned, width)
     }
 }

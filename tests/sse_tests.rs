@@ -908,3 +908,322 @@ fn test_vec_pshufd_and_psrlq() {
     let ctx = run_test_vec(&bytes, ctx);
     assert_eq!(ctx.xmm[0], [0x0000_0000_0000_0FF0, 0x0F00_0000_0000_0000]);
 }
+
+//  Packed integer add / subtract
+//
+//  PADDB/W/D/Q, PSUBB/W/D/Q and the saturating PADDS*/PADDUS*/PSUBS*/PSUBUS*
+//  forms. Every case is checked in both XMM representations: the scalar lo/hi
+//  pair (SWAR / per-lane expansion) and native vectors.
+
+/// Set `xmm0 = dst`, `xmm1 = src`, run `bytes` in both scalar and vector XMM
+/// mode, and assert `xmm0 == expected` either way.
+fn check_packed(bytes: &[u8], dst: [u64; 2], src: [u64; 2], expected: [u64; 2], what: &str) {
+    for (mode, run) in [
+        ("scalar", run_test as fn(&[u8], RegisterContext) -> RegisterContext),
+        ("vector", run_test_vec),
+    ] {
+        let mut ctx = RegisterContext::default();
+        ctx.xmm[0] = dst;
+        ctx.xmm[1] = src;
+        let ctx = run(bytes, ctx);
+        assert_eq!(
+            ctx.xmm[0], expected,
+            "{what} ({mode} xmm): dst={dst:#018x?} src={src:#018x?}"
+        );
+        assert_eq!(ctx.xmm[1], src, "{what} ({mode} xmm) must not modify the source");
+    }
+}
+
+#[test]
+fn test_paddd() {
+    // paddd xmm0, xmm1; ret  ->  66 0F FE C1  C3
+    let bytes = [0x66, 0x0F, 0xFE, 0xC1, 0xC3];
+    check_packed(
+        &bytes,
+        [0x0000_0002_FFFF_FFFF, 0x8000_0000_7FFF_FFFF],
+        [0x0000_0003_0000_0001, 0x8000_0000_0000_0001],
+        // d0 wraps to 0 without carrying into d1; d3 (0x80000000 * 2) wraps too.
+        [0x0000_0005_0000_0000, 0x0000_0000_8000_0000],
+        "paddd",
+    );
+}
+
+#[test]
+fn test_paddd_other_registers() {
+    // paddd xmm2, xmm3; ret  ->  66 0F FE D3  C3
+    let bytes = [0x66, 0x0F, 0xFE, 0xD3, 0xC3];
+    for run in [
+        run_test as fn(&[u8], RegisterContext) -> RegisterContext,
+        run_test_vec,
+    ] {
+        let mut ctx = RegisterContext::default();
+        ctx.xmm[2] = [0x0000_0001_0000_0002, 0x0000_0003_0000_0004];
+        ctx.xmm[3] = [0x0000_0010_0000_0020, 0x0000_0030_0000_0040];
+        let ctx = run(&bytes, ctx);
+        assert_eq!(
+            ctx.xmm[2],
+            [0x0000_0011_0000_0022, 0x0000_0033_0000_0044]
+        );
+        assert_eq!(ctx.xmm[0], [0, 0], "paddd xmm2,xmm3 must not touch xmm0");
+    }
+}
+
+#[test]
+fn test_paddd_mem() {
+    // paddd xmm0, [rax]; ret  ->  66 0F FE 00  C3
+    let bytes = [0x66, 0x0F, 0xFE, 0x00, 0xC3];
+    let mem: [u64; 2] = [0x0000_0003_0000_0001, 0x0000_0000_FFFF_FFFF];
+    for run in [
+        run_test as fn(&[u8], RegisterContext) -> RegisterContext,
+        run_test_vec,
+    ] {
+        let mut ctx = RegisterContext::default();
+        ctx.rax = mem.as_ptr() as u64;
+        ctx.xmm[0] = [0x0000_0002_FFFF_FFFF, 0x0000_0001_0000_0002];
+        let ctx = run(&bytes, ctx);
+        assert_eq!(
+            ctx.xmm[0],
+            [0x0000_0005_0000_0000, 0x0000_0001_0000_0001]
+        );
+    }
+}
+
+#[test]
+fn test_paddb() {
+    // paddb xmm0, xmm1; ret  ->  66 0F FC C1  C3
+    let bytes = [0x66, 0x0F, 0xFC, 0xC1, 0xC3];
+    check_packed(
+        &bytes,
+        [0x0102_0304_0506_07FF, 0x7F7F_7F7F_8080_8080],
+        [0x0101_0101_0101_0101, 0x0101_0101_0101_0101],
+        // The low byte wraps 0xFF -> 0x00 without carrying into the next lane.
+        [0x0203_0405_0607_0800, 0x8080_8080_8181_8181],
+        "paddb",
+    );
+}
+
+#[test]
+fn test_paddw() {
+    // paddw xmm0, xmm1; ret  ->  66 0F FD C1  C3
+    let bytes = [0x66, 0x0F, 0xFD, 0xC1, 0xC3];
+    check_packed(
+        &bytes,
+        [0xFFFF_0001_1234_FFFF, 0x0000_FFFF_8000_7FFF],
+        [0x0001_0001_0001_0001, 0x0001_0001_8000_0001],
+        [0x0000_0002_1235_0000, 0x0001_0000_0000_8000],
+        "paddw",
+    );
+}
+
+#[test]
+fn test_paddq() {
+    // paddq xmm0, xmm1; ret  ->  66 0F D4 C1  C3
+    let bytes = [0x66, 0x0F, 0xD4, 0xC1, 0xC3];
+    check_packed(
+        &bytes,
+        [0xFFFF_FFFF_FFFF_FFFF, 0x0000_0000_0000_0005],
+        [0x0000_0000_0000_0001, 0x0000_0000_0000_0007],
+        // The low quadword wraps to 0; no carry crosses into the high lane.
+        [0x0000_0000_0000_0000, 0x0000_0000_0000_000C],
+        "paddq",
+    );
+}
+
+#[test]
+fn test_psubd() {
+    // psubd xmm0, xmm1; ret  ->  66 0F FA C1  C3
+    let bytes = [0x66, 0x0F, 0xFA, 0xC1, 0xC3];
+    check_packed(
+        &bytes,
+        [0x0000_0005_0000_0000, 0x0000_0000_8000_0000],
+        [0x0000_0002_0000_0001, 0x0000_0001_8000_0000],
+        // d0's borrow must not reach d1; likewise d2 -> d3.
+        [0x0000_0003_FFFF_FFFF, 0xFFFF_FFFF_0000_0000],
+        "psubd",
+    );
+}
+
+#[test]
+fn test_psubb() {
+    // psubb xmm0, xmm1; ret  ->  66 0F F8 C1  C3
+    let bytes = [0x66, 0x0F, 0xF8, 0xC1, 0xC3];
+    check_packed(
+        &bytes,
+        [0x1020_3040_5060_7000, 0x0000_0000_0000_0000],
+        [0x0101_0101_0101_0101, 0x0101_0101_0101_0101],
+        [0x0F1F_2F3F_4F5F_6FFF, 0xFFFF_FFFF_FFFF_FFFF],
+        "psubb",
+    );
+}
+
+#[test]
+fn test_psubw() {
+    // psubw xmm0, xmm1; ret  ->  66 0F F9 C1  C3
+    let bytes = [0x66, 0x0F, 0xF9, 0xC1, 0xC3];
+    check_packed(
+        &bytes,
+        [0x0000_0000_0001_0000, 0x8000_1234_0000_ABCD],
+        [0x0001_0001_0001_0001, 0x0001_0234_0001_00CD],
+        [0xFFFF_FFFF_0000_FFFF, 0x7FFF_1000_FFFF_AB00],
+        "psubw",
+    );
+}
+
+#[test]
+fn test_psubw_mem() {
+    // psubw xmm0, [rax]; ret  ->  66 0F F9 00  C3
+    let bytes = [0x66, 0x0F, 0xF9, 0x00, 0xC3];
+    let mem: [u64; 2] = [0x0001_0001_0001_0001, 0x0001_0001_0001_0001];
+    for run in [
+        run_test as fn(&[u8], RegisterContext) -> RegisterContext,
+        run_test_vec,
+    ] {
+        let mut ctx = RegisterContext::default();
+        ctx.rax = mem.as_ptr() as u64;
+        ctx.xmm[0] = [0x0000_0000_0001_0000, 0x0002_0003_0004_0005];
+        let ctx = run(&bytes, ctx);
+        assert_eq!(
+            ctx.xmm[0],
+            [0xFFFF_FFFF_0000_FFFF, 0x0001_0002_0003_0004]
+        );
+    }
+}
+
+#[test]
+fn test_psubq() {
+    // psubq xmm0, xmm1; ret  ->  66 0F FB C1  C3
+    let bytes = [0x66, 0x0F, 0xFB, 0xC1, 0xC3];
+    check_packed(
+        &bytes,
+        [0x0000_0000_0000_0000, 0x0000_0000_0000_000A],
+        [0x0000_0000_0000_0001, 0x0000_0000_0000_0003],
+        [0xFFFF_FFFF_FFFF_FFFF, 0x0000_0000_0000_0007],
+        "psubq",
+    );
+}
+
+#[test]
+fn test_paddsb_saturates_signed() {
+    // paddsb xmm0, xmm1; ret  ->  66 0F EC C1  C3
+    let bytes = [0x66, 0x0F, 0xEC, 0xC1, 0xC3];
+    check_packed(
+        &bytes,
+        [0x7080_01FF_7F80_0000, 0x7F7F_7F7F_7F7F_7F7F],
+        [0x7080_0201_01FF_0000, 0x0101_0101_0101_0101],
+        // byte7: 0x70+0x70 -> +0x7F   byte6: 0x80+0x80 -> -0x80
+        // byte5: 0x01+0x02 = 0x03     byte4: 0xFF+0x01 = 0x00
+        // byte3: 0x7F+0x01 -> +0x7F   byte2: 0x80+0xFF -> -0x80
+        [0x7F80_0300_7F80_0000, 0x7F7F_7F7F_7F7F_7F7F],
+        "paddsb",
+    );
+}
+
+#[test]
+fn test_paddsw_saturates_signed() {
+    // paddsw xmm0, xmm1; ret  ->  66 0F ED C1  C3
+    let bytes = [0x66, 0x0F, 0xED, 0xC1, 0xC3];
+    check_packed(
+        &bytes,
+        [0x7FFF_8000_0100_FFFF, 0x8000_8000_8000_8000],
+        [0x0001_8000_0200_0001, 0xFFFF_FFFF_FFFF_FFFF],
+        [0x7FFF_8000_0300_0000, 0x8000_8000_8000_8000],
+        "paddsw",
+    );
+}
+
+#[test]
+fn test_paddusb_saturates_unsigned() {
+    // paddusb xmm0, xmm1; ret  ->  66 0F DC C1  C3
+    let bytes = [0x66, 0x0F, 0xDC, 0xC1, 0xC3];
+    check_packed(
+        &bytes,
+        [0xFF80_1000_FF01_0203, 0x0102_0304_0506_0708],
+        [0x0180_2000_0002_0304, 0x0101_0101_0101_0101],
+        // byte7: 0xFF+0x01 -> 0xFF    byte6: 0x80+0x80 -> 0xFF
+        [0xFFFF_3000_FF03_0507, 0x0203_0405_0607_0809],
+        "paddusb",
+    );
+}
+
+#[test]
+fn test_paddusw_saturates_unsigned() {
+    // paddusw xmm0, xmm1; ret  ->  66 0F DD C1  C3
+    let bytes = [0x66, 0x0F, 0xDD, 0xC1, 0xC3];
+    check_packed(
+        &bytes,
+        [0xFFFF_8000_1234_0001, 0x0000_1111_2222_3333],
+        [0x0001_8000_1000_0002, 0x0001_1111_1111_1111],
+        [0xFFFF_FFFF_2234_0003, 0x0001_2222_3333_4444],
+        "paddusw",
+    );
+}
+
+#[test]
+fn test_psubsb_saturates_signed() {
+    // psubsb xmm0, xmm1; ret  ->  66 0F E8 C1  C3
+    let bytes = [0x66, 0x0F, 0xE8, 0xC1, 0xC3];
+    check_packed(
+        &bytes,
+        [0x807F_0010_0000_0000, 0x7F7F_7F7F_7F7F_7F7F],
+        [0x0180_0102_0000_0000, 0x8080_8080_8080_8080],
+        // byte7: -0x80-0x01 -> -0x80   byte6: +0x7F-(-0x80) -> +0x7F
+        // byte5: 0x00-0x01 = 0xFF      byte4: 0x10-0x02 = 0x0E
+        [0x807F_FF0E_0000_0000, 0x7F7F_7F7F_7F7F_7F7F],
+        "psubsb",
+    );
+}
+
+#[test]
+fn test_psubsw_saturates_signed() {
+    // psubsw xmm0, xmm1; ret  ->  66 0F E9 C1  C3
+    let bytes = [0x66, 0x0F, 0xE9, 0xC1, 0xC3];
+    check_packed(
+        &bytes,
+        [0x8000_7FFF_0005_0000, 0x0000_0000_0000_0000],
+        [0x0001_8000_0003_0001, 0x0001_0001_0001_0001],
+        [0x8000_7FFF_0002_FFFF, 0xFFFF_FFFF_FFFF_FFFF],
+        "psubsw",
+    );
+}
+
+#[test]
+fn test_psubusb_saturates_at_zero() {
+    // psubusb xmm0, xmm1; ret  ->  66 0F D8 C1  C3
+    let bytes = [0x66, 0x0F, 0xD8, 0xC1, 0xC3];
+    check_packed(
+        &bytes,
+        [0x0010_FF80_0102_0304, 0x0203_0405_0607_0809],
+        [0x0102_FF81_0201_0004, 0x0101_0101_0101_0101],
+        // Every underflowing lane clamps to 0x00 rather than wrapping.
+        [0x000E_0000_0001_0300, 0x0102_0304_0506_0708],
+        "psubusb",
+    );
+}
+
+#[test]
+fn test_psubusw_saturates_at_zero() {
+    // psubusw xmm0, xmm1; ret  ->  66 0F D9 C1  C3
+    let bytes = [0x66, 0x0F, 0xD9, 0xC1, 0xC3];
+    check_packed(
+        &bytes,
+        [0x0000_1234_FFFF_0005, 0x1000_2000_3000_4000],
+        [0x0001_0234_FFFF_0006, 0x0001_0001_0001_0001],
+        [0x0000_1000_0000_0000, 0x0FFF_1FFF_2FFF_3FFF],
+        "psubusw",
+    );
+}
+
+#[test]
+fn test_packed_add_sub_roundtrip() {
+    // paddd xmm0, xmm1; psubd xmm0, xmm1; ret  -> the pair must be an identity
+    // even when individual lanes wrap.
+    let bytes = [0x66, 0x0F, 0xFE, 0xC1, 0x66, 0x0F, 0xFA, 0xC1, 0xC3];
+    let start = [0xDEAD_BEEF_CAFE_BABE, 0x0000_0001_FFFF_FFFF];
+    check_packed(
+        &bytes,
+        start,
+        [0x1234_5678_9ABC_DEF0, 0xFFFF_FFFF_0000_0001],
+        start,
+        "paddd+psubd roundtrip",
+    );
+}
