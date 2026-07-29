@@ -1028,9 +1028,7 @@ impl<'a> Lifter<'a> {
             .ins()
             .brif(cond, target_block, &[], next_block, &[]);
 
-        self.builder.switch_to_block(next_block);
-        self.visited_blocks.insert(next_block);
-        self.block_terminated = false;
+        self.continue_in_fallthrough(next_block);
 
         Ok(())
     }
@@ -1050,9 +1048,7 @@ impl<'a> Lifter<'a> {
             .ins()
             .brif(cond, next_block, &[], target_block, &[]);
 
-        self.builder.switch_to_block(next_block);
-        self.visited_blocks.insert(next_block);
-        self.block_terminated = false;
+        self.continue_in_fallthrough(next_block);
 
         Ok(())
     }

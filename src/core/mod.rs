@@ -508,6 +508,26 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         block
     }
 
+    /// Position the builder to keep emitting into `next_block`, the fallthrough
+    /// side of a branch that was just emitted.
+    ///
+    /// The emission loop only creates blocks for leaders, so straight-line
+    /// code after a leader is tail-duplicated into every block that reaches it. When
+    /// two such copies both end in a conditional branch, the second one finds its
+    /// fallthrough block already filled by the first. There is nothing left to emit
+    /// in that case - the `brif` edge already points at the filled block - so just
+    /// terminate the current block instead of switching into it (which would trip
+    /// cranelift's "switch to a block which is already filled" assertion).
+    pub fn continue_in_fallthrough(&mut self, next_block: Block) {
+        if self.visited_blocks.contains(&next_block) {
+            self.block_terminated = true;
+            return;
+        }
+        self.builder.switch_to_block(next_block);
+        self.visited_blocks.insert(next_block);
+        self.block_terminated = false;
+    }
+
     /// Emit a store of `code` into the `exit_code` control field.
     pub fn write_exit_code(&mut self, code: u32) {
         let ctx_ptr = self.builder.use_var(A::context_ptr_var(&self.state));

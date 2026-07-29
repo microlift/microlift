@@ -52,33 +52,22 @@ proptest! {
     /// Decoder / IR-emission robustness: lifting arbitrary bytes must return a
     /// clean `Ok`/`Err` and never panic or invoke UB. (We only lift to IR here;
     /// we never execute random bytes.)
-    ///
-    /// IGNORED: this property currently FAILS - it found a real lifter panic in
-    /// the overlapping/sub-encoded-instruction path. A conditional branch whose
-    /// target lands in the middle of a following (multi-byte, e.g. VEX)
-    /// instruction drives Cranelift's frontend to `switch_to_block` on an
-    /// already-filled block:
-    ///     "you cannot switch to a block which is already filled"
-    /// Minimal reproducer captured in `lifter_block_fill_panic_reproducer`
-    /// below. Re-enable (remove `#[ignore]`) once the block-emission bug is
-    /// fixed. Run on demand with `-- --ignored`.
     #[test]
-    #[ignore = "reproduces an unfixed lifter panic; see doc comment + reproducer test"]
     fn lifting_arbitrary_bytes_never_panics(bytes in prop::collection::vec(any::<u8>(), 0..24)) {
         let _ = lift_to_function::<X86_64>(&bytes, 0x1000, LifterConfig::default());
     }
 }
 
-/// Minimal reproducer for the lifter panic the fuzzer surfaced (see
-/// `lifting_arbitrary_bytes_never_panics`). `jo +5` targets the interior of the
-/// following 3-byte VEX-prefixed instruction; block emission then tries to
-/// switch to an already-filled block. `#[ignore]`d because it currently panics;
-/// run with `-- --ignored` to reproduce, and it should start passing once the
-/// bug is fixed.
+/// Regression test for a lifter panic the fuzzer surfaced (see
+/// `lifting_arbitrary_bytes_never_panics`). Straight-line code after a leader is
+/// tail-duplicated into every block that reaches it; here `jo 0x100E` at 0x100C
+/// is emitted both as the tail of block 0x1006 and as the tail of block 0x1007.
+/// The second copy used to `switch_to_block` on its fallthrough block, which the
+/// first copy had already filled - "you cannot switch to a block which is
+/// already filled". `continue_in_fallthrough` now terminates instead.
 #[test]
-#[ignore = "reproduces an unfixed lifter block-emission panic"]
 fn lifter_block_fill_panic_reproducer() {
-    // jo 0x1007 ; (vex) ... - overlapping decode.
+    // jo 0x1007 ; (bad) ; sbb [100Ch],cl / or eax,0 ; jo 0x100E - overlapping decode.
     let bytes = [
         0x70, 0x05, 0xC4, 0x04, 0x00, 0x00, 0x18, 0x0D, 0x00, 0x00, 0x00, 0x00, 0x70, 0x00,
     ];
