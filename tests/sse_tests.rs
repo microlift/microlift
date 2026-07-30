@@ -605,6 +605,166 @@ fn test_movhps_store_high() {
     assert_eq!(buf[0], 0xFEED_FACE_CAFE_F00D, "movhps store must write the high quadword");
 }
 
+//  MOVLPS / MOVLPD - merging load / store of the low quadword.
+//
+//  Both XMM representations are exercised, since the lo/hi accessors take
+//  different paths in vector mode.
+
+#[test]
+fn test_movlps_load_low() {
+    // movlps xmm0, [rdi]; ret  ->  0F 12 07  C3
+    let bytes = [0x0F, 0x12, 0x07, 0xC3];
+    for run in [
+        run_test as fn(&[u8], RegisterContext) -> RegisterContext,
+        run_test_vec,
+    ] {
+        let buf = [0xCAFE_BABE_DEAD_BEEFu64, 0x0BAD_0BAD_0BAD_0BAD];
+        let mut ctx = RegisterContext::default();
+        ctx.rdi = buf.as_ptr() as u64;
+        ctx.xmm[0] = [0x1111_1111_1111_1111, 0x2222_2222_2222_2222];
+        let ctx = run(&bytes, ctx);
+        assert_eq!(
+            ctx.xmm[0],
+            [0xCAFE_BABE_DEAD_BEEF, 0x2222_2222_2222_2222],
+            "movlps load must replace the low quadword and preserve the high"
+        );
+    }
+}
+
+#[test]
+fn test_movlpd_load_low_preserves_high() {
+    // movlpd xmm0, [rdi]; ret  ->  66 0F 12 07  C3
+    // Unlike movsd xmm, m64, this must NOT zero the high quadword.
+    let bytes = [0x66, 0x0F, 0x12, 0x07, 0xC3];
+    let buf = [0x1234_5678_9ABC_DEF0u64];
+    let mut ctx = RegisterContext::default();
+    ctx.rdi = buf.as_ptr() as u64;
+    ctx.xmm[0] = [0, 0xFEED_FACE_CAFE_F00D];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(
+        ctx.xmm[0],
+        [0x1234_5678_9ABC_DEF0, 0xFEED_FACE_CAFE_F00D],
+        "movlpd is a merging load, not a zeroing one"
+    );
+}
+
+#[test]
+fn test_movlps_store_low() {
+    // movlps [rdi], xmm0; ret  ->  0F 13 07  C3
+    let bytes = [0x0F, 0x13, 0x07, 0xC3];
+    for run in [
+        run_test as fn(&[u8], RegisterContext) -> RegisterContext,
+        run_test_vec,
+    ] {
+        let mut buf = [0u64; 2];
+        let mut ctx = RegisterContext::default();
+        ctx.rdi = buf.as_mut_ptr() as u64;
+        ctx.xmm[0] = [0x1234_5678_9ABC_DEF0, 0xFEED_FACE_CAFE_F00D];
+        let _ = run(&bytes, ctx);
+        assert_eq!(buf[0], 0x1234_5678_9ABC_DEF0, "movlps store must write the low quadword");
+        assert_eq!(buf[1], 0, "movlps store must only write 8 bytes");
+    }
+}
+
+//  MOVHLPS / MOVLHPS - the register-to-register half moves that share the
+//  0F 12 / 0F 16 opcodes with MOVLPS / MOVHPS.
+
+#[test]
+fn test_movhlps() {
+    // movhlps xmm0, xmm1; ret  ->  0F 12 C1  C3
+    let bytes = [0x0F, 0x12, 0xC1, 0xC3];
+    for run in [
+        run_test as fn(&[u8], RegisterContext) -> RegisterContext,
+        run_test_vec,
+    ] {
+        let mut ctx = RegisterContext::default();
+        ctx.xmm[0] = [0x1111_1111_1111_1111, 0x2222_2222_2222_2222];
+        ctx.xmm[1] = [0x3333_3333_3333_3333, 0x4444_4444_4444_4444];
+        let ctx = run(&bytes, ctx);
+        assert_eq!(
+            ctx.xmm[0],
+            [0x4444_4444_4444_4444, 0x2222_2222_2222_2222],
+            "movhlps must move src high -> dst low, preserving dst high"
+        );
+        assert_eq!(
+            ctx.xmm[1],
+            [0x3333_3333_3333_3333, 0x4444_4444_4444_4444],
+            "movhlps must not modify the source"
+        );
+    }
+}
+
+#[test]
+fn test_movlhps() {
+    // movlhps xmm0, xmm1; ret  ->  0F 16 C1  C3
+    let bytes = [0x0F, 0x16, 0xC1, 0xC3];
+    for run in [
+        run_test as fn(&[u8], RegisterContext) -> RegisterContext,
+        run_test_vec,
+    ] {
+        let mut ctx = RegisterContext::default();
+        ctx.xmm[0] = [0x1111_1111_1111_1111, 0x2222_2222_2222_2222];
+        ctx.xmm[1] = [0x3333_3333_3333_3333, 0x4444_4444_4444_4444];
+        let ctx = run(&bytes, ctx);
+        assert_eq!(
+            ctx.xmm[0],
+            [0x1111_1111_1111_1111, 0x3333_3333_3333_3333],
+            "movlhps must move src low -> dst high, preserving dst low"
+        );
+    }
+}
+
+#[test]
+fn test_movhlps_movlhps_swap_halves() {
+    // A round trip through xmm2 swaps the halves of xmm0:
+    //   movhlps xmm2, xmm0   -> xmm2.lo = xmm0.hi   (0F 12 D0)
+    //   movlhps xmm2, xmm0   -> xmm2.hi = xmm0.lo   (0F 16 D0)
+    //   movaps  xmm0, xmm2                          (0F 28 C2)
+    let bytes = [0x0F, 0x12, 0xD0, 0x0F, 0x16, 0xD0, 0x0F, 0x28, 0xC2, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [0xAAAA_AAAA_AAAA_AAAA, 0xBBBB_BBBB_BBBB_BBBB];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.xmm[0], [0xBBBB_BBBB_BBBB_BBBB, 0xAAAA_AAAA_AAAA_AAAA]);
+}
+
+//  MOVDDUP
+
+#[test]
+fn test_movddup_reg() {
+    // movddup xmm0, xmm1; ret  ->  F2 0F 12 C1  C3
+    let bytes = [0xF2, 0x0F, 0x12, 0xC1, 0xC3];
+    for run in [
+        run_test as fn(&[u8], RegisterContext) -> RegisterContext,
+        run_test_vec,
+    ] {
+        let mut ctx = RegisterContext::default();
+        ctx.xmm[0] = [0x1111_1111_1111_1111, 0x2222_2222_2222_2222];
+        ctx.xmm[1] = [0xDEAD_BEEF_CAFE_BABE, 0x9999_9999_9999_9999];
+        let ctx = run(&bytes, ctx);
+        assert_eq!(
+            ctx.xmm[0],
+            [0xDEAD_BEEF_CAFE_BABE, 0xDEAD_BEEF_CAFE_BABE],
+            "movddup must broadcast the source's low quadword to both halves"
+        );
+    }
+}
+
+#[test]
+fn test_movddup_mem() {
+    // movddup xmm0, [rdi]; ret  ->  F2 0F 12 07  C3
+    let bytes = [0xF2, 0x0F, 0x12, 0x07, 0xC3];
+    let buf = [0x0102_0304_0506_0708u64, 0x0BAD_0BAD_0BAD_0BAD];
+    let mut ctx = RegisterContext::default();
+    ctx.rdi = buf.as_ptr() as u64;
+    ctx.xmm[0] = [0, 0];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(
+        ctx.xmm[0],
+        [0x0102_0304_0506_0708, 0x0102_0304_0506_0708],
+        "movddup m64 must load 8 bytes and broadcast them"
+    );
+}
+
 //  PSRLQ
 
 #[test]

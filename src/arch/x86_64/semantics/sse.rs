@@ -651,6 +651,88 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
+    /// MOVLPS / MOVLPD - move 64 bits to/from the low quadword of an XMM.
+    ///
+    /// - `MOVLPS xmm, m64`: low 64 bits = `[mem]`; high 64 bits preserved.
+    /// - `MOVLPS m64, xmm`: store the low 64 bits of `xmm` to memory.
+    ///
+    /// Note the preserved high half: unlike `MOVSD xmm, m64`, this is a merging
+    /// load, not a zeroing one. There is no register-to-register form - those
+    /// encodings decode as `MOVHLPS` / `MOVLHPS`.
+    pub(super) fn handle_movlps(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        match self.operand_kind(instruction, 0) {
+            OpKind::Register => {
+                // Load form: dst is XMM, src must be m64.
+                let dst_idx = self.xmm_operand_index(instruction, 0, "movlps")?;
+                if self.operand_kind(instruction, 1) != OpKind::Memory {
+                    return Err(MicroliftError::UnsupportedInstruction {
+                        mnemonic: "movlps-reg-src (use movhlps)".into(),
+                    });
+                }
+                let ptr = self.get_mem_ptr(instruction, 1)?;
+                let lo = self.builder.ins().load(types::I64, MemFlagsData::new(), ptr, 0);
+                self.set_xmm_lo(dst_idx, lo);
+            }
+            OpKind::Memory => {
+                // Store form: dst is m64, src is XMM.
+                let src_idx = self.xmm_operand_index(instruction, 1, "movlps")?;
+                let lo = self.get_xmm_lo(src_idx);
+                let ptr = self.get_mem_ptr(instruction, 0)?;
+                self.builder.ins().store(MemFlagsData::new(), lo, ptr, 0);
+            }
+            other => {
+                return Err(MicroliftError::UnsupportedInstruction {
+                    mnemonic: format!("movlps-dst-{:?}", other),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// MOVHLPS - `xmm1[63:0] = xmm2[127:64]`; the high half of `xmm1` is
+    /// preserved. Register-to-register only (`0F 12` with a register operand).
+    pub(super) fn handle_movhlps(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, "movhlps")?;
+        let src_idx = self.xmm_operand_index(instruction, 1, "movhlps")?;
+        let src_hi = self.get_xmm_hi(src_idx);
+        self.set_xmm_lo(dst_idx, src_hi);
+        Ok(())
+    }
+
+    /// MOVLHPS - `xmm1[127:64] = xmm2[63:0]`; the low half of `xmm1` is
+    /// preserved. Register-to-register only (`0F 16` with a register operand).
+    pub(super) fn handle_movlhps(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, "movlhps")?;
+        let src_idx = self.xmm_operand_index(instruction, 1, "movlhps")?;
+        let src_lo = self.get_xmm_lo(src_idx);
+        self.set_xmm_hi(dst_idx, src_lo);
+        Ok(())
+    }
+
+    /// MOVDDUP - `xmm1 = broadcast(src[63:0])`: the source's low quadword is
+    /// written to both halves of the destination.
+    pub(super) fn handle_movddup(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, "movddup")?;
+        let lo = match self.operand_kind(instruction, 1) {
+            OpKind::Register => {
+                let src_idx = self.xmm_operand_index(instruction, 1, "movddup")?;
+                self.get_xmm_lo(src_idx)
+            }
+            OpKind::Memory => {
+                let ptr = self.get_mem_ptr(instruction, 1)?;
+                self.builder.ins().load(types::I64, MemFlagsData::new(), ptr, 0)
+            }
+            other => {
+                return Err(MicroliftError::UnsupportedInstruction {
+                    mnemonic: format!("movddup-src-{:?}", other),
+                });
+            }
+        };
+        self.set_xmm_lo(dst_idx, lo);
+        self.set_xmm_hi(dst_idx, lo);
+        Ok(())
+    }
+
     /// PSRLW/PSRLD/PSRLQ, PSLLW/PSLLD/PSLLQ, PSRAW/PSRAD - packed per-lane
     /// shift by a scalar count.
     ///

@@ -68,6 +68,10 @@ impl<'a> Lifter<'a> {
             Mnemonic::Movss => self.handle_movss(instruction),
             Mnemonic::Movd => self.handle_movd(instruction),
             Mnemonic::Movhps | Mnemonic::Movhpd => self.handle_movhps(instruction),
+            Mnemonic::Movlps | Mnemonic::Movlpd => self.handle_movlps(instruction),
+            Mnemonic::Movhlps => self.handle_movhlps(instruction),
+            Mnemonic::Movlhps => self.handle_movlhps(instruction),
+            Mnemonic::Movddup => self.handle_movddup(instruction),
             // SSE2 - packed per-lane shifts
             Mnemonic::Psrlw => {
                 self.handle_packed_shift(instruction, PackedShiftOp::Srl, PackedWidth::Word)
