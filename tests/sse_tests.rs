@@ -653,6 +653,297 @@ fn test_psrlq_xmm_count() {
     assert_eq!(ctx.xmm[0], [0, 0], "psrlq by >=64 (register) must zero both lanes");
 }
 
+//  Packed per-lane shifts: PSRLW/PSRLD/PSRLQ, PSLLW/PSLLD/PSLLQ, PSRAW/PSRAD.
+//
+//  Every case is checked in both XMM representations (scalar lo/hi pair with
+//  lane masking vs native vector shifts) via `check_packed`, which puts the
+//  shifted value in xmm0 and the register-form count in xmm1.
+
+/// Word-lane test pattern: lanes cover 0x0001, all-ones, sign-bit-set and a
+/// mixed value, so lane-boundary bleed and sign fill are both visible.
+const SHIFT_W: [u64; 2] = [0x000F_FF00_0F00_FFFF, 0x8000_1234_FFFF_0001];
+/// Dword-lane test pattern.
+const SHIFT_D: [u64; 2] = [0x0000_000F_FF00_0000, 0xF000_0001_8000_0000];
+/// Qword-lane test pattern.
+const SHIFT_Q: [u64; 2] = [0x0000_0000_0000_FF00, 0xF000_0000_0000_0000];
+
+//  PSRLW
+
+#[test]
+fn test_psrlw_imm() {
+    // psrlw xmm0, 4; ret  ->  66 0F 71 D0 04  C3
+    let bytes = [0x66, 0x0F, 0x71, 0xD0, 0x04, 0xC3];
+    check_packed(
+        &bytes,
+        SHIFT_W,
+        [0, 0],
+        [0x0000_0FF0_00F0_0FFF, 0x0800_0123_0FFF_0000],
+        "psrlw imm",
+    );
+}
+
+#[test]
+fn test_psrlw_imm_ge_16_zeroes() {
+    // psrlw xmm0, 16; ret  ->  66 0F 71 D0 10  C3
+    let bytes = [0x66, 0x0F, 0x71, 0xD0, 0x10, 0xC3];
+    check_packed(&bytes, SHIFT_W, [0, 0], [0, 0], "psrlw by >=16");
+}
+
+#[test]
+fn test_psrlw_xmm_count() {
+    // psrlw xmm0, xmm1; ret  ->  66 0F D1 C1  C3
+    let bytes = [0x66, 0x0F, 0xD1, 0xC1, 0xC3];
+    check_packed(
+        &bytes,
+        SHIFT_W,
+        [8, 0],
+        [0x0000_00FF_000F_00FF, 0x0080_0012_00FF_0000],
+        "psrlw xmm count",
+    );
+    check_packed(&bytes, SHIFT_W, [100, 0], [0, 0], "psrlw by >=16 (register)");
+}
+
+#[test]
+fn test_psrlw_mem_count() {
+    // psrlw xmm0, [rdi]; ret  ->  66 0F D1 07  C3
+    let bytes = [0x66, 0x0F, 0xD1, 0x07, 0xC3];
+    for run in [
+        run_test as fn(&[u8], RegisterContext) -> RegisterContext,
+        run_test_vec,
+    ] {
+        let count = [8u64, 0];
+        let mut ctx = RegisterContext::default();
+        ctx.rdi = count.as_ptr() as u64;
+        ctx.xmm[0] = SHIFT_W;
+        let ctx = run(&bytes, ctx);
+        assert_eq!(
+            ctx.xmm[0],
+            [0x0000_00FF_000F_00FF, 0x0080_0012_00FF_0000],
+            "psrlw must take the count from the low 64 bits of m128"
+        );
+    }
+}
+
+//  PSRLD
+
+#[test]
+fn test_psrld_imm() {
+    // psrld xmm0, 4; ret  ->  66 0F 72 D0 04  C3
+    let bytes = [0x66, 0x0F, 0x72, 0xD0, 0x04, 0xC3];
+    check_packed(
+        &bytes,
+        SHIFT_D,
+        [0, 0],
+        [0x0000_0000_0FF0_0000, 0x0F00_0000_0800_0000],
+        "psrld imm",
+    );
+}
+
+#[test]
+fn test_psrld_imm_ge_32_zeroes() {
+    // psrld xmm0, 32; ret  ->  66 0F 72 D0 20  C3
+    let bytes = [0x66, 0x0F, 0x72, 0xD0, 0x20, 0xC3];
+    check_packed(
+        &bytes,
+        [0xDEAD_BEEF_CAFE_BABE, 0x1234_5678_9ABC_DEF0],
+        [0, 0],
+        [0, 0],
+        "psrld by >=32",
+    );
+}
+
+#[test]
+fn test_psrld_xmm_count() {
+    // psrld xmm0, xmm1; ret  ->  66 0F D2 C1  C3
+    let bytes = [0x66, 0x0F, 0xD2, 0xC1, 0xC3];
+    check_packed(
+        &bytes,
+        [0x0000_00FF_FF00_0000, 0xF000_0001_0000_00FF],
+        [8, 0],
+        [0x0000_0000_00FF_0000, 0x00F0_0000_0000_0000],
+        "psrld xmm count",
+    );
+    check_packed(
+        &bytes,
+        [0xDEAD_BEEF_CAFE_BABE, 0x1234_5678_9ABC_DEF0],
+        [100, 0],
+        [0, 0],
+        "psrld by >=32 (register)",
+    );
+}
+
+#[test]
+fn test_psrld_zero_count_is_identity() {
+    // psrld xmm0, 0; ret  ->  66 0F 72 D0 00  C3
+    let bytes = [0x66, 0x0F, 0x72, 0xD0, 0x00, 0xC3];
+    check_packed(&bytes, SHIFT_D, [0, 0], SHIFT_D, "psrld by 0");
+}
+
+//  PSLLW / PSLLD / PSLLQ
+
+#[test]
+fn test_psllw_imm() {
+    // psllw xmm0, 4; ret  ->  66 0F 71 F0 04  C3
+    let bytes = [0x66, 0x0F, 0x71, 0xF0, 0x04, 0xC3];
+    check_packed(
+        &bytes,
+        SHIFT_W,
+        [0, 0],
+        [0x00F0_F000_F000_FFF0, 0x0000_2340_FFF0_0010],
+        "psllw imm",
+    );
+}
+
+#[test]
+fn test_psllw_xmm_count() {
+    // psllw xmm0, xmm1; ret  ->  66 0F F1 C1  C3
+    let bytes = [0x66, 0x0F, 0xF1, 0xC1, 0xC3];
+    check_packed(
+        &bytes,
+        SHIFT_W,
+        [8, 0],
+        [0x0F00_0000_0000_FF00, 0x0000_3400_FF00_0100],
+        "psllw xmm count",
+    );
+    check_packed(&bytes, SHIFT_W, [16, 0], [0, 0], "psllw by >=16 (register)");
+}
+
+#[test]
+fn test_pslld_imm() {
+    // pslld xmm0, 4; ret  ->  66 0F 72 F0 04  C3
+    let bytes = [0x66, 0x0F, 0x72, 0xF0, 0x04, 0xC3];
+    check_packed(
+        &bytes,
+        SHIFT_D,
+        [0, 0],
+        [0x0000_00F0_F000_0000, 0x0000_0010_0000_0000],
+        "pslld imm",
+    );
+}
+
+#[test]
+fn test_pslld_xmm_count() {
+    // pslld xmm0, xmm1; ret  ->  66 0F F2 C1  C3
+    let bytes = [0x66, 0x0F, 0xF2, 0xC1, 0xC3];
+    check_packed(
+        &bytes,
+        SHIFT_D,
+        [4, 0],
+        [0x0000_00F0_F000_0000, 0x0000_0010_0000_0000],
+        "pslld xmm count",
+    );
+    check_packed(&bytes, SHIFT_D, [32, 0], [0, 0], "pslld by >=32 (register)");
+}
+
+#[test]
+fn test_psllq_imm_and_reg() {
+    // psllq xmm0, 4; ret  ->  66 0F 73 F0 04  C3
+    let imm = [0x66, 0x0F, 0x73, 0xF0, 0x04, 0xC3];
+    let expected = [0x0000_0000_000F_F000, 0x0000_0000_0000_0000];
+    check_packed(&imm, SHIFT_Q, [0, 0], expected, "psllq imm");
+
+    // psllq xmm0, xmm1; ret  ->  66 0F F3 C1  C3
+    let reg = [0x66, 0x0F, 0xF3, 0xC1, 0xC3];
+    check_packed(&reg, SHIFT_Q, [4, 0], expected, "psllq xmm count");
+    check_packed(&reg, SHIFT_Q, [64, 0], [0, 0], "psllq by >=64 (register)");
+}
+
+//  PSRAW / PSRAD - an out-of-range count saturates to each lane's sign
+//  instead of zeroing the lane.
+
+#[test]
+fn test_psraw_imm() {
+    // psraw xmm0, 4; ret  ->  66 0F 71 E0 04  C3
+    let bytes = [0x66, 0x0F, 0x71, 0xE0, 0x04, 0xC3];
+    check_packed(
+        &bytes,
+        SHIFT_W,
+        [0, 0],
+        [0x0000_FFF0_00F0_FFFF, 0xF800_0123_FFFF_0000],
+        "psraw imm",
+    );
+}
+
+#[test]
+fn test_psraw_imm_ge_16_saturates_to_sign() {
+    // psraw xmm0, 20; ret  ->  66 0F 71 E0 14  C3
+    let bytes = [0x66, 0x0F, 0x71, 0xE0, 0x14, 0xC3];
+    check_packed(
+        &bytes,
+        SHIFT_W,
+        [0, 0],
+        [0x0000_FFFF_0000_FFFF, 0xFFFF_0000_FFFF_0000],
+        "psraw by >=16",
+    );
+}
+
+#[test]
+fn test_psraw_xmm_count() {
+    // psraw xmm0, xmm1; ret  ->  66 0F E1 C1  C3
+    let bytes = [0x66, 0x0F, 0xE1, 0xC1, 0xC3];
+    check_packed(
+        &bytes,
+        SHIFT_W,
+        [8, 0],
+        [0x0000_FFFF_000F_FFFF, 0xFF80_0012_FFFF_0000],
+        "psraw xmm count",
+    );
+    check_packed(
+        &bytes,
+        SHIFT_W,
+        [99, 0],
+        [0x0000_FFFF_0000_FFFF, 0xFFFF_0000_FFFF_0000],
+        "psraw by >=16 (register)",
+    );
+}
+
+#[test]
+fn test_psrad_imm() {
+    // psrad xmm0, 4; ret  ->  66 0F 72 E0 04  C3
+    let bytes = [0x66, 0x0F, 0x72, 0xE0, 0x04, 0xC3];
+    check_packed(
+        &bytes,
+        SHIFT_D,
+        [0, 0],
+        [0x0000_0000_FFF0_0000, 0xFF00_0000_F800_0000],
+        "psrad imm",
+    );
+}
+
+#[test]
+fn test_psrad_imm_ge_32_saturates_to_sign() {
+    // psrad xmm0, 32; ret  ->  66 0F 72 E0 20  C3
+    let bytes = [0x66, 0x0F, 0x72, 0xE0, 0x20, 0xC3];
+    check_packed(
+        &bytes,
+        SHIFT_D,
+        [0, 0],
+        [0x0000_0000_FFFF_FFFF, 0xFFFF_FFFF_FFFF_FFFF],
+        "psrad by >=32",
+    );
+}
+
+#[test]
+fn test_psrad_xmm_count() {
+    // psrad xmm0, xmm1; ret  ->  66 0F E2 C1  C3
+    let bytes = [0x66, 0x0F, 0xE2, 0xC1, 0xC3];
+    check_packed(
+        &bytes,
+        SHIFT_D,
+        [8, 0],
+        [0x0000_0000_FFFF_0000, 0xFFF0_0000_FF80_0000],
+        "psrad xmm count",
+    );
+    check_packed(
+        &bytes,
+        SHIFT_D,
+        [1 << 40, 0],
+        [0x0000_0000_FFFF_FFFF, 0xFFFF_FFFF_FFFF_FFFF],
+        "psrad by a huge count (register)",
+    );
+}
+
+
 //  PSHUFD
 
 #[test]

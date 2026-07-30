@@ -75,6 +75,61 @@ impl PackedWidth {
     }
 }
 
+/// Which packed-integer shift a `PSRL*` / `PSLL*` / `PSRA*` form performs.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub(super) enum PackedShiftOp {
+    /// `PSRLW`/`PSRLD`/`PSRLQ` - per-lane logical (zero-filling) right shift.
+    Srl,
+    /// `PSLLW`/`PSLLD`/`PSLLQ` - per-lane left shift.
+    Sll,
+    /// `PSRAW`/`PSRAD` - per-lane arithmetic (sign-filling) right shift.
+    Sra,
+}
+
+impl PackedShiftOp {
+    /// True for the two zero-filling shifts, which produce all-zero lanes for
+    /// an out-of-range count (`PSRA*` saturates to the sign instead).
+    fn zeroes_on_overshift(self) -> bool {
+        self != PackedShiftOp::Sra
+    }
+
+    /// The mnemonic this op/width pair came from, for error messages.
+    fn mnemonic(self, width: PackedWidth) -> &'static str {
+        match (self, width) {
+            (PackedShiftOp::Srl, PackedWidth::Word) => "psrlw",
+            (PackedShiftOp::Srl, PackedWidth::Dword) => "psrld",
+            (PackedShiftOp::Srl, PackedWidth::Qword) => "psrlq",
+            (PackedShiftOp::Sll, PackedWidth::Word) => "psllw",
+            (PackedShiftOp::Sll, PackedWidth::Dword) => "pslld",
+            (PackedShiftOp::Sll, PackedWidth::Qword) => "psllq",
+            (PackedShiftOp::Sra, PackedWidth::Word) => "psraw",
+            (PackedShiftOp::Sra, PackedWidth::Dword) => "psrad",
+            (PackedShiftOp::Sra, PackedWidth::Qword) => "psraq",
+            (_, PackedWidth::Byte) => "packed-byte-shift",
+        }
+    }
+}
+
+/// The shift count of a packed shift: a decoded `imm8`, or a value read from
+/// the low 64 bits of an `xmm/m128` source operand.
+#[derive(Copy, Clone)]
+enum ShiftCount {
+    Imm(u64),
+    Dynamic(Value),
+}
+
+/// Broadcast the lane mask `m` (confined to the lowest lane) to every lane of
+/// a 64-bit pack with `bits`-wide lanes.
+fn replicate_lane_mask(m: u64, bits: u32) -> u64 {
+    let mut out = m;
+    let mut shift = bits;
+    while shift < 64 {
+        out |= out << shift;
+        shift *= 2;
+    }
+    out
+}
+
 /// Which packed-integer add/sub variant to emit.
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub(super) enum PackedIntOp {
@@ -596,67 +651,236 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// PSRLQ - packed shift right logical of the two 64-bit lanes.
+    /// PSRLW/PSRLD/PSRLQ, PSLLW/PSLLD/PSLLQ, PSRAW/PSRAD - packed per-lane
+    /// shift by a scalar count.
     ///
-    /// - `PSRLQ xmm, imm8`: shift both lanes right by the immediate.
-    /// - `PSRLQ xmm, xmm/m128`: the shift count is the low 64 bits of the source.
+    /// - `<op> xmm, imm8`: every lane shifts by the immediate.
+    /// - `<op> xmm, xmm/m128`: the count is the low 64 bits of the source
+    ///   (all 64 bits participate, so a huge count is out of range, not
+    ///   truncated).
     ///
-    /// In both cases a count of 64 or more produces all-zero lanes (rather than
-    /// the modulo-width behaviour of a raw shift).
-    pub(super) fn handle_psrlq(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let dst_idx = self.xmm_operand_index(instruction, 0, "psrlq")?;
+    /// An out-of-range count (>= the lane width) is *not* the modulo-width
+    /// behaviour of a raw machine shift: the zero-filling shifts produce
+    /// all-zero lanes, while `PSRA*` saturates to each lane's sign, which is
+    /// the same as shifting by `lane_bits - 1`.
+    pub(super) fn handle_packed_shift(
+        &mut self,
+        instruction: &Instruction,
+        op: PackedShiftOp,
+        width: PackedWidth,
+    ) -> crate::Result<()> {
+        let who = op.mnemonic(width);
+        let dst_idx = self.xmm_operand_index(instruction, 0, who)?;
+        let count = self.read_packed_shift_count(instruction, who)?;
+
+        if self.config.use_vector_xmm {
+            let dst = self.get_xmm_vec(dst_idx);
+            let r = self.packed_shift_vec(dst, count, op, width);
+            self.set_xmm_vec(dst_idx, r);
+            return Ok(());
+        }
+
         let dst_lo = self.get_xmm_lo(dst_idx);
         let dst_hi = self.get_xmm_hi(dst_idx);
-
-        let (res_lo, res_hi) = match self.operand_kind(instruction, 1) {
-            OpKind::Immediate8 => {
-                let count = instruction.immediate8() as i64;
-                if count >= 64 {
-                    let zero = self.builder.ins().iconst(types::I64, 0);
-                    (zero, zero)
-                } else {
-                    (
-                        self.builder.ins().ushr_imm(dst_lo, count),
-                        self.builder.ins().ushr_imm(dst_hi, count),
-                    )
-                }
-            }
-            _ => {
-                // Count = low 64 bits of the xmm/m128 source.
-                let count = match self.operand_kind(instruction, 1) {
-                    OpKind::Register => {
-                        let src_idx = self.xmm_operand_index(instruction, 1, "psrlq")?;
-                        self.get_xmm_lo(src_idx)
-                    }
-                    OpKind::Memory => {
-                        let ptr = self.get_mem_ptr(instruction, 1)?;
-                        self.builder.ins().load(types::I64, MemFlagsData::new(), ptr, 0)
-                    }
-                    other => {
-                        return Err(MicroliftError::UnsupportedInstruction {
-                            mnemonic: format!("psrlq-src-{:?}", other),
-                        });
-                    }
-                };
-                let shifted_lo = self.builder.ins().ushr(dst_lo, count);
-                let shifted_hi = self.builder.ins().ushr(dst_hi, count);
-                let zero = self.builder.ins().iconst(types::I64, 0);
-                // A count > 63 zeroes the lane (the raw shift would wrap mod 64).
-                let too_big = self
-                    .builder
-                    .ins()
-                    .icmp_imm(IntCC::UnsignedGreaterThan, count, 63);
-                (
-                    self.builder.ins().select(too_big, zero, shifted_lo),
-                    self.builder.ins().select(too_big, zero, shifted_hi),
-                )
-            }
-        };
-
+        let res_lo = self.packed_shift_64(dst_lo, count, op, width);
+        let res_hi = self.packed_shift_64(dst_hi, count, op, width);
         self.set_xmm_lo(dst_idx, res_lo);
         self.set_xmm_hi(dst_idx, res_hi);
         Ok(())
     }
+
+    /// Read operand 1 of a packed shift as a shift count.
+    fn read_packed_shift_count(
+        &mut self,
+        instruction: &Instruction,
+        who: &str,
+    ) -> crate::Result<ShiftCount> {
+        match self.operand_kind(instruction, 1) {
+            OpKind::Immediate8 => Ok(ShiftCount::Imm(instruction.immediate8() as u64)),
+            OpKind::Register => {
+                let src_idx = self.xmm_operand_index(instruction, 1, who)?;
+                Ok(ShiftCount::Dynamic(self.get_xmm_lo(src_idx)))
+            }
+            OpKind::Memory => {
+                let ptr = self.get_mem_ptr(instruction, 1)?;
+                let v = self.builder.ins().load(types::I64, MemFlagsData::new(), ptr, 0);
+                Ok(ShiftCount::Dynamic(v))
+            }
+            other => Err(MicroliftError::UnsupportedInstruction {
+                mnemonic: format!("{}-src-{:?}", who, other),
+            }),
+        }
+    }
+
+    /// Packed shift in vector mode: bitcast to the lane type and use
+    /// Cranelift's native lane-wise shift, which lowers to a single host SIMD
+    /// instruction.
+    ///
+    /// Cranelift masks the shift amount to the lane width, so the out-of-range
+    /// count has to be handled explicitly: `PSRA*` clamps the count, the
+    /// zero-filling shifts mask the result away.
+    fn packed_shift_vec(
+        &mut self,
+        dst: Value,
+        count: ShiftCount,
+        op: PackedShiftOp,
+        width: PackedWidth,
+    ) -> Value {
+        let ty = width.vector_type();
+        let bits = width.bits() as u64;
+        let a = self.vec_bitcast(dst, ty);
+
+        let r = match count {
+            ShiftCount::Imm(c) => {
+                if op.zeroes_on_overshift() && c >= bits {
+                    let zero = self.builder.ins().iconst(types::I64, 0);
+                    return self.builder.ins().splat(types::I64X2, zero);
+                }
+                let c = c.min(bits - 1) as i64;
+                match op {
+                    PackedShiftOp::Srl => self.builder.ins().ushr_imm(a, c),
+                    PackedShiftOp::Sll => self.builder.ins().ishl_imm(a, c),
+                    PackedShiftOp::Sra => self.builder.ins().sshr_imm(a, c),
+                }
+            }
+            ShiftCount::Dynamic(cv) => {
+                let limit = self.builder.ins().iconst(types::I64, bits as i64 - 1);
+                let clamped = self.builder.ins().umin(cv, limit);
+                match op {
+                    PackedShiftOp::Sra => self.builder.ins().sshr(a, clamped),
+                    _ => {
+                        let shifted = if op == PackedShiftOp::Sll {
+                            self.builder.ins().ishl(a, clamped)
+                        } else {
+                            self.builder.ins().ushr(a, clamped)
+                        };
+                        // Zero every lane when the count was out of range. A
+                        // splat of a scalar select keeps the mask off the
+                        // vector unit's critical path.
+                        let too_big = self
+                            .builder
+                            .ins()
+                            .icmp(IntCC::UnsignedGreaterThan, cv, limit);
+                        let lane_ty = ty.lane_type();
+                        let ones = self.builder.ins().iconst(lane_ty, -1);
+                        let zero = self.builder.ins().iconst(lane_ty, 0);
+                        let keep = self.builder.ins().select(too_big, zero, ones);
+                        let keep_vec = self.builder.ins().splat(ty, keep);
+                        self.builder.ins().band(shifted, keep_vec)
+                    }
+                }
+            }
+        };
+        self.vec_bitcast(r, types::I64X2)
+    }
+
+    /// Packed shift of one 64-bit half of an XMM register (scalar mode).
+    fn packed_shift_64(
+        &mut self,
+        a: Value,
+        count: ShiftCount,
+        op: PackedShiftOp,
+        width: PackedWidth,
+    ) -> Value {
+        let bits = width.bits() as u64;
+
+        if op == PackedShiftOp::Sra {
+            // Per lane, `sra(x, c) == srl(x ^ S, c) - srl(S, c)` where `S` is
+            // the lane's sign bit: the xor turns the sign-fill into a
+            // zero-fill, and subtracting the shifted sign bit restores it.
+            // `swar_sub` keeps the subtraction from borrowing across lanes.
+            // A count >= bits saturates to the sign, i.e. a shift by bits - 1.
+            let clamped = self.clamp_shift_count(count, bits - 1);
+            let sign_imm = width.lane_sign_mask();
+            let sign = self.builder.ins().iconst(types::I64, sign_imm);
+            let flipped = self.builder.ins().bxor(a, sign);
+            let shifted = self.packed_logical_shift_64(flipped, clamped, false, width);
+            let sign_shifted = self.packed_logical_shift_64(sign, clamped, false, width);
+            return self.swar_sub(shifted, sign_shifted, width);
+        }
+
+        let left = op == PackedShiftOp::Sll;
+        match count {
+            ShiftCount::Imm(c) if c >= bits => self.builder.ins().iconst(types::I64, 0),
+            ShiftCount::Imm(_) => self.packed_logical_shift_64(a, count, left, width),
+            ShiftCount::Dynamic(cv) => {
+                let shifted = self.packed_logical_shift_64(a, count, left, width);
+                let zero = self.builder.ins().iconst(types::I64, 0);
+                let too_big = self.builder.ins().icmp_imm(
+                    IntCC::UnsignedGreaterThan,
+                    cv,
+                    bits as i64 - 1,
+                );
+                self.builder.ins().select(too_big, zero, shifted)
+            }
+        }
+    }
+
+    /// Clamp a shift count to at most `max`, so the shift stays in range.
+    fn clamp_shift_count(&mut self, count: ShiftCount, max: u64) -> ShiftCount {
+        match count {
+            ShiftCount::Imm(c) => ShiftCount::Imm(c.min(max)),
+            ShiftCount::Dynamic(cv) => {
+                let limit = self.builder.ins().iconst(types::I64, max as i64);
+                ShiftCount::Dynamic(self.builder.ins().umin(cv, limit))
+            }
+        }
+    }
+
+    /// Lane-wise logical shift of one 64-bit lane pack by a count that must
+    /// already be in range (`< lane width`).
+    ///
+    /// The raw 64-bit shift lets bits cross lane boundaries, so the result is
+    /// masked with the shifted lane mask replicated across every lane - e.g.
+    /// for `PSRLD` by 4 the mask is `0x0FFF_FFFF_0FFF_FFFF`.
+    fn packed_logical_shift_64(
+        &mut self,
+        a: Value,
+        count: ShiftCount,
+        left: bool,
+        width: PackedWidth,
+    ) -> Value {
+        let bits = width.bits();
+        let lane = width.lane_mask() as u64;
+
+        match count {
+            ShiftCount::Imm(c) => {
+                let c = c as i64;
+                let lane_keep = if left { (lane << c) & lane } else { lane >> c };
+                let mask = replicate_lane_mask(lane_keep, bits) as i64;
+                let shifted = if left {
+                    self.builder.ins().ishl_imm(a, c)
+                } else {
+                    self.builder.ins().ushr_imm(a, c)
+                };
+                self.builder.ins().band_imm(shifted, mask)
+            }
+            ShiftCount::Dynamic(cv) => {
+                // Build the same mask at runtime: shift the lowest lane's mask,
+                // then double it up into every lane.
+                let lane_const = self.builder.ins().iconst(types::I64, lane as i64);
+                let mut mask = if left {
+                    let s = self.builder.ins().ishl(lane_const, cv);
+                    self.builder.ins().band_imm(s, lane as i64)
+                } else {
+                    self.builder.ins().ushr(lane_const, cv)
+                };
+                let mut shift = bits;
+                while shift < 64 {
+                    let up = self.builder.ins().ishl_imm(mask, shift as i64);
+                    mask = self.builder.ins().bor(mask, up);
+                    shift *= 2;
+                }
+                let shifted = if left {
+                    self.builder.ins().ishl(a, cv)
+                } else {
+                    self.builder.ins().ushr(a, cv)
+                };
+                self.builder.ins().band(shifted, mask)
+            }
+        }
+    }
+
 
     /// PSHUFD - shuffle the four 32-bit dwords of `xmm2/m128` into `xmm1`
     /// according to `imm8` (2 bits per destination dword select a source dword).

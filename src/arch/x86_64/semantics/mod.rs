@@ -19,7 +19,7 @@ pub mod unimplemented;
 
 use crate::MicroliftError;
 use crate::arch::x86_64::semantics::fpu::FpuOp;
-use crate::arch::x86_64::semantics::sse::PackedWidth;
+use crate::arch::x86_64::semantics::sse::{PackedShiftOp, PackedWidth};
 use crate::lifter::Lifter;
 use iced_x86::{Instruction, Mnemonic, OpKind};
 
@@ -68,7 +68,31 @@ impl<'a> Lifter<'a> {
             Mnemonic::Movss => self.handle_movss(instruction),
             Mnemonic::Movd => self.handle_movd(instruction),
             Mnemonic::Movhps | Mnemonic::Movhpd => self.handle_movhps(instruction),
-            Mnemonic::Psrlq => self.handle_psrlq(instruction),
+            // SSE2 - packed per-lane shifts
+            Mnemonic::Psrlw => {
+                self.handle_packed_shift(instruction, PackedShiftOp::Srl, PackedWidth::Word)
+            }
+            Mnemonic::Psrld => {
+                self.handle_packed_shift(instruction, PackedShiftOp::Srl, PackedWidth::Dword)
+            }
+            Mnemonic::Psrlq => {
+                self.handle_packed_shift(instruction, PackedShiftOp::Srl, PackedWidth::Qword)
+            }
+            Mnemonic::Psllw => {
+                self.handle_packed_shift(instruction, PackedShiftOp::Sll, PackedWidth::Word)
+            }
+            Mnemonic::Pslld => {
+                self.handle_packed_shift(instruction, PackedShiftOp::Sll, PackedWidth::Dword)
+            }
+            Mnemonic::Psllq => {
+                self.handle_packed_shift(instruction, PackedShiftOp::Sll, PackedWidth::Qword)
+            }
+            Mnemonic::Psraw => {
+                self.handle_packed_shift(instruction, PackedShiftOp::Sra, PackedWidth::Word)
+            }
+            Mnemonic::Psrad => {
+                self.handle_packed_shift(instruction, PackedShiftOp::Sra, PackedWidth::Dword)
+            }
             Mnemonic::Pshufd => self.handle_pshufd(instruction),
             Mnemonic::Punpckldq => self.handle_punpckldq(instruction),
             Mnemonic::Unpckhpd => self.handle_unpckhpd(instruction),
