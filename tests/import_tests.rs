@@ -14,6 +14,7 @@ use cranelift::prelude::*;
 use cranelift_codegen::ir::{Function, UserFuncName};
 use microlift::backend::CraneliftBackend;
 use microlift::context::{ExitReason, RegisterContext};
+use microlift::core::abi::CallAbi;
 use microlift::function_traits::{trampoline_func, DynamicSymbol};
 use microlift::lifter::{ExecutionMode, Lifter, LifterConfig};
 use microlift::os::get_host_calling_conv;
@@ -127,6 +128,7 @@ fn test_import_fast_call_strlen() {
     config.register_fast_import(
         IMPORT_VA,
         DynamicSymbol::new("host_strlen", trampoline_func!(host_strlen, _)),
+        CallAbi::sysv_amd64(),
     );
 
     let (_backend, code_ptr) = lift_and_compile(&bytes, config);
@@ -231,6 +233,7 @@ fn test_runtime_assisted_fast_call_strlen() {
     config.register_fast_import(
         IMPORT_VA,
         DynamicSymbol::new("host_strlen", trampoline_func!(host_strlen, _)),
+        CallAbi::sysv_amd64(),
     );
 
     let mut func = Function::with_name_signature(
@@ -345,6 +348,7 @@ fn test_runtime_assisted_fast_call_two_imports() {
     config.register_fast_import(
         IMPORT_VA,
         DynamicSymbol::new("host_strlen", trampoline_func!(host_strlen, _)),
+        CallAbi::sysv_amd64(),
     );
     config.register_fast_import(
         STRCMP_VA,
@@ -352,6 +356,7 @@ fn test_runtime_assisted_fast_call_two_imports() {
             "host_strcmp",
             host_strcmp as unsafe extern "C" fn(*const u8, *const u8) -> i64,
         ),
+        CallAbi::sysv_amd64(),
     );
 
     let mut func = Function::with_name_signature(
@@ -388,4 +393,182 @@ fn test_runtime_assisted_fast_call_two_imports() {
     );
     // strcmp("abc", "abc") == 0
     assert_eq!(ctx.rax as i64, 0, "strcmp(\"abc\", \"abc\") should be 0");
+}
+
+// Per-import calling conventions
+//
+// The guest ABI is a property of the code being lifted, not of the host running
+// the lifter. These tests register the *same* host function under different
+// `CallAbi` descriptors and check that the lifter reads each call's arguments
+// from where that convention puts them - on a host whose own convention is
+// something else entirely.
+
+/// `call rel32` from `next_ip` to `target`.
+fn call_bytes(target: u64, next_ip: u64) -> Vec<u8> {
+    let mut b = vec![0xE8];
+    b.extend_from_slice(&((target as i64 - next_ip as i64) as i32).to_le_bytes());
+    b
+}
+
+/// Microsoft x64 guest: the first integer argument arrives in RCX, not RDI.
+///
+/// ```asm
+/// mov rcx, <string_ptr>   ; 48 B9 imm64
+/// call 0x2000
+/// ret
+/// ```
+#[test]
+fn test_import_fast_call_win64_abi() {
+    let test_string = b"hello, world!\0"; // strlen == 13
+    let mut bytes = vec![0x48, 0xB9];
+    bytes.extend_from_slice(&(test_string.as_ptr() as u64).to_le_bytes());
+    bytes.extend_from_slice(&call_bytes(IMPORT_VA, LIFT_BASE + 10 + 5));
+    bytes.push(0xC3);
+
+    let mut config = LifterConfig::default();
+    config.register_fast_import(
+        IMPORT_VA,
+        DynamicSymbol::new("host_strlen", trampoline_func!(host_strlen, _)),
+        CallAbi::win64(),
+    );
+
+    let (_backend, code_ptr) = lift_and_compile(&bytes, config);
+    let (mut ctx, _stack) = make_ctx_and_stack();
+    let f: fn(*mut RegisterContext) = unsafe { std::mem::transmute(code_ptr) };
+    f(&mut ctx);
+
+    assert_eq!(ctx.exit_reason, ExitReason::Return as u32);
+    assert_eq!(
+        ctx.rax, 13,
+        "win64 fast call must read its argument from RCX"
+    );
+}
+
+/// Two imports in one region, each with its own convention: RDI feeds the SysV
+/// one, RCX the Microsoft x64 one.
+///
+/// ```asm
+/// mov rdi, <"hello, world!">  ; 48 BF imm64
+/// call 0x2000                 ; sysv strlen  -> 13
+/// mov rbx, rax                ; 48 89 C3
+/// mov rcx, <"abc">            ; 48 B9 imm64
+/// call 0x3000                 ; win64 strlen -> 3
+/// add rax, rbx                ; 48 01 D8
+/// ret
+/// ```
+#[test]
+fn test_import_fast_calls_with_mixed_abis() {
+    const WIN64_VA: u64 = 0x3000;
+    let long_string = b"hello, world!\0"; // 13
+    let short_string = b"abc\0"; // 3
+
+    let mut bytes = vec![0x48, 0xBF];
+    bytes.extend_from_slice(&(long_string.as_ptr() as u64).to_le_bytes());
+    bytes.extend_from_slice(&call_bytes(IMPORT_VA, LIFT_BASE + 15));
+    bytes.extend_from_slice(&[0x48, 0x89, 0xC3]);
+    bytes.extend_from_slice(&[0x48, 0xB9]);
+    bytes.extend_from_slice(&(short_string.as_ptr() as u64).to_le_bytes());
+    bytes.extend_from_slice(&call_bytes(WIN64_VA, LIFT_BASE + 33));
+    bytes.extend_from_slice(&[0x48, 0x01, 0xD8]);
+    bytes.push(0xC3);
+
+    let mut config = LifterConfig::default();
+    config.register_fast_import(
+        IMPORT_VA,
+        DynamicSymbol::new("host_strlen", trampoline_func!(host_strlen, _)),
+        CallAbi::sysv_amd64(),
+    );
+    config.register_fast_import(
+        WIN64_VA,
+        DynamicSymbol::new("host_strlen_win64", trampoline_func!(host_strlen, _)),
+        CallAbi::win64(),
+    );
+
+    let (_backend, code_ptr) = lift_and_compile(&bytes, config);
+    let (mut ctx, _stack) = make_ctx_and_stack();
+    let f: fn(*mut RegisterContext) = unsafe { std::mem::transmute(code_ptr) };
+    f(&mut ctx);
+
+    assert_eq!(ctx.exit_reason, ExitReason::Return as u32);
+    assert_eq!(ctx.rax, 13 + 3, "each import must use its own convention");
+}
+
+/// A stack-based convention: no argument registers at all, every argument
+/// pushed by the caller (what a 32-bit `cdecl`/`stdcall` guest looks like).
+///
+/// ```asm
+/// mov rax, <string_ptr>   ; 48 B8 imm64
+/// push rax                ; 50
+/// call 0x2000             ; argument at [rsp]
+/// add rsp, 8              ; 48 83 C4 08
+/// ret
+/// ```
+#[test]
+fn test_import_fast_call_stack_passed_argument() {
+    let test_string = b"hello, world!\0"; // strlen == 13
+
+    let mut bytes = vec![0x48, 0xB8];
+    bytes.extend_from_slice(&(test_string.as_ptr() as u64).to_le_bytes());
+    bytes.push(0x50);
+    bytes.extend_from_slice(&call_bytes(IMPORT_VA, LIFT_BASE + 16));
+    bytes.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]);
+    bytes.push(0xC3);
+
+    let stack_abi = CallAbi {
+        name: "all_stack",
+        int_arg_regs: Vec::new(),
+        fp_arg_regs: Vec::new(),
+        ..CallAbi::sysv_amd64()
+    };
+
+    let mut config = LifterConfig::default();
+    config.register_fast_import(
+        IMPORT_VA,
+        DynamicSymbol::new("host_strlen", trampoline_func!(host_strlen, _)),
+        stack_abi,
+    );
+
+    let (_backend, code_ptr) = lift_and_compile(&bytes, config);
+    let (mut ctx, _stack) = make_ctx_and_stack();
+    let f: fn(*mut RegisterContext) = unsafe { std::mem::transmute(code_ptr) };
+    f(&mut ctx);
+
+    assert_eq!(ctx.exit_reason, ExitReason::Return as u32);
+    assert_eq!(ctx.rax, 13, "argument must be read from the guest stack");
+}
+
+/// An ABI with no stack rule cannot place an argument once its registers run
+/// out, so the import is demoted to an `ImportedFunctionCall` VM exit rather
+/// than miscompiled.
+#[test]
+fn test_import_without_stack_rule_is_demoted() {
+    let test_string = b"hello, world!\0";
+    let bytes = strlen_call_bytes(test_string.as_ptr() as u64);
+
+    let no_arg_regs = CallAbi {
+        name: "registerless",
+        int_arg_regs: Vec::new(),
+        fp_arg_regs: Vec::new(),
+        stack_args: None,
+        ..CallAbi::sysv_amd64()
+    };
+
+    let mut config = LifterConfig::default();
+    config.register_fast_import(
+        IMPORT_VA,
+        DynamicSymbol::new("host_strlen", trampoline_func!(host_strlen, _)),
+        no_arg_regs,
+    );
+
+    let (_backend, code_ptr) = lift_and_compile(&bytes, config);
+    let (mut ctx, _stack) = make_ctx_and_stack();
+    let f: fn(*mut RegisterContext) = unsafe { std::mem::transmute(code_ptr) };
+    f(&mut ctx);
+
+    assert_eq!(
+        ctx.exit_reason,
+        ExitReason::ImportedFunctionCall as u32,
+        "an unplaceable argument must fall back to the slow exit"
+    );
+    assert_eq!(ctx.imported_function_va, IMPORT_VA);
 }

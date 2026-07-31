@@ -5,6 +5,7 @@ use cranelift_codegen::settings;
 use microlift::backend::ArtifactBackend;
 use microlift::backend::CraneliftBackend;
 use microlift::context::{ExitReason, RegisterContext};
+use microlift::core::abi::CallAbi;
 use microlift::function_traits::{trampoline_func, DynamicSymbol};
 use microlift::lifter::{ExecutionMode, Lifter, LifterConfig};
 use microlift::os::get_host_calling_conv;
@@ -242,6 +243,7 @@ fn test_compile_runtime_assisted_fast_import_has_relocation() {
     config.register_fast_import(
         IMPORT_VA,
         DynamicSymbol::new("host_strlen", trampoline_func!(host_strlen, _)),
+        CallAbi::sysv_amd64(),
     );
 
     let mut func = Function::with_name_signature(
@@ -355,6 +357,7 @@ fn test_compile_runtime_assisted_two_fast_imports_have_relocations() {
     config.register_fast_import(
         STRLEN_VA,
         DynamicSymbol::new("host_strlen", trampoline_func!(host_strlen, _)),
+        CallAbi::sysv_amd64(),
     );
     config.register_fast_import(
         STRCMP_VA,
@@ -362,6 +365,7 @@ fn test_compile_runtime_assisted_two_fast_imports_have_relocations() {
             "host_strcmp",
             host_strcmp as unsafe extern "C" fn(*const u8, *const u8) -> i64,
         ),
+        CallAbi::sysv_amd64(),
     );
 
     let mut func = Function::with_name_signature(

@@ -8,9 +8,11 @@
 //! `Lifter<'a>` (the historical name) is a type alias for `LiftEngine<'a,
 //! X86_64>`, re-exported from `crate::lifter` for source compatibility.
 
+pub mod abi;
 pub mod exit;
 
 use crate::arch::{ControlFlow, ControlFlowKind, InstructionEffects};
+use crate::core::abi::CallAbi;
 use crate::core::exit::{ExitReason, MemorySegment, TransferKind};
 use crate::function_traits::{DynamicSymbol, FunctionArgumentType};
 use crate::os::get_host_calling_conv;
@@ -183,30 +185,12 @@ pub(crate) fn fat_to_cl_type(ty: FunctionArgumentType) -> Option<types::Type> {
     }
 }
 
-/// Whether an import's arguments all fit in the SysV AMD64 argument registers
-/// (6 integer + 8 XMM). The inline fast-call path marshals arguments from the
-/// guest register file only; anything that would spill to the stack must take
-/// the slow `ImportedFunctionCall` exit instead - otherwise the emitted call
-/// would carry fewer arguments than its signature and fail the IR verifier.
-pub(crate) fn fits_in_fast_call_regs(arg_types: &[FunctionArgumentType]) -> bool {
-    let mut ints = 0usize;
-    let mut fps = 0usize;
-    for &ty in arg_types.iter().skip(1) {
-        match ty {
-            FunctionArgumentType::VariadicList | FunctionArgumentType::None => break,
-            FunctionArgumentType::SinglePrecisionFp | FunctionArgumentType::DoublePrecisionFp => {
-                fps += 1
-            }
-            _ => ints += 1,
-        }
-    }
-    ints <= 6 && fps <= 8
-}
-
 /// Build a Cranelift `Signature` from a `DynamicSymbol`'s `arg_types` slice.
 ///
 /// `arg_types[0]` is the return type; `arg_types[1..]` are parameter types.
-/// Stops at the first `VariadicList` entry.
+/// Stops at the first `VariadicList`/`None` marker - the same cutoff
+/// [`CallAbi::place_args`] uses, so the emitted call always carries exactly as
+/// many arguments as this signature declares.
 pub(crate) fn build_import_sig(
     arg_types: &[FunctionArgumentType],
     call_conv: CallConv,
@@ -216,14 +200,41 @@ pub(crate) fn build_import_sig(
         sig.returns.push(AbiParam::new(ret_ty));
     }
     for &ty in arg_types.iter().skip(1) {
-        if ty == FunctionArgumentType::VariadicList {
-            break;
-        }
-        if let Some(param_ty) = fat_to_cl_type(ty) {
-            sig.params.push(AbiParam::new(param_ty));
+        match fat_to_cl_type(ty) {
+            Some(param_ty) => sig.params.push(AbiParam::new(param_ty)),
+            None => break,
         }
     }
     sig
+}
+
+/// A registered fast-call import: the host function to call, plus the guest
+/// calling convention its call sites use.
+#[derive(Debug, Clone)]
+pub struct FastImport {
+    pub symbol: DynamicSymbol,
+    pub abi: CallAbi,
+}
+
+/// How a fast-call import is reached from the lifted code.
+#[derive(Debug, Clone, Copy)]
+pub enum FastCallTarget {
+    /// `Jit` mode: `call_indirect` through the symbol's absolute address, using
+    /// the imported signature.
+    Absolute { sig_ref: SigRef, fn_ptr: i64 },
+    /// `RuntimeAssisted` mode: `call` a declared external function, so the
+    /// object backend emits a named relocation instead of baking in an address.
+    Relocatable(FuncRef),
+}
+
+/// Everything the per-guest emitter needs to inline one fast-call import.
+#[derive(Debug, Clone)]
+pub struct FastCall {
+    pub target: FastCallTarget,
+    /// `[0]` is the return type; `[1..]` the parameter types.
+    pub arg_types: Vec<FunctionArgumentType>,
+    /// Guest convention the call site follows.
+    pub abi: CallAbi,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -244,10 +255,11 @@ pub struct LifterConfig {
     ///
     /// - Key: virtual address of the imported function as it appears in the code
     ///   being lifted.
-    /// - Value: `Some(sym)` -> attempt a fast inline call using the guest ABI's
-    ///   argument passing (skipped for variadic functions). `None` -> always
-    ///   emit an `ImportedFunctionCall` exit.
-    pub imports: HashMap<u64, Option<DynamicSymbol>>,
+    /// - Value: `Some(import)` -> attempt a fast inline call, reading arguments
+    ///   from wherever the import's [`CallAbi`] says the guest put them (skipped
+    ///   for variadic functions). `None` -> always emit an
+    ///   `ImportedFunctionCall` exit.
+    pub imports: HashMap<u64, Option<FastImport>>,
     /// When `true`, vector registers are stored as native `I64X2` SSA variables
     /// and whole-register handlers take a vector fast path. When `false` (the
     /// default) they are stored as scalar lo/hi 64-bit pairs, which avoids
@@ -286,10 +298,18 @@ impl Default for LifterConfig {
 }
 
 impl LifterConfig {
-    /// Register an import with full fast-call metadata. Variadic functions are
-    /// automatically demoted to slow calls.
-    pub fn register_fast_import(&mut self, va: u64, symbol: DynamicSymbol) {
-        self.imports.insert(va, Some(symbol));
+    /// Register an import with full fast-call metadata.
+    ///
+    /// `abi` describes how the *guest* passes arguments to this function - the
+    /// convention the guest binary was compiled for, which is a per-function
+    /// property and need not match the host's. Use a preset such as
+    /// [`CallAbi::sysv_amd64`](crate::core::abi::CallAbi::sysv_amd64) or
+    /// [`CallAbi::win64`](crate::core::abi::CallAbi::win64), or build your own.
+    ///
+    /// Imports are demoted to slow `ImportedFunctionCall` exits when they are
+    /// variadic, or when `abi` cannot place all of their arguments.
+    pub fn register_fast_import(&mut self, va: u64, symbol: DynamicSymbol, abi: CallAbi) {
+        self.imports.insert(va, Some(FastImport { symbol, abi }));
     }
 
     /// Register an import address with no fast-call metadata. Every call to this
@@ -319,12 +339,10 @@ pub struct LiftEngine<'a, A: GuestArch = crate::arch::x86_64::X86_64> {
     /// Designated address for controlled VM exit via RET.
     pub exit_trampoline_address: u64,
     pub syscall_handler_sig: Option<SigRef>,
-    /// Pre-built fast-call data for registered imports in `Jit` mode.
-    /// Key = import VA. Value = (signature ref, raw fn pointer, arg types).
-    pub fast_call_data: HashMap<u64, (SigRef, i64, Vec<FunctionArgumentType>)>,
-    /// Relocatable fast-call data for `RuntimeAssisted` mode.
-    /// Key = import VA. Value = (FuncRef via `ExternalName::user(0, i)`, arg types).
-    pub fast_call_funcrefs: HashMap<u64, (FuncRef, Vec<FunctionArgumentType>)>,
+    /// Pre-built fast-call data for registered non-variadic imports, keyed by
+    /// import VA. The execution mode decides whether the target is absolute
+    /// (`Jit`) or relocatable (`RuntimeAssisted`).
+    pub fast_calls: HashMap<u64, FastCall>,
     /// Ordered external functions for object/JIT backends. Index `i` corresponds
     /// to `ExternalName::user(0, i)`. Entry = `(symbol_name, fn_ptr, signature)`.
     pub aot_imports: Vec<(&'static str, *const u8, Signature)>,
@@ -366,11 +384,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         };
 
         // Build fast-call data for every registered non-variadic import.
-        let host_cc = get_host_calling_conv();
-        let mut fast_call_data: HashMap<u64, (SigRef, i64, Vec<FunctionArgumentType>)> =
-            HashMap::new();
-        let mut fast_call_funcrefs: HashMap<u64, (FuncRef, Vec<FunctionArgumentType>)> =
-            HashMap::new();
+        let mut fast_calls: HashMap<u64, FastCall> = HashMap::new();
         let mut aot_imports: Vec<(&'static str, *const u8, Signature)> = Vec::new();
         let mut import_vas: HashSet<u64> = HashSet::new();
         // The same imported symbol may be registered at several virtual
@@ -379,48 +393,64 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         // relocation target, so reuse a single `FuncRef` per symbol name;
         // emitting the name twice would collide when the object backend
         // deduplicates imports and break the `FuncId(i) == i` invariant.
-        let mut funcref_by_name: HashMap<&'static str, (FuncRef, Vec<FunctionArgumentType>)> =
-            HashMap::new();
+        // Keyed by symbol name; the whole `FastCall` is reused so the arguments
+        // marshaled at every site match the one signature that was declared.
+        let mut fast_call_by_name: HashMap<&'static str, FastCall> = HashMap::new();
 
-        for (&va, opt_sym) in &config.imports {
+        for (&va, opt_import) in &config.imports {
             import_vas.insert(va);
-            if let Some(sym) = opt_sym {
-                // Variadic functions and functions whose arguments spill past
-                // the SysV argument registers are demoted to slow calls.
-                if !sym.is_ellipsis_function && fits_in_fast_call_regs(&sym.arg_types) {
-                    match config.execution_mode {
-                        ExecutionMode::Jit => {
-                            let sig = build_import_sig(&sym.arg_types, host_cc);
-                            let sig_ref = builder.import_signature(sig);
-                            fast_call_data
-                                .insert(va, (sig_ref, sym.value as i64, sym.arg_types.clone()));
-                        }
-                        ExecutionMode::RuntimeAssisted => {
-                            let entry = if let Some(existing) = funcref_by_name.get(sym.name) {
-                                existing.clone()
-                            } else {
-                                let index = aot_imports.len() as u32;
-                                let sig = build_import_sig(&sym.arg_types, host_cc);
-                                let sig_ref = builder.import_signature(sig.clone());
-                                let user_name = builder.func.declare_imported_user_function(
-                                    UserExternalName { namespace: 0, index },
-                                );
-                                let func_ref = builder.import_function(ExtFuncData {
-                                    name: ExternalName::user(user_name),
-                                    signature: sig_ref,
-                                    colocated: false,
-                                    patchable: false,
-                                });
-                                aot_imports.push((sym.name, sym.value as *const u8, sig));
-                                let entry = (func_ref, sym.arg_types.clone());
-                                funcref_by_name.insert(sym.name, entry.clone());
-                                entry
-                            };
-                            fast_call_funcrefs.insert(va, entry);
-                        }
+            let Some(import) = opt_import else { continue };
+            let sym = &import.symbol;
+            // Variadic functions, and functions with arguments the registered
+            // ABI cannot place, are demoted to slow calls.
+            if sym.is_ellipsis_function || !import.abi.can_fast_call(&sym.arg_types) {
+                continue;
+            }
+            // The signature describes the *host* callee; the ABI descriptor
+            // describes where the guest left the arguments.
+            let host_cc = import
+                .abi
+                .host_call_conv
+                .unwrap_or_else(get_host_calling_conv);
+            let fast_call = match config.execution_mode {
+                ExecutionMode::Jit => {
+                    let sig = build_import_sig(&sym.arg_types, host_cc);
+                    FastCall {
+                        target: FastCallTarget::Absolute {
+                            sig_ref: builder.import_signature(sig),
+                            fn_ptr: sym.value as i64,
+                        },
+                        arg_types: sym.arg_types.clone(),
+                        abi: import.abi.clone(),
                     }
                 }
-            }
+                ExecutionMode::RuntimeAssisted => match fast_call_by_name.get(sym.name) {
+                    Some(existing) => existing.clone(),
+                    None => {
+                        let index = aot_imports.len() as u32;
+                        let sig = build_import_sig(&sym.arg_types, host_cc);
+                        let sig_ref = builder.import_signature(sig.clone());
+                        let user_name = builder.func.declare_imported_user_function(
+                            UserExternalName { namespace: 0, index },
+                        );
+                        let func_ref = builder.import_function(ExtFuncData {
+                            name: ExternalName::user(user_name),
+                            signature: sig_ref,
+                            colocated: false,
+                            patchable: false,
+                        });
+                        aot_imports.push((sym.name, sym.value as *const u8, sig));
+                        let fast_call = FastCall {
+                            target: FastCallTarget::Relocatable(func_ref),
+                            arg_types: sym.arg_types.clone(),
+                            abi: import.abi.clone(),
+                        };
+                        fast_call_by_name.insert(sym.name, fast_call.clone());
+                        fast_call
+                    }
+                },
+            };
+            fast_calls.insert(va, fast_call);
         }
 
         Self {
@@ -436,8 +466,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             block_terminated: false,
             exit_trampoline_address: 0xFFFF_FFFF_FFFF_FFFF,
             syscall_handler_sig,
-            fast_call_data,
-            fast_call_funcrefs,
+            fast_calls,
             aot_imports,
             import_vas,
             block_transfer_kinds: HashMap::new(),

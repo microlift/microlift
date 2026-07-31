@@ -2,6 +2,7 @@
 //! classification, state sync, and instruction semantics. Wires them together
 //! through the [`GuestArch`] impl for [`X86_64`].
 
+pub mod abi;
 pub mod context;
 pub mod decode;
 pub mod regs;
