@@ -220,6 +220,7 @@ impl<'a> Lifter<'a> {
             Mnemonic::Jmp => self.handle_jmp(instruction),
             Mnemonic::Call => self.handle_call(instruction),
             Mnemonic::Ret => self.handle_ret(instruction),
+            Mnemonic::Retf => self.handle_retf(instruction),
             Mnemonic::Loop => self.handle_loop(instruction),
             Mnemonic::Loope => self.handle_loope(instruction),
             Mnemonic::Loopne => self.handle_loopne(instruction),

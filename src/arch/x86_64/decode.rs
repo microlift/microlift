@@ -93,7 +93,7 @@ pub fn control_flow(instruction: &Instruction) -> ControlFlow {
                 ControlFlow::call(None)
             }
         }
-        Mnemonic::Ret => ControlFlow::ret(),
+        Mnemonic::Ret | Mnemonic::Retf => ControlFlow::ret(),
         _ => ControlFlow::fallthrough(),
     }
 }

@@ -567,7 +567,7 @@ impl ValueSetAnalyzer {
                     self.propagate(target, &post_state, instructions);
                     self.propagate(next_ip, &post_state, instructions);
                 }
-                Mnemonic::Ret => {
+                Mnemonic::Ret | Mnemonic::Retf => {
                     // Terminator; no fallthrough.
                 }
                 _ => {

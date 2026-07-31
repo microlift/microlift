@@ -67,6 +67,44 @@ impl<'a> Lifter<'a> {
     }
 
     pub(super) fn handle_ret(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        // Near return: pop a full 64-bit return address off the stack.
+        self.emit_return(instruction, 8, false)
+    }
+
+    /// `RETF`/`RETFQ` - far return.
+    ///
+    /// Pops the return offset and then the code selector, both stored in
+    /// operand-size-wide stack slots: 2 bytes each for `RETFW` (0x66 prefix),
+    /// 4 for `RETFD` (the 64-bit-mode default), 8 for `RETFQ` (REX.W).
+    ///
+    /// Microlift models a flat address space with no segmentation, so the
+    /// popped CS selector is discarded (it cannot change the linear address of
+    /// the target) - only the stack adjustment and the branch to the popped
+    /// offset are architecturally observable here. Everything past the pop
+    /// (in-region dispatch, exit trampoline, `UnknownJump`) is identical to a
+    /// near `RET`.
+    pub(super) fn handle_retf(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let operand_size = match instruction.code() {
+            Code::Retfw | Code::Retfw_imm16 => 2,
+            Code::Retfq | Code::Retfq_imm16 => 8,
+            // Retfd/Retfd_imm16, and anything unexpected: 32-bit default.
+            _ => 4,
+        };
+        self.emit_return(instruction, operand_size, true)
+    }
+
+    /// Shared `RET`/`RETF` emitter.
+    ///
+    /// `slot_size` is the width in bytes of each stack slot popped (8 for a
+    /// near return, the operand size for a far one) and `pop_cs` selects
+    /// whether a second (discarded) selector slot follows the return offset.
+    /// `RET/RETF imm16` additionally releases `imm16` bytes of arguments.
+    fn emit_return(
+        &mut self,
+        instruction: &Instruction,
+        slot_size: i64,
+        pop_cs: bool,
+    ) -> crate::Result<()> {
         if self.config.analysis_mode {
             // Inspection IR: a return terminates the function. The runtime stack
             // pop + dispatch switch + trampoline check are execution-only
@@ -79,12 +117,24 @@ impl<'a> Lifter<'a> {
         let imm = instruction.immediate16(); // for RET n
 
         let rsp = self.get_reg_val(Register::RSP)?;
-        let target_ip = self
+        // A narrow far return leaves the upper bits of the target undefined on
+        // real hardware; zero-extending the popped slot matches what the CPU
+        // loads into RIP.
+        let slot_ty = size_to_type(slot_size as usize);
+        let popped = self
             .builder
             .ins()
-            .load(types::I64, MemFlagsData::new(), rsp, 0);
+            .load(slot_ty, MemFlagsData::new(), rsp, 0);
+        let target_ip = if slot_ty == types::I64 {
+            popped
+        } else {
+            self.builder.ins().uextend(types::I64, popped)
+        };
 
-        let mut new_rsp = self.builder.ins().iadd_imm(rsp, 8);
+        // Pop the return offset, then the discarded CS selector for a far
+        // return, then any `imm16` argument bytes.
+        let popped_bytes = if pop_cs { slot_size * 2 } else { slot_size };
+        let mut new_rsp = self.builder.ins().iadd_imm(rsp, popped_bytes);
         if imm > 0 {
             new_rsp = self.builder.ins().iadd_imm(new_rsp, imm as i64);
         }
