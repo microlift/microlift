@@ -69,13 +69,7 @@ fn jit_binop(op: Op, a: u128, b: u128) -> u128 {
     let (am_v, ase_v) = parts(a);
     let (bm_v, bse_v) = parts(b);
     let mut outbuf = [0u64; 2];
-    f(
-        am_v,
-        ase_v as u64,
-        bm_v,
-        bse_v as u64,
-        outbuf.as_mut_ptr(),
-    );
+    f(am_v, ase_v as u64, bm_v, bse_v as u64, outbuf.as_mut_ptr());
     bits(outbuf[0], outbuf[1] as u16)
 }
 
@@ -292,7 +286,8 @@ fn test_mul_matches_apfloat() {
         let a = rand_normal(&mut rng);
         let b = rand_normal(&mut rng);
         let got = jit_binop(Op::Mul, a, b);
-        let want = af(a).mul_r(af(b), Round::NearestTiesToEven).value.to_bits() & 0xFFFF_FFFF_FFFF_FFFF_FFFF;
+        let want = af(a).mul_r(af(b), Round::NearestTiesToEven).value.to_bits()
+            & 0xFFFF_FFFF_FFFF_FFFF_FFFF;
         assert_eq!(
             got, want,
             "mul {a:#022x} * {b:#022x}: got {got:#022x} want {want:#022x}"
@@ -307,7 +302,8 @@ fn test_div_matches_apfloat() {
         let a = rand_normal(&mut rng);
         let b = rand_normal(&mut rng);
         let got = jit_binop(Op::Div, a, b);
-        let want = af(a).div_r(af(b), Round::NearestTiesToEven).value.to_bits() & 0xFFFF_FFFF_FFFF_FFFF_FFFF;
+        let want = af(a).div_r(af(b), Round::NearestTiesToEven).value.to_bits()
+            & 0xFFFF_FFFF_FFFF_FFFF_FFFF;
         assert_eq!(
             got, want,
             "div {a:#022x} / {b:#022x}: got {got:#022x} want {want:#022x}"
@@ -349,7 +345,10 @@ fn test_sqrt_matches_hardware() {
         let a = rand_normal(&mut rng) & !(1u128 << 79);
         let got = jit_sqrt(a);
         let want = host_sqrt(a);
-        assert_eq!(got, want, "sqrt {a:#022x}: got {got:#022x} want {want:#022x}");
+        assert_eq!(
+            got, want,
+            "sqrt {a:#022x}: got {got:#022x} want {want:#022x}"
+        );
     }
 }
 
@@ -409,7 +408,10 @@ fn is_nan_bits(x: u128) -> bool {
 #[test]
 fn test_mul_special() {
     // 2 * 2 = 4
-    assert_eq!(jit_binop(Op::Mul, TWO, TWO), bits_const(0x8000_0000_0000_0000, 0x4001));
+    assert_eq!(
+        jit_binop(Op::Mul, TWO, TWO),
+        bits_const(0x8000_0000_0000_0000, 0x4001)
+    );
     // inf * 2 = inf
     assert_eq!(jit_binop(Op::Mul, POS_INF, TWO), POS_INF);
     // -inf * 2 = -inf

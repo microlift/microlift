@@ -113,7 +113,14 @@ fn decode_movz_and_ret() {
 #[test]
 fn decode_conditional_branch_target() {
     // subs at 0x1008, b.eq at 0x100C -> taken target 0x1014.
-    let bytes = program(&[MOVZ_X0_7, MOVZ_X1_7, SUBS_XZR_X0_X1, BEQ_PLUS8, MOVZ_X0_0, RET]);
+    let bytes = program(&[
+        MOVZ_X0_7,
+        MOVZ_X1_7,
+        SUBS_XZR_X0_X1,
+        BEQ_PLUS8,
+        MOVZ_X0_0,
+        RET,
+    ]);
     let insts = decode_region(&bytes, BASE);
     let beq = &insts[3];
     let cf = control_flow(beq);
@@ -123,7 +130,10 @@ fn decode_conditional_branch_target() {
 
 #[test]
 fn movz_ret() {
-    let ctx = run(&program(&[MOVZ_X0_42, RET]), Aarch64RegisterContext::default());
+    let ctx = run(
+        &program(&[MOVZ_X0_42, RET]),
+        Aarch64RegisterContext::default(),
+    );
     assert_eq!(ctx.x[0], 42);
     assert_eq!(ctx.exit_reason, ExitReason::Return as u32);
 }
@@ -152,7 +162,14 @@ fn subs_sets_flags() {
 #[test]
 fn conditional_branch_taken() {
     // 7 == 7 -> Z=1 -> b.eq taken -> skips `movz x0, #0`, so x0 stays 7.
-    let bytes = program(&[MOVZ_X0_7, MOVZ_X1_7, SUBS_XZR_X0_X1, BEQ_PLUS8, MOVZ_X0_0, RET]);
+    let bytes = program(&[
+        MOVZ_X0_7,
+        MOVZ_X1_7,
+        SUBS_XZR_X0_X1,
+        BEQ_PLUS8,
+        MOVZ_X0_0,
+        RET,
+    ]);
     let ctx = run(&bytes, Aarch64RegisterContext::default());
     assert_eq!(ctx.z, 1);
     assert_eq!(ctx.x[0], 7);
@@ -200,14 +217,20 @@ fn stp_stores_register_pair() {
 #[test]
 fn adrp_forms_page_address() {
     // adrp x0, #0x1000 at PC 0x1000: (0x1000 & ~0xFFF) + 0x1000 = 0x2000.
-    let ctx = run(&program(&[ADRP_X0_1, RET]), Aarch64RegisterContext::default());
+    let ctx = run(
+        &program(&[ADRP_X0_1, RET]),
+        Aarch64RegisterContext::default(),
+    );
     assert_eq!(ctx.x[0], 0x2000);
 }
 
 #[test]
 fn blr_exits_indirect_with_link() {
     // movz x0,#42; blr x0  -> IndirectCall to 42, x30/pc = resume (0x1008).
-    let ctx = run(&program(&[MOVZ_X0_42, BLR_X0]), Aarch64RegisterContext::default());
+    let ctx = run(
+        &program(&[MOVZ_X0_42, BLR_X0]),
+        Aarch64RegisterContext::default(),
+    );
     assert_eq!(ctx.exit_reason, ExitReason::IndirectCall as u32);
     assert_eq!(ctx.imported_function_va, 42);
     assert_eq!(ctx.x[30], BASE + 8); // return address = instruction after BLR
@@ -262,7 +285,10 @@ fn csel_picks_first_when_cond_true() {
     // csel x2,x0,x1,eq with Z=1 -> x2 = x0 = 10.
     let mut ctx = Aarch64RegisterContext::default();
     ctx.z = 1;
-    let ctx = run(&program(&[MOVZ_X0_10, MOVZ_X1_20, CSEL_X2_X0_X1_EQ, RET]), ctx);
+    let ctx = run(
+        &program(&[MOVZ_X0_10, MOVZ_X1_20, CSEL_X2_X0_X1_EQ, RET]),
+        ctx,
+    );
     assert_eq!(ctx.x[2], 10);
 }
 
@@ -271,14 +297,24 @@ fn csel_picks_second_when_cond_false() {
     // csel x2,x0,x1,eq with Z=0 -> x2 = x1 = 20.
     let mut ctx = Aarch64RegisterContext::default();
     ctx.z = 0;
-    let ctx = run(&program(&[MOVZ_X0_10, MOVZ_X1_20, CSEL_X2_X0_X1_EQ, RET]), ctx);
+    let ctx = run(
+        &program(&[MOVZ_X0_10, MOVZ_X1_20, CSEL_X2_X0_X1_EQ, RET]),
+        ctx,
+    );
     assert_eq!(ctx.x[2], 20);
 }
 
 #[test]
 fn conditional_branch_not_taken() {
     // 5 != 3 -> Z=0 -> b.eq not taken -> falls through to `movz x0, #0`.
-    let bytes = program(&[MOVZ_X0_5, MOVZ_X1_3, SUBS_XZR_X0_X1, BEQ_PLUS8, MOVZ_X0_0, RET]);
+    let bytes = program(&[
+        MOVZ_X0_5,
+        MOVZ_X1_3,
+        SUBS_XZR_X0_X1,
+        BEQ_PLUS8,
+        MOVZ_X0_0,
+        RET,
+    ]);
     let ctx = run(&bytes, Aarch64RegisterContext::default());
     assert_eq!(ctx.z, 0);
     assert_eq!(ctx.x[0], 0);
@@ -456,10 +492,7 @@ fn stp_ldp_roundtrip() {
     ctx.x[0] = 0x1234;
     ctx.x[1] = 0x5678;
     // stp x0,x1,[sp]; clobber; ldp x0,x1,[sp] back.
-    let ctx = run(
-        &program(&[STP_X0_X1_SP, MOVZ_X0_0, LDP_X0_X1_SP, RET]),
-        ctx,
-    );
+    let ctx = run(&program(&[STP_X0_X1_SP, MOVZ_X0_0, LDP_X0_X1_SP, RET]), ctx);
     assert_eq!(ctx.x[0], 0x1234);
     assert_eq!(ctx.x[1], 0x5678);
 }
@@ -469,7 +502,10 @@ fn csinc_else_increments() {
     // Z=0 -> cond false -> x2 = x1 + 1 = 21.
     let mut ctx = Aarch64RegisterContext::default();
     ctx.z = 0;
-    let ctx = run(&program(&[MOVZ_X0_10, MOVZ_X1_20, CSINC_X2_X0_X1_EQ, RET]), ctx);
+    let ctx = run(
+        &program(&[MOVZ_X0_10, MOVZ_X1_20, CSINC_X2_X0_X1_EQ, RET]),
+        ctx,
+    );
     assert_eq!(ctx.x[2], 21);
 }
 
@@ -478,7 +514,10 @@ fn csinc_true_picks_first() {
     // Z=1 -> cond true -> x2 = x0 = 10 (no increment).
     let mut ctx = Aarch64RegisterContext::default();
     ctx.z = 1;
-    let ctx = run(&program(&[MOVZ_X0_10, MOVZ_X1_20, CSINC_X2_X0_X1_EQ, RET]), ctx);
+    let ctx = run(
+        &program(&[MOVZ_X0_10, MOVZ_X1_20, CSINC_X2_X0_X1_EQ, RET]),
+        ctx,
+    );
     assert_eq!(ctx.x[2], 10);
 }
 
@@ -487,7 +526,10 @@ fn csinv_else_inverts() {
     // Z=0 -> x2 = ~x1 = ~20.
     let mut ctx = Aarch64RegisterContext::default();
     ctx.z = 0;
-    let ctx = run(&program(&[MOVZ_X0_10, MOVZ_X1_20, CSINV_X2_X0_X1_EQ, RET]), ctx);
+    let ctx = run(
+        &program(&[MOVZ_X0_10, MOVZ_X1_20, CSINV_X2_X0_X1_EQ, RET]),
+        ctx,
+    );
     assert_eq!(ctx.x[2], !20u64);
 }
 
@@ -496,7 +538,10 @@ fn csneg_else_negates() {
     // Z=0 -> x2 = -x1 = -20.
     let mut ctx = Aarch64RegisterContext::default();
     ctx.z = 0;
-    let ctx = run(&program(&[MOVZ_X0_10, MOVZ_X1_20, CSNEG_X2_X0_X1_EQ, RET]), ctx);
+    let ctx = run(
+        &program(&[MOVZ_X0_10, MOVZ_X1_20, CSNEG_X2_X0_X1_EQ, RET]),
+        ctx,
+    );
     assert_eq!(ctx.x[2] as i64, -20);
 }
 
@@ -527,7 +572,10 @@ fn rev_reverses_bytes() {
 #[test]
 fn adr_forms_byte_address() {
     // adr x0,#+8 at PC 0x1000 -> 0x1008 (no page masking).
-    let ctx = run(&program(&[ADR_X0_PLUS8, RET]), Aarch64RegisterContext::default());
+    let ctx = run(
+        &program(&[ADR_X0_PLUS8, RET]),
+        Aarch64RegisterContext::default(),
+    );
     assert_eq!(ctx.x[0], BASE + 8);
 }
 

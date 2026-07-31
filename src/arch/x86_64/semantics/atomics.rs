@@ -7,8 +7,8 @@
 //! - LOCK-prefixed arithmetic and bit operations
 
 use crate::MicroliftError;
-use crate::lifter::{Lifter, X86Flag};
 use crate::arch::x86_64::semantics::helpers::size_to_type;
+use crate::lifter::{Lifter, X86Flag};
 use cranelift::prelude::*;
 use cranelift_codegen::ir::AtomicRmwOp;
 use iced_x86::{Instruction, Mnemonic, OpKind, Register};
@@ -67,10 +67,10 @@ impl<'a> Lifter<'a> {
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 0)?;
                 // atomic_cas: if *ptr == acc_narrow { *ptr = src_val }; returns old *ptr
-                let old = self
-                    .builder
-                    .ins()
-                    .atomic_cas(MemFlagsData::new(), ptr, acc_narrow, src_val);
+                let old =
+                    self.builder
+                        .ins()
+                        .atomic_cas(MemFlagsData::new(), ptr, acc_narrow, src_val);
 
                 // Update flags as CMP acc, old  (acc - old)
                 let cmp_result = self.builder.ins().isub(acc_narrow, old);
@@ -188,10 +188,10 @@ impl<'a> Lifter<'a> {
         let ty = size_to_type(size);
         let ptr = self.get_mem_ptr(instruction, 0)?;
         let src = self.read_operand(instruction, 1, size)?;
-        let old = self
-            .builder
-            .ins()
-            .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::Add, ptr, src);
+        let old =
+            self.builder
+                .ins()
+                .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::Add, ptr, src);
         let result = self.builder.ins().iadd(old, src);
         self.update_flags_add(old, src, result, size)?;
         Ok(())
@@ -202,10 +202,10 @@ impl<'a> Lifter<'a> {
         let ty = size_to_type(size);
         let ptr = self.get_mem_ptr(instruction, 0)?;
         let src = self.read_operand(instruction, 1, size)?;
-        let old = self
-            .builder
-            .ins()
-            .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::Sub, ptr, src);
+        let old =
+            self.builder
+                .ins()
+                .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::Sub, ptr, src);
         let result = self.builder.ins().isub(old, src);
         self.update_flags_sub(old, src, result, size)?;
         Ok(())
@@ -216,10 +216,10 @@ impl<'a> Lifter<'a> {
         let ty = size_to_type(size);
         let ptr = self.get_mem_ptr(instruction, 0)?;
         let src = self.read_operand(instruction, 1, size)?;
-        let old = self
-            .builder
-            .ins()
-            .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::And, ptr, src);
+        let old =
+            self.builder
+                .ins()
+                .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::And, ptr, src);
         let result = self.builder.ins().band(old, src);
         self.update_flags_logical(result, size)?;
         Ok(())
@@ -244,10 +244,10 @@ impl<'a> Lifter<'a> {
         let ty = size_to_type(size);
         let ptr = self.get_mem_ptr(instruction, 0)?;
         let src = self.read_operand(instruction, 1, size)?;
-        let old = self
-            .builder
-            .ins()
-            .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::Xor, ptr, src);
+        let old =
+            self.builder
+                .ins()
+                .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::Xor, ptr, src);
         let result = self.builder.ins().bxor(old, src);
         self.update_flags_logical(result, size)?;
         Ok(())
@@ -258,10 +258,10 @@ impl<'a> Lifter<'a> {
         let ty = size_to_type(size);
         let ptr = self.get_mem_ptr(instruction, 0)?;
         let one = self.builder.ins().iconst(ty, 1);
-        let old = self
-            .builder
-            .ins()
-            .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::Add, ptr, one);
+        let old =
+            self.builder
+                .ins()
+                .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::Add, ptr, one);
         let result = self.builder.ins().iadd(old, one);
         self.update_flags_inc_dec(old, one, result, true, size)?;
         Ok(())
@@ -272,10 +272,10 @@ impl<'a> Lifter<'a> {
         let ty = size_to_type(size);
         let ptr = self.get_mem_ptr(instruction, 0)?;
         let one = self.builder.ins().iconst(ty, 1);
-        let old = self
-            .builder
-            .ins()
-            .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::Sub, ptr, one);
+        let old =
+            self.builder
+                .ins()
+                .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::Sub, ptr, one);
         let result = self.builder.ins().isub(old, one);
         self.update_flags_inc_dec(old, one, result, false, size)?;
         Ok(())
@@ -294,10 +294,10 @@ impl<'a> Lifter<'a> {
             src_val
         };
         // atomic fetch-add: returns old *ptr, then *ptr += src
-        let old = self
-            .builder
-            .ins()
-            .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::Add, ptr, src);
+        let old =
+            self.builder
+                .ins()
+                .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::Add, ptr, src);
         // src register gets the pre-add memory value
         self.set_reg_val(src_reg, old)?;
         let result = self.builder.ins().iadd(old, src);
@@ -325,10 +325,13 @@ impl<'a> Lifter<'a> {
             reg_val
         };
         // atomic swap: returns old *ptr, writes reg_narrow to *ptr
-        let old =
-            self.builder
-                .ins()
-                .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::Xchg, ptr, reg_narrow);
+        let old = self.builder.ins().atomic_rmw(
+            ty,
+            MemFlagsData::new(),
+            AtomicRmwOp::Xchg,
+            ptr,
+            reg_narrow,
+        );
         self.set_reg_val(reg, old)?;
         // XCHG does not modify flags.
         Ok(())
@@ -427,7 +430,10 @@ impl<'a> Lifter<'a> {
                 } else {
                     self.builder.ins().sextend(types::I64, idx)
                 };
-                let word = self.builder.ins().sshr_imm(idx64, bits.trailing_zeros() as i64);
+                let word = self
+                    .builder
+                    .ins()
+                    .sshr_imm(idx64, bits.trailing_zeros() as i64);
                 let byte_off = self.builder.ins().imul_imm(word, size as i64);
                 ptr = self.builder.ins().iadd(ptr, byte_off);
                 self.builder.ins().band_imm(idx, bits - 1)
@@ -456,9 +462,13 @@ impl<'a> Lifter<'a> {
             BitOp::Reset => {
                 let all_ones = self.builder.ins().iconst(ty, -1);
                 let inv_mask = self.builder.ins().bxor(mask, all_ones);
-                self.builder
-                    .ins()
-                    .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::And, ptr, inv_mask)
+                self.builder.ins().atomic_rmw(
+                    ty,
+                    MemFlagsData::new(),
+                    AtomicRmwOp::And,
+                    ptr,
+                    inv_mask,
+                )
             }
             BitOp::Complement => {
                 self.builder

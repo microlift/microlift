@@ -160,10 +160,12 @@ impl<'a> Lifter64<'a> {
         self.builder.def_var(self.state.tpidr_el0, tpidr_val);
 
         let image_base_offset = std::mem::offset_of!(Aarch64RegisterContext, image_base) as i32;
-        let image_base_val =
-            self.builder
-                .ins()
-                .load(types::I64, MemFlagsData::trusted(), ctx_ptr, image_base_offset);
+        let image_base_val = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::trusted(),
+            ctx_ptr,
+            image_base_offset,
+        );
         self.builder.def_var(self.state.image_base, image_base_val);
 
         self.state.dirty_gprs.clear();

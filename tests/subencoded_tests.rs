@@ -28,5 +28,8 @@ fn test_subencoded_in_mov_immediate() {
         0xC3,                         // 0x100A: ret
     ];
     let ctx = run_test(&bytes, RegisterContext::default());
-    assert_eq!(ctx.rax, 0x2A, "bytes entered mid-mov should decode as add eax, 0x2A");
+    assert_eq!(
+        ctx.rax, 0x2A,
+        "bytes entered mid-mov should decode as add eax, 0x2A"
+    );
 }

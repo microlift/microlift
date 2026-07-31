@@ -214,10 +214,7 @@ impl<'a> Lifter<'a> {
         // Biased f64 exponent of the integer bit: exp80 - 16383 + 1023.
         let e = self.builder.ins().iadd_imm(exp80_64, -15360);
 
-        let is_special = self
-            .builder
-            .ins()
-            .icmp_imm(IntCC::Equal, exp80_64, 0x7FFF);
+        let is_special = self.builder.ins().icmp_imm(IntCC::Equal, exp80_64, 0x7FFF);
         let is_zero_mant = self.builder.ins().icmp_imm(IntCC::Equal, mant, 0);
         let overflow = self
             .builder
@@ -258,7 +255,10 @@ impl<'a> Lifter<'a> {
             let shm1 = self.builder.ins().iadd_imm(sh, -1);
             self.builder.ins().ishl(one, shm1)
         };
-        let gt = self.builder.ins().icmp(IntCC::UnsignedGreaterThan, rem, half);
+        let gt = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThan, rem, half);
         let eq = self.builder.ins().icmp(IntCC::Equal, rem, half);
         let odd = self.builder.ins().band(keep, one);
         let odd = self.builder.ins().icmp_imm(IntCC::NotEqual, odd, 0);
@@ -287,7 +287,10 @@ impl<'a> Lifter<'a> {
         let special_bits = self.builder.ins().bor(inf_bits, frac);
 
         let magnitude = self.builder.ins().select(overflow, inf_bits, combined);
-        let magnitude = self.builder.ins().select(is_special, special_bits, magnitude);
+        let magnitude = self
+            .builder
+            .ins()
+            .select(is_special, special_bits, magnitude);
         // Zero mantissa -> signed zero (also covers the true-zero encoding).
         let magnitude = self.builder.ins().select(is_zero_mant, zero64, magnitude);
 
@@ -342,7 +345,10 @@ impl<'a> Lifter<'a> {
             .select(is_special, special_exp, exp80_normal);
         let exp80 = self.builder.ins().select(is_subnormal, exp80_sub, exp80);
         let exp80 = self.builder.ins().select(is_zero, zero_val, exp80);
-        let mant = self.builder.ins().select(is_subnormal, mant_sub, mant_normal);
+        let mant = self
+            .builder
+            .ins()
+            .select(is_subnormal, mant_sub, mant_normal);
         let mant = self.builder.ins().select(is_zero, zero_val, mant);
 
         let sign15 = self.builder.ins().ishl_imm(sign, 15);
@@ -403,7 +409,10 @@ impl<'a> Lifter<'a> {
             // Cap shift at 63 so the shift is well-defined; the >=64 case is
             // selected away below.
             let sixty3 = self.builder.ins().iconst(types::I64, 63);
-            let too_small = self.builder.ins().icmp(IntCC::SignedGreaterThan, shift, sixty3);
+            let too_small = self
+                .builder
+                .ins()
+                .icmp(IntCC::SignedGreaterThan, shift, sixty3);
             self.builder.ins().select(too_small, sixty3, shift)
         };
         let trunc_mag = self.builder.ins().ushr(mant, shift_clamped);
@@ -423,7 +432,10 @@ impl<'a> Lifter<'a> {
                 let sh = self.builder.ins().iadd_imm(shift_clamped, -1);
                 self.builder.ins().ishl(one, sh)
             };
-            let gt = self.builder.ins().icmp(IntCC::UnsignedGreaterThan, rem, half);
+            let gt = self
+                .builder
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThan, rem, half);
             let eq = self.builder.ins().icmp(IntCC::Equal, rem, half);
             let odd = self.builder.ins().band_imm(trunc_mag, 1);
             let odd = self.builder.ins().icmp_imm(IntCC::NotEqual, odd, 0);
@@ -446,7 +458,10 @@ impl<'a> Lifter<'a> {
 
         // Out-of-range: value < 1 (shift >= 64) -> 0; magnitude too large
         // (shift < 0, i.e. exponent >= 63) -> integer indefinite.
-        let value_lt_one = self.builder.ins().icmp_imm(IntCC::SignedGreaterThanOrEqual, shift, 64);
+        let value_lt_one = self
+            .builder
+            .ins()
+            .icmp_imm(IntCC::SignedGreaterThanOrEqual, shift, 64);
         let too_large = self.builder.ins().icmp_imm(IntCC::SignedLessThan, shift, 0);
         let zero = self.builder.ins().iconst(types::I64, 0);
         let indef = self.builder.ins().iconst(types::I64, i64::MIN);
@@ -467,17 +482,29 @@ impl<'a> Lifter<'a> {
         let ptr = self.get_mem_ptr(instruction, op_index)?;
         match instruction.memory_size() {
             MemorySize::Float32 => {
-                let f32v = self.builder.ins().load(types::F32, MemFlagsData::new(), ptr, 0);
+                let f32v = self
+                    .builder
+                    .ins()
+                    .load(types::F32, MemFlagsData::new(), ptr, 0);
                 let f64v = self.builder.ins().fpromote(types::F64, f32v);
                 Ok(self.f64_to_f80(f64v))
             }
             MemorySize::Float64 => {
-                let f64v = self.builder.ins().load(types::F64, MemFlagsData::new(), ptr, 0);
+                let f64v = self
+                    .builder
+                    .ins()
+                    .load(types::F64, MemFlagsData::new(), ptr, 0);
                 Ok(self.f64_to_f80(f64v))
             }
             MemorySize::Float80 => {
-                let mant = self.builder.ins().load(types::I64, MemFlagsData::new(), ptr, 0);
-                let se16 = self.builder.ins().load(types::I16, MemFlagsData::new(), ptr, 8);
+                let mant = self
+                    .builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::new(), ptr, 0);
+                let se16 = self
+                    .builder
+                    .ins()
+                    .load(types::I16, MemFlagsData::new(), ptr, 8);
                 let se = self.builder.ins().uextend(types::I32, se16);
                 Ok((mant, se))
             }
@@ -496,14 +523,23 @@ impl<'a> Lifter<'a> {
         let ptr = self.get_mem_ptr(instruction, op_index)?;
         let int64 = match instruction.memory_size() {
             MemorySize::Int16 => {
-                let v = self.builder.ins().load(types::I16, MemFlagsData::new(), ptr, 0);
+                let v = self
+                    .builder
+                    .ins()
+                    .load(types::I16, MemFlagsData::new(), ptr, 0);
                 self.builder.ins().sextend(types::I64, v)
             }
             MemorySize::Int32 => {
-                let v = self.builder.ins().load(types::I32, MemFlagsData::new(), ptr, 0);
+                let v = self
+                    .builder
+                    .ins()
+                    .load(types::I32, MemFlagsData::new(), ptr, 0);
                 self.builder.ins().sextend(types::I64, v)
             }
-            MemorySize::Int64 => self.builder.ins().load(types::I64, MemFlagsData::new(), ptr, 0),
+            MemorySize::Int64 => self
+                .builder
+                .ins()
+                .load(types::I64, MemFlagsData::new(), ptr, 0),
             other => {
                 return Err(MicroliftError::UnsupportedInstruction {
                     mnemonic: format!("fpu-load-int-{:?}", other),
@@ -544,8 +580,7 @@ impl<'a> Lifter<'a> {
     /// Push an implicit constant (`FLDZ`, `FLD1`, `FLDPI`, ...). The constant is
     /// converted to its exact 80-bit encoding at lift time.
     pub(super) fn handle_fld_const(&mut self, value: f64) -> crate::Result<()> {
-        let (mant_bits, se_bits) =
-            crate::arch::x86_64::context::f64_bits_to_f80(value.to_bits());
+        let (mant_bits, se_bits) = crate::arch::x86_64::context::f64_bits_to_f80(value.to_bits());
         let mant = self.builder.ins().iconst(types::I64, mant_bits as i64);
         let se = self.builder.ins().iconst(types::I32, se_bits as i64);
         self.fpu_push_raw(mant, se);
@@ -555,11 +590,7 @@ impl<'a> Lifter<'a> {
     /// FST / FSTP - store `ST(0)`; `pop` selects the popping form.
     ///
     /// Covers `FST(P) m32/m64`, `FSTP m80` (`fstpt`) and `FST(P) ST(i)`.
-    pub(super) fn handle_fst(
-        &mut self,
-        instruction: &Instruction,
-        pop: bool,
-    ) -> crate::Result<()> {
+    pub(super) fn handle_fst(&mut self, instruction: &Instruction, pop: bool) -> crate::Result<()> {
         let (mant, se) = self.fpu_read_st_raw(0);
         match self.operand_kind(instruction, 0) {
             OpKind::Memory => {
@@ -892,11 +923,7 @@ impl<'a> Lifter<'a> {
 
     /// FCMOVcc - conditionally copy `ST(i)` into `ST(0)` based on the integer
     /// flags. `cond` is a non-zero `I8` when the move should occur.
-    fn handle_fcmov_cond(
-        &mut self,
-        instruction: &Instruction,
-        cond: Value,
-    ) -> crate::Result<()> {
+    fn handle_fcmov_cond(&mut self, instruction: &Instruction, cond: Value) -> crate::Result<()> {
         // Source is `ST(i)` - op1 for the two-operand `FCMOVcc ST0, ST(i)`.
         let op_index = instruction.op_count().saturating_sub(1);
         let i = self.fpu_st_index(instruction, op_index)?;
@@ -1022,7 +1049,10 @@ impl<'a> Lifter<'a> {
     /// FLDCW - load the control word from a 16-bit memory operand.
     pub(super) fn handle_fldcw(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let ptr = self.get_mem_ptr(instruction, 0)?;
-        let cw = self.builder.ins().load(types::I16, MemFlagsData::new(), ptr, 0);
+        let cw = self
+            .builder
+            .ins()
+            .load(types::I16, MemFlagsData::new(), ptr, 0);
         let ctx = self.fpu_ctx_ptr();
         let cw_off = std::mem::offset_of!(RegisterContext, fpu_cw) as i32;
         self.builder

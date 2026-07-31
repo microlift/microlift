@@ -458,7 +458,7 @@ unsafe fn munmap_raw(addr: *mut core::ffi::c_void, len: usize) -> i32 {
 
 #[cfg(feature = "unicorn-oracle")]
 pub mod unicorn {
-    use super::{gpr, CpuOracle, CpuState, MemImage, OracleExit, OracleOutcome};
+    use super::{CpuOracle, CpuState, MemImage, OracleExit, OracleOutcome, gpr};
     use crate::testkit::trampoline::{ImportOracle, ImportTable};
     use crate::testkit::{DEFAULT_STACK_WORDS, EXIT_TRAMPOLINE};
     use core::cell::Cell;
@@ -543,7 +543,10 @@ pub mod unicorn {
         }
 
         /// Seed the engine's architectural registers from `st`.
-        fn write_state(uc: &mut Unicorn<'_, ()>, st: &CpuState) -> Result<(), unicorn_engine::uc_error> {
+        fn write_state(
+            uc: &mut Unicorn<'_, ()>,
+            st: &CpuState,
+        ) -> Result<(), unicorn_engine::uc_error> {
             for (i, &reg) in GPR_REG.iter().enumerate() {
                 uc.reg_write(reg, st.gpr[i])?;
             }
@@ -662,21 +665,21 @@ pub mod unicorn {
                 bail!(e);
             }
 
-            // on first touch of any other page, map it backed by its own address so 
+            // on first touch of any other page, map it backed by its own address so
             // guest VA == host VA
-            if let Err(e) = uc.add_mem_hook(HookType::MEM_UNMAPPED, 1, 0, |uc, _ty, addr, _sz, _v| {
-                let base = page_base(addr);
-                // SAFETY: The host owns this page for every address
-                // the diffable program legitimately touches (stack / arena).
-                // A bad access faults here exactly as it would under
-                // Microlift's JIT. Ignore the result: an `Err` (e.g. a race
-                // that mapped it first) simply means the retry will succeed or
-                // fault on its own.
-                let _ = unsafe {
-                    uc.mem_map_ptr(base, PAGE, Prot::ALL, base as *mut c_void)
-                };
-                true
-            }) {
+            if let Err(e) =
+                uc.add_mem_hook(HookType::MEM_UNMAPPED, 1, 0, |uc, _ty, addr, _sz, _v| {
+                    let base = page_base(addr);
+                    // SAFETY: The host owns this page for every address
+                    // the diffable program legitimately touches (stack / arena).
+                    // A bad access faults here exactly as it would under
+                    // Microlift's JIT. Ignore the result: an `Err` (e.g. a race
+                    // that mapped it first) simply means the retry will succeed or
+                    // fault on its own.
+                    let _ = unsafe { uc.mem_map_ptr(base, PAGE, Prot::ALL, base as *mut c_void) };
+                    true
+                })
+            {
                 bail!(e);
             }
 

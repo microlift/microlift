@@ -229,10 +229,12 @@ impl<'a> Lifter<'a> {
         }
 
         let image_base_offset = std::mem::offset_of!(RegisterContext, image_base) as i32;
-        let image_base_val =
-            self.builder
-                .ins()
-                .load(types::I64, MemFlagsData::trusted(), ctx_ptr, image_base_offset);
+        let image_base_val = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::trusted(),
+            ctx_ptr,
+            image_base_offset,
+        );
         self.builder.def_var(self.state.image_base, image_base_val);
 
         if self.state.use_vector_xmm {
@@ -251,14 +253,18 @@ impl<'a> Lifter<'a> {
             for i in 0u8..16 {
                 let lo_offset = RegisterState::get_xmm_offset(i, false);
                 let hi_offset = RegisterState::get_xmm_offset(i, true);
-                let lo_val =
-                    self.builder
-                        .ins()
-                        .load(types::I64, MemFlagsData::trusted(), ctx_ptr, lo_offset);
-                let hi_val =
-                    self.builder
-                        .ins()
-                        .load(types::I64, MemFlagsData::trusted(), ctx_ptr, hi_offset);
+                let lo_val = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::trusted(),
+                    ctx_ptr,
+                    lo_offset,
+                );
+                let hi_val = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::trusted(),
+                    ctx_ptr,
+                    hi_offset,
+                );
                 let lo_var = *self.state.xmms_lo.get(&i).unwrap();
                 let hi_var = *self.state.xmms_hi.get(&i).unwrap();
                 self.builder.def_var(lo_var, lo_val);

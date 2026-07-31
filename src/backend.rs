@@ -80,14 +80,13 @@ impl CraneliftBackend {
         imports: &[AotImport],
         flags: settings::Flags,
     ) -> Result<*const u8> {
-        let isa_builder = native_builder()
-            .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
+        let isa_builder =
+            native_builder().map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
         let isa = isa_builder
             .finish(flags)
             .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
 
-        let mut jit_builder =
-            JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+        let mut jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
         for &(name, ptr, _) in imports {
             jit_builder.symbol(name, ptr);
         }

@@ -1,7 +1,7 @@
 use crate::MicroliftError;
+use crate::arch::x86_64::semantics::helpers::size_to_type;
 use crate::context::ExitReason;
 use crate::lifter::{Lifter, X86Flag};
-use crate::arch::x86_64::semantics::helpers::size_to_type;
 use cranelift::prelude::*;
 use iced_x86::{Instruction, OpKind, Register};
 
@@ -143,7 +143,9 @@ impl<'a> Lifter<'a> {
         let rsp = self.get_reg_val(Register::RSP)?;
         let new_rsp = self.builder.ins().iadd_imm(rsp, -(push_size as i64));
         self.set_reg_val(Register::RSP, new_rsp)?;
-        self.builder.ins().store(MemFlagsData::new(), val, new_rsp, 0);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), val, new_rsp, 0);
         Ok(())
     }
 
@@ -187,7 +189,10 @@ impl<'a> Lifter<'a> {
         // RSP <- RBP
         self.set_reg_val(Register::RSP, rbp)?;
         // POP RBP: RBP <- [RSP]; RSP += 8
-        let old_rbp = self.builder.ins().load(types::I64, MemFlagsData::new(), rbp, 0);
+        let old_rbp = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), rbp, 0);
         self.set_reg_val(Register::RBP, old_rbp)?;
         let new_rsp = self.builder.ins().iadd_imm(rbp, 8);
         self.set_reg_val(Register::RSP, new_rsp)?;
@@ -506,7 +511,9 @@ impl<'a> Lifter<'a> {
         let rsp = self.get_reg_val(Register::RSP)?;
         let new_rsp = self.builder.ins().iadd_imm(rsp, -8);
         self.set_reg_val(Register::RSP, new_rsp)?;
-        self.builder.ins().store(MemFlagsData::new(), rflags, new_rsp, 0);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), rflags, new_rsp, 0);
         Ok(())
     }
 
@@ -515,7 +522,10 @@ impl<'a> Lifter<'a> {
     /// flags (IF, TF, etc.) and the reserved/system bits are simply discarded.
     pub(super) fn handle_popfq(&mut self, _instruction: &Instruction) -> crate::Result<()> {
         let rsp = self.get_reg_val(Register::RSP)?;
-        let rflags = self.builder.ins().load(types::I64, MemFlagsData::new(), rsp, 0);
+        let rflags = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), rsp, 0);
         let new_rsp = self.builder.ins().iadd_imm(rsp, 8);
         self.set_reg_val(Register::RSP, new_rsp)?;
 

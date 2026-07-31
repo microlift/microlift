@@ -524,7 +524,10 @@ fn test_in_region_call_returns_to_resume_point() {
 
     let out = LiftTest::new(&bytes).run();
     assert_eq!(out.exit, ExitReason::Return, "call/ret must halt cleanly");
-    assert_eq!(out.ctx.rax, 42, "callee ran and returned to the resume point");
+    assert_eq!(
+        out.ctx.rax, 42,
+        "callee ran and returned to the resume point"
+    );
     // Both frames were popped: the guest's stack is exactly balanced.
     assert_eq!(out.ctx.rsp, out.initial_rsp + 8);
 }

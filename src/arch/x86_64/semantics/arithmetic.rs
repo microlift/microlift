@@ -1,7 +1,7 @@
 use crate::MicroliftError;
+use crate::arch::x86_64::semantics::helpers::size_to_type;
 use crate::context::ExitReason;
 use crate::lifter::{Lifter, X86Flag};
-use crate::arch::x86_64::semantics::helpers::size_to_type;
 use cranelift::prelude::*;
 use iced_x86::{Instruction, OpKind, Register};
 
@@ -19,19 +19,16 @@ impl<'a> Lifter<'a> {
 
         let src_val = match op1 {
             OpKind::Register => self.get_reg_val(instruction.op1_register())?,
-            OpKind::Immediate32to64 => {
-                self.builder.ins().iconst(ty, instruction.immediate32to64())
-            }
+            OpKind::Immediate32to64 => self.builder.ins().iconst(ty, instruction.immediate32to64()),
             OpKind::Immediate8
             | OpKind::Immediate16
             | OpKind::Immediate32
             | OpKind::Immediate64
             | OpKind::Immediate8to16
             | OpKind::Immediate8to32
-            | OpKind::Immediate8to64 => self
-                .builder
-                .ins()
-                .iconst(ty, Self::read_imm64(instruction)),
+            | OpKind::Immediate8to64 => {
+                self.builder.ins().iconst(ty, Self::read_imm64(instruction))
+            }
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 1)?;
                 self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0)
@@ -55,7 +52,9 @@ impl<'a> Lifter<'a> {
                 let ptr = self.get_mem_ptr(instruction, 0)?;
                 let dst_val = self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0);
                 let result = self.builder.ins().iadd(dst_val, src_val);
-                self.builder.ins().store(MemFlagsData::new(), result, ptr, 0);
+                self.builder
+                    .ins()
+                    .store(MemFlagsData::new(), result, ptr, 0);
                 self.update_flags_add(dst_val, src_val, result, size)?;
             }
             _ => {
@@ -80,19 +79,16 @@ impl<'a> Lifter<'a> {
 
         let src_val = match op1 {
             OpKind::Register => self.get_reg_val(instruction.op1_register())?,
-            OpKind::Immediate32to64 => {
-                self.builder.ins().iconst(ty, instruction.immediate32to64())
-            }
+            OpKind::Immediate32to64 => self.builder.ins().iconst(ty, instruction.immediate32to64()),
             OpKind::Immediate8
             | OpKind::Immediate16
             | OpKind::Immediate32
             | OpKind::Immediate64
             | OpKind::Immediate8to16
             | OpKind::Immediate8to32
-            | OpKind::Immediate8to64 => self
-                .builder
-                .ins()
-                .iconst(ty, Self::read_imm64(instruction)),
+            | OpKind::Immediate8to64 => {
+                self.builder.ins().iconst(ty, Self::read_imm64(instruction))
+            }
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 1)?;
                 self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0)
@@ -116,7 +112,9 @@ impl<'a> Lifter<'a> {
                 let ptr = self.get_mem_ptr(instruction, 0)?;
                 let dst_val = self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0);
                 let result = self.builder.ins().isub(dst_val, src_val);
-                self.builder.ins().store(MemFlagsData::new(), result, ptr, 0);
+                self.builder
+                    .ins()
+                    .store(MemFlagsData::new(), result, ptr, 0);
                 self.update_flags_sub(dst_val, src_val, result, size)?;
             }
             _ => {
@@ -149,19 +147,16 @@ impl<'a> Lifter<'a> {
 
         let src_val = match op1 {
             OpKind::Register => self.get_reg_val(instruction.op1_register())?,
-            OpKind::Immediate32to64 => {
-                self.builder.ins().iconst(ty, instruction.immediate32to64())
-            }
+            OpKind::Immediate32to64 => self.builder.ins().iconst(ty, instruction.immediate32to64()),
             OpKind::Immediate8
             | OpKind::Immediate16
             | OpKind::Immediate32
             | OpKind::Immediate64
             | OpKind::Immediate8to16
             | OpKind::Immediate8to32
-            | OpKind::Immediate8to64 => self
-                .builder
-                .ins()
-                .iconst(ty, Self::read_imm64(instruction)),
+            | OpKind::Immediate8to64 => {
+                self.builder.ins().iconst(ty, Self::read_imm64(instruction))
+            }
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 1)?;
                 self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0)
@@ -179,9 +174,15 @@ impl<'a> Lifter<'a> {
                 let dst_val = self.get_reg_val(reg)?;
                 // Two-step add to properly propagate carry.
                 let tmp = self.builder.ins().iadd(dst_val, src_val);
-                let cf1 = self.builder.ins().icmp(IntCC::UnsignedLessThan, tmp, dst_val);
+                let cf1 = self
+                    .builder
+                    .ins()
+                    .icmp(IntCC::UnsignedLessThan, tmp, dst_val);
                 let result = self.builder.ins().iadd(tmp, cf_ext);
-                let cf2 = self.builder.ins().icmp(IntCC::UnsignedLessThan, result, tmp);
+                let cf2 = self
+                    .builder
+                    .ins()
+                    .icmp(IntCC::UnsignedLessThan, result, tmp);
                 let cf_out = self.builder.ins().bor(cf1, cf2);
                 self.set_reg_val(reg, result)?;
                 self.update_flags_adc(dst_val, src_val, result, cf_out, size)?;
@@ -190,11 +191,19 @@ impl<'a> Lifter<'a> {
                 let ptr = self.get_mem_ptr(instruction, 0)?;
                 let dst_val = self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0);
                 let tmp = self.builder.ins().iadd(dst_val, src_val);
-                let cf1 = self.builder.ins().icmp(IntCC::UnsignedLessThan, tmp, dst_val);
+                let cf1 = self
+                    .builder
+                    .ins()
+                    .icmp(IntCC::UnsignedLessThan, tmp, dst_val);
                 let result = self.builder.ins().iadd(tmp, cf_ext);
-                let cf2 = self.builder.ins().icmp(IntCC::UnsignedLessThan, result, tmp);
+                let cf2 = self
+                    .builder
+                    .ins()
+                    .icmp(IntCC::UnsignedLessThan, result, tmp);
                 let cf_out = self.builder.ins().bor(cf1, cf2);
-                self.builder.ins().store(MemFlagsData::new(), result, ptr, 0);
+                self.builder
+                    .ins()
+                    .store(MemFlagsData::new(), result, ptr, 0);
                 self.update_flags_adc(dst_val, src_val, result, cf_out, size)?;
             }
             _ => {
@@ -227,19 +236,16 @@ impl<'a> Lifter<'a> {
 
         let src_val = match op1 {
             OpKind::Register => self.get_reg_val(instruction.op1_register())?,
-            OpKind::Immediate32to64 => {
-                self.builder.ins().iconst(ty, instruction.immediate32to64())
-            }
+            OpKind::Immediate32to64 => self.builder.ins().iconst(ty, instruction.immediate32to64()),
             OpKind::Immediate8
             | OpKind::Immediate16
             | OpKind::Immediate32
             | OpKind::Immediate64
             | OpKind::Immediate8to16
             | OpKind::Immediate8to32
-            | OpKind::Immediate8to64 => self
-                .builder
-                .ins()
-                .iconst(ty, Self::read_imm64(instruction)),
+            | OpKind::Immediate8to64 => {
+                self.builder.ins().iconst(ty, Self::read_imm64(instruction))
+            }
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 1)?;
                 self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0)
@@ -257,12 +263,15 @@ impl<'a> Lifter<'a> {
                 let dst_val = self.get_reg_val(reg)?;
                 // Two-step sub to properly propagate borrow.
                 let tmp = self.builder.ins().isub(dst_val, src_val);
-                let borrow1 =
-                    self.builder
-                        .ins()
-                        .icmp(IntCC::UnsignedLessThan, dst_val, src_val);
+                let borrow1 = self
+                    .builder
+                    .ins()
+                    .icmp(IntCC::UnsignedLessThan, dst_val, src_val);
                 let result = self.builder.ins().isub(tmp, cf_ext);
-                let borrow2 = self.builder.ins().icmp(IntCC::UnsignedLessThan, tmp, cf_ext);
+                let borrow2 = self
+                    .builder
+                    .ins()
+                    .icmp(IntCC::UnsignedLessThan, tmp, cf_ext);
                 let cf_out = self.builder.ins().bor(borrow1, borrow2);
                 self.set_reg_val(reg, result)?;
                 self.update_flags_sbb(dst_val, src_val, result, cf_out, size)?;
@@ -271,14 +280,19 @@ impl<'a> Lifter<'a> {
                 let ptr = self.get_mem_ptr(instruction, 0)?;
                 let dst_val = self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0);
                 let tmp = self.builder.ins().isub(dst_val, src_val);
-                let borrow1 =
-                    self.builder
-                        .ins()
-                        .icmp(IntCC::UnsignedLessThan, dst_val, src_val);
+                let borrow1 = self
+                    .builder
+                    .ins()
+                    .icmp(IntCC::UnsignedLessThan, dst_val, src_val);
                 let result = self.builder.ins().isub(tmp, cf_ext);
-                let borrow2 = self.builder.ins().icmp(IntCC::UnsignedLessThan, tmp, cf_ext);
+                let borrow2 = self
+                    .builder
+                    .ins()
+                    .icmp(IntCC::UnsignedLessThan, tmp, cf_ext);
                 let cf_out = self.builder.ins().bor(borrow1, borrow2);
-                self.builder.ins().store(MemFlagsData::new(), result, ptr, 0);
+                self.builder
+                    .ins()
+                    .store(MemFlagsData::new(), result, ptr, 0);
                 self.update_flags_sbb(dst_val, src_val, result, cf_out, size)?;
             }
             _ => {
@@ -327,19 +341,16 @@ impl<'a> Lifter<'a> {
 
         let src_val = match op1 {
             OpKind::Register => self.get_reg_val(instruction.op1_register())?,
-            OpKind::Immediate32to64 => {
-                self.builder.ins().iconst(ty, instruction.immediate32to64())
-            }
+            OpKind::Immediate32to64 => self.builder.ins().iconst(ty, instruction.immediate32to64()),
             OpKind::Immediate8
             | OpKind::Immediate16
             | OpKind::Immediate32
             | OpKind::Immediate64
             | OpKind::Immediate8to16
             | OpKind::Immediate8to32
-            | OpKind::Immediate8to64 => self
-                .builder
-                .ins()
-                .iconst(ty, Self::read_imm64(instruction)),
+            | OpKind::Immediate8to64 => {
+                self.builder.ins().iconst(ty, Self::read_imm64(instruction))
+            }
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 1)?;
                 self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0)

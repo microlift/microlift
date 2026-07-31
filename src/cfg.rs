@@ -174,9 +174,7 @@ pub fn discover_cfg<A: GuestArch>(bytes: &[u8], base: u64) -> Cfg {
                     }
                 }
             }
-            ControlFlowKind::Ret
-            | ControlFlowKind::IndirectBranch
-            | ControlFlowKind::Invalid => {
+            ControlFlowKind::Ret | ControlFlowKind::IndirectBranch | ControlFlowKind::Invalid => {
                 leaders.insert(*next);
             }
             ControlFlowKind::Fallthrough => {}
@@ -207,24 +205,40 @@ pub fn discover_cfg<A: GuestArch>(bytes: &[u8], base: u64) -> Cfg {
                 ControlFlowKind::DirectBranch => {
                     for &t in &cf.static_targets {
                         successors.push(t);
-                        edges.push(Edge { from: start, to: t, kind: EdgeKind::Branch });
+                        edges.push(Edge {
+                            from: start,
+                            to: t,
+                            kind: EdgeKind::Branch,
+                        });
                     }
                     true
                 }
                 ControlFlowKind::CondBranch => {
                     for &t in &cf.static_targets {
                         successors.push(t);
-                        edges.push(Edge { from: start, to: t, kind: EdgeKind::CondBranch });
+                        edges.push(Edge {
+                            from: start,
+                            to: t,
+                            kind: EdgeKind::CondBranch,
+                        });
                     }
                     successors.push(*next);
-                    edges.push(Edge { from: start, to: *next, kind: EdgeKind::Fallthrough });
+                    edges.push(Edge {
+                        from: start,
+                        to: *next,
+                        kind: EdgeKind::Fallthrough,
+                    });
                     true
                 }
                 ControlFlowKind::Ret | ControlFlowKind::IndirectBranch => true,
                 ControlFlowKind::Invalid => true,
                 ControlFlowKind::Call { static_target } => {
                     if let Some(t) = static_target {
-                        edges.push(Edge { from: start, to: t, kind: EdgeKind::Call });
+                        edges.push(Edge {
+                            from: start,
+                            to: t,
+                            kind: EdgeKind::Call,
+                        });
                     }
                     // The block continues unless the *next* instruction is a
                     // leader (e.g. it is the call's in-region callee).
@@ -252,7 +266,11 @@ pub fn discover_cfg<A: GuestArch>(bytes: &[u8], base: u64) -> Cfg {
                 );
                 if !ends_block && next_is_leader && !unconditional {
                     successors.push(*next);
-                    edges.push(Edge { from: start, to: *next, kind: EdgeKind::Fallthrough });
+                    edges.push(Edge {
+                        from: start,
+                        to: *next,
+                        kind: EdgeKind::Fallthrough,
+                    });
                 }
                 break;
             }
@@ -271,7 +289,12 @@ pub fn discover_cfg<A: GuestArch>(bytes: &[u8], base: u64) -> Cfg {
     edges.sort_by_key(|e| (e.from, e.to, e.kind as u8));
     edges.dedup();
 
-    Cfg { base, end, blocks, edges }
+    Cfg {
+        base,
+        end,
+        blocks,
+        edges,
+    }
 }
 
 /// Recursive-descent decode: starting from `entries`, decode only the
@@ -332,9 +355,7 @@ pub fn decode_reachable<A: GuestArch>(bytes: &[u8], base: u64, entries: &[u64]) 
                 // A call returns to the following instruction.
                 work.push(next);
             }
-            ControlFlowKind::Ret
-            | ControlFlowKind::IndirectBranch
-            | ControlFlowKind::Invalid => {}
+            ControlFlowKind::Ret | ControlFlowKind::IndirectBranch | ControlFlowKind::Invalid => {}
         }
     }
 
@@ -378,7 +399,9 @@ pub fn static_targets<A: GuestArch>(bytes: &[u8], base: u64) -> Targets {
     for instr in A::decode_region(bytes, base) {
         let cf = A::control_flow(&instr);
         match cf.kind {
-            ControlFlowKind::Call { static_target: Some(t) } => {
+            ControlFlowKind::Call {
+                static_target: Some(t),
+            } => {
                 targets.calls.insert(t);
             }
             ControlFlowKind::DirectBranch | ControlFlowKind::CondBranch => {

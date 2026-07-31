@@ -178,7 +178,10 @@ fn test_int_imm8_exit_reason_and_vector() {
     ];
     let ctx = compile_and_run(&bytes, RegisterContext::default());
     assert_eq!(ctx.exit_reason, ExitReason::Interrupt as u32);
-    assert_eq!(ctx.exit_code, 0x80, "exit_code should hold the interrupt vector");
+    assert_eq!(
+        ctx.exit_code, 0x80,
+        "exit_code should hold the interrupt vector"
+    );
     assert_eq!(ctx.rip, 0x1002, "rip should point past the int instruction");
 }
 
@@ -240,7 +243,10 @@ fn test_insd_exit_reason_and_size() {
     ];
     let ctx = compile_and_run(&bytes, RegisterContext::default());
     assert_eq!(ctx.exit_reason, ExitReason::PortInput as u32);
-    assert_eq!(ctx.exit_code, 4, "exit_code should hold the element size in bytes");
+    assert_eq!(
+        ctx.exit_code, 4,
+        "exit_code should hold the element size in bytes"
+    );
     assert_eq!(ctx.rip, 0x1000, "rip should point at the insd instruction");
 }
 
@@ -256,7 +262,10 @@ fn test_insb_size_and_state_synced() {
     let ctx = compile_and_run(&bytes, RegisterContext::default());
     assert_eq!(ctx.exit_reason, ExitReason::PortInput as u32);
     assert_eq!(ctx.exit_code, 1);
-    assert_eq!(ctx.rdx, 0x60, "port number in DX must be synced for the host");
+    assert_eq!(
+        ctx.rdx, 0x60,
+        "port number in DX must be synced for the host"
+    );
     assert_eq!(ctx.rip, 0x1007, "rip should point at the insb instruction");
 }
 
@@ -270,7 +279,10 @@ fn test_outsd_exit_reason_and_size() {
     ];
     let ctx = compile_and_run(&bytes, RegisterContext::default());
     assert_eq!(ctx.exit_reason, ExitReason::PortOutput as u32);
-    assert_eq!(ctx.exit_code, 4, "exit_code should hold the element size in bytes");
+    assert_eq!(
+        ctx.exit_code, 4,
+        "exit_code should hold the element size in bytes"
+    );
     assert_eq!(ctx.rip, 0x1000, "rip should point at the outsd instruction");
 }
 
@@ -286,7 +298,10 @@ fn test_outsb_size_and_state_synced() {
     let ctx = compile_and_run(&bytes, RegisterContext::default());
     assert_eq!(ctx.exit_reason, ExitReason::PortOutput as u32);
     assert_eq!(ctx.exit_code, 1);
-    assert_eq!(ctx.rdx, 0x70, "port number in DX must be synced for the host");
+    assert_eq!(
+        ctx.rdx, 0x70,
+        "port number in DX must be synced for the host"
+    );
     assert_eq!(ctx.rip, 0x1007, "rip should point at the outsb instruction");
 }
 
@@ -306,7 +321,10 @@ fn test_rdtsc_exit_reason() {
     ];
     let ctx = compile_and_run(&bytes, RegisterContext::default());
     assert_eq!(ctx.exit_reason, ExitReason::Rdtsc as u32);
-    assert_eq!(ctx.rip, 0x1002, "rip should point past rdtsc (resume point)");
+    assert_eq!(
+        ctx.rip, 0x1002,
+        "rip should point past rdtsc (resume point)"
+    );
 }
 
 /// State preceding `RDTSC` must be synced on exit so the host sees current

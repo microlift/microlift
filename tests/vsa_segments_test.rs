@@ -1,6 +1,6 @@
-use microlift::vsa::{ValueSet, ValueSetAnalyzer};
-use microlift::context::MemorySegment;
 use iced_x86::{Decoder, DecoderOptions};
+use microlift::context::MemorySegment;
+use microlift::vsa::{ValueSet, ValueSetAnalyzer};
 
 #[test]
 fn test_vsa_rodata_load() {
@@ -23,7 +23,7 @@ fn test_vsa_rodata_load() {
 
     let state = analyzer.value_sets.get(&ip).unwrap();
     let inst = instructions[0];
-    
+
     // Evaluate the move
     let out_state = analyzer.transfer(state, &inst);
     let rax_vs = out_state.get(iced_x86::Register::RAX);
@@ -62,7 +62,7 @@ fn test_vsa_indirect_jump_resolution() {
     // jmp rax
     let bytes = [
         0x48, 0x8B, 0x04, 0x25, 0x00, 0x20, 0x00, 0x00, // mov rax, [0x2000]
-        0xFF, 0xE0,                                     // jmp rax
+        0xFF, 0xE0, // jmp rax
     ];
     let ip = 0x1000;
     let mut decoder = Decoder::with_ip(64, &bytes, ip, DecoderOptions::NONE);

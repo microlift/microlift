@@ -170,7 +170,9 @@ fn clamp_over_under(
     nm: Value,
     nse: Value,
 ) -> (Value, Value) {
-    let overflow = b.ins().icmp_imm(IntCC::SignedGreaterThanOrEqual, exp, EXP_MAX);
+    let overflow = b
+        .ins()
+        .icmp_imm(IntCC::SignedGreaterThanOrEqual, exp, EXP_MAX);
     let underflow = b.ins().icmp_imm(IntCC::SignedLessThanOrEqual, exp, 0);
     let (im, ise) = inf(b, sign);
     let (zm, zse) = signed_zero(b, sign);
@@ -250,9 +252,7 @@ pub fn emit_f80_mul(
 
     let nse = compose_se(b, sign, exp);
     let (nm, nse) = clamp_over_under(b, sign, exp, sig_r, nse);
-    apply_specials_mul(
-        b, nm, nse, sign, a_nan, b_nan, a_inf, b_inf, a_zero, b_zero,
-    )
+    apply_specials_mul(b, nm, nse, sign, a_nan, b_nan, a_inf, b_inf, a_zero, b_zero)
 }
 
 /// Unsigned 128-bit / 128-bit division via restoring shift/subtract, returning
@@ -424,7 +424,10 @@ pub fn emit_f80_div(
         b.ins().select(a_zero, zse, se),
     );
     // finite / 0 = inf
-    (m, se) = (b.ins().select(b_zero, im, m), b.ins().select(b_zero, ise, se));
+    (m, se) = (
+        b.ins().select(b_zero, im, m),
+        b.ins().select(b_zero, ise, se),
+    );
     // inf / finite = inf
     (m, se) = (b.ins().select(a_inf, im, m), b.ins().select(a_inf, ise, se));
     // inf / inf = NaN
@@ -557,7 +560,9 @@ pub fn emit_f80_add(
     // Select the (non-negative) difference directly rather than max/min of the
     // operands: `select(uge(a,b), a, b)` would be folded by the mid-end into
     // `umax.i128`, which the x86 backend cannot lower.
-    let hi_ge = b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, hi128, lo_aligned);
+    let hi_ge = b
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, hi128, lo_aligned);
     let d_hilo = b.ins().isub(hi128, lo_aligned);
     let d_lohi = b.ins().isub(lo_aligned, hi128);
     let diff = b.ins().select(hi_ge, d_hilo, d_lohi);
@@ -688,7 +693,9 @@ fn isqrt128(b: &mut FunctionBuilder, n0: Value) -> (Value, Value) {
     let res = b.block_params(body)[1];
     let bit = b.block_params(body)[2];
     let res_plus_bit = b.ins().iadd(res, bit);
-    let ge = b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, n, res_plus_bit);
+    let ge = b
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, n, res_plus_bit);
     let n_sub = b.ins().isub(n, res_plus_bit);
     let n_new = b.ins().select(ge, n_sub, n);
     let res_shr = b.ins().ushr_imm(res, 1);

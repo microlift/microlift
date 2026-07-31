@@ -231,10 +231,9 @@ impl<'a> Lifter<'a> {
             | OpKind::Immediate64
             | OpKind::Immediate8to16
             | OpKind::Immediate8to32
-            | OpKind::Immediate8to64 => Ok(self
-                .builder
-                .ins()
-                .iconst(ty, Self::read_imm64(instruction))),
+            | OpKind::Immediate8to64 => {
+                Ok(self.builder.ins().iconst(ty, Self::read_imm64(instruction)))
+            }
             _ => Err(MicroliftError::UnsupportedInstruction {
                 mnemonic: format!("read-op-{}-{:?}", op_index, op_kind),
             }),
@@ -276,10 +275,9 @@ impl<'a> Lifter<'a> {
         // index registers. Compute in I64 (widening each component) and
         // truncate the final sum to 32 bits, matching hardware's wrap-around,
         // so the load/store below always sees a 64-bit address.
-        let addr32 = (base_reg != Register::None
-            && base_reg != Register::RIP
-            && base_reg.size() == 4)
-            || (index_reg != Register::None && index_reg.size() == 4);
+        let addr32 =
+            (base_reg != Register::None && base_reg != Register::RIP && base_reg.size() == 4)
+                || (index_reg != Register::None && index_reg.size() == 4);
         let widen64 = |lifter: &mut Self, v: Value| {
             if lifter.builder.func.dfg.value_type(v) == types::I64 {
                 v

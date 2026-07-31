@@ -57,9 +57,9 @@ fn parity(v: u64) -> u8 {
 
 fn zsp(result: u64) -> (u8, u8, u8) {
     (
-        (result == 0) as u8,          // ZF
-        ((result >> 63) & 1) as u8,   // SF
-        parity(result),               // PF
+        (result == 0) as u8,        // ZF
+        ((result >> 63) & 1) as u8, // SF
+        parity(result),             // PF
     )
 }
 
@@ -145,8 +145,8 @@ pub struct StateFingerprint {
 pub fn fingerprint(ctx: &RegisterContext) -> StateFingerprint {
     StateFingerprint {
         gpr: [
-            ctx.rax, ctx.rcx, ctx.rdx, ctx.rbx, ctx.rbp, ctx.rsi, ctx.rdi, ctx.r8, ctx.r9,
-            ctx.r10, ctx.r11, ctx.r12, ctx.r13, ctx.r14, ctx.r15,
+            ctx.rax, ctx.rcx, ctx.rdx, ctx.rbx, ctx.rbp, ctx.rsi, ctx.rdi, ctx.r8, ctx.r9, ctx.r10,
+            ctx.r11, ctx.r12, ctx.r13, ctx.r14, ctx.r15,
         ],
         flags: [ctx.cf, ctx.pf, ctx.af, ctx.zf, ctx.sf, ctx.of, ctx.df],
         xmm: ctx.xmm,

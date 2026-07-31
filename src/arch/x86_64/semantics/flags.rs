@@ -35,7 +35,6 @@ impl<'a> Lifter<'a> {
         self.set_flag(X86Flag::Direction, zero)
     }
 
-
     pub fn update_flags_add(
         &mut self,
         lhs: Value,

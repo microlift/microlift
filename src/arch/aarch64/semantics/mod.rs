@@ -158,9 +158,10 @@ impl<'a> Lifter64<'a> {
             Operand::RegisterOrSP(_, n) => Ok(self.read_reg_val(n, true, ty)),
             Operand::Immediate(v) => Ok(self.builder.ins().iconst(ty, v as i64)),
             Operand::Imm64(v) => Ok(self.builder.ins().iconst(ty, v as i64)),
-            Operand::ImmShift(imm, shift) => {
-                Ok(self.builder.ins().iconst(ty, ((imm as u64) << shift) as i64))
-            }
+            Operand::ImmShift(imm, shift) => Ok(self
+                .builder
+                .ins()
+                .iconst(ty, ((imm as u64) << shift) as i64)),
             Operand::RegShift(style, amount, _sz, n) => {
                 let base = self.read_reg_val(n, false, ty);
                 Ok(match style {
@@ -197,7 +198,10 @@ impl<'a> Lifter64<'a> {
 
     /// Set N and Z from a result value of width `ty`.
     fn set_nz(&mut self, result: Value, ty: Type) {
-        let n = self.builder.ins().icmp_imm(IntCC::SignedLessThan, result, 0);
+        let n = self
+            .builder
+            .ins()
+            .icmp_imm(IntCC::SignedLessThan, result, 0);
         self.set_flag(Nzcv::N, n);
         let z = self.builder.ins().icmp_imm(IntCC::Equal, result, 0);
         self.set_flag(Nzcv::Z, z);
@@ -530,7 +534,12 @@ impl<'a> Lifter64<'a> {
 
     /// `CLZ`/`RBIT`/`REV Rd, Rn`: count-leading-zeros, bit-reverse, and byte-swap
     /// of a single source register.
-    fn handle_bit_unary(&mut self, op0: Operand, op1: Operand, kind: BitUnary) -> crate::Result<()> {
+    fn handle_bit_unary(
+        &mut self,
+        op0: Operand,
+        op1: Operand,
+        kind: BitUnary,
+    ) -> crate::Result<()> {
         let (d, sz, _) = decode_reg(op0).ok_or_else(|| Self::bad_operand("bit-unary", op0))?;
         let ty = size_ty(sz);
         let a = self.read_source(op1, ty)?;
@@ -652,7 +661,9 @@ impl<'a> Lifter64<'a> {
         let v2 = self.read_reg_val(t2, false, ty);
         let (addr, wb) = self.mem_address(op2)?;
         self.builder.ins().store(MemFlagsData::new(), v1, addr, 0);
-        self.builder.ins().store(MemFlagsData::new(), v2, addr, elem);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), v2, addr, elem);
         self.apply_writeback(wb);
         Ok(())
     }
@@ -761,7 +772,9 @@ impl<'a> Lifter64<'a> {
             self.block_terminated = false;
             return Ok(());
         }
-        Err(MicroliftError::UnsupportedInstruction { mnemonic: "bl".into() })
+        Err(MicroliftError::UnsupportedInstruction {
+            mnemonic: "bl".into(),
+        })
     }
 
     /// `BLR Rn`: indirect call through a register. Sets the link register (X30)
@@ -881,10 +894,10 @@ impl<'a> Lifter64<'a> {
         // inverts the result.
         let base = cond >> 1;
         let result = match base {
-            0 => z,                                                  // EQ: Z==1
-            1 => c,                                                  // CS: C==1
-            2 => n,                                                  // MI: N==1
-            3 => v,                                                  // VS: V==1
+            0 => z, // EQ: Z==1
+            1 => c, // CS: C==1
+            2 => n, // MI: N==1
+            3 => v, // VS: V==1
             4 => {
                 // HI: C==1 && Z==0
                 let z0 = self.builder.ins().icmp_imm(IntCC::Equal, z, 0);

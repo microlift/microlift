@@ -560,7 +560,11 @@ fn test_movd_gpr_to_xmm() {
     ctx.rax = 0xFFFF_FFFF_DEAD_BEEF; // only eax (0xDEADBEEF) participates
     ctx.xmm[0] = [0x1111_1111_1111_1111, 0x2222_2222_2222_2222];
     let ctx = run_test(&bytes, ctx);
-    assert_eq!(ctx.xmm[0], [0xDEAD_BEEF, 0], "movd must load low dword and zero the rest");
+    assert_eq!(
+        ctx.xmm[0],
+        [0xDEAD_BEEF, 0],
+        "movd must load low dword and zero the rest"
+    );
 }
 
 #[test]
@@ -571,7 +575,10 @@ fn test_movd_xmm_to_gpr() {
     ctx.rax = 0xAAAA_AAAA_AAAA_AAAA;
     ctx.xmm[0] = [0x1122_3344_5566_7788, 0x9999_9999_9999_9999];
     let ctx = run_test(&bytes, ctx);
-    assert_eq!(ctx.rax, 0x5566_7788, "movd r32,xmm extracts low dword and zero-extends");
+    assert_eq!(
+        ctx.rax, 0x5566_7788,
+        "movd r32,xmm extracts low dword and zero-extends"
+    );
 }
 
 //  MOVHPS
@@ -602,7 +609,10 @@ fn test_movhps_store_high() {
     ctx.rdi = buf.as_mut_ptr() as u64;
     ctx.xmm[0] = [0x1234_5678_9ABC_DEF0, 0xFEED_FACE_CAFE_F00D];
     let _ = run_test(&bytes, ctx);
-    assert_eq!(buf[0], 0xFEED_FACE_CAFE_F00D, "movhps store must write the high quadword");
+    assert_eq!(
+        buf[0], 0xFEED_FACE_CAFE_F00D,
+        "movhps store must write the high quadword"
+    );
 }
 
 //  MOVLPS / MOVLPD - merging load / store of the low quadword.
@@ -661,7 +671,10 @@ fn test_movlps_store_low() {
         ctx.rdi = buf.as_mut_ptr() as u64;
         ctx.xmm[0] = [0x1234_5678_9ABC_DEF0, 0xFEED_FACE_CAFE_F00D];
         let _ = run(&bytes, ctx);
-        assert_eq!(buf[0], 0x1234_5678_9ABC_DEF0, "movlps store must write the low quadword");
+        assert_eq!(
+            buf[0], 0x1234_5678_9ABC_DEF0,
+            "movlps store must write the low quadword"
+        );
         assert_eq!(buf[1], 0, "movlps store must only write 8 bytes");
     }
 }
@@ -810,7 +823,11 @@ fn test_psrlq_xmm_count() {
     ctx.xmm[0] = [0xDEAD_BEEF_CAFE_BABE, 0x1234_5678_9ABC_DEF0];
     ctx.xmm[1] = [100, 0];
     let ctx = run_test(&bytes, ctx);
-    assert_eq!(ctx.xmm[0], [0, 0], "psrlq by >=64 (register) must zero both lanes");
+    assert_eq!(
+        ctx.xmm[0],
+        [0, 0],
+        "psrlq by >=64 (register) must zero both lanes"
+    );
 }
 
 //  Packed per-lane shifts: PSRLW/PSRLD/PSRLQ, PSLLW/PSLLD/PSLLQ, PSRAW/PSRAD.
@@ -860,7 +877,13 @@ fn test_psrlw_xmm_count() {
         [0x0000_00FF_000F_00FF, 0x0080_0012_00FF_0000],
         "psrlw xmm count",
     );
-    check_packed(&bytes, SHIFT_W, [100, 0], [0, 0], "psrlw by >=16 (register)");
+    check_packed(
+        &bytes,
+        SHIFT_W,
+        [100, 0],
+        [0, 0],
+        "psrlw by >=16 (register)",
+    );
 }
 
 #[test]
@@ -1102,7 +1125,6 @@ fn test_psrad_xmm_count() {
         "psrad by a huge count (register)",
     );
 }
-
 
 //  PSHUFD
 
@@ -1370,7 +1392,10 @@ fn test_vec_pshufd_and_psrlq() {
 /// mode, and assert `xmm0 == expected` either way.
 fn check_packed(bytes: &[u8], dst: [u64; 2], src: [u64; 2], expected: [u64; 2], what: &str) {
     for (mode, run) in [
-        ("scalar", run_test as fn(&[u8], RegisterContext) -> RegisterContext),
+        (
+            "scalar",
+            run_test as fn(&[u8], RegisterContext) -> RegisterContext,
+        ),
         ("vector", run_test_vec),
     ] {
         let mut ctx = RegisterContext::default();
@@ -1381,7 +1406,10 @@ fn check_packed(bytes: &[u8], dst: [u64; 2], src: [u64; 2], expected: [u64; 2], 
             ctx.xmm[0], expected,
             "{what} ({mode} xmm): dst={dst:#018x?} src={src:#018x?}"
         );
-        assert_eq!(ctx.xmm[1], src, "{what} ({mode} xmm) must not modify the source");
+        assert_eq!(
+            ctx.xmm[1], src,
+            "{what} ({mode} xmm) must not modify the source"
+        );
     }
 }
 
@@ -1411,10 +1439,7 @@ fn test_paddd_other_registers() {
         ctx.xmm[2] = [0x0000_0001_0000_0002, 0x0000_0003_0000_0004];
         ctx.xmm[3] = [0x0000_0010_0000_0020, 0x0000_0030_0000_0040];
         let ctx = run(&bytes, ctx);
-        assert_eq!(
-            ctx.xmm[2],
-            [0x0000_0011_0000_0022, 0x0000_0033_0000_0044]
-        );
+        assert_eq!(ctx.xmm[2], [0x0000_0011_0000_0022, 0x0000_0033_0000_0044]);
         assert_eq!(ctx.xmm[0], [0, 0], "paddd xmm2,xmm3 must not touch xmm0");
     }
 }
@@ -1432,10 +1457,7 @@ fn test_paddd_mem() {
         ctx.rax = mem.as_ptr() as u64;
         ctx.xmm[0] = [0x0000_0002_FFFF_FFFF, 0x0000_0001_0000_0002];
         let ctx = run(&bytes, ctx);
-        assert_eq!(
-            ctx.xmm[0],
-            [0x0000_0005_0000_0000, 0x0000_0001_0000_0001]
-        );
+        assert_eq!(ctx.xmm[0], [0x0000_0005_0000_0000, 0x0000_0001_0000_0001]);
     }
 }
 
@@ -1533,10 +1555,7 @@ fn test_psubw_mem() {
         ctx.rax = mem.as_ptr() as u64;
         ctx.xmm[0] = [0x0000_0000_0001_0000, 0x0002_0003_0004_0005];
         let ctx = run(&bytes, ctx);
-        assert_eq!(
-            ctx.xmm[0],
-            [0xFFFF_FFFF_0000_FFFF, 0x0001_0002_0003_0004]
-        );
+        assert_eq!(ctx.xmm[0], [0xFFFF_FFFF_0000_FFFF, 0x0001_0002_0003_0004]);
     }
 }
 

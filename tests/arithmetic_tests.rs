@@ -772,9 +772,15 @@ fn test_sar_by_zero_preserves_flags() {
     ];
     let ctx = run_test(&bytes, RegisterContext::default());
     assert_eq!(ctx.rax, u64::MAX);
-    assert_eq!(ctx.cf, 1, "SAR by 0 must preserve CF (not pick up MSB of val)");
+    assert_eq!(
+        ctx.cf, 1,
+        "SAR by 0 must preserve CF (not pick up MSB of val)"
+    );
     assert_eq!(ctx.zf, 1, "SAR by 0 must preserve ZF");
-    assert_eq!(ctx.sf, 0, "SAR by 0 must preserve SF (not pick up MSB of val)");
+    assert_eq!(
+        ctx.sf, 0,
+        "SAR by 0 must preserve SF (not pick up MSB of val)"
+    );
 }
 
 // Direct STC/CLC/CMC sanity tests.
@@ -880,5 +886,9 @@ fn test_idiv_8bit_uses_ax_as_dividend() {
     ];
     let ctx = run_test(&bytes, RegisterContext::default());
     assert_eq!((ctx.rax & 0xFF) as i8, -14, "AL (quotient) should be -14");
-    assert_eq!(((ctx.rax >> 8) & 0xFF) as i8, -2, "AH (remainder) should be -2");
+    assert_eq!(
+        ((ctx.rax >> 8) & 0xFF) as i8,
+        -2,
+        "AH (remainder) should be -2"
+    );
 }

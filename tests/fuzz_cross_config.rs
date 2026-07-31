@@ -11,7 +11,7 @@
 #[path = "fuzz/mod.rs"]
 mod fuzz;
 
-use fuzz::{alu_snippet, fingerprint, AluOp};
+use fuzz::{AluOp, alu_snippet, fingerprint};
 use microlift::testkit::prelude::*;
 use proptest::prelude::*;
 

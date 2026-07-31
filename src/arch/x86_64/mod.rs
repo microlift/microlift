@@ -10,7 +10,7 @@ pub mod semantics;
 pub mod sync;
 
 use crate::core::exit::ExitReason;
-use crate::core::{GuestArch, LifterConfig, LiftEngine};
+use crate::core::{GuestArch, LiftEngine, LifterConfig};
 use cranelift::prelude::*;
 use cranelift_frontend::{FunctionBuilder, Variable};
 use iced_x86::Instruction;

@@ -10,7 +10,7 @@
 
 #![cfg(feature = "unicorn-oracle")]
 
-use microlift::testkit::oracle::unicorn::{differential_unicorn, UnicornOracle};
+use microlift::testkit::oracle::unicorn::{UnicornOracle, differential_unicorn};
 use microlift::testkit::oracle::*;
 use microlift::testkit::prelude::*;
 
@@ -65,15 +65,9 @@ fn alu_flags_agree_over_operands() {
             let mut init = CpuState::zeroed();
             init.gpr[gpr::RAX] = a;
             init.gpr[gpr::RCX] = b;
-            let diff = differential_unicorn(
-                &code,
-                CODE_VA,
-                &init,
-                &[],
-                BUDGET,
-                DiffOptions::default(),
-            )
-            .expect("clean halt");
+            let diff =
+                differential_unicorn(&code, CODE_VA, &init, &[], BUDGET, DiffOptions::default())
+                    .expect("clean halt");
             assert!(diff.is_empty(), "{name} {a:#x},{b:#x} diverged: {diff:?}");
         }
     }
@@ -149,7 +143,10 @@ fn identity_memory_roundtrip_agrees() {
     assert!(out_uc.is_halted(), "unicorn should halt at the trampoline");
 
     let diff = diff_states(out_ml.state(), out_uc.state(), DiffOptions::default());
-    assert!(diff.is_empty(), "engines diverged on memory roundtrip: {diff:?}");
+    assert!(
+        diff.is_empty(),
+        "engines diverged on memory roundtrip: {diff:?}"
+    );
 
     let stored = u64::from_le_bytes(arena.as_mut_slice()[8..16].try_into().unwrap());
     assert_eq!(stored, seed.wrapping_add(1));
@@ -231,15 +228,9 @@ fn packed_int_add_sub_agrees() {
             let mut init = CpuState::zeroed();
             init.xmm[0] = dst;
             init.xmm[1] = src;
-            let diff = differential_unicorn(
-                &code,
-                CODE_VA,
-                &init,
-                &[],
-                BUDGET,
-                DiffOptions::default(),
-            )
-            .expect("clean halt");
+            let diff =
+                differential_unicorn(&code, CODE_VA, &init, &[], BUDGET, DiffOptions::default())
+                    .expect("clean halt");
             assert!(
                 diff.is_empty(),
                 "{name} {dst:#018x?},{src:#018x?} diverged: {diff:?}"

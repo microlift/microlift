@@ -6,7 +6,7 @@ use microlift::backend::ArtifactBackend;
 use microlift::backend::CraneliftBackend;
 use microlift::context::{ExitReason, RegisterContext};
 use microlift::core::abi::CallAbi;
-use microlift::function_traits::{trampoline_func, DynamicSymbol};
+use microlift::function_traits::{DynamicSymbol, trampoline_func};
 use microlift::lifter::{ExecutionMode, Lifter, LifterConfig};
 use microlift::os::get_host_calling_conv;
 use object::{Object, ObjectSymbol};
@@ -261,14 +261,9 @@ fn test_compile_runtime_assisted_fast_import_has_relocation() {
     assert_eq!(aot_imports.len(), 1, "should have exactly one AOT import");
     drop(lifter);
 
-    let obj_bytes = ArtifactBackend::compile_to_object_with_fast_imports(
-        func,
-        &aot_imports,
-        None,
-        None,
-        &[],
-    )
-    .expect("failed to compile object with fast imports");
+    let obj_bytes =
+        ArtifactBackend::compile_to_object_with_fast_imports(func, &aot_imports, None, None, &[])
+            .expect("failed to compile object with fast imports");
     assert!(!obj_bytes.is_empty());
 
     let obj = object::File::parse(&*obj_bytes).expect("failed to parse object");
@@ -383,14 +378,9 @@ fn test_compile_runtime_assisted_two_fast_imports_have_relocations() {
     assert_eq!(aot_imports.len(), 2, "should have exactly 2 AOT imports");
     drop(lifter);
 
-    let obj_bytes = ArtifactBackend::compile_to_object_with_fast_imports(
-        func,
-        &aot_imports,
-        None,
-        None,
-        &[],
-    )
-    .expect("failed to compile object with fast imports");
+    let obj_bytes =
+        ArtifactBackend::compile_to_object_with_fast_imports(func, &aot_imports, None, None, &[])
+            .expect("failed to compile object with fast imports");
 
     let obj = object::File::parse(&*obj_bytes).expect("failed to parse object");
 

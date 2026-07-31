@@ -9,8 +9,8 @@
 
 #![cfg(feature = "testkit")]
 
-use microlift::testkit::oracle::*;
 use microlift::testkit::Opt;
+use microlift::testkit::oracle::*;
 
 const CODE_VA: u64 = 0x1000;
 

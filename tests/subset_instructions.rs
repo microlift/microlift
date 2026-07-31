@@ -95,7 +95,10 @@ fn test_pushfq() {
         0xC3, // ret
     ];
     let ctx = run_test(&bytes, RegisterContext::default());
-    assert_eq!(ctx.rax, 0x2, "only the always-set reserved bit should be present");
+    assert_eq!(
+        ctx.rax, 0x2,
+        "only the always-set reserved bit should be present"
+    );
 
     // STC sets CF; PUSHFQ should then report CF (bit 0) alongside the reserved
     // bit -> 0x3.
@@ -106,16 +109,19 @@ fn test_pushfq() {
         0xC3, // ret
     ];
     let ctx = run_test(&bytes, RegisterContext::default());
-    assert_eq!(ctx.rax, 0x3, "CF (bit 0) and the reserved bit (bit 1) should be set");
+    assert_eq!(
+        ctx.rax, 0x3,
+        "CF (bit 0) and the reserved bit (bit 1) should be set"
+    );
 
     // A subtraction that yields zero sets ZF (bit 6) and PF (bit 2); the result
     // is non-negative so SF/OF/CF stay clear. RFLAGS = reserved | ZF | PF.
     let bytes = [
         0x48, 0xC7, 0xC0, 0x05, 0x00, 0x00, 0x00, // mov rax, 5
-        0x48, 0x2B, 0xC0,                         // sub rax, rax  (-> 0, ZF=1, PF=1)
-        0x9C,                                     // pushfq
-        0x58,                                     // pop rax
-        0xC3,                                     // ret
+        0x48, 0x2B, 0xC0, // sub rax, rax  (-> 0, ZF=1, PF=1)
+        0x9C, // pushfq
+        0x58, // pop rax
+        0xC3, // ret
     ];
     let ctx = run_test(&bytes, RegisterContext::default());
     assert_eq!(ctx.rax & (1 << 6), 1 << 6, "ZF should be set");
@@ -133,30 +139,36 @@ fn test_popfq() {
     // always-set reserved bit) -> 0xC3.
     let bytes = [
         0x48, 0xC7, 0xC0, 0xC3, 0x00, 0x00, 0x00, // mov rax, 0xC3
-        0x50,                                      // push rax
-        0x9D,                                      // popfq
-        0x9C,                                      // pushfq
-        0x58,                                      // pop rax
-        0xC3,                                      // ret
+        0x50, // push rax
+        0x9D, // popfq
+        0x9C, // pushfq
+        0x58, // pop rax
+        0xC3, // ret
     ];
     let ctx = run_test(&bytes, RegisterContext::default());
-    assert_eq!(ctx.rax, 0xC3, "POPFQ should load CF/ZF/SF and PUSHFQ reproduce them");
+    assert_eq!(
+        ctx.rax, 0xC3,
+        "POPFQ should load CF/ZF/SF and PUSHFQ reproduce them"
+    );
 
     // POPFQ must also clear flags whose bit is 0 in the popped image. Start with
     // CF preset, pop a value with CF clear (only reserved bit, 0x2), and confirm
     // CF reads back as 0.
     let bytes = [
         0x48, 0xC7, 0xC0, 0x02, 0x00, 0x00, 0x00, // mov rax, 0x2
-        0x50,                                      // push rax
-        0x9D,                                      // popfq
-        0x9C,                                      // pushfq
-        0x58,                                      // pop rax
-        0xC3,                                      // ret
+        0x50, // push rax
+        0x9D, // popfq
+        0x9C, // pushfq
+        0x58, // pop rax
+        0xC3, // ret
     ];
     let mut ctx_in = RegisterContext::default();
     ctx_in.cf = 1;
     let ctx = run_test(&bytes, ctx_in);
-    assert_eq!(ctx.rax, 0x2, "POPFQ should clear CF when its source bit is 0");
+    assert_eq!(
+        ctx.rax, 0x2,
+        "POPFQ should clear CF when its source bit is 0"
+    );
 }
 
 #[test]
@@ -166,12 +178,15 @@ fn test_loopne() {
     let bytes = [
         0x48, 0xC7, 0xC1, 0x04, 0x00, 0x00, 0x00, // mov rcx, 4
         0x48, 0xC7, 0xC0, 0x00, 0x00, 0x00, 0x00, // mov rax, 0
-        0x48, 0xFF, 0xC0,                         // inc rax   <- loop target
-        0xE0, 0xFB,                               // loopne -5
-        0xC3,                                     // ret
+        0x48, 0xFF, 0xC0, // inc rax   <- loop target
+        0xE0, 0xFB, // loopne -5
+        0xC3, // ret
     ];
     let ctx = run_test(&bytes, RegisterContext::default());
-    assert_eq!(ctx.rax, 4, "loopne should run the full count when ZF stays 0");
+    assert_eq!(
+        ctx.rax, 4,
+        "loopne should run the full count when ZF stays 0"
+    );
     assert_eq!(ctx.rcx, 0);
 
     // LOOPNE must exit early when ZF becomes 1, even with RCX still nonzero.
@@ -180,13 +195,16 @@ fn test_loopne() {
     let bytes = [
         0x48, 0xC7, 0xC1, 0x05, 0x00, 0x00, 0x00, // mov rcx, 5
         0x48, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00, // mov rax, 3
-        0x48, 0xFF, 0xC8,                         // dec rax   <- loop target
-        0xE0, 0xFB,                               // loopne -5
-        0xC3,                                     // ret
+        0x48, 0xFF, 0xC8, // dec rax   <- loop target
+        0xE0, 0xFB, // loopne -5
+        0xC3, // ret
     ];
     let ctx = run_test(&bytes, RegisterContext::default());
     assert_eq!(ctx.rax, 0, "loopne should stop once dec rax sets ZF");
-    assert_eq!(ctx.rcx, 2, "loopne should exit early with RCX still nonzero");
+    assert_eq!(
+        ctx.rcx, 2,
+        "loopne should exit early with RCX still nonzero"
+    );
 }
 
 #[test]
@@ -197,9 +215,9 @@ fn test_loope() {
     let bytes = [
         0x48, 0xC7, 0xC1, 0x05, 0x00, 0x00, 0x00, // mov rcx, 5
         0x48, 0xC7, 0xC0, 0x02, 0x00, 0x00, 0x00, // mov rax, 2
-        0x48, 0xFF, 0xC8,                         // dec rax   <- loop target
-        0xE1, 0xFB,                               // loope -5
-        0xC3,                                     // ret
+        0x48, 0xFF, 0xC8, // dec rax   <- loop target
+        0xE1, 0xFB, // loope -5
+        0xC3, // ret
     ];
     let ctx = run_test(&bytes, RegisterContext::default());
     // iter1: rax=1 (ZF=0) -> loope: rcx=4, ZF=0 -> stop.
@@ -417,7 +435,11 @@ fn test_direction_flag_in_rflags() {
     ];
     let ctx_out = run_test(&bytes, ctx);
     assert_eq!(mem[8], 0x7E);
-    assert_eq!(ctx_out.rdi, mem_ptr + 7, "POPFQ should have set DF -> rdi decremented");
+    assert_eq!(
+        ctx_out.rdi,
+        mem_ptr + 7,
+        "POPFQ should have set DF -> rdi decremented"
+    );
     assert_eq!(ctx_out.df, 1, "DF should be synced back to the context");
 }
 

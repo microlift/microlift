@@ -26,7 +26,10 @@ impl<'a> Lifter<'a> {
             OpKind::Memory => {
                 // Indirect jump via memory - load the target then dispatch
                 let ptr = self.get_mem_ptr(instruction, 0)?;
-                let target_val = self.builder.ins().load(types::I64, MemFlagsData::new(), ptr, 0);
+                let target_val = self
+                    .builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::new(), ptr, 0);
                 self.emit_runtime_indirect_jump(target_val)?;
             }
             other => {
@@ -76,7 +79,10 @@ impl<'a> Lifter<'a> {
         let imm = instruction.immediate16(); // for RET n
 
         let rsp = self.get_reg_val(Register::RSP)?;
-        let target_ip = self.builder.ins().load(types::I64, MemFlagsData::new(), rsp, 0);
+        let target_ip = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), rsp, 0);
 
         let mut new_rsp = self.builder.ins().iadd_imm(rsp, 8);
         if imm > 0 {
@@ -176,7 +182,9 @@ impl<'a> Lifter<'a> {
                     let rsp = self.get_reg_val(Register::RSP)?;
                     let new_rsp = self.builder.ins().iadd_imm(rsp, -8);
                     self.set_reg_val(Register::RSP, new_rsp)?;
-                    self.builder.ins().store(MemFlagsData::new(), ret_addr, new_rsp, 0);
+                    self.builder
+                        .ins()
+                        .store(MemFlagsData::new(), ret_addr, new_rsp, 0);
 
                     self.sync_to_context(None, ExitReason::UnknownJump)?;
                     self.write_exit_code(TransferKind::DirectCall as u32);
@@ -219,7 +227,10 @@ impl<'a> Lifter<'a> {
                     }
                 }
                 let ptr = self.get_mem_ptr(instruction, 0)?;
-                let target_val = self.builder.ins().load(types::I64, MemFlagsData::new(), ptr, 0);
+                let target_val = self
+                    .builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::new(), ptr, 0);
                 self.emit_indirect_call_exit(target_val)
             }
             other => Err(MicroliftError::UnsupportedInstruction {
@@ -251,7 +262,10 @@ impl<'a> Lifter<'a> {
             }
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 0)?;
-                let target_val = self.builder.ins().load(types::I64, MemFlagsData::new(), ptr, 0);
+                let target_val = self
+                    .builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::new(), ptr, 0);
                 let sig = self.analysis_call_sig();
                 self.builder.ins().call_indirect(sig, target_val, &[]);
             }

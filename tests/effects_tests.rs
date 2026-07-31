@@ -18,7 +18,10 @@ fn add_reads_both_writes_dest_and_flags() {
     assert!(e.writes.contains(&"rax".to_string()));
     // ADD writes the arithmetic status flags.
     for flag in ["cf", "zf", "sf", "of", "pf", "af"] {
-        assert!(e.writes.contains(&flag.to_string()), "missing flag write: {flag}");
+        assert!(
+            e.writes.contains(&flag.to_string()),
+            "missing flag write: {flag}"
+        );
     }
     assert!(!e.reads_memory);
     assert!(!e.writes_memory);

@@ -86,11 +86,7 @@ impl<'a> Lifter<'a> {
 
     /// Emit an `Interrupt` VM exit for vector `vector`, syncing guest state and
     /// pointing RIP at the instruction after `instruction` (the resume point).
-    fn emit_interrupt_exit(
-        &mut self,
-        instruction: &Instruction,
-        vector: u32,
-    ) -> crate::Result<()> {
+    fn emit_interrupt_exit(&mut self, instruction: &Instruction, vector: u32) -> crate::Result<()> {
         let rip_after = self.rip_after(instruction);
         self.sync_to_context(Some(rip_after), ExitReason::Interrupt)?;
         self.write_exit_code(vector);

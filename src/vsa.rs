@@ -50,8 +50,7 @@ const DEFAULT_CALL_CLOBBERS: &[Register] = &[
 /// are written by the instruction itself on all x86-64; RAX is the syscall
 /// return register under every mainstream OS (Linux/*BSD/Windows). Every other
 /// GPR is preserved across a syscall under those conventions.
-const DEFAULT_SYSCALL_CLOBBERS: &[Register] =
-    &[Register::RAX, Register::RCX, Register::R11];
+const DEFAULT_SYSCALL_CLOBBERS: &[Register] = &[Register::RAX, Register::RCX, Register::R11];
 
 /// All 16 general-purpose registers - the ABI-agnostic conservative clobber set
 /// for a `CALL` whose callee convention is unknown or untrusted.
@@ -643,15 +642,14 @@ impl ValueSetAnalyzer {
                     // LEA with a constant displacement can propagate
                     let base_reg = inst.memory_base();
                     let disp = inst.memory_displacement64() as i64;
-                    let addr_vs = if inst.memory_index() == Register::None
-                        && base_reg != Register::None
-                    {
-                        let base_vs = read_reg(state, base_reg);
-                        let disp_vs = ValueSet::Constant(disp);
-                        base_vs.abstract_add(&disp_vs)
-                    } else {
-                        ValueSet::Top
-                    };
+                    let addr_vs =
+                        if inst.memory_index() == Register::None && base_reg != Register::None {
+                            let base_vs = read_reg(state, base_reg);
+                            let disp_vs = ValueSet::Constant(disp);
+                            base_vs.abstract_add(&disp_vs)
+                        } else {
+                            ValueSet::Top
+                        };
                     write_reg(&mut out, inst.op0_register(), addr_vs);
                 }
             }

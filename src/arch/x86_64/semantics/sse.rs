@@ -15,8 +15,8 @@
 //! representations.
 
 use crate::MicroliftError;
-use crate::lifter::{Lifter, X86Flag};
 use crate::arch::x86_64::semantics::helpers::xmm_register_index;
+use crate::lifter::{Lifter, X86Flag};
 use cranelift::prelude::*;
 use iced_x86::{Instruction, OpKind};
 
@@ -189,8 +189,14 @@ impl<'a> Lifter<'a> {
             }
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, op_index)?;
-                let lo = self.builder.ins().load(types::I64, MemFlagsData::new(), ptr, 0);
-                let hi = self.builder.ins().load(types::I64, MemFlagsData::new(), ptr, 8);
+                let lo = self
+                    .builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::new(), ptr, 0);
+                let hi = self
+                    .builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::new(), ptr, 8);
                 Ok((lo, hi))
             }
             other => Err(MicroliftError::UnsupportedInstruction {
@@ -345,7 +351,9 @@ impl<'a> Lifter<'a> {
                         }
                         OpKind::Memory => {
                             let ptr = self.get_mem_ptr(instruction, 1)?;
-                            self.builder.ins().load(types::I64, MemFlagsData::new(), ptr, 0)
+                            self.builder
+                                .ins()
+                                .load(types::I64, MemFlagsData::new(), ptr, 0)
                         }
                         other => {
                             return Err(MicroliftError::UnsupportedInstruction {
@@ -525,7 +533,10 @@ impl<'a> Lifter<'a> {
                     OpKind::Memory => {
                         // MOVSS xmm, m32 - load 32 bits, zero upper 96 bits.
                         let ptr = self.get_mem_ptr(instruction, 1)?;
-                        let val32 = self.builder.ins().load(types::I32, MemFlagsData::new(), ptr, 0);
+                        let val32 =
+                            self.builder
+                                .ins()
+                                .load(types::I32, MemFlagsData::new(), ptr, 0);
                         let lo = self.builder.ins().uextend(types::I64, val32);
                         let hi = self.builder.ins().iconst(types::I64, 0);
                         self.set_xmm_lo(dst_idx, lo);
@@ -580,7 +591,9 @@ impl<'a> Lifter<'a> {
                         }
                         OpKind::Memory => {
                             let ptr = self.get_mem_ptr(instruction, 1)?;
-                            self.builder.ins().load(types::I32, MemFlagsData::new(), ptr, 0)
+                            self.builder
+                                .ins()
+                                .load(types::I32, MemFlagsData::new(), ptr, 0)
                         }
                         other => {
                             return Err(MicroliftError::UnsupportedInstruction {
@@ -632,7 +645,10 @@ impl<'a> Lifter<'a> {
                     });
                 }
                 let ptr = self.get_mem_ptr(instruction, 1)?;
-                let hi = self.builder.ins().load(types::I64, MemFlagsData::new(), ptr, 0);
+                let hi = self
+                    .builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::new(), ptr, 0);
                 self.set_xmm_hi(dst_idx, hi);
             }
             OpKind::Memory => {
@@ -670,7 +686,10 @@ impl<'a> Lifter<'a> {
                     });
                 }
                 let ptr = self.get_mem_ptr(instruction, 1)?;
-                let lo = self.builder.ins().load(types::I64, MemFlagsData::new(), ptr, 0);
+                let lo = self
+                    .builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::new(), ptr, 0);
                 self.set_xmm_lo(dst_idx, lo);
             }
             OpKind::Memory => {
@@ -720,7 +739,9 @@ impl<'a> Lifter<'a> {
             }
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 1)?;
-                self.builder.ins().load(types::I64, MemFlagsData::new(), ptr, 0)
+                self.builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::new(), ptr, 0)
             }
             other => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -785,7 +806,10 @@ impl<'a> Lifter<'a> {
             }
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 1)?;
-                let v = self.builder.ins().load(types::I64, MemFlagsData::new(), ptr, 0);
+                let v = self
+                    .builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::new(), ptr, 0);
                 Ok(ShiftCount::Dynamic(v))
             }
             other => Err(MicroliftError::UnsupportedInstruction {
@@ -839,10 +863,10 @@ impl<'a> Lifter<'a> {
                         // Zero every lane when the count was out of range. A
                         // splat of a scalar select keeps the mask off the
                         // vector unit's critical path.
-                        let too_big = self
-                            .builder
-                            .ins()
-                            .icmp(IntCC::UnsignedGreaterThan, cv, limit);
+                        let too_big =
+                            self.builder
+                                .ins()
+                                .icmp(IntCC::UnsignedGreaterThan, cv, limit);
                         let lane_ty = ty.lane_type();
                         let ones = self.builder.ins().iconst(lane_ty, -1);
                         let zero = self.builder.ins().iconst(lane_ty, 0);
@@ -888,11 +912,10 @@ impl<'a> Lifter<'a> {
             ShiftCount::Dynamic(cv) => {
                 let shifted = self.packed_logical_shift_64(a, count, left, width);
                 let zero = self.builder.ins().iconst(types::I64, 0);
-                let too_big = self.builder.ins().icmp_imm(
-                    IntCC::UnsignedGreaterThan,
-                    cv,
-                    bits as i64 - 1,
-                );
+                let too_big =
+                    self.builder
+                        .ins()
+                        .icmp_imm(IntCC::UnsignedGreaterThan, cv, bits as i64 - 1);
                 self.builder.ins().select(too_big, zero, shifted)
             }
         }
@@ -962,7 +985,6 @@ impl<'a> Lifter<'a> {
             }
         }
     }
-
 
     /// PSHUFD - shuffle the four 32-bit dwords of `xmm2/m128` into `xmm1`
     /// according to `imm8` (2 bits per destination dword select a source dword).
@@ -1038,7 +1060,10 @@ impl<'a> Lifter<'a> {
                     OpKind::Memory => {
                         // MOVSD xmm, m64 - load 64 bits, zero hi.
                         let ptr = self.get_mem_ptr(instruction, 1)?;
-                        let lo = self.builder.ins().load(types::I64, MemFlagsData::new(), ptr, 0);
+                        let lo = self
+                            .builder
+                            .ins()
+                            .load(types::I64, MemFlagsData::new(), ptr, 0);
                         let hi = self.builder.ins().iconst(types::I64, 0);
                         self.set_xmm_lo(dst_idx, lo);
                         self.set_xmm_hi(dst_idx, hi);
@@ -1092,7 +1117,10 @@ impl<'a> Lifter<'a> {
             }
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, op_index)?;
-                Ok(self.builder.ins().load(types::I64, MemFlagsData::new(), ptr, 0))
+                Ok(self
+                    .builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::new(), ptr, 0))
             }
             other => Err(MicroliftError::UnsupportedInstruction {
                 mnemonic: format!("scalar-f64-src-op{}-{:?}", op_index, other),
@@ -1154,10 +1182,18 @@ impl<'a> Lifter<'a> {
     /// Subtract two `f64` values given as raw `I64` bit patterns, returning the
     /// difference's bits.
     fn fsub_f64_bits(&mut self, a_bits: Value, b_bits: Value) -> Value {
-        let a = self.builder.ins().bitcast(types::F64, MemFlagsData::new(), a_bits);
-        let b = self.builder.ins().bitcast(types::F64, MemFlagsData::new(), b_bits);
+        let a = self
+            .builder
+            .ins()
+            .bitcast(types::F64, MemFlagsData::new(), a_bits);
+        let b = self
+            .builder
+            .ins()
+            .bitcast(types::F64, MemFlagsData::new(), b_bits);
         let r = self.builder.ins().fsub(a, b);
-        self.builder.ins().bitcast(types::I64, MemFlagsData::new(), r)
+        self.builder
+            .ins()
+            .bitcast(types::I64, MemFlagsData::new(), r)
     }
 
     /// Shared implementation for the scalar double-precision arithmetic
@@ -1176,10 +1212,19 @@ impl<'a> Lifter<'a> {
         let dst_lo = self.get_xmm_lo(dst_idx);
         let src_lo = self.read_scalar_f64_bits(instruction, 1)?;
 
-        let a = self.builder.ins().bitcast(types::F64, MemFlagsData::new(), dst_lo);
-        let b = self.builder.ins().bitcast(types::F64, MemFlagsData::new(), src_lo);
+        let a = self
+            .builder
+            .ins()
+            .bitcast(types::F64, MemFlagsData::new(), dst_lo);
+        let b = self
+            .builder
+            .ins()
+            .bitcast(types::F64, MemFlagsData::new(), src_lo);
         let r = op(&mut self.builder, a, b);
-        let res_lo = self.builder.ins().bitcast(types::I64, MemFlagsData::new(), r);
+        let res_lo = self
+            .builder
+            .ins()
+            .bitcast(types::I64, MemFlagsData::new(), r);
 
         // hi 64 bits are preserved (no write needed).
         self.set_xmm_lo(dst_idx, res_lo);
@@ -1215,8 +1260,14 @@ impl<'a> Lifter<'a> {
         let a_bits = self.get_xmm_lo(dst_idx);
         let b_bits = self.read_scalar_f64_bits(instruction, 1)?;
 
-        let a = self.builder.ins().bitcast(types::F64, MemFlagsData::new(), a_bits);
-        let b = self.builder.ins().bitcast(types::F64, MemFlagsData::new(), b_bits);
+        let a = self
+            .builder
+            .ins()
+            .bitcast(types::F64, MemFlagsData::new(), a_bits);
+        let b = self
+            .builder
+            .ins()
+            .bitcast(types::F64, MemFlagsData::new(), b_bits);
 
         let unord = self.builder.ins().fcmp(FloatCC::Unordered, a, b);
         let eq = self.builder.ins().fcmp(FloatCC::Equal, a, b);

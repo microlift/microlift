@@ -318,9 +318,22 @@ mod tests {
 
     #[test]
     fn exit_reason_display_and_roundtrip() {
-        assert_eq!(ExitReason::ImportedFunctionCall.to_string(), "imported-function-call");
+        assert_eq!(
+            ExitReason::ImportedFunctionCall.to_string(),
+            "imported-function-call"
+        );
         // try_from is the inverse of the discriminant.
-        for r in [ExitReason::None, ExitReason::Return, ExitReason::IndirectCall, ExitReason::Xgetbv, ExitReason::Interrupt, ExitReason::PortInput, ExitReason::PortOutput, ExitReason::Rdtsc, ExitReason::DivideError] {
+        for r in [
+            ExitReason::None,
+            ExitReason::Return,
+            ExitReason::IndirectCall,
+            ExitReason::Xgetbv,
+            ExitReason::Interrupt,
+            ExitReason::PortInput,
+            ExitReason::PortOutput,
+            ExitReason::Rdtsc,
+            ExitReason::DivideError,
+        ] {
             assert_eq!(ExitReason::try_from(r as u32), Ok(r));
             assert!(!r.to_string().is_empty());
         }
@@ -329,6 +342,9 @@ mod tests {
     #[test]
     fn transfer_kind_display() {
         assert_eq!(TransferKind::DirectCall.to_string(), "direct-call");
-        assert_eq!(TransferKind::try_from(TransferKind::IndirectJump as u32), Ok(TransferKind::IndirectJump));
+        assert_eq!(
+            TransferKind::try_from(TransferKind::IndirectJump as u32),
+            Ok(TransferKind::IndirectJump)
+        );
     }
 }

@@ -15,7 +15,7 @@ use cranelift_codegen::ir::{Function, UserFuncName};
 use microlift::backend::CraneliftBackend;
 use microlift::context::{ExitReason, RegisterContext};
 use microlift::core::abi::CallAbi;
-use microlift::function_traits::{trampoline_func, DynamicSymbol};
+use microlift::function_traits::{DynamicSymbol, trampoline_func};
 use microlift::lifter::{ExecutionMode, Lifter, LifterConfig};
 use microlift::os::get_host_calling_conv;
 

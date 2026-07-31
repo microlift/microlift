@@ -2,8 +2,8 @@
 //! the host with `UnimplementedInstruction`, the host shims it, and re-entering
 //! the same compiled region resumes at the following instruction.
 
-use microlift::testkit::prelude::*;
 use microlift::testkit::DEFAULT_LIFT_BASE;
+use microlift::testkit::prelude::*;
 
 /// `WBINVD` (`0F 09`) stands in for "an instruction the lifter will never
 /// implement": it is ring-0 only, so it cannot appear in the usermode guest code
@@ -50,5 +50,8 @@ fn test_resumable_unimplemented_fallback() {
         "resumed region should run to the RET, got {:?}",
         out.exit
     );
-    assert_eq!(out.ctx.rax, 43, "the instruction after the exit must execute");
+    assert_eq!(
+        out.ctx.rax, 43,
+        "the instruction after the exit must execute"
+    );
 }

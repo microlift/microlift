@@ -10,9 +10,9 @@
 #[path = "fuzz/mod.rs"]
 mod fuzz;
 
-use fuzz::{alu_reference, alu_snippet, AluOp};
+use fuzz::{AluOp, alu_reference, alu_snippet};
 use microlift::arch::x86_64::X86_64;
-use microlift::core::{lift_to_function, LifterConfig};
+use microlift::core::{LifterConfig, lift_to_function};
 use microlift::testkit::prelude::*;
 use proptest::prelude::*;
 

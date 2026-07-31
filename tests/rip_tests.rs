@@ -1,11 +1,6 @@
 use microlift::testkit::prelude::*;
 
-fn run_rip_test(
-    bytes: &[u8],
-    ip: u64,
-    base_address: u64,
-    ctx: RegisterContext,
-) -> RegisterContext {
+fn run_rip_test(bytes: &[u8], ip: u64, base_address: u64, ctx: RegisterContext) -> RegisterContext {
     LiftTest::new(bytes)
         .at(ip)
         .image_base(base_address)

@@ -18,7 +18,7 @@ use crate::function_traits::{DynamicSymbol, FunctionArgumentType};
 use crate::os::get_host_calling_conv;
 use cranelift::prelude::*;
 use cranelift_codegen::ir::{
-    ExtFuncData, ExternalName, Function, FuncRef, SigRef, UserExternalName, UserFuncName,
+    ExtFuncData, ExternalName, FuncRef, Function, SigRef, UserExternalName, UserFuncName,
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch, Variable};
@@ -430,9 +430,13 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                         let index = aot_imports.len() as u32;
                         let sig = build_import_sig(&sym.arg_types, host_cc);
                         let sig_ref = builder.import_signature(sig.clone());
-                        let user_name = builder.func.declare_imported_user_function(
-                            UserExternalName { namespace: 0, index },
-                        );
+                        let user_name =
+                            builder
+                                .func
+                                .declare_imported_user_function(UserExternalName {
+                                    namespace: 0,
+                                    index,
+                                });
                         let func_ref = builder.import_function(ExtFuncData {
                             name: ExternalName::user(user_name),
                             signature: sig_ref,
@@ -586,9 +590,12 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             .store(MemFlagsData::trusted(), pc_val, ctx_ptr, A::pc_offset());
 
         let reason_val = self.builder.ins().iconst(types::I32, reason as i64);
-        self.builder
-            .ins()
-            .store(MemFlagsData::trusted(), reason_val, ctx_ptr, A::exit_reason_offset());
+        self.builder.ins().store(
+            MemFlagsData::trusted(),
+            reason_val,
+            ctx_ptr,
+            A::exit_reason_offset(),
+        );
         Ok(())
     }
 

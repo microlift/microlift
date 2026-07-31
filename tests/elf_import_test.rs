@@ -269,14 +269,8 @@ fn run_microlift(
     handler: &mut dyn FnMut(u64, &mut CpuState),
 ) -> CpuState {
     let mut table = ImportTable::new(imports.iter().copied(), handler);
-    let out = MicroliftOracle::default().run_with_imports(
-        &f.bytes,
-        f.va,
-        init,
-        &[],
-        BUDGET,
-        &mut table,
-    );
+    let out =
+        MicroliftOracle::default().run_with_imports(&f.bytes, f.va, init, &[], BUDGET, &mut table);
     assert!(
         out.is_halted(),
         "microlift did not reach a clean halt: {out:?}"
@@ -295,8 +289,7 @@ fn run_unicorn(
     use microlift::testkit::oracle::unicorn::UnicornOracle;
 
     let mut table = ImportTable::new(imports.iter().copied(), handler);
-    let out =
-        UnicornOracle::new().run_with_imports(&f.bytes, f.va, init, &[], BUDGET, &mut table);
+    let out = UnicornOracle::new().run_with_imports(&f.bytes, f.va, init, &[], BUDGET, &mut table);
     assert!(
         out.is_halted(),
         "unicorn did not reach a clean halt: {out:?}"
@@ -306,7 +299,8 @@ fn run_unicorn(
 
 #[test]
 fn test_elf_process_string() {
-    let Some((func, elf)) = load_function(PROCESS_STRING_SOURCE, "process_string", "process_string")
+    let Some((func, elf)) =
+        load_function(PROCESS_STRING_SOURCE, "process_string", "process_string")
     else {
         eprintln!("skipping test_elf_process_string: no x86-64 ELF compiler on PATH");
         return;
@@ -402,11 +396,7 @@ fn test_elf_memcpy_semantics() {
     init.gpr[gpr::RSI] = data.as_ptr() as u64; // src
     init.gpr[gpr::RDX] = data.len() as u64; // n
 
-    let expected_args = (
-        dst.as_ptr() as u64,
-        data.as_ptr() as u64,
-        data.len() as u64,
-    );
+    let expected_args = (dst.as_ptr() as u64, data.as_ptr() as u64, data.len() as u64);
 
     // Per-engine bookkeeping: each run records its own calls, so "memcpy is
     // called exactly once" is asserted for each engine independently.
@@ -470,7 +460,8 @@ fn test_elf_memcpy_semantics() {
 #[cfg(feature = "unicorn-oracle")]
 #[test]
 fn test_elf_process_string_differential_helper() {
-    let Some((func, elf)) = load_function(PROCESS_STRING_SOURCE, "process_string", "process_string")
+    let Some((func, elf)) =
+        load_function(PROCESS_STRING_SOURCE, "process_string", "process_string")
     else {
         eprintln!("skipping differential helper test: no x86-64 ELF compiler on PATH");
         return;
@@ -916,9 +907,7 @@ fn load_stack_discipline_image() -> Option<LoadedImage> {
         );
     }
 
-    let text = file
-        .section_by_name(".text")
-        .expect(".text section");
+    let text = file.section_by_name(".text").expect(".text section");
     let text_end = text.address() + text.size();
     assert!(text_end > entry_va);
 
@@ -1096,7 +1085,10 @@ fn test_guest_stack_discipline_selftest() {
         );
         assert_callee_saved_intact(&uc.state, "unicorn");
         let diff = diff_states(&ml.state, &uc.state, DIFF);
-        assert!(diff.is_empty(), "stack-discipline self-test diverged: {diff:?}");
+        assert!(
+            diff.is_empty(),
+            "stack-discipline self-test diverged: {diff:?}"
+        );
     }
 }
 

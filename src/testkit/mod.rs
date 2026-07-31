@@ -18,7 +18,7 @@
 use crate::arch::x86_64::X86_64;
 use crate::backend::CraneliftBackend;
 use crate::context::{ExitReason, MemorySegment, RegisterContext};
-use crate::core::{lift_to_function, ExecutionMode, LifterConfig};
+use crate::core::{ExecutionMode, LifterConfig, lift_to_function};
 use cranelift_codegen::settings::{self, Configurable};
 
 pub mod oracle;
@@ -296,7 +296,13 @@ impl<'a> LiftTest<'a> {
         let xcheck = (self.unicorn_check
             && !self.config.analysis_mode
             && self.config.execution_mode == ExecutionMode::Jit)
-            .then(|| (self.bytes.to_vec(), self.ip, oracle::CpuState::from_ctx(&self.init)));
+            .then(|| {
+                (
+                    self.bytes.to_vec(),
+                    self.ip,
+                    oracle::CpuState::from_ctx(&self.init),
+                )
+            });
 
         let mut harness = self.compile()?;
         let exit = harness.enter();
@@ -343,7 +349,7 @@ impl<'a> LiftTest<'a> {
 ///   the comparison.
 #[cfg(feature = "unicorn-oracle")]
 fn cross_check_unicorn(bytes: &[u8], ip: u64, init: &oracle::CpuState, outcome: &RunOutcome) {
-    use oracle::{diff_states, CpuOracle, CpuState, DiffOptions, OracleOutcome};
+    use oracle::{CpuOracle, CpuState, DiffOptions, OracleOutcome, diff_states};
 
     // Only a clean `RET` into the exit trampoline is diffable. `ExitReason::None`
     // means Microlift stopped at the *region boundary* (the program fell off the
@@ -460,7 +466,10 @@ fn analyze_program(bytes: &[u8], ip: u64) -> ProgramFacts {
         for m in info.used_memory() {
             let writes = matches!(
                 m.access(),
-                OpAccess::Write | OpAccess::CondWrite | OpAccess::ReadWrite | OpAccess::ReadCondWrite
+                OpAccess::Write
+                    | OpAccess::CondWrite
+                    | OpAccess::ReadWrite
+                    | OpAccess::ReadCondWrite
             );
             // Stack writes self-heal across the two runs; only non-`RSP` writes
             // corrupt the second engine's inputs.
@@ -561,10 +570,7 @@ impl<'a> LiftTest<'a> {
     /// Only the register/flag/xmm seed and the lift base are carried over; the
     /// full [`LifterConfig`] is not (the oracle path always JITs in the default
     /// execution mode). Feed it code from the diffable subset only.
-    pub fn differential_unicorn(
-        &self,
-        opts: oracle::DiffOptions,
-    ) -> Option<oracle::StateDiff> {
+    pub fn differential_unicorn(&self, opts: oracle::DiffOptions) -> Option<oracle::StateDiff> {
         let state = oracle::CpuState::from_ctx(&self.init);
         oracle::unicorn::differential_unicorn(self.bytes, self.ip, &state, &[], 1 << 20, opts)
     }
@@ -576,10 +582,7 @@ impl<'a> LiftTest<'a> {
     /// cross-checking on top of their existing Microlift assertions.
     pub fn assert_matches_unicorn(&self, opts: oracle::DiffOptions) {
         if let Some(diff) = self.differential_unicorn(opts) {
-            assert!(
-                diff.is_empty(),
-                "microlift and unicorn disagree: {diff:?}"
-            );
+            assert!(diff.is_empty(), "microlift and unicorn disagree: {diff:?}");
         }
     }
 }
@@ -594,6 +597,6 @@ pub fn run_test(bytes: &[u8], ctx: RegisterContext) -> RegisterContext {
 
 /// Re-exports for `use microlift::testkit::prelude::*;`.
 pub mod prelude {
-    pub use super::{run_test, Harness, LiftTest, Opt, RetAddr, RunOutcome, TestError};
+    pub use super::{Harness, LiftTest, Opt, RetAddr, RunOutcome, TestError, run_test};
     pub use crate::context::{ExitReason, RegisterContext};
 }
