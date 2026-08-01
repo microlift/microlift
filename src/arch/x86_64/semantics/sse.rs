@@ -32,7 +32,7 @@ pub(super) enum PackedWidth {
 
 impl PackedWidth {
     /// Lane width in bits.
-    fn bits(self) -> u32 {
+    pub(super) fn bits(self) -> u32 {
         match self {
             PackedWidth::Byte => 8,
             PackedWidth::Word => 16,
@@ -216,7 +216,7 @@ impl<'a> Lifter<'a> {
     ///  - XMM register source
     ///  - GPR source (zero-extends 64-bit value into lo; hi = 0)
     ///  - Memory source (two 8-byte loads)
-    fn read_xmm_src(
+    pub(super) fn read_xmm_src(
         &mut self,
         instruction: &Instruction,
         op_index: u32,
@@ -1062,7 +1062,7 @@ impl<'a> Lifter<'a> {
 
     /// Resolve operand `op_index` to an XMM register index, or error with a
     /// handler-specific mnemonic tag.
-    fn xmm_operand_index(
+    pub(super) fn xmm_operand_index(
         &self,
         instruction: &Instruction,
         op_index: u32,
@@ -1734,7 +1734,13 @@ impl<'a> Lifter<'a> {
 
     /// Widen the `lane_bits`-wide lane at bit offset `shift` of `v` into a full
     /// `I64`, sign- or zero-extending as requested.
-    fn extract_lane(&mut self, v: Value, shift: i64, lane_bits: u32, signed: bool) -> Value {
+    pub(super) fn extract_lane(
+        &mut self,
+        v: Value,
+        shift: i64,
+        lane_bits: u32,
+        signed: bool,
+    ) -> Value {
         if signed {
             let left = 64 - shift - lane_bits as i64;
             let aligned = if left == 0 {
@@ -2761,65 +2767,6 @@ impl<'a> Lifter<'a> {
         } else {
             self.set_xmm_lo(dst_idx, acc);
             self.set_xmm_hi(dst_idx, src_hi);
-        }
-        Ok(())
-    }
-
-    /// PINSRW - insert a 16-bit value into one word lane of an XMM register.
-    ///
-    /// `PINSRW xmm, r32/m16, imm8`: `imm8[2:0]` selects the destination word;
-    /// the source contributes its low 16 bits (a GPR source ignores the upper
-    /// bits, a memory source is a plain 16-bit load). Every other word of the
-    /// destination is preserved.
-    pub(super) fn handle_pinsrw(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let dst_idx = self.xmm_operand_index(instruction, 0, "pinsrw")?;
-
-        let word = match self.operand_kind(instruction, 1) {
-            OpKind::Register => {
-                let src = self.operand_register(instruction, 1);
-                let val = self.get_reg_val(src)?;
-                let val64 = if self.builder.func.dfg.value_type(val) == types::I64 {
-                    val
-                } else {
-                    self.builder.ins().uextend(types::I64, val)
-                };
-                self.builder.ins().band_imm(val64, 0xFFFF)
-            }
-            OpKind::Memory => {
-                let ptr = self.get_mem_ptr(instruction, 1)?;
-                self.builder
-                    .ins()
-                    .uload16(types::I64, MemFlagsData::new(), ptr, 0)
-            }
-            other => {
-                return Err(MicroliftError::UnsupportedInstruction {
-                    mnemonic: format!("pinsrw-src-{:?}", other),
-                });
-            }
-        };
-
-        // imm8[2:0] picks one of the eight words; the low four live in `lo`.
-        let sel = i64::from(instruction.immediate8() & 0b111);
-        let high_half = sel >= 4;
-        let shift = (sel % 4) * 16;
-
-        let half = if high_half {
-            self.get_xmm_hi(dst_idx)
-        } else {
-            self.get_xmm_lo(dst_idx)
-        };
-        let cleared = self.builder.ins().band_imm(half, !(0xFFFF_i64 << shift));
-        let placed = if shift == 0 {
-            word
-        } else {
-            self.builder.ins().ishl_imm(word, shift)
-        };
-        let merged = self.builder.ins().bor(cleared, placed);
-
-        if high_half {
-            self.set_xmm_hi(dst_idx, merged);
-        } else {
-            self.set_xmm_lo(dst_idx, merged);
         }
         Ok(())
     }

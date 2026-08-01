@@ -538,6 +538,13 @@ const PACKED_OPERANDS: &[([u64; 2], [u64; 2])] = &[
         [0x0706_0504_0302_0100, 0x0F0E_0D0C_0B0A_0908],
         [0x1716_1514_1312_1110, 0x1F1E_1D1C_1B1A_1918],
     ),
+    // Byte patterns aimed at PSHUFB's control rules: indices with bit 7 set
+    // (which zero the output byte) and indices whose bits 4..6 are set (which
+    // hardware masks away rather than treating as out of range).
+    (
+        [0x0F0E_0D0C_0B0A_0908, 0x0706_0504_0302_0100],
+        [0x8898_A8B8_C8D8_E8F8, 0x3021_1203_7F40_5160],
+    ),
 ];
 
 /// XMM seeds interpreted as floats, for the arithmetic differential.
@@ -868,5 +875,250 @@ fn pinsrw_mem_agrees() {
             differential_unicorn(&code, CODE_VA, &init, &seed, BUDGET, DiffOptions::default())
                 .expect("clean halt");
         assert!(diff.is_empty(), "pinsrw mem imm={imm} diverged: {diff:?}");
+    }
+}
+
+/// Run `code` against Unicorn for every [`PACKED_OPERANDS`] pair, seeded into
+/// `xmm0` (destination) and `xmm1` (source).
+fn agree_packed(name: &str, code: &[u8]) {
+    for &(dst, src) in PACKED_OPERANDS {
+        let mut init = CpuState::zeroed();
+        init.xmm[0] = dst;
+        init.xmm[1] = src;
+        let diff = differential_unicorn(code, CODE_VA, &init, &[], BUDGET, DiffOptions::default())
+            .expect("clean halt");
+        assert!(
+            diff.is_empty(),
+            "{name} {dst:#018x?},{src:#018x?} diverged: {diff:?}"
+        );
+    }
+}
+
+/// The SSSE3 block: `PSHUFB`, the horizontal add/sub forms, the sign ops, the
+/// mixed-signedness multiply-accumulates and `PABS*`.
+///
+/// `PSHUFB` gets the shuffle-heavy operand set for free - every pair above is
+/// used as a control vector as well as data, so the byte selectors cover
+/// in-range indices, the high-bit zeroing rule and indices whose bits 4..6 are
+/// set (which hardware masks away and Cranelift's `swizzle` would not).
+#[test]
+fn ssse3_lane_ops_agree() {
+    // <op> xmm0, xmm1 ; ret   (all `66 0F 38 <op> C1`)
+    let ops: &[(&str, u8)] = &[
+        ("pshufb", 0x00),
+        ("phaddw", 0x01),
+        ("phaddd", 0x02),
+        ("phaddsw", 0x03),
+        ("pmaddubsw", 0x04),
+        ("phsubw", 0x05),
+        ("phsubd", 0x06),
+        ("phsubsw", 0x07),
+        ("psignb", 0x08),
+        ("psignw", 0x09),
+        ("psignd", 0x0A),
+        ("pmulhrsw", 0x0B),
+        ("pabsb", 0x1C),
+        ("pabsw", 0x1D),
+        ("pabsd", 0x1E),
+    ];
+    for (name, op) in ops {
+        agree_packed(name, &[0x66, 0x0F, 0x38, *op, 0xC1, 0xC3]);
+    }
+}
+
+/// PALIGNR over every byte count, including the 16..31 range that shifts the
+/// destination down into the result and the >= 32 range that clears it.
+#[test]
+fn palignr_agrees() {
+    for imm in 0..=34u8 {
+        agree_packed("palignr", &[0x66, 0x0F, 0x3A, 0x0F, 0xC1, imm, 0xC3]);
+    }
+}
+
+/// The widening multiplies, the dot product, sum-of-absolute-differences and
+/// the saturating narrowing packs.
+#[test]
+fn packed_multiply_and_pack_agree() {
+    // `66 0F <op> C1`
+    for (name, op) in [
+        ("pmuludq", 0xF4u8),
+        ("pmaddwd", 0xF5),
+        ("psadbw", 0xF6),
+        ("packsswb", 0x63),
+        ("packssdw", 0x6B),
+        ("packuswb", 0x67),
+    ] {
+        agree_packed(name, &[0x66, 0x0F, op, 0xC1, 0xC3]);
+    }
+    // `66 0F 38 <op> C1`
+    for (name, op) in [("pmuldq", 0x28u8), ("pmulld", 0x40), ("packusdw", 0x2B)] {
+        agree_packed(name, &[0x66, 0x0F, 0x38, op, 0xC1, 0xC3]);
+    }
+}
+
+/// The SSE4.1 min/max set and `PTEST` (whose whole observable effect is
+/// flags - the `rflags` comparison in the diff is the test).
+#[test]
+fn sse41_minmax_and_ptest_agree() {
+    let ops: &[(&str, u8)] = &[
+        ("pminsb", 0x38),
+        ("pminsd", 0x39),
+        ("pminuw", 0x3A),
+        ("pminud", 0x3B),
+        ("pmaxsb", 0x3C),
+        ("pmaxsd", 0x3D),
+        ("pmaxuw", 0x3E),
+        ("pmaxud", 0x3F),
+        ("ptest", 0x17),
+    ];
+    for (name, op) in ops {
+        agree_packed(name, &[0x66, 0x0F, 0x38, *op, 0xC1, 0xC3]);
+    }
+    // PTEST's two flag-setting edges: CF is set only when src & ~dst is zero.
+    for (dst, src) in [
+        ([0u64; 2], [0u64; 2]),
+        ([!0, !0], [0x1234, 0]),
+        ([0x00FF_00FF, 0], [0x00FF_0000, 0]),
+    ] {
+        let mut init = CpuState::zeroed();
+        init.xmm[0] = dst;
+        init.xmm[1] = src;
+        let code = [0x66, 0x0F, 0x38, 0x17, 0xC1, 0xC3];
+        let diff = differential_unicorn(&code, CODE_VA, &init, &[], BUDGET, DiffOptions::default())
+            .expect("clean halt");
+        assert!(diff.is_empty(), "ptest {dst:?},{src:?} diverged: {diff:?}");
+    }
+}
+
+/// The sign- and zero-extending widening loads (register source form).
+#[test]
+fn pmovsx_pmovzx_agree() {
+    let ops: &[(&str, u8)] = &[
+        ("pmovsxbw", 0x20),
+        ("pmovsxbd", 0x21),
+        ("pmovsxbq", 0x22),
+        ("pmovsxwd", 0x23),
+        ("pmovsxwq", 0x24),
+        ("pmovsxdq", 0x25),
+        ("pmovzxbw", 0x30),
+        ("pmovzxbd", 0x31),
+        ("pmovzxbq", 0x32),
+        ("pmovzxwd", 0x33),
+        ("pmovzxwq", 0x34),
+        ("pmovzxdq", 0x35),
+    ];
+    for (name, op) in ops {
+        agree_packed(name, &[0x66, 0x0F, 0x38, *op, 0xC1, 0xC3]);
+    }
+}
+
+/// Blends: the `imm8`-selected forms and the variable forms that take their
+/// mask from the implicit `XMM0` - which is also the destination here, so the
+/// mask is read before it is overwritten.
+#[test]
+fn blends_agree() {
+    for imm in [0x00u8, 0x01, 0x55, 0xAA, 0xF0, 0xFF] {
+        for (name, op) in [("pblendw", 0x0Eu8), ("blendps", 0x0C), ("blendpd", 0x0D)] {
+            agree_packed(name, &[0x66, 0x0F, 0x3A, op, 0xC1, imm, 0xC3]);
+        }
+    }
+    // pblendvb/blendvps/blendvpd xmm2, xmm1  - mask in xmm0, dst xmm2.
+    for (name, op) in [("pblendvb", 0x10u8), ("blendvps", 0x14), ("blendvpd", 0x15)] {
+        for &(mask, src) in PACKED_OPERANDS {
+            let mut init = CpuState::zeroed();
+            init.xmm[0] = mask;
+            init.xmm[1] = src;
+            init.xmm[2] = [0xAAAA_AAAA_AAAA_AAAA, 0x5555_5555_5555_5555];
+            // modrm D1: reg = xmm2, rm = xmm1
+            let code = [0x66, 0x0F, 0x38, op, 0xD1, 0xC3];
+            let diff =
+                differential_unicorn(&code, CODE_VA, &init, &[], BUDGET, DiffOptions::default())
+                    .expect("clean halt");
+            assert!(
+                diff.is_empty(),
+                "{name} mask={mask:#018x?} diverged: {diff:?}"
+            );
+        }
+    }
+}
+
+/// Lane insert and extract at every lane width and index, in both directions
+/// (`PINSR*` from a GPR, `PEXTR*` into a GPR).
+#[test]
+fn lane_insert_extract_agree() {
+    for lane in 0..16u8 {
+        let mut init = CpuState::zeroed();
+        init.xmm[0] = [0x1111_2222_3333_4444, 0x5555_6666_7777_8888];
+        init.gpr[gpr::RCX] = 0xDEAD_BEEF_1234_ABCD;
+
+        // pinsrb / pinsrw / pinsrd / pinsrq xmm0, rcx, lane ; ret
+        let progs: Vec<(&str, Vec<u8>)> = vec![
+            ("pinsrb", vec![0x66, 0x0F, 0x3A, 0x20, 0xC1, lane, 0xC3]),
+            ("pinsrw", vec![0x66, 0x0F, 0xC4, 0xC1, lane, 0xC3]),
+            ("pinsrd", vec![0x66, 0x0F, 0x3A, 0x22, 0xC1, lane, 0xC3]),
+            (
+                "pinsrq",
+                vec![0x66, 0x48, 0x0F, 0x3A, 0x22, 0xC1, lane, 0xC3],
+            ),
+            ("pextrb", vec![0x66, 0x0F, 0x3A, 0x14, 0xC1, lane, 0xC3]),
+            ("pextrw", vec![0x66, 0x0F, 0xC5, 0xC1, lane, 0xC3]),
+            ("pextrd", vec![0x66, 0x0F, 0x3A, 0x16, 0xC1, lane, 0xC3]),
+            (
+                "pextrq",
+                vec![0x66, 0x48, 0x0F, 0x3A, 0x16, 0xC1, lane, 0xC3],
+            ),
+        ];
+        for (name, code) in progs {
+            let diff =
+                differential_unicorn(&code, CODE_VA, &init, &[], BUDGET, DiffOptions::default())
+                    .expect("clean halt");
+            assert!(diff.is_empty(), "{name} lane={lane} diverged: {diff:?}");
+        }
+    }
+}
+
+/// The memory-source forms: a 128-bit operand for PSHUFB/PMULUDQ and the
+/// *narrower* loads PMOVZX/PMOVSX and PINSRB use, which must read only the
+/// bytes they consume. Skipped if the fixed mapping is unavailable.
+#[cfg(unix)]
+#[test]
+fn packed_memory_sources_agree() {
+    const ARENA_VA: u64 = 0x3_6000_0000;
+
+    let Some(mut arena) = IdentityArena::map(ARENA_VA, 0x1000) else {
+        eprintln!("identity arena unavailable at {ARENA_VA:#x}; skipping");
+        return;
+    };
+    let data: [u8; 16] = [
+        0x81, 0x02, 0xF3, 0x04, 0x85, 0x06, 0x77, 0x08, 0x09, 0x8A, 0x0B, 0xCC, 0x0D, 0x0E, 0x0F,
+        0x90,
+    ];
+    arena.write_at(0, &data);
+    let seed = [MemImage {
+        base: ARENA_VA,
+        bytes: data.to_vec(),
+    }];
+
+    // <op> xmm0, [rax] ; ret   - modrm 00 selects [rax] with reg = xmm0.
+    let progs: &[(&str, &[u8])] = &[
+        ("pshufb", &[0x66, 0x0F, 0x38, 0x00, 0x00, 0xC3]),
+        ("pmuludq", &[0x66, 0x0F, 0xF4, 0x00, 0xC3]),
+        ("palignr", &[0x66, 0x0F, 0x3A, 0x0F, 0x00, 0x07, 0xC3]),
+        ("packsswb", &[0x66, 0x0F, 0x63, 0x00, 0xC3]),
+        ("pmovzxbw", &[0x66, 0x0F, 0x38, 0x30, 0x00, 0xC3]),
+        ("pmovsxbq", &[0x66, 0x0F, 0x38, 0x22, 0x00, 0xC3]),
+        ("pmovsxwd", &[0x66, 0x0F, 0x38, 0x23, 0x00, 0xC3]),
+        ("pmovzxdq", &[0x66, 0x0F, 0x38, 0x35, 0x00, 0xC3]),
+        ("pinsrb", &[0x66, 0x0F, 0x3A, 0x20, 0x00, 0x05, 0xC3]),
+        ("ptest", &[0x66, 0x0F, 0x38, 0x17, 0x00, 0xC3]),
+    ];
+    for (name, code) in progs {
+        let mut init = CpuState::zeroed();
+        init.xmm[0] = [0x0706_0504_0302_0100, 0x8F0E_0D0C_0B0A_0908];
+        init.gpr[gpr::RAX] = ARENA_VA;
+        let diff =
+            differential_unicorn(code, CODE_VA, &init, &seed, BUDGET, DiffOptions::default())
+                .expect("clean halt");
+        assert!(diff.is_empty(), "{name} (mem) diverged: {diff:?}");
     }
 }

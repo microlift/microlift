@@ -14,14 +14,16 @@ pub mod memory;
 pub mod setcc;
 pub mod softfloat;
 pub mod sse;
+pub mod sse_int;
 pub mod syscall;
 pub mod unimplemented;
 
 use crate::MicroliftError;
 use crate::arch::x86_64::semantics::fpu::FpuOp;
 use crate::arch::x86_64::semantics::sse::{PackedLaneOp, PackedShiftOp, PackedWidth};
+use crate::arch::x86_64::semantics::sse_int::HorizOp;
 use crate::lifter::Lifter;
-use iced_x86::{Instruction, Mnemonic, OpKind};
+use iced_x86::{Instruction, Mnemonic, OpKind, Register};
 
 impl<'a> Lifter<'a> {
     pub fn handle_instruction(&mut self, instruction: &Instruction) -> crate::Result<()> {
@@ -29,6 +31,15 @@ impl<'a> Lifter<'a> {
         // before the main match so that ADD, SUB, etc. only see non-locked ops.
         if instruction.has_lock_prefix() {
             return self.handle_locked_instruction(instruction);
+        }
+
+        // Most SSE integer opcodes have an MMX encoding (the same mnemonic
+        // without the 0x66 prefix) that operates on MM0..MM7 - an aliased view
+        // of the x87 stack this frontend does not model. Exit to the host
+        // rather than failing the whole lift on an operand the handlers cannot
+        // resolve to an XMM register.
+        if uses_mmx_register(instruction) {
+            return self.handle_unimplemented_instruction(instruction);
         }
 
         match instruction.mnemonic() {
@@ -68,7 +79,11 @@ impl<'a> Lifter<'a> {
             // lifter does not model.
             | Mnemonic::Movntps
             | Mnemonic::Movntpd
-            | Mnemonic::Movntdq => self.handle_movaps(instruction),
+            | Mnemonic::Movntdq
+            // LDDQU and the non-temporal load MOVNTDQA differ from an ordinary
+            // 128-bit load only in cache/split-load hints.
+            | Mnemonic::Lddqu
+            | Mnemonic::Movntdqa => self.handle_movaps(instruction),
             Mnemonic::Movq => self.handle_movq_sse(instruction),
             Mnemonic::Movss => self.handle_movss(instruction),
             Mnemonic::Movd => self.handle_movd(instruction),
@@ -198,7 +213,6 @@ impl<'a> Lifter<'a> {
             }
             Mnemonic::Shufps => self.handle_shufps(instruction),
             Mnemonic::Shufpd => self.handle_shufpd(instruction),
-            Mnemonic::Pinsrw => self.handle_pinsrw(instruction),
             Mnemonic::Pshuflw => self.handle_pshuflhw(instruction, false),
             Mnemonic::Pshufhw => self.handle_pshuflhw(instruction, true),
             Mnemonic::Rcpps => self.handle_rcpps(instruction, false),
@@ -342,6 +356,138 @@ impl<'a> Lifter<'a> {
                 PackedLaneOp::MulHighU,
                 PackedWidth::Word,
             ),
+
+            // SSE4.1 - the min / max forms the earlier generations lacked.
+            Mnemonic::Pminsb => self.handle_packed_lane_op(
+                instruction,
+                "pminsb",
+                PackedLaneOp::MinS,
+                PackedWidth::Byte,
+            ),
+            Mnemonic::Pmaxsb => self.handle_packed_lane_op(
+                instruction,
+                "pmaxsb",
+                PackedLaneOp::MaxS,
+                PackedWidth::Byte,
+            ),
+            Mnemonic::Pminuw => self.handle_packed_lane_op(
+                instruction,
+                "pminuw",
+                PackedLaneOp::MinU,
+                PackedWidth::Word,
+            ),
+            Mnemonic::Pmaxuw => self.handle_packed_lane_op(
+                instruction,
+                "pmaxuw",
+                PackedLaneOp::MaxU,
+                PackedWidth::Word,
+            ),
+            Mnemonic::Pminsd => self.handle_packed_lane_op(
+                instruction,
+                "pminsd",
+                PackedLaneOp::MinS,
+                PackedWidth::Dword,
+            ),
+            Mnemonic::Pmaxsd => self.handle_packed_lane_op(
+                instruction,
+                "pmaxsd",
+                PackedLaneOp::MaxS,
+                PackedWidth::Dword,
+            ),
+            Mnemonic::Pminud => self.handle_packed_lane_op(
+                instruction,
+                "pminud",
+                PackedLaneOp::MinU,
+                PackedWidth::Dword,
+            ),
+            Mnemonic::Pmaxud => self.handle_packed_lane_op(
+                instruction,
+                "pmaxud",
+                PackedLaneOp::MaxU,
+                PackedWidth::Dword,
+            ),
+            Mnemonic::Pmulld => self.handle_packed_lane_op(
+                instruction,
+                "pmulld",
+                PackedLaneOp::MulLow,
+                PackedWidth::Dword,
+            ),
+
+            // SSSE3 - byte shuffle, concat-rotate, sign ops and horizontal
+            // arithmetic.
+            Mnemonic::Pshufb => self.handle_pshufb(instruction),
+            Mnemonic::Palignr => self.handle_palignr(instruction),
+            Mnemonic::Pabsb => self.handle_pabs(instruction, PackedWidth::Byte),
+            Mnemonic::Pabsw => self.handle_pabs(instruction, PackedWidth::Word),
+            Mnemonic::Pabsd => self.handle_pabs(instruction, PackedWidth::Dword),
+            Mnemonic::Psignb => self.handle_psign(instruction, PackedWidth::Byte),
+            Mnemonic::Psignw => self.handle_psign(instruction, PackedWidth::Word),
+            Mnemonic::Psignd => self.handle_psign(instruction, PackedWidth::Dword),
+            Mnemonic::Phaddw => {
+                self.handle_horizontal(instruction, HorizOp::Add, PackedWidth::Word)
+            }
+            Mnemonic::Phaddd => {
+                self.handle_horizontal(instruction, HorizOp::Add, PackedWidth::Dword)
+            }
+            Mnemonic::Phaddsw => {
+                self.handle_horizontal(instruction, HorizOp::AddSat, PackedWidth::Word)
+            }
+            Mnemonic::Phsubw => {
+                self.handle_horizontal(instruction, HorizOp::Sub, PackedWidth::Word)
+            }
+            Mnemonic::Phsubd => {
+                self.handle_horizontal(instruction, HorizOp::Sub, PackedWidth::Dword)
+            }
+            Mnemonic::Phsubsw => {
+                self.handle_horizontal(instruction, HorizOp::SubSat, PackedWidth::Word)
+            }
+            Mnemonic::Pmaddubsw => self.handle_pmaddubsw(instruction),
+            Mnemonic::Pmulhrsw => self.handle_pmulhrsw(instruction),
+
+            // SSE2 / SSE4.1 - widening multiply, dot product and SAD.
+            Mnemonic::Pmuludq => self.handle_pmuldq(instruction, false),
+            Mnemonic::Pmuldq => self.handle_pmuldq(instruction, true),
+            Mnemonic::Pmaddwd => self.handle_pmaddwd(instruction),
+            Mnemonic::Psadbw => self.handle_psadbw(instruction),
+
+            // SSE2 / SSE4.1 - saturating narrowing packs.
+            Mnemonic::Packsswb => self.handle_pack(instruction, PackedWidth::Word, true),
+            Mnemonic::Packssdw => self.handle_pack(instruction, PackedWidth::Dword, true),
+            Mnemonic::Packuswb => self.handle_pack(instruction, PackedWidth::Word, false),
+            Mnemonic::Packusdw => self.handle_pack(instruction, PackedWidth::Dword, false),
+
+            // SSE4.1 - sign / zero extending widening.
+            Mnemonic::Pmovzxbw => self.handle_pmovx(instruction, 8, 16, false),
+            Mnemonic::Pmovzxbd => self.handle_pmovx(instruction, 8, 32, false),
+            Mnemonic::Pmovzxbq => self.handle_pmovx(instruction, 8, 64, false),
+            Mnemonic::Pmovzxwd => self.handle_pmovx(instruction, 16, 32, false),
+            Mnemonic::Pmovzxwq => self.handle_pmovx(instruction, 16, 64, false),
+            Mnemonic::Pmovzxdq => self.handle_pmovx(instruction, 32, 64, false),
+            Mnemonic::Pmovsxbw => self.handle_pmovx(instruction, 8, 16, true),
+            Mnemonic::Pmovsxbd => self.handle_pmovx(instruction, 8, 32, true),
+            Mnemonic::Pmovsxbq => self.handle_pmovx(instruction, 8, 64, true),
+            Mnemonic::Pmovsxwd => self.handle_pmovx(instruction, 16, 32, true),
+            Mnemonic::Pmovsxwq => self.handle_pmovx(instruction, 16, 64, true),
+            Mnemonic::Pmovsxdq => self.handle_pmovx(instruction, 32, 64, true),
+
+            // SSE2 / SSE4.1 - lane insert and extract.
+            Mnemonic::Pinsrb => self.handle_pinsr(instruction, PackedWidth::Byte),
+            Mnemonic::Pinsrw => self.handle_pinsr(instruction, PackedWidth::Word),
+            Mnemonic::Pinsrd => self.handle_pinsr(instruction, PackedWidth::Dword),
+            Mnemonic::Pinsrq => self.handle_pinsr(instruction, PackedWidth::Qword),
+            Mnemonic::Pextrb => self.handle_pextr(instruction, PackedWidth::Byte),
+            Mnemonic::Pextrw => self.handle_pextr(instruction, PackedWidth::Word),
+            Mnemonic::Pextrd => self.handle_pextr(instruction, PackedWidth::Dword),
+            Mnemonic::Pextrq => self.handle_pextr(instruction, PackedWidth::Qword),
+
+            // SSE4.1 - blends and the 128-bit bitwise test.
+            Mnemonic::Pblendw => self.handle_blend_imm(instruction, PackedWidth::Word),
+            Mnemonic::Blendps => self.handle_blend_imm(instruction, PackedWidth::Dword),
+            Mnemonic::Blendpd => self.handle_blend_imm(instruction, PackedWidth::Qword),
+            Mnemonic::Pblendvb => self.handle_blendv(instruction, PackedWidth::Byte),
+            Mnemonic::Blendvps => self.handle_blendv(instruction, PackedWidth::Dword),
+            Mnemonic::Blendvpd => self.handle_blendv(instruction, PackedWidth::Qword),
+            Mnemonic::Ptest => self.handle_ptest(instruction),
 
             // SSE / SSE2 - sign-bit extraction into a GPR
             Mnemonic::Pmovmskb => self.handle_movmsk(instruction, "pmovmskb", PackedWidth::Byte),
@@ -594,4 +740,21 @@ impl<'a> Lifter<'a> {
             }
         }
     }
+}
+
+/// True when any operand names an MMX register (`MM0..MM7`).
+fn uses_mmx_register(instruction: &Instruction) -> bool {
+    (0..instruction.op_count()).any(|i| {
+        matches!(
+            instruction.op_register(i),
+            Register::MM0
+                | Register::MM1
+                | Register::MM2
+                | Register::MM3
+                | Register::MM4
+                | Register::MM5
+                | Register::MM6
+                | Register::MM7
+        )
+    })
 }

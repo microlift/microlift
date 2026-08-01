@@ -3517,3 +3517,266 @@ fn test_conversions_and_shuffles_vector_xmm() {
     let ctx = run_test_vec(&[0x0F, 0xC2, 0xC1, 0x01, 0xC3], ctx);
     assert_eq!(ctx.xmm[0], [T32, T32]);
 }
+
+//  SSSE3 / SSE4.1 packed integer ops
+//
+//  These pin down concrete results (and the vector-XMM representation); the
+//  exhaustive hardware cross-check lives in `tests/unicorn_oracle_tests.rs`.
+
+/// Bytes 0x00..0x0F laid out lane 0 first.
+const IDENTITY_BYTES: [u64; 2] = [0x0706_0504_0302_0100, 0x0F0E_0D0C_0B0A_0908];
+
+#[test]
+fn test_pshufb_selects_zeroes_and_masks() {
+    // pshufb xmm0, xmm1 ; ret  ->  66 0F 38 00 C1  C3
+    let bytes = [0x66, 0x0F, 0x38, 0x00, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = IDENTITY_BYTES;
+    // Control bytes, lane 0 first: 0x0F..0x08 reverse the low half from the
+    // destination's high bytes; 0x80 zeroes; 0x31 must be masked to index 1.
+    ctx.xmm[1] = [0x0809_0A0B_0C0D_0E0F, 0x3180_0000_0000_0007];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.xmm[0][0], 0x0809_0A0B_0C0D_0E0F, "reversed high bytes");
+    assert_eq!(
+        ctx.xmm[0][1], 0x0100_0000_0000_0007,
+        "bit 7 zeroes the byte; index 0x31 masks to 1"
+    );
+}
+
+#[test]
+fn test_pmuludq_multiplies_even_dwords() {
+    // pmuludq xmm0, xmm1 ; ret  ->  66 0F F4 C1  C3
+    let bytes = [0x66, 0x0F, 0xF4, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    // Odd dwords (the high halves) must be ignored entirely.
+    ctx.xmm[0] = [0xFFFF_FFFF_0000_0003, 0xFFFF_FFFF_FFFF_FFFF];
+    ctx.xmm[1] = [0xFFFF_FFFF_0000_0007, 0xFFFF_FFFF_FFFF_FFFF];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.xmm[0][0], 21);
+    // 0xFFFF_FFFF * 0xFFFF_FFFF, unsigned - the signed PMULDQ would give 1.
+    assert_eq!(ctx.xmm[0][1], 0xFFFF_FFFE_0000_0001);
+}
+
+#[test]
+fn test_pmuldq_multiplies_signed() {
+    // pmuldq xmm0, xmm1 ; ret  ->  66 0F 38 28 C1  C3
+    let bytes = [0x66, 0x0F, 0x38, 0x28, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [0xFFFF_FFFF, 0x0000_0000_FFFF_FFFE];
+    ctx.xmm[1] = [0xFFFF_FFFF, 0x0000_0000_0000_0003];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.xmm[0][0], 1, "-1 * -1");
+    assert_eq!(ctx.xmm[0][1], (-6i64) as u64, "-2 * 3");
+}
+
+#[test]
+fn test_palignr_shifts_across_the_pair() {
+    // palignr xmm0, xmm1, imm8 ; ret  ->  66 0F 3A 0F C1 ib  C3
+    let run = |imm: u8| {
+        let bytes = [0x66, 0x0F, 0x3A, 0x0F, 0xC1, imm, 0xC3];
+        let mut ctx = RegisterContext::default();
+        ctx.xmm[0] = [0x1716_1514_1312_1110, 0x1F1E_1D1C_1B1A_1918];
+        ctx.xmm[1] = IDENTITY_BYTES;
+        run_test(&bytes, ctx).xmm[0]
+    };
+    assert_eq!(run(0), IDENTITY_BYTES, "count 0 is the source unchanged");
+    assert_eq!(run(4), [0x0B0A_0908_0706_0504, 0x1312_1110_0F0E_0D0C]);
+    assert_eq!(
+        run(16),
+        [0x1716_1514_1312_1110, 0x1F1E_1D1C_1B1A_1918],
+        "count 16 is the destination unchanged"
+    );
+    assert_eq!(
+        run(20),
+        [0x1B1A_1918_1716_1514, 0x0000_0000_1F1E_1D1C],
+        "the destination shifts down and the top bytes zero-fill"
+    );
+    assert_eq!(run(32), [0, 0], "counts past 31 clear the register");
+}
+
+#[test]
+fn test_packsswb_and_packuswb_saturate() {
+    // The destination's eight words, lane 0 first: 0, -128, 127, 128,
+    // -1, 1, 32767, -32768. The source is zero, so the result's high half is
+    // whatever those words saturate zero to.
+    let dst = [0x0080_007F_FF80_0000u64, 0x8000_7FFF_0001_FFFF];
+
+    // packsswb xmm0, xmm1 ; ret  ->  66 0F 63 C1  C3  (signed, clamps to i8)
+    let bytes = [0x66, 0x0F, 0x63, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = dst;
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.xmm[0][0], 0x807F_01FF_7F7F_8000);
+    assert_eq!(ctx.xmm[0][1], 0, "the zero source packs to zero bytes");
+
+    // packuswb xmm0, xmm1 ; ret  ->  66 0F 67 C1  C3  (clamps to u8)
+    let bytes = [0x66, 0x0F, 0x67, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = dst;
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.xmm[0][0], 0x00FF_0100_807F_0000, "negatives clamp to 0");
+    assert_eq!(ctx.xmm[0][1], 0);
+}
+
+#[test]
+fn test_pmovzx_and_pmovsx_widen() {
+    // pmovzxbw xmm0, xmm1 ; ret  ->  66 0F 38 30 C1  C3
+    let bytes = [0x66, 0x0F, 0x38, 0x30, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[1] = [0x8070_6050_4030_2010, 0xFFFF_FFFF_FFFF_FFFF];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.xmm[0], [0x0040_0030_0020_0010, 0x0080_0070_0060_0050]);
+
+    // pmovsxbw xmm0, xmm1 ; ret  ->  66 0F 38 20 C1  C3
+    let bytes = [0x66, 0x0F, 0x38, 0x20, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[1] = [0x8070_6050_4030_2010, 0xFFFF_FFFF_FFFF_FFFF];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.xmm[0], [0x0040_0030_0020_0010, 0xFF80_0070_0060_0050]);
+
+    // pmovsxdq xmm0, xmm1 ; ret  ->  66 0F 38 25 C1  C3  (only the low 8 bytes)
+    let bytes = [0x66, 0x0F, 0x38, 0x25, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[1] = [0x0000_0007_FFFF_FFFE, 0xDEAD_BEEF_DEAD_BEEF];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.xmm[0], [(-2i64) as u64, 7]);
+}
+
+#[test]
+fn test_ptest_sets_zf_and_cf() {
+    // ptest xmm0, xmm1 ; ret  ->  66 0F 38 17 C1  C3
+    let bytes = [0x66, 0x0F, 0x38, 0x17, 0xC1, 0xC3];
+    let cases = [
+        // (dst, src, zf, cf)
+        ([0u64; 2], [0u64; 2], 1, 1),
+        ([0xFF, 0], [0x0F, 0], 0, 1),
+        ([0xFF, 0], [0x0F00, 0], 1, 0),
+        ([0xFF, 0], [0x0FF0, 0], 0, 0),
+        ([0, 0xFF], [0, 0x0F], 0, 1),
+    ];
+    for (dst, src, zf, cf) in cases {
+        let mut ctx = RegisterContext::default();
+        ctx.xmm[0] = dst;
+        ctx.xmm[1] = src;
+        // Seed the flags PTEST must clear.
+        ctx.sf = 1;
+        ctx.of = 1;
+        ctx.pf = 1;
+        ctx.af = 1;
+        let ctx = run_test(&bytes, ctx);
+        assert_eq!(ctx.zf, zf, "ZF for {dst:#x?} & {src:#x?}");
+        assert_eq!(ctx.cf, cf, "CF for {dst:#x?} & ~{src:#x?}");
+        assert_eq!((ctx.sf, ctx.of, ctx.pf, ctx.af), (0, 0, 0, 0), "cleared");
+        assert_eq!(ctx.xmm[0], dst, "ptest must not write its operand");
+    }
+}
+
+#[test]
+fn test_lane_extract_to_gpr() {
+    // pextrw eax, xmm1, 5 ; ret  ->  66 0F C5 C1 05  C3
+    let bytes = [0x66, 0x0F, 0xC5, 0xC1, 0x05, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.rax = 0xDEAD_BEEF_DEAD_BEEF;
+    ctx.xmm[1] = [0x1111_2222_3333_4444, 0x5555_6666_7777_8888];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.rax, 0x7777, "zero-extends into the full GPR");
+
+    // pextrq rcx, xmm0, 1 ; ret  ->  66 48 0F 3A 16 C1 01  C3
+    // (the SSE4.1 extract forms put the GPR destination in the r/m field)
+    let bytes = [0x66, 0x48, 0x0F, 0x3A, 0x16, 0xC1, 0x01, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [0x1111_2222_3333_4444, 0x5555_6666_7777_8888];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.rcx, 0x5555_6666_7777_8888);
+}
+
+#[test]
+fn test_pblendvb_uses_xmm0_mask() {
+    // pblendvb xmm2, xmm1 ; ret  ->  66 0F 38 10 D1  C3   (mask is xmm0)
+    let bytes = [0x66, 0x0F, 0x38, 0x10, 0xD1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [0x8000_0080_0000_0080, 0x0000_0000_0000_0000];
+    ctx.xmm[1] = [0xAAAA_AAAA_AAAA_AAAA, 0xAAAA_AAAA_AAAA_AAAA];
+    ctx.xmm[2] = [0x1111_1111_1111_1111, 0x2222_2222_2222_2222];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.xmm[2][0], 0xAA11_11AA_1111_11AA);
+    assert_eq!(ctx.xmm[2][1], 0x2222_2222_2222_2222, "zero mask keeps dst");
+}
+
+/// The scalar lo/hi and native-vector XMM representations must agree on every
+/// new op - the lane plumbing is shared, but the reads and writes are not.
+#[test]
+fn test_new_packed_ops_match_in_vector_mode() {
+    let progs: &[(&str, &[u8])] = &[
+        ("pshufb", &[0x66, 0x0F, 0x38, 0x00, 0xC1, 0xC3]),
+        ("phaddw", &[0x66, 0x0F, 0x38, 0x01, 0xC1, 0xC3]),
+        ("phsubd", &[0x66, 0x0F, 0x38, 0x06, 0xC1, 0xC3]),
+        ("psignb", &[0x66, 0x0F, 0x38, 0x08, 0xC1, 0xC3]),
+        ("pmulhrsw", &[0x66, 0x0F, 0x38, 0x0B, 0xC1, 0xC3]),
+        ("pabsw", &[0x66, 0x0F, 0x38, 0x1D, 0xC1, 0xC3]),
+        ("pmaddubsw", &[0x66, 0x0F, 0x38, 0x04, 0xC1, 0xC3]),
+        ("pmuludq", &[0x66, 0x0F, 0xF4, 0xC1, 0xC3]),
+        ("pmuldq", &[0x66, 0x0F, 0x38, 0x28, 0xC1, 0xC3]),
+        ("pmulld", &[0x66, 0x0F, 0x38, 0x40, 0xC1, 0xC3]),
+        ("pmaddwd", &[0x66, 0x0F, 0xF5, 0xC1, 0xC3]),
+        ("psadbw", &[0x66, 0x0F, 0xF6, 0xC1, 0xC3]),
+        ("packsswb", &[0x66, 0x0F, 0x63, 0xC1, 0xC3]),
+        ("packusdw", &[0x66, 0x0F, 0x38, 0x2B, 0xC1, 0xC3]),
+        ("pmovzxbw", &[0x66, 0x0F, 0x38, 0x30, 0xC1, 0xC3]),
+        ("pmovsxwq", &[0x66, 0x0F, 0x38, 0x24, 0xC1, 0xC3]),
+        ("pminsb", &[0x66, 0x0F, 0x38, 0x38, 0xC1, 0xC3]),
+        ("pmaxud", &[0x66, 0x0F, 0x38, 0x3F, 0xC1, 0xC3]),
+        ("palignr", &[0x66, 0x0F, 0x3A, 0x0F, 0xC1, 0x05, 0xC3]),
+        ("pblendw", &[0x66, 0x0F, 0x3A, 0x0E, 0xC1, 0x5A, 0xC3]),
+        ("pblendvb", &[0x66, 0x0F, 0x38, 0x10, 0xD1, 0xC3]),
+        ("pinsrd", &[0x66, 0x0F, 0x3A, 0x22, 0xC1, 0x02, 0xC3]),
+        ("pextrb", &[0x66, 0x0F, 0x3A, 0x14, 0xC1, 0x0B, 0xC3]),
+        ("ptest", &[0x66, 0x0F, 0x38, 0x17, 0xC1, 0xC3]),
+    ];
+    for (name, bytes) in progs {
+        let mut ctx = RegisterContext::default();
+        ctx.rcx = 0x1234_5678_9ABC_DEF0;
+        ctx.xmm[0] = [0x8F0E_0D0C_0B0A_0908, 0x0706_0504_0302_0100];
+        ctx.xmm[1] = [0xDEAD_BEEF_CAFE_BABE, 0x1122_3344_5566_7788];
+        ctx.xmm[2] = [0x1111_1111_1111_1111, 0x2222_2222_2222_2222];
+        let scalar = run_test(bytes, ctx);
+
+        let mut ctx = RegisterContext::default();
+        ctx.rcx = 0x1234_5678_9ABC_DEF0;
+        ctx.xmm[0] = [0x8F0E_0D0C_0B0A_0908, 0x0706_0504_0302_0100];
+        ctx.xmm[1] = [0xDEAD_BEEF_CAFE_BABE, 0x1122_3344_5566_7788];
+        ctx.xmm[2] = [0x1111_1111_1111_1111, 0x2222_2222_2222_2222];
+        let vector = run_test_vec(bytes, ctx);
+
+        assert_eq!(scalar.xmm, vector.xmm, "{name}: xmm differs across modes");
+        assert_eq!(
+            (scalar.rax, scalar.rcx),
+            (vector.rax, vector.rcx),
+            "{name}: GPR result differs across modes"
+        );
+        assert_eq!(
+            (scalar.zf, scalar.cf),
+            (vector.zf, vector.cf),
+            "{name}: flags differ across modes"
+        );
+    }
+}
+
+/// The MMX encodings of the SSE integer opcodes (same mnemonic, no 0x66
+/// prefix) operate on `MM0..MM7`, which this frontend does not model. They must
+/// exit to the host as unimplemented - a resumable, shimmable exit - rather
+/// than failing the lift of the whole region.
+#[test]
+fn test_mmx_encodings_exit_to_host() {
+    // pshufb mm0, mm1 ; ret  ->  0F 38 00 C1  C3
+    let out = LiftTest::new(&[0x0F, 0x38, 0x00, 0xC1, 0xC3])
+        .try_run()
+        .expect("mmx forms must lift, not error");
+    assert_eq!(out.exit, ExitReason::UnimplementedInstruction);
+
+    // pmuludq mm0, mm1 ; ret  ->  0F F4 C1  C3
+    let out = LiftTest::new(&[0x0F, 0xF4, 0xC1, 0xC3])
+        .try_run()
+        .expect("mmx forms must lift, not error");
+    assert_eq!(out.exit, ExitReason::UnimplementedInstruction);
+}
