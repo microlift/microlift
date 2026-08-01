@@ -824,3 +824,49 @@ fn packed_compare_and_shuffle_agree() {
         assert!(diff.is_empty(), "{name} diverged: {diff:?}");
     }
 }
+
+/// PINSRW against hardware: every word selector (including the imm8 bits above
+/// `[2:0]` that hardware ignores), for both the GPR and the m16 source form.
+#[test]
+fn pinsrw_agrees() {
+    for imm in 0..16u8 {
+        // pinsrw xmm0, ecx, imm8 ; ret
+        let code = [0x66, 0x0F, 0xC4, 0xC1, imm, 0xC3];
+        let mut init = CpuState::zeroed();
+        init.xmm[0] = [0x1111_2222_3333_4444, 0x5555_6666_7777_8888];
+        init.gpr[gpr::RCX] = 0xDEAD_BEEF_0000_ABCD;
+        let diff = differential_unicorn(&code, CODE_VA, &init, &[], BUDGET, DiffOptions::default())
+            .expect("clean halt");
+        assert!(diff.is_empty(), "pinsrw reg imm={imm} diverged: {diff:?}");
+    }
+}
+
+/// The `PINSRW xmm, m16, imm8` form, which needs an identity-mapped source
+/// word both engines can read. Skipped if the fixed mapping is unavailable.
+#[cfg(unix)]
+#[test]
+fn pinsrw_mem_agrees() {
+    const ARENA_VA: u64 = 0x3_5000_0000;
+
+    let Some(mut arena) = IdentityArena::map(ARENA_VA, 0x1000) else {
+        eprintln!("identity arena unavailable at {ARENA_VA:#x}; skipping");
+        return;
+    };
+    arena.write_at(0, &0xBEEFu16.to_le_bytes());
+    let seed = [MemImage {
+        base: ARENA_VA,
+        bytes: 0xBEEFu16.to_le_bytes().to_vec(),
+    }];
+
+    for imm in 0..8u8 {
+        // pinsrw xmm0, word ptr [rax], imm8 ; ret
+        let code = [0x66, 0x0F, 0xC4, 0x00, imm, 0xC3];
+        let mut init = CpuState::zeroed();
+        init.xmm[0] = [0x1111_2222_3333_4444, 0x5555_6666_7777_8888];
+        init.gpr[gpr::RAX] = ARENA_VA;
+        let diff =
+            differential_unicorn(&code, CODE_VA, &init, &seed, BUDGET, DiffOptions::default())
+                .expect("clean halt");
+        assert!(diff.is_empty(), "pinsrw mem imm={imm} diverged: {diff:?}");
+    }
+}

@@ -198,6 +198,7 @@ impl<'a> Lifter<'a> {
             }
             Mnemonic::Shufps => self.handle_shufps(instruction),
             Mnemonic::Shufpd => self.handle_shufpd(instruction),
+            Mnemonic::Pinsrw => self.handle_pinsrw(instruction),
             Mnemonic::Pshuflw => self.handle_pshuflhw(instruction, false),
             Mnemonic::Pshufhw => self.handle_pshuflhw(instruction, true),
             Mnemonic::Rcpps => self.handle_rcpps(instruction, false),

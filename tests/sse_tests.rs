@@ -3341,6 +3341,62 @@ fn test_pshuflw_and_pshufhw() {
     assert_eq!(ctx.xmm[0][1], 0x0001_0002_0003_0004);
 }
 
+//  PINSRW
+
+#[test]
+fn test_pinsrw_reg_all_lanes() {
+    for lane in 0..8u8 {
+        // pinsrw xmm0, ecx, imm8; ret  ->  66 0F C4 C1 ib  C3
+        let bytes = [0x66, 0x0F, 0xC4, 0xC1, lane, 0xC3];
+        let mut ctx = RegisterContext::default();
+        ctx.xmm[0] = [0x1111_2222_3333_4444, 0x5555_6666_7777_8888];
+        // Only the low 16 bits of the GPR are used.
+        ctx.rcx = 0xDEAD_BEEF_0000_ABCD;
+        let ctx = run_test(&bytes, ctx);
+
+        let mut want = [0x1111_2222_3333_4444u64, 0x5555_6666_7777_8888];
+        let half = usize::from(lane) / 4;
+        let shift = (u32::from(lane) % 4) * 16;
+        want[half] = (want[half] & !(0xFFFFu64 << shift)) | (0xABCDu64 << shift);
+        assert_eq!(ctx.xmm[0], want, "pinsrw lane {lane}");
+    }
+}
+
+#[test]
+fn test_pinsrw_imm_selector_masks_to_three_bits() {
+    // pinsrw xmm0, ecx, 0x0A; ret - imm8 bits above [2:0] are ignored, so
+    // 0x0A selects word 2.
+    let bytes = [0x66, 0x0F, 0xC4, 0xC1, 0x0A, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [0x1111_2222_3333_4444, 0x5555_6666_7777_8888];
+    ctx.rcx = 0xABCD;
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.xmm[0], [0x1111_ABCD_3333_4444, 0x5555_6666_7777_8888]);
+}
+
+#[test]
+fn test_pinsrw_from_mem() {
+    // pinsrw xmm0, word ptr [rax], 5; ret  ->  66 0F C4 00 05  C3
+    let bytes = [0x66, 0x0F, 0xC4, 0x00, 0x05, 0xC3];
+    let mem: u16 = 0xBEEF;
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [0x1111_2222_3333_4444, 0x5555_6666_7777_8888];
+    ctx.rax = &mem as *const u16 as u64;
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.xmm[0], [0x1111_2222_3333_4444, 0x5555_6666_BEEF_8888]);
+}
+
+#[test]
+fn test_pinsrw_vector_mode() {
+    // Same as the register form above, but with native I64X2 XMM vars.
+    let bytes = [0x66, 0x0F, 0xC4, 0xC1, 0x07, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [0x1111_2222_3333_4444, 0x5555_6666_7777_8888];
+    ctx.rcx = 0xABCD;
+    let ctx = run_test_vec(&bytes, ctx);
+    assert_eq!(ctx.xmm[0], [0x1111_2222_3333_4444, 0xABCD_6666_7777_8888]);
+}
+
 //  RCPPS / RSQRTPS / RCPSS / RSQRTSS - approximate, so compared with a
 //  tolerance well inside the architectural 1.5 * 2^-12 relative error bound.
 

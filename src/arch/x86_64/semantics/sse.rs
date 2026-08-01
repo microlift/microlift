@@ -2765,6 +2765,65 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
+    /// PINSRW - insert a 16-bit value into one word lane of an XMM register.
+    ///
+    /// `PINSRW xmm, r32/m16, imm8`: `imm8[2:0]` selects the destination word;
+    /// the source contributes its low 16 bits (a GPR source ignores the upper
+    /// bits, a memory source is a plain 16-bit load). Every other word of the
+    /// destination is preserved.
+    pub(super) fn handle_pinsrw(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, "pinsrw")?;
+
+        let word = match self.operand_kind(instruction, 1) {
+            OpKind::Register => {
+                let src = self.operand_register(instruction, 1);
+                let val = self.get_reg_val(src)?;
+                let val64 = if self.builder.func.dfg.value_type(val) == types::I64 {
+                    val
+                } else {
+                    self.builder.ins().uextend(types::I64, val)
+                };
+                self.builder.ins().band_imm(val64, 0xFFFF)
+            }
+            OpKind::Memory => {
+                let ptr = self.get_mem_ptr(instruction, 1)?;
+                self.builder
+                    .ins()
+                    .uload16(types::I64, MemFlagsData::new(), ptr, 0)
+            }
+            other => {
+                return Err(MicroliftError::UnsupportedInstruction {
+                    mnemonic: format!("pinsrw-src-{:?}", other),
+                });
+            }
+        };
+
+        // imm8[2:0] picks one of the eight words; the low four live in `lo`.
+        let sel = i64::from(instruction.immediate8() & 0b111);
+        let high_half = sel >= 4;
+        let shift = (sel % 4) * 16;
+
+        let half = if high_half {
+            self.get_xmm_hi(dst_idx)
+        } else {
+            self.get_xmm_lo(dst_idx)
+        };
+        let cleared = self.builder.ins().band_imm(half, !(0xFFFF_i64 << shift));
+        let placed = if shift == 0 {
+            word
+        } else {
+            self.builder.ins().ishl_imm(word, shift)
+        };
+        let merged = self.builder.ins().bor(cleared, placed);
+
+        if high_half {
+            self.set_xmm_hi(dst_idx, merged);
+        } else {
+            self.set_xmm_lo(dst_idx, merged);
+        }
+        Ok(())
+    }
+
     /// The lane operation of `RCP*` / `RSQRT*`, applied to the *source* lane
     /// (`y`) - these are unary instructions expressed through the shared binary
     /// lane plumbing, so the destination lane `x` is ignored.
