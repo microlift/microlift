@@ -238,3 +238,421 @@ fn packed_int_add_sub_agrees() {
         }
     }
 }
+
+/// PCMPEQ/PCMPGT, PMIN/PMAX, PAVG and the PMUL forms against hardware.
+///
+/// The compares in particular are worth pinning down: they produce all-ones
+/// lane masks, so any lane-boundary slip in the scalar expansion shows up as a
+/// glaringly wrong result rather than an off-by-one.
+#[test]
+fn packed_lane_ops_agree() {
+    // <op> xmm0, xmm1 ; ret   (all `66 0F <op> C1`)
+    let ops: &[(&str, u8)] = &[
+        ("pcmpeqb", 0x74),
+        ("pcmpeqw", 0x75),
+        ("pcmpeqd", 0x76),
+        ("pcmpgtb", 0x64),
+        ("pcmpgtw", 0x65),
+        ("pcmpgtd", 0x66),
+        ("pminub", 0xDA),
+        ("pmaxub", 0xDE),
+        ("pminsw", 0xEA),
+        ("pmaxsw", 0xEE),
+        ("pavgb", 0xE0),
+        ("pavgw", 0xE3),
+        ("pmullw", 0xD5),
+        ("pmulhw", 0xE5),
+        ("pmulhuw", 0xE4),
+    ];
+    for (name, opcode) in ops {
+        for &(dst, src) in PACKED_OPERANDS {
+            let code = [0x66, 0x0F, *opcode, 0xC1, 0xC3];
+            let mut init = CpuState::zeroed();
+            init.xmm[0] = dst;
+            init.xmm[1] = src;
+            let diff =
+                differential_unicorn(&code, CODE_VA, &init, &[], BUDGET, DiffOptions::default())
+                    .expect("clean halt");
+            assert!(
+                diff.is_empty(),
+                "{name} {dst:#018x?},{src:#018x?} diverged: {diff:?}"
+            );
+        }
+    }
+}
+
+/// PCMPEQQ / PCMPGTQ - the SSE4 quadword compares (three-byte opcodes).
+#[test]
+fn packed_qword_compares_agree() {
+    for (name, opcode) in [("pcmpeqq", 0x29u8), ("pcmpgtq", 0x37)] {
+        for &(dst, src) in PACKED_OPERANDS {
+            let code = [0x66, 0x0F, 0x38, opcode, 0xC1, 0xC3];
+            let mut init = CpuState::zeroed();
+            init.xmm[0] = dst;
+            init.xmm[1] = src;
+            let diff =
+                differential_unicorn(&code, CODE_VA, &init, &[], BUDGET, DiffOptions::default())
+                    .expect("clean halt");
+            assert!(
+                diff.is_empty(),
+                "{name} {dst:#018x?},{src:#018x?} diverged: {diff:?}"
+            );
+        }
+    }
+}
+
+/// The full PUNPCK{L,H}{BW,WD,DQ,QDQ} family - pure lane permutation, so any
+/// mis-ordered interleave is caught exactly.
+#[test]
+fn packed_unpack_agrees() {
+    let ops: &[(&str, u8)] = &[
+        ("punpcklbw", 0x60),
+        ("punpcklwd", 0x61),
+        ("punpckldq", 0x62),
+        ("punpcklqdq", 0x6C),
+        ("punpckhbw", 0x68),
+        ("punpckhwd", 0x69),
+        ("punpckhdq", 0x6A),
+        ("punpckhqdq", 0x6D),
+    ];
+    for (name, opcode) in ops {
+        for &(dst, src) in PACKED_OPERANDS {
+            let code = [0x66, 0x0F, *opcode, 0xC1, 0xC3];
+            let mut init = CpuState::zeroed();
+            init.xmm[0] = dst;
+            init.xmm[1] = src;
+            let diff =
+                differential_unicorn(&code, CODE_VA, &init, &[], BUDGET, DiffOptions::default())
+                    .expect("clean halt");
+            assert!(
+                diff.is_empty(),
+                "{name} {dst:#018x?},{src:#018x?} diverged: {diff:?}"
+            );
+        }
+    }
+}
+
+/// PMOVMSKB / MOVMSKPS / MOVMSKPD - sign-bit gathering into a GPR.
+#[test]
+fn sign_mask_extraction_agrees() {
+    // pmovmskb eax, xmm0 / movmskps eax, xmm0 / movmskpd eax, xmm0
+    let ops: &[(&str, &[u8])] = &[
+        ("pmovmskb", &[0x66, 0x0F, 0xD7, 0xC0, 0xC3]),
+        ("movmskps", &[0x0F, 0x50, 0xC0, 0xC3]),
+        ("movmskpd", &[0x66, 0x0F, 0x50, 0xC0, 0xC3]),
+    ];
+    for (name, code) in ops {
+        for &(dst, _) in PACKED_OPERANDS {
+            let mut init = CpuState::zeroed();
+            init.xmm[0] = dst;
+            // Seed a dirty destination so a failure to zero the upper bits shows.
+            init.gpr[gpr::RAX] = 0xDEAD_BEEF_DEAD_BEEF;
+            let diff =
+                differential_unicorn(code, CODE_VA, &init, &[], BUDGET, DiffOptions::default())
+                    .expect("clean halt");
+            assert!(diff.is_empty(), "{name} {dst:#018x?} diverged: {diff:?}");
+        }
+    }
+}
+
+/// PSLLDQ / PSRLDQ across every interesting byte count: within a half, exactly
+/// at the half boundary, across it, and past the end of the register.
+#[test]
+fn byte_shift_dq_agrees() {
+    for count in [0u8, 1, 3, 7, 8, 9, 15, 16, 31, 255] {
+        // pslldq xmm0, imm8 -> 66 0F 73 F8 ib ; psrldq -> 66 0F 73 D8 ib
+        for (name, modrm) in [("pslldq", 0xF8u8), ("psrldq", 0xD8)] {
+            let code = [0x66, 0x0F, 0x73, modrm, count, 0xC3];
+            for &(dst, _) in PACKED_OPERANDS {
+                let mut init = CpuState::zeroed();
+                init.xmm[0] = dst;
+                let diff = differential_unicorn(
+                    &code,
+                    CODE_VA,
+                    &init,
+                    &[],
+                    BUDGET,
+                    DiffOptions::default(),
+                )
+                .expect("clean halt");
+                assert!(
+                    diff.is_empty(),
+                    "{name} {dst:#018x?}, {count} diverged: {diff:?}"
+                );
+            }
+        }
+    }
+}
+
+/// The newly added floating-point arithmetic, including the MIN/MAX forms whose
+/// NaN and signed-zero behaviour is deliberately *not* IEEE.
+#[test]
+fn sse_float_arith_agrees() {
+    let ops: &[(&str, &[u8])] = &[
+        ("subsd", &[0xF2, 0x0F, 0x5C, 0xC1, 0xC3]),
+        ("mulpd", &[0x66, 0x0F, 0x59, 0xC1, 0xC3]),
+        ("divpd", &[0x66, 0x0F, 0x5E, 0xC1, 0xC3]),
+        ("addps", &[0x0F, 0x58, 0xC1, 0xC3]),
+        ("subps", &[0x0F, 0x5C, 0xC1, 0xC3]),
+        ("divps", &[0x0F, 0x5E, 0xC1, 0xC3]),
+        ("sqrtsd", &[0xF2, 0x0F, 0x51, 0xC1, 0xC3]),
+        ("sqrtss", &[0xF3, 0x0F, 0x51, 0xC1, 0xC3]),
+        ("sqrtps", &[0x0F, 0x51, 0xC1, 0xC3]),
+        ("sqrtpd", &[0x66, 0x0F, 0x51, 0xC1, 0xC3]),
+        ("minss", &[0xF3, 0x0F, 0x5D, 0xC1, 0xC3]),
+        ("maxss", &[0xF3, 0x0F, 0x5F, 0xC1, 0xC3]),
+        ("minsd", &[0xF2, 0x0F, 0x5D, 0xC1, 0xC3]),
+        ("maxsd", &[0xF2, 0x0F, 0x5F, 0xC1, 0xC3]),
+        ("minps", &[0x0F, 0x5D, 0xC1, 0xC3]),
+        ("maxps", &[0x0F, 0x5F, 0xC1, 0xC3]),
+        ("minpd", &[0x66, 0x0F, 0x5D, 0xC1, 0xC3]),
+        ("maxpd", &[0x66, 0x0F, 0x5F, 0xC1, 0xC3]),
+        ("cvtss2sd", &[0xF3, 0x0F, 0x5A, 0xC1, 0xC3]),
+        ("cvtsd2ss", &[0xF2, 0x0F, 0x5A, 0xC1, 0xC3]),
+    ];
+    for (name, code) in ops {
+        for &(dst, src) in FLOAT_OPERANDS {
+            let mut init = CpuState::zeroed();
+            init.xmm[0] = dst;
+            init.xmm[1] = src;
+            let diff =
+                differential_unicorn(code, CODE_VA, &init, &[], BUDGET, DiffOptions::default())
+                    .expect("clean halt");
+            assert!(
+                diff.is_empty(),
+                "{name} {dst:#018x?},{src:#018x?} diverged: {diff:?}"
+            );
+        }
+    }
+}
+
+/// UCOMISS / COMISS - the flag-setting single-precision compares.
+#[test]
+fn ucomiss_agrees() {
+    for (name, code) in [
+        ("ucomiss", [0x0F, 0x2E, 0xC1, 0xC3]),
+        ("comiss", [0x0F, 0x2F, 0xC1, 0xC3]),
+    ] {
+        for &(dst, src) in FLOAT_OPERANDS {
+            let mut init = CpuState::zeroed();
+            init.xmm[0] = dst;
+            init.xmm[1] = src;
+            let diff =
+                differential_unicorn(&code, CODE_VA, &init, &[], BUDGET, DiffOptions::default())
+                    .expect("clean halt");
+            assert!(
+                diff.is_empty(),
+                "{name} {dst:#018x?},{src:#018x?} diverged: {diff:?}"
+            );
+        }
+    }
+}
+
+/// CVTSI2SD / CVTTSD2SI in both the 32- and 64-bit operand forms, including the
+/// NaN and out-of-range inputs that must yield the integer indefinite value.
+#[test]
+fn sse2_int_float_conversions_agree() {
+    let doubles: &[f64] = &[
+        0.0,
+        -0.0,
+        1.0,
+        -1.0,
+        12.75,
+        -12.75,
+        1e12,
+        -1e12,
+        1e30,
+        -1e30,
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        9223372036854775808.0,
+        -9223372036854775808.0,
+    ];
+    // cvttsd2si eax, xmm0 / cvttsd2si rax, xmm0
+    for (name, code) in [
+        ("cvttsd2si r32", &[0xF2, 0x0F, 0x2C, 0xC0, 0xC3][..]),
+        ("cvttsd2si r64", &[0xF2, 0x48, 0x0F, 0x2C, 0xC0, 0xC3][..]),
+    ] {
+        for &v in doubles {
+            let mut init = CpuState::zeroed();
+            init.xmm[0] = [v.to_bits(), 0];
+            init.gpr[gpr::RAX] = 0xDEAD_BEEF_DEAD_BEEF;
+            let diff =
+                differential_unicorn(code, CODE_VA, &init, &[], BUDGET, DiffOptions::default())
+                    .expect("clean halt");
+            assert!(diff.is_empty(), "{name} {v} diverged: {diff:?}");
+        }
+    }
+
+    // cvtsi2sd xmm0, eax / cvtsi2sd xmm0, rax
+    for (name, code) in [
+        ("cvtsi2sd r32", &[0xF2, 0x0F, 0x2A, 0xC0, 0xC3][..]),
+        ("cvtsi2sd r64", &[0xF2, 0x48, 0x0F, 0x2A, 0xC0, 0xC3][..]),
+    ] {
+        for v in [
+            0i64,
+            1,
+            -1,
+            12345,
+            -12345,
+            i32::MIN as i64,
+            i64::MIN,
+            i64::MAX,
+        ] {
+            let mut init = CpuState::zeroed();
+            init.gpr[gpr::RAX] = v as u64;
+            init.xmm[0] = [0xDEAD_BEEF_CAFE_BABE, 0x1234_5678_9ABC_DEF0];
+            let diff =
+                differential_unicorn(code, CODE_VA, &init, &[], BUDGET, DiffOptions::default())
+                    .expect("clean halt");
+            assert!(diff.is_empty(), "{name} {v} diverged: {diff:?}");
+        }
+    }
+}
+
+/// Bit patterns that stress lane boundaries, sign bits and saturation edges.
+const PACKED_OPERANDS: &[([u64; 2], [u64; 2])] = &[
+    ([0, 0], [0, 0]),
+    (
+        [0xFFFF_FFFF_FFFF_FFFF, 0xFFFF_FFFF_FFFF_FFFF],
+        [0x0101_0101_0101_0101, 0x0000_0000_0000_0001],
+    ),
+    (
+        [0x8080_8080_8080_8080, 0x7F7F_7F7F_7F7F_7F7F],
+        [0x8080_8080_8080_8080, 0x0101_0101_0101_0101],
+    ),
+    (
+        [0x8000_8000_8000_8000, 0x7FFF_7FFF_7FFF_7FFF],
+        [0xFFFF_0001_8000_7FFF, 0x0001_FFFF_8000_7FFF],
+    ),
+    (
+        [0x0000_0002_FFFF_FFFF, 0x8000_0000_7FFF_FFFF],
+        [0x0000_0003_0000_0001, 0x8000_0000_0000_0001],
+    ),
+    (
+        [0xDEAD_BEEF_CAFE_BABE, 0x1234_5678_9ABC_DEF0],
+        [0x1122_3344_5566_7788, 0xFEDC_BA98_7654_3210],
+    ),
+    (
+        [0x0706_0504_0302_0100, 0x0F0E_0D0C_0B0A_0908],
+        [0x1716_1514_1312_1110, 0x1F1E_1D1C_1B1A_1918],
+    ),
+];
+
+/// XMM seeds interpreted as floats, for the arithmetic differential.
+///
+/// Every *dword* of the **source** operand is a positive finite normal `f32`
+/// and the whole quadword is a positive finite normal `f64`, while the
+/// destination ranges freely over signed
+/// zeros, NaNs, infinities, negatives and denormals. That asymmetry is
+/// deliberate: it keeps every case free of an operation that *generates* a
+/// fresh default NaN (`0/0`, `inf-inf`, `0*inf`, `sqrt(-x)`).
+///
+/// Generated default NaNs are excluded because x86 and AArch64 disagree on
+/// their sign - x86's integer/floating indefinite is `0xFFF8_0000_0000_0000`,
+/// the AArch64 default NaN is `0x7FF8_0000_0000_0000` - and Microlift lowers
+/// these ops to Cranelift `fdiv`/`fsub`/`sqrt`, so the *host* FPU picks the
+/// sign. That divergence is pre-existing and general (untouched instructions
+/// such as `DIVSD` show it identically); it is not a property of the
+/// instructions added here. *Propagated* input NaNs keep their exact bits and
+/// are covered - the NaN destinations below flow through every op.
+const FLOAT_OPERANDS: &[([u64; 2], [u64; 2])] = &[
+    // 1.0 / 2.0 (f64) destinations against 2.0 / 1.0 sources
+    (
+        [0x3FF0_0000_0000_0000, 0x4000_0000_0000_0000],
+        [0x4000_0000_4000_0000, 0x3F80_0000_3F80_0000],
+    ),
+    // f32 lanes 1.5, 2.5, -3.0, 4.0 against 2.0, 2.0, 4.0, 8.0
+    (
+        [0x4020_0000_3FC0_0000, 0x4080_0000_C040_0000],
+        [0x4000_0000_4000_0000, 0x4100_0000_4080_0000],
+    ),
+    // signed zeros in the destination
+    (
+        [0x8000_0000_0000_0000, 0x0000_0000_0000_0000],
+        [0x3F80_0000_3F80_0000, 0x4049_0FDB_4049_0FDB],
+    ),
+    // QNaN destinations: the payload and sign must propagate unchanged
+    (
+        [0x7FF8_0000_0000_0000, 0xFFF8_0000_0000_0000],
+        [0x4000_0000_4000_0000, 0x3F80_0000_3F80_0000],
+    ),
+    // infinities and negatives in the destination
+    (
+        [0xFFF0_0000_0000_0000, 0x7FF0_0000_0000_0000],
+        [0x4049_0FDB_4049_0FDB, 0x4000_0000_4000_0000],
+    ),
+    // denormal and near-overflow magnitudes
+    (
+        [0x0000_0000_0000_0001, 0x7FEF_FFFF_FFFF_FFFF],
+        [0x4100_0000_4080_0000, 0x3FC0_0000_4020_0000],
+    ),
+];
+
+/// MIN/MAX and the compares against NaN- and zero-heavy operands.
+///
+/// These never generate a NaN - they only *select* an operand - so unlike
+/// [`FLOAT_OPERANDS`] they can put NaNs and zeros on both sides, which is
+/// exactly where x86's asymmetric "return the source unless the strict
+/// comparison holds" rule differs from an IEEE `minNum`/`maxNum`.
+const SELECT_OPERANDS: &[([u64; 2], [u64; 2])] = &[
+    // -0.0 vs +0.0, both orders
+    (
+        [0x8000_0000_0000_0000, 0x0000_0000_0000_0000],
+        [0x0000_0000_0000_0000, 0x8000_0000_0000_0000],
+    ),
+    // NaN destination against a finite source, and the reverse
+    (
+        [0x7FF8_0000_0000_0000, 0x3FF0_0000_0000_0000],
+        [0x3FF0_0000_0000_0000, 0xFFF8_0000_0000_0000],
+    ),
+    // NaN on both sides: the source must win
+    (
+        [0x7FF8_0000_DEAD_BEEF, 0xFFF8_0000_CAFE_BABE],
+        [0xFFF8_0000_1234_5678, 0x7FF8_0000_9ABC_DEF0],
+    ),
+    // ordinary ordered pairs, plus infinities
+    (
+        [0x3FF0_0000_0000_0000, 0xFFF0_0000_0000_0000],
+        [0x4000_0000_0000_0000, 0x7FF0_0000_0000_0000],
+    ),
+    (
+        [0x4020_0000_3FC0_0000, 0x4080_0000_C040_0000],
+        [0xBF80_0000_3F00_0000, 0x4100_0000_4000_0000],
+    ),
+];
+
+/// MINSS/MAXSS/MINPS/MAXPS/MINSD/MAXSD/MINPD/MAXPD over NaNs and signed zeros.
+///
+/// Split out from [`sse_float_arith_agrees`] so it can use the NaN-on-both-sides
+/// operands that a NaN-generating op could not.
+#[test]
+fn sse_minmax_selection_agrees() {
+    let ops: &[(&str, &[u8])] = &[
+        ("minss", &[0xF3, 0x0F, 0x5D, 0xC1, 0xC3]),
+        ("maxss", &[0xF3, 0x0F, 0x5F, 0xC1, 0xC3]),
+        ("minsd", &[0xF2, 0x0F, 0x5D, 0xC1, 0xC3]),
+        ("maxsd", &[0xF2, 0x0F, 0x5F, 0xC1, 0xC3]),
+        ("minps", &[0x0F, 0x5D, 0xC1, 0xC3]),
+        ("maxps", &[0x0F, 0x5F, 0xC1, 0xC3]),
+        ("minpd", &[0x66, 0x0F, 0x5D, 0xC1, 0xC3]),
+        ("maxpd", &[0x66, 0x0F, 0x5F, 0xC1, 0xC3]),
+        ("ucomiss", &[0x0F, 0x2E, 0xC1, 0xC3]),
+        ("ucomisd", &[0x66, 0x0F, 0x2E, 0xC1, 0xC3]),
+    ];
+    for (name, code) in ops {
+        for &(dst, src) in SELECT_OPERANDS {
+            let mut init = CpuState::zeroed();
+            init.xmm[0] = dst;
+            init.xmm[1] = src;
+            let diff =
+                differential_unicorn(code, CODE_VA, &init, &[], BUDGET, DiffOptions::default())
+                    .expect("clean halt");
+            assert!(
+                diff.is_empty(),
+                "{name} {dst:#018x?},{src:#018x?} diverged: {diff:?}"
+            );
+        }
+    }
+}

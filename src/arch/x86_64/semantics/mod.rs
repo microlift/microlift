@@ -19,7 +19,7 @@ pub mod unimplemented;
 
 use crate::MicroliftError;
 use crate::arch::x86_64::semantics::fpu::FpuOp;
-use crate::arch::x86_64::semantics::sse::{PackedShiftOp, PackedWidth};
+use crate::arch::x86_64::semantics::sse::{PackedLaneOp, PackedShiftOp, PackedWidth};
 use crate::lifter::Lifter;
 use iced_x86::{Instruction, Mnemonic, OpKind};
 
@@ -98,15 +98,52 @@ impl<'a> Lifter<'a> {
                 self.handle_packed_shift(instruction, PackedShiftOp::Sra, PackedWidth::Dword)
             }
             Mnemonic::Pshufd => self.handle_pshufd(instruction),
-            Mnemonic::Punpckldq => self.handle_punpckldq(instruction),
-            Mnemonic::Unpckhpd => self.handle_unpckhpd(instruction),
+            // SSE2 - whole-register byte shifts
+            Mnemonic::Pslldq => self.handle_byte_shift_dq(instruction, true),
+            Mnemonic::Psrldq => self.handle_byte_shift_dq(instruction, false),
+
+            // SSE / SSE2 - unpack / interleave. The `pd`/`ps` forms are exact
+            // aliases of the integer ones at the same lane width.
+            Mnemonic::Punpcklbw => {
+                self.handle_punpck(instruction, "punpcklbw", PackedWidth::Byte, false)
+            }
+            Mnemonic::Punpcklwd => {
+                self.handle_punpck(instruction, "punpcklwd", PackedWidth::Word, false)
+            }
+            Mnemonic::Punpckldq | Mnemonic::Unpcklps => {
+                self.handle_punpck(instruction, "punpckldq", PackedWidth::Dword, false)
+            }
+            Mnemonic::Punpcklqdq | Mnemonic::Unpcklpd => {
+                self.handle_punpck(instruction, "punpcklqdq", PackedWidth::Qword, false)
+            }
+            Mnemonic::Punpckhbw => {
+                self.handle_punpck(instruction, "punpckhbw", PackedWidth::Byte, true)
+            }
+            Mnemonic::Punpckhwd => {
+                self.handle_punpck(instruction, "punpckhwd", PackedWidth::Word, true)
+            }
+            Mnemonic::Punpckhdq | Mnemonic::Unpckhps => {
+                self.handle_punpck(instruction, "punpckhdq", PackedWidth::Dword, true)
+            }
+            Mnemonic::Punpckhqdq | Mnemonic::Unpckhpd => {
+                self.handle_punpck(instruction, "punpckhqdq", PackedWidth::Qword, true)
+            }
 
             // SSE2 - scalar / packed double-precision arithmetic
             Mnemonic::Addpd => self.handle_addpd(instruction),
             Mnemonic::Subpd => self.handle_subpd(instruction),
+            Mnemonic::Mulpd => self.handle_mulpd(instruction),
+            Mnemonic::Divpd => self.handle_divpd(instruction),
             Mnemonic::Addsd => self.handle_addsd(instruction),
+            Mnemonic::Subsd => self.handle_subsd(instruction),
             Mnemonic::Mulsd => self.handle_mulsd(instruction),
             Mnemonic::Divsd => self.handle_divsd(instruction),
+            Mnemonic::Sqrtsd => self.handle_sqrtsd(instruction),
+            Mnemonic::Sqrtpd => self.handle_sqrtpd(instruction),
+            Mnemonic::Minsd => self.handle_minmaxsd(instruction, true),
+            Mnemonic::Maxsd => self.handle_minmaxsd(instruction, false),
+            Mnemonic::Minpd => self.handle_minmaxpd(instruction, true),
+            Mnemonic::Maxpd => self.handle_minmaxpd(instruction, false),
             Mnemonic::Ucomisd | Mnemonic::Comisd => self.handle_ucomisd(instruction),
 
             // SSE - scalar / packed single-precision arithmetic
@@ -114,11 +151,25 @@ impl<'a> Lifter<'a> {
             Mnemonic::Subss => self.handle_subss(instruction),
             Mnemonic::Mulss => self.handle_mulss(instruction),
             Mnemonic::Divss => self.handle_divss(instruction),
+            Mnemonic::Sqrtss => self.handle_sqrtss(instruction),
+            Mnemonic::Addps => self.handle_addps(instruction),
+            Mnemonic::Subps => self.handle_subps(instruction),
             Mnemonic::Mulps => self.handle_mulps(instruction),
+            Mnemonic::Divps => self.handle_divps(instruction),
+            Mnemonic::Sqrtps => self.handle_sqrtps(instruction),
+            Mnemonic::Minss => self.handle_minmaxss(instruction, true),
+            Mnemonic::Maxss => self.handle_minmaxss(instruction, false),
+            Mnemonic::Minps => self.handle_minmaxps(instruction, true),
+            Mnemonic::Maxps => self.handle_minmaxps(instruction, false),
+            Mnemonic::Ucomiss | Mnemonic::Comiss => self.handle_ucomiss(instruction),
 
-            // SSE - integer <-> floating-point conversion
+            // SSE / SSE2 - integer <-> floating-point conversion
             Mnemonic::Cvtsi2ss => self.handle_cvtsi2ss(instruction),
             Mnemonic::Cvttss2si => self.handle_cvttss2si(instruction),
+            Mnemonic::Cvtsi2sd => self.handle_cvtsi2sd(instruction),
+            Mnemonic::Cvttsd2si => self.handle_cvttsd2si(instruction),
+            Mnemonic::Cvtss2sd => self.handle_cvtss2sd(instruction),
+            Mnemonic::Cvtsd2ss => self.handle_cvtsd2ss(instruction),
 
             // SSE / SSE2 - XMM logic
             Mnemonic::Xorps | Mnemonic::Xorpd => self.handle_xorps(instruction),
@@ -146,6 +197,119 @@ impl<'a> Lifter<'a> {
             Mnemonic::Psubsw => self.handle_psubs(instruction, PackedWidth::Word),
             Mnemonic::Psubusb => self.handle_psubus(instruction, PackedWidth::Byte),
             Mnemonic::Psubusw => self.handle_psubus(instruction, PackedWidth::Word),
+
+            // SSE2 - packed integer compare (all-ones / all-zeros lane masks)
+            Mnemonic::Pcmpeqb => self.handle_packed_lane_op(
+                instruction,
+                "pcmpeqb",
+                PackedLaneOp::CmpEq,
+                PackedWidth::Byte,
+            ),
+            Mnemonic::Pcmpeqw => self.handle_packed_lane_op(
+                instruction,
+                "pcmpeqw",
+                PackedLaneOp::CmpEq,
+                PackedWidth::Word,
+            ),
+            Mnemonic::Pcmpeqd => self.handle_packed_lane_op(
+                instruction,
+                "pcmpeqd",
+                PackedLaneOp::CmpEq,
+                PackedWidth::Dword,
+            ),
+            // PCMPEQQ / PCMPGTQ are SSE4.1 / SSE4.2, but are the same lane-wise
+            // op one width up.
+            Mnemonic::Pcmpeqq => self.handle_packed_lane_op(
+                instruction,
+                "pcmpeqq",
+                PackedLaneOp::CmpEq,
+                PackedWidth::Qword,
+            ),
+            Mnemonic::Pcmpgtb => self.handle_packed_lane_op(
+                instruction,
+                "pcmpgtb",
+                PackedLaneOp::CmpGt,
+                PackedWidth::Byte,
+            ),
+            Mnemonic::Pcmpgtw => self.handle_packed_lane_op(
+                instruction,
+                "pcmpgtw",
+                PackedLaneOp::CmpGt,
+                PackedWidth::Word,
+            ),
+            Mnemonic::Pcmpgtd => self.handle_packed_lane_op(
+                instruction,
+                "pcmpgtd",
+                PackedLaneOp::CmpGt,
+                PackedWidth::Dword,
+            ),
+            Mnemonic::Pcmpgtq => self.handle_packed_lane_op(
+                instruction,
+                "pcmpgtq",
+                PackedLaneOp::CmpGt,
+                PackedWidth::Qword,
+            ),
+
+            // SSE / SSE2 - packed integer min / max / average / multiply
+            Mnemonic::Pminub => self.handle_packed_lane_op(
+                instruction,
+                "pminub",
+                PackedLaneOp::MinU,
+                PackedWidth::Byte,
+            ),
+            Mnemonic::Pmaxub => self.handle_packed_lane_op(
+                instruction,
+                "pmaxub",
+                PackedLaneOp::MaxU,
+                PackedWidth::Byte,
+            ),
+            Mnemonic::Pminsw => self.handle_packed_lane_op(
+                instruction,
+                "pminsw",
+                PackedLaneOp::MinS,
+                PackedWidth::Word,
+            ),
+            Mnemonic::Pmaxsw => self.handle_packed_lane_op(
+                instruction,
+                "pmaxsw",
+                PackedLaneOp::MaxS,
+                PackedWidth::Word,
+            ),
+            Mnemonic::Pavgb => self.handle_packed_lane_op(
+                instruction,
+                "pavgb",
+                PackedLaneOp::Avg,
+                PackedWidth::Byte,
+            ),
+            Mnemonic::Pavgw => self.handle_packed_lane_op(
+                instruction,
+                "pavgw",
+                PackedLaneOp::Avg,
+                PackedWidth::Word,
+            ),
+            Mnemonic::Pmullw => self.handle_packed_lane_op(
+                instruction,
+                "pmullw",
+                PackedLaneOp::MulLow,
+                PackedWidth::Word,
+            ),
+            Mnemonic::Pmulhw => self.handle_packed_lane_op(
+                instruction,
+                "pmulhw",
+                PackedLaneOp::MulHighS,
+                PackedWidth::Word,
+            ),
+            Mnemonic::Pmulhuw => self.handle_packed_lane_op(
+                instruction,
+                "pmulhuw",
+                PackedLaneOp::MulHighU,
+                PackedWidth::Word,
+            ),
+
+            // SSE / SSE2 - sign-bit extraction into a GPR
+            Mnemonic::Pmovmskb => self.handle_movmsk(instruction, "pmovmskb", PackedWidth::Byte),
+            Mnemonic::Movmskps => self.handle_movmsk(instruction, "movmskps", PackedWidth::Dword),
+            Mnemonic::Movmskpd => self.handle_movmsk(instruction, "movmskpd", PackedWidth::Qword),
 
             // String Operations
             Mnemonic::Movsb => self.handle_movsb(instruction),

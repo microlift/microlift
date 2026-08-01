@@ -147,6 +147,52 @@ pub(super) enum PackedIntOp {
     SubSatUnsigned,
 }
 
+/// A lane-wise packed-integer operation whose lanes are independent and fit in
+/// a widened `I64` - compares, min/max, average and multiply.
+///
+/// These share one expansion ([`Lifter::lanewise_64`]) in scalar mode and, for
+/// most of them, a single native Cranelift vector op in vector mode.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub(super) enum PackedLaneOp {
+    /// `PCMPEQB`/`PCMPEQW`/`PCMPEQD`/`PCMPEQQ` - lanes equal -> all-ones mask.
+    CmpEq,
+    /// `PCMPGTB`/`PCMPGTW`/`PCMPGTD`/`PCMPGTQ` - signed greater-than -> all-ones.
+    CmpGt,
+    /// `PMINUB`/`PMINUW` - unsigned per-lane minimum.
+    MinU,
+    /// `PMINSB`/`PMINSW`/`PMINSD` - signed per-lane minimum.
+    MinS,
+    /// `PMAXUB`/`PMAXUW` - unsigned per-lane maximum.
+    MaxU,
+    /// `PMAXSB`/`PMAXSW`/`PMAXSD` - signed per-lane maximum.
+    MaxS,
+    /// `PAVGB`/`PAVGW` - unsigned rounded average, `(a + b + 1) >> 1`.
+    Avg,
+    /// `PMULLW` - low half of the per-lane product.
+    MulLow,
+    /// `PMULHW` - high half of the signed per-lane product.
+    MulHighS,
+    /// `PMULHUW` - high half of the unsigned per-lane product.
+    MulHighU,
+}
+
+impl PackedLaneOp {
+    /// True when lanes must be *sign*-extended as they are widened to `I64` for
+    /// the scalar expansion.
+    fn is_signed(self) -> bool {
+        matches!(
+            self,
+            PackedLaneOp::CmpGt | PackedLaneOp::MinS | PackedLaneOp::MaxS | PackedLaneOp::MulHighS
+        )
+    }
+
+    /// True when Cranelift has a single native vector instruction for this op,
+    /// so vector mode can take the fast path instead of expanding lanes.
+    fn has_vector_form(self) -> bool {
+        !matches!(self, PackedLaneOp::MulHighS | PackedLaneOp::MulHighU)
+    }
+}
+
 impl PackedIntOp {
     /// True for the two ops that interpret lanes as signed and clamp to
     /// `[-2^(n-1), 2^(n-1)-1]`.
@@ -1172,39 +1218,64 @@ impl<'a> Lifter<'a> {
         self.set_xmm_lo(idx, merged);
     }
 
-    /// PUNPCKLDQ - interleave the low doublewords of dst and src.
+    /// The whole `PUNPCK{L,H}{BW,WD,DQ,QDQ}` family, plus their floating-point
+    /// aliases `UNPCK{L,H}P{S,D}`.
     ///
-    /// The result's four dwords are `[dst.d0, src.d0, dst.d1, src.d1]`, so only
-    /// the low quadword of each operand participates.
-    pub(super) fn handle_punpckldq(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let dst_idx = self.xmm_operand_index(instruction, 0, "punpckldq")?;
-        let dst_lo = self.get_xmm_lo(dst_idx);
-        let (src_lo, _src_hi) = self.read_xmm_src(instruction, 1)?;
+    /// Every form interleaves `width`-wide lanes taken from one 64-bit half of
+    /// each operand: the *low* half for `PUNPCKL*`, the *high* half for
+    /// `PUNPCKH*`. Result lane `2i` comes from the destination, lane `2i+1` from
+    /// the source, so the selected half of each operand expands to fill all 128
+    /// bits of the destination.
+    ///
+    /// For example `PUNPCKLDQ` yields `[dst.d0, src.d0, dst.d1, src.d1]`.
+    pub(super) fn handle_punpck(
+        &mut self,
+        instruction: &Instruction,
+        who: &str,
+        width: PackedWidth,
+        high: bool,
+    ) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, who)?;
+        let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
+        let (a, b) = if high {
+            (self.get_xmm_hi(dst_idx), src_hi)
+        } else {
+            (self.get_xmm_lo(dst_idx), src_lo)
+        };
 
-        let dst_d0 = self.builder.ins().band_imm(dst_lo, 0xFFFF_FFFF);
-        let dst_d1 = self.builder.ins().ushr_imm(dst_lo, 32);
-        let src_d0 = self.builder.ins().band_imm(src_lo, 0xFFFF_FFFF);
-        let src_d1 = self.builder.ins().ushr_imm(src_lo, 32);
+        let lane_bits = width.bits();
+        if lane_bits == 64 {
+            // A single lane from each operand: no interleaving to do.
+            self.set_xmm_lo(dst_idx, a);
+            self.set_xmm_hi(dst_idx, b);
+            return Ok(());
+        }
 
-        let src_d0_hi = self.builder.ins().ishl_imm(src_d0, 32);
-        let res_lo = self.builder.ins().bor(dst_d0, src_d0_hi);
-        let src_d1_hi = self.builder.ins().ishl_imm(src_d1, 32);
-        let res_hi = self.builder.ins().bor(dst_d1, src_d1_hi);
+        // `n` lanes per source half expand into `2n` result lanes, i.e. exactly
+        // the two 64-bit halves of the destination.
+        let n = 64 / lane_bits;
+        let mut acc = [
+            self.builder.ins().iconst(types::I64, 0),
+            self.builder.ins().iconst(types::I64, 0),
+        ];
+        for i in 0..n {
+            let shift = (i * lane_bits) as i64;
+            let x = self.extract_lane(a, shift, lane_bits, false);
+            let y = self.extract_lane(b, shift, lane_bits, false);
+            for (val, out) in [(x, 2 * i), (y, 2 * i + 1)] {
+                let half = (out / n) as usize;
+                let pos = ((out % n) * lane_bits) as i64;
+                let placed = if pos == 0 {
+                    val
+                } else {
+                    self.builder.ins().ishl_imm(val, pos)
+                };
+                acc[half] = self.builder.ins().bor(acc[half], placed);
+            }
+        }
 
-        self.set_xmm_lo(dst_idx, res_lo);
-        self.set_xmm_hi(dst_idx, res_hi);
-        Ok(())
-    }
-
-    /// UNPCKHPD - unpack and interleave the high 64-bit lanes:
-    /// `dst[63:0] = dst[127:64]`, `dst[127:64] = src[127:64]`.
-    pub(super) fn handle_unpckhpd(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let dst_idx = self.xmm_operand_index(instruction, 0, "unpckhpd")?;
-        let dst_hi = self.get_xmm_hi(dst_idx);
-        let (_src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
-
-        self.set_xmm_lo(dst_idx, dst_hi);
-        self.set_xmm_hi(dst_idx, src_hi);
+        self.set_xmm_lo(dst_idx, acc[0]);
+        self.set_xmm_hi(dst_idx, acc[1]);
         Ok(())
     }
 
@@ -1429,40 +1500,7 @@ impl<'a> Lifter<'a> {
     /// Bits [127:32] of the destination are preserved.
     pub(super) fn handle_cvtsi2ss(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let dst_idx = self.xmm_operand_index(instruction, 0, "cvtsi2ss")?;
-
-        let src = match self.operand_kind(instruction, 1) {
-            OpKind::Register => {
-                let reg = self.operand_register(instruction, 1);
-                self.get_reg_val(reg)?
-            }
-            OpKind::Memory => {
-                let size = instruction.memory_size().size();
-                let ty = match size {
-                    4 => types::I32,
-                    8 => types::I64,
-                    other => {
-                        return Err(MicroliftError::UnsupportedInstruction {
-                            mnemonic: format!("cvtsi2ss-mem-size-{}", other),
-                        });
-                    }
-                };
-                let ptr = self.get_mem_ptr(instruction, 1)?;
-                self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0)
-            }
-            other => {
-                return Err(MicroliftError::UnsupportedInstruction {
-                    mnemonic: format!("cvtsi2ss-src-{:?}", other),
-                });
-            }
-        };
-
-        let src_ty = self.builder.func.dfg.value_type(src);
-        if src_ty != types::I32 && src_ty != types::I64 {
-            return Err(MicroliftError::UnsupportedInstruction {
-                mnemonic: format!("cvtsi2ss-src-width-{}", src_ty.bits()),
-            });
-        }
-
+        let src = self.read_int32_or_64_src(instruction, 1, "cvtsi2ss")?;
         let f = self.builder.ins().fcvt_from_sint(types::F32, src);
         let bits32 = self
             .builder
@@ -1798,5 +1836,546 @@ impl<'a> Lifter<'a> {
         width: PackedWidth,
     ) -> crate::Result<()> {
         self.packed_int_arith(instruction, "psubus", PackedIntOp::SubSatUnsigned, width)
+    }
+
+    //  Lane-wise packed integer compare / min / max / average / multiply.
+
+    /// Shared implementation of every [`PackedLaneOp`] form.
+    ///
+    /// Vector mode maps most ops straight onto a native Cranelift vector
+    /// instruction; the high-multiply forms (which have no such instruction)
+    /// and scalar mode both fall back to the per-lane expansion in
+    /// [`Self::lanewise_64`].
+    pub(super) fn handle_packed_lane_op(
+        &mut self,
+        instruction: &Instruction,
+        who: &str,
+        op: PackedLaneOp,
+        width: PackedWidth,
+    ) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, who)?;
+
+        if self.config.use_vector_xmm && op.has_vector_form() {
+            let ty = width.vector_type();
+            let dst = self.get_xmm_vec(dst_idx);
+            let src = self.read_xmm_src_vec(instruction, 1)?;
+            let a = self.vec_bitcast(dst, ty);
+            let b = self.vec_bitcast(src, ty);
+            let r = match op {
+                PackedLaneOp::CmpEq => self.builder.ins().icmp(IntCC::Equal, a, b),
+                PackedLaneOp::CmpGt => self.builder.ins().icmp(IntCC::SignedGreaterThan, a, b),
+                PackedLaneOp::MinU => self.builder.ins().umin(a, b),
+                PackedLaneOp::MinS => self.builder.ins().smin(a, b),
+                PackedLaneOp::MaxU => self.builder.ins().umax(a, b),
+                PackedLaneOp::MaxS => self.builder.ins().smax(a, b),
+                PackedLaneOp::Avg => self.builder.ins().avg_round(a, b),
+                PackedLaneOp::MulLow => self.builder.ins().imul(a, b),
+                PackedLaneOp::MulHighS | PackedLaneOp::MulHighU => unreachable!(),
+            };
+            let r = self.vec_bitcast(r, types::I64X2);
+            self.set_xmm_vec(dst_idx, r);
+            return Ok(());
+        }
+
+        let dst_lo = self.get_xmm_lo(dst_idx);
+        let dst_hi = self.get_xmm_hi(dst_idx);
+        let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
+        let res_lo = self.lanewise_64(dst_lo, src_lo, op, width);
+        let res_hi = self.lanewise_64(dst_hi, src_hi, op, width);
+        self.set_xmm_lo(dst_idx, res_lo);
+        self.set_xmm_hi(dst_idx, res_hi);
+        Ok(())
+    }
+
+    /// Apply a [`PackedLaneOp`] to every lane of one 64-bit half, by widening
+    /// each lane to a full `I64`, operating there, and repacking.
+    fn lanewise_64(&mut self, a: Value, b: Value, op: PackedLaneOp, width: PackedWidth) -> Value {
+        let lane_bits = width.bits();
+        let lane_mask = width.lane_mask();
+        let signed = op.is_signed();
+
+        let mut acc = self.builder.ins().iconst(types::I64, 0);
+        for lane in 0..(64 / lane_bits) {
+            let shift = (lane * lane_bits) as i64;
+            let x = self.extract_lane(a, shift, lane_bits, signed);
+            let y = self.extract_lane(b, shift, lane_bits, signed);
+            let r = self.lane_op_64(x, y, op, lane_bits);
+            let lane_val = self.builder.ins().band_imm(r, lane_mask);
+            let placed = if shift == 0 {
+                lane_val
+            } else {
+                self.builder.ins().ishl_imm(lane_val, shift)
+            };
+            acc = self.builder.ins().bor(acc, placed);
+        }
+        acc
+    }
+
+    /// Apply a [`PackedLaneOp`] to a single pair of already-widened lanes.
+    ///
+    /// Only the low `lane_bits` of the result matter - the caller masks it back
+    /// into place - so the multiply forms need no overflow care beyond keeping
+    /// the (at most 64-bit) product exact, which holds for every lane width x86
+    /// defines these ops at.
+    fn lane_op_64(&mut self, x: Value, y: Value, op: PackedLaneOp, lane_bits: u32) -> Value {
+        match op {
+            PackedLaneOp::CmpEq | PackedLaneOp::CmpGt => {
+                let cc = if op == PackedLaneOp::CmpEq {
+                    IntCC::Equal
+                } else {
+                    IntCC::SignedGreaterThan
+                };
+                let c = self.builder.ins().icmp(cc, x, y);
+                let ones = self.builder.ins().iconst(types::I64, -1);
+                let zero = self.builder.ins().iconst(types::I64, 0);
+                self.builder.ins().select(c, ones, zero)
+            }
+            // Lanes are zero-extended for the unsigned forms and sign-extended
+            // for the signed ones, so a signed min/max on the widened values is
+            // correct in both cases - but use the matching op for clarity.
+            PackedLaneOp::MinU => self.builder.ins().umin(x, y),
+            PackedLaneOp::MinS => self.builder.ins().smin(x, y),
+            PackedLaneOp::MaxU => self.builder.ins().umax(x, y),
+            PackedLaneOp::MaxS => self.builder.ins().smax(x, y),
+            PackedLaneOp::Avg => {
+                let sum = self.builder.ins().iadd(x, y);
+                let rounded = self.builder.ins().iadd_imm(sum, 1);
+                self.builder.ins().ushr_imm(rounded, 1)
+            }
+            PackedLaneOp::MulLow => self.builder.ins().imul(x, y),
+            PackedLaneOp::MulHighS => {
+                let p = self.builder.ins().imul(x, y);
+                self.builder.ins().sshr_imm(p, lane_bits as i64)
+            }
+            PackedLaneOp::MulHighU => {
+                let p = self.builder.ins().imul(x, y);
+                self.builder.ins().ushr_imm(p, lane_bits as i64)
+            }
+        }
+    }
+
+    /// PMOVMSKB / MOVMSKPS / MOVMSKPD - gather the sign bit of every `width`
+    /// lane into the low bits of a GPR, zeroing the rest of the destination.
+    ///
+    /// The lane width is what distinguishes the three: byte lanes give the 16
+    /// bits of `PMOVMSKB`, dword lanes the 4 of `MOVMSKPS`, qword lanes the 2
+    /// of `MOVMSKPD`.
+    pub(super) fn handle_movmsk(
+        &mut self,
+        instruction: &Instruction,
+        who: &str,
+        width: PackedWidth,
+    ) -> crate::Result<()> {
+        let dst_reg = self.operand_register(instruction, 0);
+        let src_idx = self.xmm_operand_index(instruction, 1, who)?;
+        let halves = [self.get_xmm_lo(src_idx), self.get_xmm_hi(src_idx)];
+
+        let lane_bits = width.bits();
+        let per_half = 64 / lane_bits;
+        let mut acc = self.builder.ins().iconst(types::I64, 0);
+        for (half, v) in halves.into_iter().enumerate() {
+            for lane in 0..per_half {
+                let sign_bit = (lane * lane_bits + lane_bits - 1) as i64;
+                let out = half as u32 * per_half + lane;
+                let shifted = self.builder.ins().ushr_imm(v, sign_bit);
+                let bit = self.builder.ins().band_imm(shifted, 1);
+                let placed = if out == 0 {
+                    bit
+                } else {
+                    self.builder.ins().ishl_imm(bit, out as i64)
+                };
+                acc = self.builder.ins().bor(acc, placed);
+            }
+        }
+
+        // The 32-bit destination form zero-extends to the full GPR anyway, so
+        // both widths just write the same value at their own type.
+        if dst_reg.size() == 8 {
+            self.set_reg_val(dst_reg, acc)
+        } else {
+            let acc32 = self.builder.ins().ireduce(types::I32, acc);
+            self.set_reg_val(dst_reg, acc32)
+        }
+    }
+
+    /// PSLLDQ / PSRLDQ - shift the whole 128-bit register left/right by an
+    /// *byte* count, zero-filling. A count above 15 clears the register.
+    ///
+    /// Only the `imm8` form exists, so the count is a lift-time constant and
+    /// this compiles down to at most a couple of shifts and an OR.
+    pub(super) fn handle_byte_shift_dq(
+        &mut self,
+        instruction: &Instruction,
+        left: bool,
+    ) -> crate::Result<()> {
+        let who = if left { "pslldq" } else { "psrldq" };
+        let dst_idx = self.xmm_operand_index(instruction, 0, who)?;
+        let lo = self.get_xmm_lo(dst_idx);
+        let hi = self.get_xmm_hi(dst_idx);
+        let count = instruction.immediate8() as u32;
+
+        let (res_lo, res_hi) = if count > 15 {
+            let zero = self.builder.ins().iconst(types::I64, 0);
+            (zero, zero)
+        } else if count == 0 {
+            (lo, hi)
+        } else {
+            let bits = (count * 8) as i64;
+            match (left, bits < 64) {
+                (true, true) => {
+                    let hi_shifted = self.builder.ins().ishl_imm(hi, bits);
+                    let carry = self.builder.ins().ushr_imm(lo, 64 - bits);
+                    let new_hi = self.builder.ins().bor(hi_shifted, carry);
+                    (self.builder.ins().ishl_imm(lo, bits), new_hi)
+                }
+                (true, false) => {
+                    let zero = self.builder.ins().iconst(types::I64, 0);
+                    (zero, self.builder.ins().ishl_imm(lo, bits - 64))
+                }
+                (false, true) => {
+                    let lo_shifted = self.builder.ins().ushr_imm(lo, bits);
+                    let carry = self.builder.ins().ishl_imm(hi, 64 - bits);
+                    let new_lo = self.builder.ins().bor(lo_shifted, carry);
+                    (new_lo, self.builder.ins().ushr_imm(hi, bits))
+                }
+                (false, false) => {
+                    let zero = self.builder.ins().iconst(types::I64, 0);
+                    (self.builder.ins().ushr_imm(hi, bits - 64), zero)
+                }
+            }
+        };
+
+        self.set_xmm_lo(dst_idx, res_lo);
+        self.set_xmm_hi(dst_idx, res_hi);
+        Ok(())
+    }
+
+    //  Floating-point: the remaining scalar/packed arithmetic, MIN/MAX, SQRT,
+    //  the single-precision compare and the SSE2 conversions.
+
+    /// SUBSD - scalar double-precision subtract of the low 64 bits (`dst - src`);
+    /// the high 64 bits of the destination are preserved.
+    pub(super) fn handle_subsd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.scalar_double_arith(instruction, "subsd", |b, x, y| b.ins().fsub(x, y))
+    }
+
+    /// MULPD - packed double-precision multiply of both 64-bit lanes.
+    pub(super) fn handle_mulpd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.packed_double_arith(instruction, "mulpd", |b, x, y| b.ins().fmul(x, y))
+    }
+
+    /// DIVPD - packed double-precision divide of both 64-bit lanes.
+    pub(super) fn handle_divpd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.packed_double_arith(instruction, "divpd", |b, x, y| b.ins().fdiv(x, y))
+    }
+
+    /// ADDPS - packed single-precision add of all four 32-bit lanes.
+    pub(super) fn handle_addps(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.packed_single_arith(instruction, "addps", |b, x, y| b.ins().fadd(x, y))
+    }
+
+    /// SUBPS - packed single-precision subtract of all four 32-bit lanes.
+    pub(super) fn handle_subps(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.packed_single_arith(instruction, "subps", |b, x, y| b.ins().fsub(x, y))
+    }
+
+    /// DIVPS - packed single-precision divide of all four 32-bit lanes.
+    pub(super) fn handle_divps(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.packed_single_arith(instruction, "divps", |b, x, y| b.ins().fdiv(x, y))
+    }
+
+    /// MINSS / MINSD / MINPS / MINPD, MAXSS / MAXSD / MAXPS / MAXPD.
+    ///
+    /// x86's MIN/MAX are **not** IEEE `minNum`/`maxNum` and are not commutative:
+    /// the result is the destination operand only when the strict comparison
+    /// holds, and the *source* operand otherwise. That single rule covers all
+    /// three documented special cases at once - if either operand is a NaN the
+    /// comparison is false and the source is returned, and `min(+0.0, -0.0)`
+    /// likewise returns the source. So `select(dst < src, dst, src)` (and its
+    /// `>` mirror) is the exact semantics, which is why this cannot use
+    /// Cranelift's NaN-propagating `fmin`/`fmax`.
+    fn fp_min_max(min: bool) -> impl Fn(&mut FunctionBuilder<'a>, Value, Value) -> Value {
+        move |b, x, y| {
+            let cc = if min {
+                FloatCC::LessThan
+            } else {
+                FloatCC::GreaterThan
+            };
+            let c = b.ins().fcmp(cc, x, y);
+            b.ins().select(c, x, y)
+        }
+    }
+
+    /// MINSD / MAXSD - scalar double-precision minimum/maximum of the low 64
+    /// bits; the high 64 bits of the destination are preserved.
+    pub(super) fn handle_minmaxsd(
+        &mut self,
+        instruction: &Instruction,
+        min: bool,
+    ) -> crate::Result<()> {
+        let who = if min { "minsd" } else { "maxsd" };
+        self.scalar_double_arith(instruction, who, Self::fp_min_max(min))
+    }
+
+    /// MINPD / MAXPD - packed double-precision minimum/maximum of both lanes.
+    pub(super) fn handle_minmaxpd(
+        &mut self,
+        instruction: &Instruction,
+        min: bool,
+    ) -> crate::Result<()> {
+        let who = if min { "minpd" } else { "maxpd" };
+        self.packed_double_arith(instruction, who, Self::fp_min_max(min))
+    }
+
+    /// MINSS / MAXSS - scalar single-precision minimum/maximum of the low 32
+    /// bits; bits[127:32] of the destination are preserved.
+    pub(super) fn handle_minmaxss(
+        &mut self,
+        instruction: &Instruction,
+        min: bool,
+    ) -> crate::Result<()> {
+        let who = if min { "minss" } else { "maxss" };
+        self.scalar_single_arith(instruction, who, Self::fp_min_max(min))
+    }
+
+    /// MINPS / MAXPS - packed single-precision minimum/maximum of all four lanes.
+    pub(super) fn handle_minmaxps(
+        &mut self,
+        instruction: &Instruction,
+        min: bool,
+    ) -> crate::Result<()> {
+        let who = if min { "minps" } else { "maxps" };
+        self.packed_single_arith(instruction, who, Self::fp_min_max(min))
+    }
+
+    /// SQRTSD - scalar double-precision square root.
+    ///
+    /// Note the shape difference from the binary forms: the operand read is the
+    /// *source*, not the destination, and only the destination's low lane is
+    /// written (bits[127:64] are preserved).
+    pub(super) fn handle_sqrtsd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, "sqrtsd")?;
+        let src_bits = self.read_scalar_f64_bits(instruction, 1)?;
+        let x = self
+            .builder
+            .ins()
+            .bitcast(types::F64, MemFlagsData::new(), src_bits);
+        let r = self.builder.ins().sqrt(x);
+        let bits = self
+            .builder
+            .ins()
+            .bitcast(types::I64, MemFlagsData::new(), r);
+        self.set_xmm_lo(dst_idx, bits);
+        Ok(())
+    }
+
+    /// SQRTSS - scalar single-precision square root; bits[127:32] of the
+    /// destination are preserved.
+    pub(super) fn handle_sqrtss(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, "sqrtss")?;
+        let src_bits = self.read_scalar_f32_bits(instruction, 1, "sqrtss")?;
+        let x = self
+            .builder
+            .ins()
+            .bitcast(types::F32, MemFlagsData::new(), src_bits);
+        let r = self.builder.ins().sqrt(x);
+        let bits = self
+            .builder
+            .ins()
+            .bitcast(types::I32, MemFlagsData::new(), r);
+        self.merge_xmm_dword0(dst_idx, bits);
+        Ok(())
+    }
+
+    /// SQRTPD - packed double-precision square root of both 64-bit lanes of the
+    /// source into the destination.
+    pub(super) fn handle_sqrtpd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, "sqrtpd")?;
+        let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
+        // The unary op is expressed as a binary one that ignores its second
+        // argument, reusing the shared bit-level plumbing.
+        let sqrt = |b: &mut FunctionBuilder<'a>, x: Value, _y: Value| b.ins().sqrt(x);
+        let res_lo = self.f64_bits_arith(src_lo, src_lo, &sqrt);
+        let res_hi = self.f64_bits_arith(src_hi, src_hi, &sqrt);
+        self.set_xmm_lo(dst_idx, res_lo);
+        self.set_xmm_hi(dst_idx, res_hi);
+        Ok(())
+    }
+
+    /// SQRTPS - packed single-precision square root of all four lanes of the
+    /// source into the destination.
+    pub(super) fn handle_sqrtps(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, "sqrtps")?;
+        let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
+        let sqrt = |b: &mut FunctionBuilder<'a>, x: Value, _y: Value| b.ins().sqrt(x);
+        let res_lo = self.f32_pair_arith(src_lo, src_lo, &sqrt);
+        let res_hi = self.f32_pair_arith(src_hi, src_hi, &sqrt);
+        self.set_xmm_lo(dst_idx, res_lo);
+        self.set_xmm_hi(dst_idx, res_hi);
+        Ok(())
+    }
+
+    /// UCOMISS / COMISS - the single-precision twin of [`Self::handle_ucomisd`]:
+    /// compare the low scalar floats and set ZF/PF/CF, clearing OF/SF/AF.
+    pub(super) fn handle_ucomiss(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, "ucomiss")?;
+        let a_lo = self.get_xmm_lo(dst_idx);
+        let a_bits = self.builder.ins().ireduce(types::I32, a_lo);
+        let b_bits = self.read_scalar_f32_bits(instruction, 1, "ucomiss")?;
+
+        let a = self
+            .builder
+            .ins()
+            .bitcast(types::F32, MemFlagsData::new(), a_bits);
+        let b = self
+            .builder
+            .ins()
+            .bitcast(types::F32, MemFlagsData::new(), b_bits);
+
+        let unord = self.builder.ins().fcmp(FloatCC::Unordered, a, b);
+        let eq = self.builder.ins().fcmp(FloatCC::Equal, a, b);
+        let lt = self.builder.ins().fcmp(FloatCC::LessThan, a, b);
+
+        let zf = self.builder.ins().bor(eq, unord);
+        let cf = self.builder.ins().bor(lt, unord);
+        self.set_flag(X86Flag::Zero, zf)?;
+        self.set_flag(X86Flag::Parity, unord)?;
+        self.set_flag(X86Flag::Carry, cf)?;
+        let zero = self.builder.ins().iconst(types::I8, 0);
+        self.set_flag(X86Flag::Overflow, zero)?;
+        self.set_flag(X86Flag::Sign, zero)?;
+        self.set_flag(X86Flag::Auxiliary, zero)?;
+        Ok(())
+    }
+
+    /// Read an `r/m32` or `r/m64` integer source operand, as used by the
+    /// `CVTSI2S*` conversions.
+    fn read_int32_or_64_src(
+        &mut self,
+        instruction: &Instruction,
+        op_index: u32,
+        who: &str,
+    ) -> crate::Result<Value> {
+        let src = match self.operand_kind(instruction, op_index) {
+            OpKind::Register => {
+                let reg = self.operand_register(instruction, op_index);
+                self.get_reg_val(reg)?
+            }
+            OpKind::Memory => {
+                let ty = match instruction.memory_size().size() {
+                    4 => types::I32,
+                    8 => types::I64,
+                    other => {
+                        return Err(MicroliftError::UnsupportedInstruction {
+                            mnemonic: format!("{}-mem-size-{}", who, other),
+                        });
+                    }
+                };
+                let ptr = self.get_mem_ptr(instruction, op_index)?;
+                self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0)
+            }
+            other => {
+                return Err(MicroliftError::UnsupportedInstruction {
+                    mnemonic: format!("{}-src-{:?}", who, other),
+                });
+            }
+        };
+
+        let src_ty = self.builder.func.dfg.value_type(src);
+        if src_ty != types::I32 && src_ty != types::I64 {
+            return Err(MicroliftError::UnsupportedInstruction {
+                mnemonic: format!("{}-src-width-{}", who, src_ty.bits()),
+            });
+        }
+        Ok(src)
+    }
+
+    /// CVTSI2SD - convert a signed integer to a scalar double-precision float.
+    ///
+    /// - `CVTSI2SD xmm, r/m32`: `dst[63:0] = (f64)(i32)src`
+    /// - `CVTSI2SD xmm, r/m64` (REX.W): `dst[63:0] = (f64)(i64)src`
+    ///
+    /// Bits [127:64] of the destination are preserved.
+    pub(super) fn handle_cvtsi2sd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, "cvtsi2sd")?;
+        let src = self.read_int32_or_64_src(instruction, 1, "cvtsi2sd")?;
+        let f = self.builder.ins().fcvt_from_sint(types::F64, src);
+        let bits = self
+            .builder
+            .ins()
+            .bitcast(types::I64, MemFlagsData::new(), f);
+        self.set_xmm_lo(dst_idx, bits);
+        Ok(())
+    }
+
+    /// CVTTSD2SI - convert a scalar double-precision float to a signed integer,
+    /// truncating toward zero.
+    ///
+    /// The double-precision twin of [`Self::handle_cvttss2si`], including the
+    /// integer-indefinite patch-up for NaN / out-of-range inputs.
+    pub(super) fn handle_cvttsd2si(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst_reg = self.operand_register(instruction, 0);
+        let (ty, limit, indefinite) = match dst_reg.size() {
+            4 => (types::I32, 2147483648.0f64, i32::MIN as u32 as i64),
+            8 => (types::I64, 9223372036854775808.0f64, i64::MIN),
+            other => {
+                return Err(MicroliftError::UnsupportedInstruction {
+                    mnemonic: format!("cvttsd2si-dst-size-{}", other),
+                });
+            }
+        };
+
+        let src_bits = self.read_scalar_f64_bits(instruction, 1)?;
+        let x = self
+            .builder
+            .ins()
+            .bitcast(types::F64, MemFlagsData::new(), src_bits);
+
+        let sat = self.builder.ins().fcvt_to_sint_sat(ty, x);
+        let limit = self.builder.ins().f64const(limit);
+        let invalid = self
+            .builder
+            .ins()
+            .fcmp(FloatCC::UnorderedOrGreaterThanOrEqual, x, limit);
+        let indefinite = self.builder.ins().iconst(ty, indefinite);
+        let res = self.builder.ins().select(invalid, indefinite, sat);
+
+        self.set_reg_val(dst_reg, res)
+    }
+
+    /// CVTSS2SD - widen the source's low single to a double in `dst[63:0]`;
+    /// bits[127:64] of the destination are preserved.
+    pub(super) fn handle_cvtss2sd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, "cvtss2sd")?;
+        let src_bits = self.read_scalar_f32_bits(instruction, 1, "cvtss2sd")?;
+        let x = self
+            .builder
+            .ins()
+            .bitcast(types::F32, MemFlagsData::new(), src_bits);
+        let r = self.builder.ins().fpromote(types::F64, x);
+        let bits = self
+            .builder
+            .ins()
+            .bitcast(types::I64, MemFlagsData::new(), r);
+        self.set_xmm_lo(dst_idx, bits);
+        Ok(())
+    }
+
+    /// CVTSD2SS - narrow the source's low double to a single in `dst[31:0]`;
+    /// bits[127:32] of the destination are preserved.
+    pub(super) fn handle_cvtsd2ss(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, "cvtsd2ss")?;
+        let src_bits = self.read_scalar_f64_bits(instruction, 1)?;
+        let x = self
+            .builder
+            .ins()
+            .bitcast(types::F64, MemFlagsData::new(), src_bits);
+        let r = self.builder.ins().fdemote(types::F32, x);
+        let bits = self
+            .builder
+            .ins()
+            .bitcast(types::I32, MemFlagsData::new(), r);
+        self.merge_xmm_dword0(dst_idx, bits);
+        Ok(())
     }
 }
