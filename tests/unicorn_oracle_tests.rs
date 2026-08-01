@@ -656,3 +656,171 @@ fn sse_minmax_selection_agrees() {
         }
     }
 }
+
+/// The packed conversions - `CVTPD2PS`, `CVTPS2PD`, `CVTDQ2PS`,
+/// `CVT[T]PS2DQ`, `CVTDQ2PD`, `CVT[T]PD2DQ` - over the shared float operand
+/// pool plus integer bit patterns that exercise the dword-lane forms.
+///
+/// This is the check that the rounding mode (nearest-even), the
+/// integer-indefinite result for unrepresentable inputs, and the zeroing of
+/// bits[127:64] by the narrowing forms all match hardware.
+#[test]
+fn packed_conversions_agree() {
+    let ops: &[(&str, &[u8])] = &[
+        ("cvtpd2ps", &[0x66, 0x0F, 0x5A, 0xC1, 0xC3]),
+        ("cvtps2pd", &[0x0F, 0x5A, 0xC1, 0xC3]),
+        ("cvtdq2ps", &[0x0F, 0x5B, 0xC1, 0xC3]),
+        ("cvtps2dq", &[0x66, 0x0F, 0x5B, 0xC1, 0xC3]),
+        ("cvttps2dq", &[0xF3, 0x0F, 0x5B, 0xC1, 0xC3]),
+        ("cvtdq2pd", &[0xF3, 0x0F, 0xE6, 0xC1, 0xC3]),
+        ("cvtpd2dq", &[0xF2, 0x0F, 0xE6, 0xC1, 0xC3]),
+        ("cvttpd2dq", &[0x66, 0x0F, 0xE6, 0xC1, 0xC3]),
+    ];
+
+    // Dword patterns: zero, +-1, the signed extremes, and values whose f32
+    // conversion must round, plus halfway cases for the float -> int direction.
+    let int_operands: &[([u64; 2], [u64; 2])] = &[
+        (
+            [0x0000_0001_0000_0000, 0xFFFF_FFFF_7FFF_FFFF],
+            [0x8000_0000_0000_0002, 0x0100_0001_00FF_FFFF],
+        ),
+        (
+            [0x3FC0_0000_4020_0000, 0xBFC0_0000_3F00_0000], // 1.5 / 2.5 / 0.5 / -1.5
+            [0x4700_0000_C700_0000, 0x7F80_0000_FF80_0000], // +-32768.0, +-inf
+        ),
+    ];
+
+    for (name, code) in ops {
+        for &(dst, src) in FLOAT_OPERANDS.iter().chain(int_operands) {
+            let mut init = CpuState::zeroed();
+            init.xmm[0] = dst;
+            init.xmm[1] = src;
+            let diff =
+                differential_unicorn(code, CODE_VA, &init, &[], BUDGET, DiffOptions::default())
+                    .expect("clean halt");
+            assert!(
+                diff.is_empty(),
+                "{name} {dst:#018x?},{src:#018x?} diverged: {diff:?}"
+            );
+        }
+    }
+}
+
+/// CVTSS2SI / CVTSD2SI - the rounding (not truncating) scalar-to-integer forms,
+/// in both operand widths.
+#[test]
+fn rounding_scalar_to_int_conversions_agree() {
+    // Halfway cases in both directions, plus the unrepresentable inputs.
+    let doubles: &[f64] = &[
+        0.5,
+        1.5,
+        2.5,
+        -0.5,
+        -1.5,
+        -2.5,
+        12.75,
+        -12.75,
+        1e12,
+        1e30,
+        -1e30,
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        2147483647.5,
+        -2147483648.5,
+    ];
+
+    for (name, code) in [
+        ("cvtsd2si r32", &[0xF2, 0x0F, 0x2D, 0xC0, 0xC3][..]),
+        ("cvtsd2si r64", &[0xF2, 0x48, 0x0F, 0x2D, 0xC0, 0xC3][..]),
+    ] {
+        for &v in doubles {
+            let mut init = CpuState::zeroed();
+            init.xmm[0] = [v.to_bits(), 0];
+            init.gpr[gpr::RAX] = 0xDEAD_BEEF_DEAD_BEEF;
+            let diff =
+                differential_unicorn(code, CODE_VA, &init, &[], BUDGET, DiffOptions::default())
+                    .expect("clean halt");
+            assert!(diff.is_empty(), "{name} {v} diverged: {diff:?}");
+        }
+    }
+
+    for (name, code) in [
+        ("cvtss2si r32", &[0xF3, 0x0F, 0x2D, 0xC0, 0xC3][..]),
+        ("cvtss2si r64", &[0xF3, 0x48, 0x0F, 0x2D, 0xC0, 0xC3][..]),
+    ] {
+        for &v in doubles {
+            let v = v as f32;
+            let mut init = CpuState::zeroed();
+            init.xmm[0] = [u64::from(v.to_bits()), 0];
+            init.gpr[gpr::RAX] = 0xDEAD_BEEF_DEAD_BEEF;
+            let diff =
+                differential_unicorn(code, CODE_VA, &init, &[], BUDGET, DiffOptions::default())
+                    .expect("clean halt");
+            assert!(diff.is_empty(), "{name} {v} diverged: {diff:?}");
+        }
+    }
+}
+
+/// CMPPS / CMPPD / CMPSS / CMPSD across all eight legacy predicates, and the
+/// lane shuffles (SHUFPS / SHUFPD / PSHUFLW / PSHUFHW) and dword duplications
+/// (MOVSLDUP / MOVSHDUP) compilers emit alongside them.
+#[test]
+fn packed_compare_and_shuffle_agree() {
+    for imm in 0..8u8 {
+        let ops: &[(&str, &[u8])] = &[
+            ("cmpps", &[0x0F, 0xC2, 0xC1, imm, 0xC3]),
+            ("cmppd", &[0x66, 0x0F, 0xC2, 0xC1, imm, 0xC3]),
+            ("cmpss", &[0xF3, 0x0F, 0xC2, 0xC1, imm, 0xC3]),
+            ("cmpsd", &[0xF2, 0x0F, 0xC2, 0xC1, imm, 0xC3]),
+        ];
+        for (name, code) in ops {
+            for &(dst, src) in FLOAT_OPERANDS {
+                let mut init = CpuState::zeroed();
+                init.xmm[0] = dst;
+                init.xmm[1] = src;
+                let diff =
+                    differential_unicorn(code, CODE_VA, &init, &[], BUDGET, DiffOptions::default())
+                        .expect("clean halt");
+                assert!(
+                    diff.is_empty(),
+                    "{name} imm={imm} {dst:#018x?},{src:#018x?} diverged: {diff:?}"
+                );
+            }
+        }
+    }
+
+    let lanes = (
+        [0x0004_0003_0002_0001u64, 0x0008_0007_0006_0005u64],
+        [0x1004_1003_1002_1001u64, 0x1008_1007_1006_1005u64],
+    );
+    for imm in [0x00u8, 0x1B, 0x55, 0xE4, 0xFF] {
+        let ops: &[(&str, &[u8])] = &[
+            ("shufps", &[0x0F, 0xC6, 0xC1, imm, 0xC3]),
+            ("shufpd", &[0x66, 0x0F, 0xC6, 0xC1, imm, 0xC3]),
+            ("pshuflw", &[0xF2, 0x0F, 0x70, 0xC1, imm, 0xC3]),
+            ("pshufhw", &[0xF3, 0x0F, 0x70, 0xC1, imm, 0xC3]),
+        ];
+        for (name, code) in ops {
+            let mut init = CpuState::zeroed();
+            init.xmm[0] = lanes.0;
+            init.xmm[1] = lanes.1;
+            let diff =
+                differential_unicorn(code, CODE_VA, &init, &[], BUDGET, DiffOptions::default())
+                    .expect("clean halt");
+            assert!(diff.is_empty(), "{name} imm={imm:#04x} diverged: {diff:?}");
+        }
+    }
+
+    for (name, code) in [
+        ("movsldup", &[0xF3, 0x0F, 0x12, 0xC1, 0xC3][..]),
+        ("movshdup", &[0xF3, 0x0F, 0x16, 0xC1, 0xC3][..]),
+    ] {
+        let mut init = CpuState::zeroed();
+        init.xmm[0] = lanes.0;
+        init.xmm[1] = lanes.1;
+        let diff = differential_unicorn(code, CODE_VA, &init, &[], BUDGET, DiffOptions::default())
+            .expect("clean halt");
+        assert!(diff.is_empty(), "{name} diverged: {diff:?}");
+    }
+}

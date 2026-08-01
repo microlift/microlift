@@ -428,14 +428,11 @@ impl<'a> Lifter<'a> {
                 let rax = self.get_reg_val(Register::RAX)?;
                 let src = self.read_operand(instruction, 0, size)?;
 
-                let (rax_narrow, src_narrow) = if size == 8 {
-                    (rax, src)
-                } else {
-                    (
-                        self.builder.ins().ireduce(ty, rax),
-                        self.builder.ins().ireduce(ty, src),
-                    )
-                };
+                // `rax` is the whole 64-bit register and needs narrowing;
+                // `src` was read at the operand's own width and usually does
+                // not. See [`Lifter::narrow_to`].
+                let rax_narrow = self.narrow_to(ty, rax);
+                let src_narrow = self.narrow_to(ty, src);
 
                 // Low half
                 let lo = self.builder.ins().imul(rax_narrow, src_narrow);
@@ -547,11 +544,9 @@ impl<'a> Lifter<'a> {
                     _ => unreachable!(),
                 };
                 let acc = self.get_reg_val(acc_reg)?;
-                let acc_narrow = if size == 8 {
-                    acc
-                } else {
-                    self.builder.ins().ireduce(ty, acc)
-                };
+                // `acc_reg` is AX/EAX/RAX, so this is already the operand's
+                // width - but say so rather than assume it.
+                let acc_narrow = self.narrow_to(ty, acc);
                 let lo = self.builder.ins().imul(acc_narrow, src);
                 let hi = self.builder.ins().umulhi(acc_narrow, src);
                 self.set_reg_val(lo_reg, lo)?;

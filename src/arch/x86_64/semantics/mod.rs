@@ -63,7 +63,12 @@ impl<'a> Lifter<'a> {
             | Mnemonic::Movups
             | Mnemonic::Movupd
             | Mnemonic::Movdqa
-            | Mnemonic::Movdqu => self.handle_movaps(instruction),
+            | Mnemonic::Movdqu
+            // The non-temporal stores differ only in cache hint, which this
+            // lifter does not model.
+            | Mnemonic::Movntps
+            | Mnemonic::Movntpd
+            | Mnemonic::Movntdq => self.handle_movaps(instruction),
             Mnemonic::Movq => self.handle_movq_sse(instruction),
             Mnemonic::Movss => self.handle_movss(instruction),
             Mnemonic::Movd => self.handle_movd(instruction),
@@ -165,11 +170,42 @@ impl<'a> Lifter<'a> {
 
             // SSE / SSE2 - integer <-> floating-point conversion
             Mnemonic::Cvtsi2ss => self.handle_cvtsi2ss(instruction),
-            Mnemonic::Cvttss2si => self.handle_cvttss2si(instruction),
+            Mnemonic::Cvttss2si => self.handle_cvtss2si(instruction, true),
+            Mnemonic::Cvtss2si => self.handle_cvtss2si(instruction, false),
             Mnemonic::Cvtsi2sd => self.handle_cvtsi2sd(instruction),
-            Mnemonic::Cvttsd2si => self.handle_cvttsd2si(instruction),
+            Mnemonic::Cvttsd2si => self.handle_cvtsd2si(instruction, true),
+            Mnemonic::Cvtsd2si => self.handle_cvtsd2si(instruction, false),
             Mnemonic::Cvtss2sd => self.handle_cvtss2sd(instruction),
             Mnemonic::Cvtsd2ss => self.handle_cvtsd2ss(instruction),
+            Mnemonic::Cvtpd2ps => self.handle_cvtpd2ps(instruction),
+            Mnemonic::Cvtps2pd => self.handle_cvtps2pd(instruction),
+            Mnemonic::Cvtdq2ps => self.handle_cvtdq2ps(instruction),
+            Mnemonic::Cvtps2dq => self.handle_cvtps2dq(instruction, false),
+            Mnemonic::Cvttps2dq => self.handle_cvtps2dq(instruction, true),
+            Mnemonic::Cvtdq2pd => self.handle_cvtdq2pd(instruction),
+            Mnemonic::Cvtpd2dq => self.handle_cvtpd2dq(instruction, false),
+            Mnemonic::Cvttpd2dq => self.handle_cvtpd2dq(instruction, true),
+
+            // SSE / SSE2 - packed compares, shuffles and approximate reciprocals
+            Mnemonic::Cmpps => self.handle_cmpps(instruction),
+            Mnemonic::Cmppd => self.handle_cmppd(instruction),
+            Mnemonic::Cmpss => self.handle_cmpss(instruction),
+            // CMPSD is shared between the string compare (memory-string
+            // operands) and SSE2 scalar-double compare (XMM destination), the
+            // same collision MOVSD has below.
+            Mnemonic::Cmpsd if matches!(instruction.op0_kind(), OpKind::Register) => {
+                self.handle_cmpsd_sse(instruction)
+            }
+            Mnemonic::Shufps => self.handle_shufps(instruction),
+            Mnemonic::Shufpd => self.handle_shufpd(instruction),
+            Mnemonic::Pshuflw => self.handle_pshuflhw(instruction, false),
+            Mnemonic::Pshufhw => self.handle_pshuflhw(instruction, true),
+            Mnemonic::Rcpps => self.handle_rcpps(instruction, false),
+            Mnemonic::Rsqrtps => self.handle_rcpps(instruction, true),
+            Mnemonic::Rcpss => self.handle_rcpss(instruction, false),
+            Mnemonic::Rsqrtss => self.handle_rcpss(instruction, true),
+            Mnemonic::Movsldup => self.handle_movsldup(instruction, false),
+            Mnemonic::Movshdup => self.handle_movsldup(instruction, true),
 
             // SSE / SSE2 - XMM logic
             Mnemonic::Xorps | Mnemonic::Xorpd => self.handle_xorps(instruction),

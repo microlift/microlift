@@ -71,6 +71,22 @@ pub fn get_base_reg_64(reg: Register) -> Register {
 // Register and flag accessors on Lifter
 
 impl<'a> Lifter<'a> {
+    /// Narrow `val` to `ty`, or return it unchanged if it is already that wide.
+    ///
+    /// `ireduce` requires a *strictly* wider source, so an unconditional
+    /// narrowing is not a no-op when the value already has the target type: it
+    /// is malformed IR, and the verifier rejects the whole function rather than
+    /// the instruction. Every caller here reads a value whose width depends on
+    /// an operand size, so "already narrow" is the ordinary case rather than
+    /// the exception.
+    pub fn narrow_to(&mut self, ty: Type, val: Value) -> Value {
+        if self.builder.func.dfg.value_type(val) == ty {
+            val
+        } else {
+            self.builder.ins().ireduce(ty, val)
+        }
+    }
+
     pub fn get_reg_val(&mut self, reg: Register) -> crate::Result<Value> {
         // RIP is handled specially: reconcile it dynamically using the
         // image_base (loaded from context) + offset formula.

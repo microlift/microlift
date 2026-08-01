@@ -56,7 +56,7 @@ impl CraneliftBackend {
 
         self.module
             .define_function(id, &mut ctx)
-            .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
+            .map_err(|e| crate::MicroliftError::CraneliftError(format!("{e:?}")))?;
 
         self.module.clear_context(&mut ctx);
         self.module
@@ -107,7 +107,7 @@ impl CraneliftBackend {
             .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
         module
             .define_function(id, &mut ctx)
-            .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
+            .map_err(|e| crate::MicroliftError::CraneliftError(format!("{e:?}")))?;
         module
             .finalize_definitions()
             .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
@@ -197,7 +197,7 @@ impl ArtifactBackend {
             .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
         module
             .define_function(id, &mut ctx)
-            .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
+            .map_err(|e| crate::MicroliftError::CraneliftError(format!("{e:?}")))?;
 
         let product = module.finish();
         product
@@ -224,7 +224,7 @@ impl ArtifactBackend {
 
         module
             .define_function(id, &mut ctx)
-            .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
+            .map_err(|e| crate::MicroliftError::CraneliftError(format!("{e:?}")))?;
 
         let product = module.finish();
         Ok(product

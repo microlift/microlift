@@ -144,6 +144,59 @@ fn test_mul() {
     assert_eq!(ctx.cf, 0);
 }
 
+/// The narrower `mul` forms, which every 64-bit test above misses: the
+/// accumulator and the operand are read at the operand's own width, so
+/// narrowing them again is an `ireduce` from a type to itself — malformed IR
+/// that the verifier rejects for the whole function. libpng's `png_zalloc`
+/// does `mul esi` on its way to every allocation, which is how this was found.
+#[test]
+fn test_mul_32_and_16_bit() {
+    // mul esi (32-bit: edx:eax = eax * esi), with a product that overflows 32
+    // bits so the high half is checked too.
+    #[rustfmt::skip]
+    let bytes = [
+        0xB8, 0x00, 0x00, 0x00, 0x10,             // mov eax, 0x10000000
+        0xBE, 0x20, 0x00, 0x00, 0x00,             // mov esi, 0x20
+        0xF7, 0xE6,                               // mul esi
+        0xC3,
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rax, 0x0000_0000, "low half of 0x10000000 * 0x20");
+    assert_eq!(ctx.rdx, 0x0000_0002, "high half");
+    assert_eq!(ctx.of, 1);
+    assert_eq!(ctx.cf, 1);
+
+    // mul cx (16-bit: dx:ax = ax * cx)
+    #[rustfmt::skip]
+    let bytes = [
+        0x66, 0xB8, 0x00, 0x10,                   // mov ax, 0x1000
+        0x66, 0xB9, 0x20, 0x00,                   // mov cx, 0x20
+        0x66, 0xF7, 0xE1,                         // mul cx
+        0xC3,
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rax & 0xFFFF, 0x0000, "low half of 0x1000 * 0x20");
+    assert_eq!(ctx.rdx & 0xFFFF, 0x0002, "high half");
+    assert_eq!(ctx.of, 1);
+    assert_eq!(ctx.cf, 1);
+}
+
+/// The same double-narrowing in `imul`'s one-operand form, which reads its
+/// source operand at the operand width and then narrowed it again.
+#[test]
+fn test_imul_one_operand_32_bit() {
+    #[rustfmt::skip]
+    let bytes = [
+        0xB8, 0xFF, 0xFF, 0xFF, 0x7F,             // mov eax, i32::MAX
+        0xB9, 0x02, 0x00, 0x00, 0x00,             // mov ecx, 2
+        0xF7, 0xE9,                               // imul ecx
+        0xC3,
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rax, 0xFFFF_FFFE, "low half of i32::MAX * 2");
+    assert_eq!(ctx.rdx, 0, "smulhi(i32::MAX, 2) is zero");
+}
+
 #[test]
 fn test_mul_overflow() {
     // u64::MAX * 2 = 2^65 - 2 = rdx=1, rax=0xFFFFFFFFFFFFFFFE

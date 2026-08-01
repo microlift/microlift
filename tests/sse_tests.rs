@@ -2979,3 +2979,485 @@ fn test_cvtsd2ss_cvtss2sd_roundtrip() {
         assert_eq!(f64::from_bits(ctx.xmm[0][0]), v, "roundtrip of {v}");
     }
 }
+
+//  Packed conversions: CVTPD2PS / CVTPS2PD / CVTDQ2PS / CVT[T]PS2DQ /
+//  CVTDQ2PD / CVT[T]PD2DQ.
+
+/// Split a 64-bit XMM half into its two `f32` lanes.
+fn unpack_f32(half: u64) -> (f32, f32) {
+    (
+        f32::from_bits(half as u32),
+        f32::from_bits((half >> 32) as u32),
+    )
+}
+
+/// Pack two signed dwords into a 64-bit XMM half.
+fn pack_i32(l0: i32, l1: i32) -> u64 {
+    (l0 as u32 as u64) | ((l1 as u32 as u64) << 32)
+}
+
+/// Split a 64-bit XMM half into its two signed dword lanes.
+fn unpack_i32(half: u64) -> (i32, i32) {
+    (half as u32 as i32, (half >> 32) as u32 as i32)
+}
+
+#[test]
+fn test_cvtpd2ps() {
+    // cvtpd2ps xmm0, xmm1; ret  ->  66 0F 5A C1  C3
+    let bytes = [0x66, 0x0F, 0x5A, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [0xDEAD_BEEF_CAFE_BABE, 0x1122_3344_5566_7788];
+    ctx.xmm[1] = [1.5f64.to_bits(), (-2.25f64).to_bits()];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(unpack_f32(ctx.xmm[0][0]), (1.5, -2.25));
+    assert_eq!(
+        ctx.xmm[0][1], 0,
+        "cvtpd2ps must zero bits[127:64] of the destination"
+    );
+}
+
+#[test]
+fn test_cvtpd2ps_rounds_and_overflows() {
+    let bytes = [0x66, 0x0F, 0x5A, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    // A double too large for f32 becomes +inf; a tiny one becomes +0.
+    ctx.xmm[1] = [1e300f64.to_bits(), 1e-300f64.to_bits()];
+    let ctx = run_test(&bytes, ctx);
+    let (l0, l1) = unpack_f32(ctx.xmm[0][0]);
+    assert_eq!(l0, f32::INFINITY);
+    assert_eq!(l1, 0.0);
+    assert!(l1.is_sign_positive());
+}
+
+#[test]
+fn test_cvtpd2ps_mem() {
+    // cvtpd2ps xmm0, [rdi]; ret  ->  66 0F 5A 07  C3
+    let bytes = [0x66, 0x0F, 0x5A, 0x07, 0xC3];
+    let src = [3.5f64, -0.5];
+    let mut ctx = RegisterContext::default();
+    ctx.rdi = src.as_ptr() as u64;
+    ctx.xmm[0] = [0xFFFF_FFFF_FFFF_FFFF, 0xFFFF_FFFF_FFFF_FFFF];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(unpack_f32(ctx.xmm[0][0]), (3.5, -0.5));
+    assert_eq!(ctx.xmm[0][1], 0);
+}
+
+#[test]
+fn test_cvtps2pd() {
+    // cvtps2pd xmm0, xmm1; ret  ->  0F 5A C1  C3
+    let bytes = [0x0F, 0x5A, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [0xDEAD_BEEF_CAFE_BABE, 0x1122_3344_5566_7788];
+    // Only the low two lanes of the source participate.
+    ctx.xmm[1] = [pack_f32(1.5, -8.0), pack_f32(99.0, 99.0)];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(f64::from_bits(ctx.xmm[0][0]), 1.5);
+    assert_eq!(f64::from_bits(ctx.xmm[0][1]), -8.0);
+}
+
+#[test]
+fn test_cvtps2pd_mem_reads_only_8_bytes() {
+    // cvtps2pd xmm0, [rdi]; ret  ->  0F 5A 07  C3
+    let bytes = [0x0F, 0x5A, 0x07, 0xC3];
+    // A 2-element f32 array: reading 16 bytes here would run off the end.
+    let src = [2.5f32, -0.25];
+    let mut ctx = RegisterContext::default();
+    ctx.rdi = src.as_ptr() as u64;
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(f64::from_bits(ctx.xmm[0][0]), 2.5);
+    assert_eq!(f64::from_bits(ctx.xmm[0][1]), -0.25);
+}
+
+#[test]
+fn test_cvtpd2ps_cvtps2pd_roundtrip() {
+    // cvtpd2ps xmm0, xmm0 ; cvtps2pd xmm0, xmm0 ; ret
+    let bytes = [
+        0x66, 0x0F, 0x5A, 0xC0, // cvtpd2ps xmm0, xmm0
+        0x0F, 0x5A, 0xC0, // cvtps2pd xmm0, xmm0
+        0xC3,
+    ];
+    for (a, b) in [(0.0f64, 1.0f64), (-1.0, 1024.0), (0.5, -8388608.0)] {
+        let mut ctx = RegisterContext::default();
+        ctx.xmm[0] = [a.to_bits(), b.to_bits()];
+        let ctx = run_test(&bytes, ctx);
+        assert_eq!(f64::from_bits(ctx.xmm[0][0]), a, "lane 0 roundtrip of {a}");
+        assert_eq!(f64::from_bits(ctx.xmm[0][1]), b, "lane 1 roundtrip of {b}");
+    }
+}
+
+#[test]
+fn test_cvtdq2ps() {
+    // cvtdq2ps xmm0, xmm1; ret  ->  0F 5B C1  C3
+    let bytes = [0x0F, 0x5B, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[1] = [pack_i32(0, -1), pack_i32(1 << 24, i32::MIN)];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(unpack_f32(ctx.xmm[0][0]), (0.0, -1.0));
+    assert_eq!(
+        unpack_f32(ctx.xmm[0][1]),
+        (16777216.0, -2147483648.0),
+        "large magnitudes round to nearest f32"
+    );
+}
+
+#[test]
+fn test_cvtps2dq_rounds_to_nearest_even() {
+    // cvtps2dq xmm0, xmm1; ret  ->  66 0F 5B C1  C3
+    let bytes = [0x66, 0x0F, 0x5B, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    // Ties round to even under the default MXCSR rounding mode.
+    ctx.xmm[1] = [pack_f32(1.5, 2.5), pack_f32(-1.5, -0.4)];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(unpack_i32(ctx.xmm[0][0]), (2, 2));
+    assert_eq!(unpack_i32(ctx.xmm[0][1]), (-2, 0));
+}
+
+#[test]
+fn test_cvttps2dq_truncates() {
+    // cvttps2dq xmm0, xmm1; ret  ->  F3 0F 5B C1  C3
+    let bytes = [0xF3, 0x0F, 0x5B, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[1] = [pack_f32(1.9, -1.9), pack_f32(0.5, -0.5)];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(unpack_i32(ctx.xmm[0][0]), (1, -1));
+    assert_eq!(unpack_i32(ctx.xmm[0][1]), (0, 0));
+}
+
+#[test]
+fn test_cvttps2dq_indefinite_on_out_of_range() {
+    let bytes = [0xF3, 0x0F, 0x5B, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[1] = [
+        pack_f32(f32::NAN, f32::INFINITY),
+        pack_f32(f32::NEG_INFINITY, 1e30),
+    ];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(
+        unpack_i32(ctx.xmm[0][0]),
+        (i32::MIN, i32::MIN),
+        "NaN and +inf yield the integer indefinite value"
+    );
+    assert_eq!(unpack_i32(ctx.xmm[0][1]), (i32::MIN, i32::MIN));
+}
+
+#[test]
+fn test_cvtdq2pd() {
+    // cvtdq2pd xmm0, xmm1; ret  ->  F3 0F E6 C1  C3
+    let bytes = [0xF3, 0x0F, 0xE6, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    // Only the low quadword (two dwords) of the source participates.
+    ctx.xmm[1] = [pack_i32(7, -9), pack_i32(1234, 5678)];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(f64::from_bits(ctx.xmm[0][0]), 7.0);
+    assert_eq!(f64::from_bits(ctx.xmm[0][1]), -9.0);
+}
+
+#[test]
+fn test_cvtdq2pd_mem_reads_only_8_bytes() {
+    // cvtdq2pd xmm0, [rdi]; ret  ->  F3 0F E6 07  C3
+    let bytes = [0xF3, 0x0F, 0xE6, 0x07, 0xC3];
+    let src = [i32::MIN, i32::MAX];
+    let mut ctx = RegisterContext::default();
+    ctx.rdi = src.as_ptr() as u64;
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(f64::from_bits(ctx.xmm[0][0]), -2147483648.0);
+    assert_eq!(f64::from_bits(ctx.xmm[0][1]), 2147483647.0);
+}
+
+#[test]
+fn test_cvtpd2dq_rounds_and_zeroes_high() {
+    // cvtpd2dq xmm0, xmm1; ret  ->  F2 0F E6 C1  C3
+    let bytes = [0xF2, 0x0F, 0xE6, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [0xFFFF_FFFF_FFFF_FFFF, 0xFFFF_FFFF_FFFF_FFFF];
+    ctx.xmm[1] = [2.5f64.to_bits(), (-3.5f64).to_bits()];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(unpack_i32(ctx.xmm[0][0]), (2, -4), "ties round to even");
+    assert_eq!(
+        ctx.xmm[0][1], 0,
+        "cvtpd2dq must zero bits[127:64] of the destination"
+    );
+}
+
+#[test]
+fn test_cvttpd2dq_truncates() {
+    // cvttpd2dq xmm0, xmm1; ret  ->  66 0F E6 C1  C3
+    let bytes = [0x66, 0x0F, 0xE6, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[1] = [2.9f64.to_bits(), f64::NAN.to_bits()];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(unpack_i32(ctx.xmm[0][0]), (2, i32::MIN));
+    assert_eq!(ctx.xmm[0][1], 0);
+}
+
+//  CVTSS2SI / CVTSD2SI - the rounding scalar-to-integer forms.
+
+#[test]
+fn test_cvtss2si_rounds_to_nearest_even() {
+    // cvtss2si eax, xmm0; ret  ->  F3 0F 2D C0  C3
+    let bytes = [0xF3, 0x0F, 0x2D, 0xC0, 0xC3];
+    for (input, want) in [(1.5f32, 2i64), (2.5, 2), (-1.5, -2), (0.4, 0), (-0.6, -1)] {
+        let mut ctx = RegisterContext::default();
+        ctx.xmm[0] = [pack_f32(input, 0.0), 0];
+        let ctx = run_test(&bytes, ctx);
+        assert_eq!(ctx.rax as i32 as i64, want, "cvtss2si of {input}");
+    }
+}
+
+#[test]
+fn test_cvtsd2si_64bit_and_indefinite() {
+    // cvtsd2si rax, xmm0; ret  ->  F2 48 0F 2D C0  C3
+    let bytes = [0xF2, 0x48, 0x0F, 0x2D, 0xC0, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [(1e12f64 + 0.5).to_bits(), 0];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.rax as i64, 1_000_000_000_000);
+
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [f64::NAN.to_bits(), 0];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.rax as i64, i64::MIN, "NaN yields integer indefinite");
+}
+
+//  CMPPS / CMPPD / CMPSS / CMPSD
+
+/// All-ones / all-zeros lane masks, as the `CMP*` family produces them.
+const T32: u64 = 0xFFFF_FFFF;
+const T64: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+
+#[test]
+fn test_cmpps_predicates() {
+    // cmpps xmm0, xmm1, imm8; ret  ->  0F C2 C1 ib  C3
+    // Lanes: (1<2), (2>1), (equal), (NaN vs 1).
+    for (imm, want) in [
+        (0u8, [0, 0, T32, 0]),   // EQ
+        (1, [T32, 0, 0, 0]),     // LT
+        (2, [T32, 0, T32, 0]),   // LE
+        (3, [0, 0, 0, T32]),     // UNORD
+        (4, [T32, T32, 0, T32]), // NEQ (true for unordered)
+        (5, [0, T32, T32, T32]), // NLT
+        (6, [0, T32, 0, T32]),   // NLE
+        (7, [T32, T32, T32, 0]), // ORD
+    ] {
+        let bytes = [0x0F, 0xC2, 0xC1, imm, 0xC3];
+        let mut ctx = RegisterContext::default();
+        ctx.xmm[0] = [pack_f32(1.0, 2.0), pack_f32(3.0, f32::NAN)];
+        ctx.xmm[1] = [pack_f32(2.0, 1.0), pack_f32(3.0, 1.0)];
+        let ctx = run_test(&bytes, ctx);
+        let got = [
+            ctx.xmm[0][0] & 0xFFFF_FFFF,
+            ctx.xmm[0][0] >> 32,
+            ctx.xmm[0][1] & 0xFFFF_FFFF,
+            ctx.xmm[0][1] >> 32,
+        ];
+        assert_eq!(got, want, "cmpps predicate {imm}");
+    }
+}
+
+#[test]
+fn test_cmppd_lt() {
+    // cmppd xmm0, xmm1, 1; ret  ->  66 0F C2 C1 01  C3
+    let bytes = [0x66, 0x0F, 0xC2, 0xC1, 0x01, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [1.0f64.to_bits(), 5.0f64.to_bits()];
+    ctx.xmm[1] = [2.0f64.to_bits(), 5.0f64.to_bits()];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.xmm[0], [T64, 0]);
+}
+
+#[test]
+fn test_cmpss_preserves_high_lanes() {
+    // cmpss xmm0, xmm1, 0; ret  ->  F3 0F C2 C1 00  C3
+    let bytes = [0xF3, 0x0F, 0xC2, 0xC1, 0x00, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [pack_f32(4.0, 7.0), 0x1111_2222_3333_4444];
+    ctx.xmm[1] = [pack_f32(4.0, 9.0), 0];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.xmm[0][0] & 0xFFFF_FFFF, T32, "lane 0 compares equal");
+    assert_eq!(ctx.xmm[0][0] >> 32, 7.0f32.to_bits() as u64);
+    assert_eq!(ctx.xmm[0][1], 0x1111_2222_3333_4444);
+}
+
+#[test]
+fn test_cmpsd_sse_preserves_high_quadword() {
+    // cmpsd xmm0, xmm1, 6; ret  ->  F2 0F C2 C1 06  C3   (NLE)
+    let bytes = [0xF2, 0x0F, 0xC2, 0xC1, 0x06, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [9.0f64.to_bits(), 0xDEAD_BEEF];
+    ctx.xmm[1] = [3.0f64.to_bits(), 0];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.xmm[0], [T64, 0xDEAD_BEEF]);
+}
+
+//  SHUFPS / SHUFPD / PSHUFLW / PSHUFHW
+
+#[test]
+fn test_shufps() {
+    // shufps xmm0, xmm1, 0x1B; ret  ->  0F C6 C1 1B  C3
+    // imm 0x1B = 00 01 10 11 -> lanes [dst3, dst2, src1, src0].
+    let bytes = [0x0F, 0xC6, 0xC1, 0x1B, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [pack_i32(0, 1), pack_i32(2, 3)];
+    ctx.xmm[1] = [pack_i32(10, 11), pack_i32(12, 13)];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(unpack_i32(ctx.xmm[0][0]), (3, 2));
+    assert_eq!(unpack_i32(ctx.xmm[0][1]), (11, 10));
+}
+
+#[test]
+fn test_shufpd() {
+    // shufpd xmm0, xmm1, imm8; ret  ->  66 0F C6 C1 ib  C3
+    // imm[0] selects the destination's quadword, imm[1] the source's.
+    const D0: u64 = 0xD000_0000_0000_0000;
+    const D1: u64 = 0xD111_1111_1111_1111;
+    const S0: u64 = 0x5000_0000_0000_0000;
+    const S1: u64 = 0x5111_1111_1111_1111;
+    for (imm, want) in [(0u8, [D0, S0]), (1, [D1, S0]), (2, [D0, S1]), (3, [D1, S1])] {
+        let bytes = [0x66, 0x0F, 0xC6, 0xC1, imm, 0xC3];
+        let mut ctx = RegisterContext::default();
+        ctx.xmm[0] = [D0, D1];
+        ctx.xmm[1] = [S0, S1];
+        let ctx = run_test(&bytes, ctx);
+        assert_eq!(ctx.xmm[0], want, "shufpd imm8={imm}");
+    }
+}
+
+#[test]
+fn test_pshuflw_and_pshufhw() {
+    // pshuflw xmm0, xmm1, 0x1B; ret  ->  F2 0F 70 C1 1B  C3  (reverse low words)
+    let bytes = [0xF2, 0x0F, 0x70, 0xC1, 0x1B, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[1] = [0x0004_0003_0002_0001, 0xAAAA_BBBB_CCCC_DDDD];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.xmm[0][0], 0x0001_0002_0003_0004);
+    assert_eq!(ctx.xmm[0][1], 0xAAAA_BBBB_CCCC_DDDD, "high half copied");
+
+    // pshufhw xmm0, xmm1, 0x1B; ret  ->  F3 0F 70 C1 1B  C3
+    let bytes = [0xF3, 0x0F, 0x70, 0xC1, 0x1B, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[1] = [0xAAAA_BBBB_CCCC_DDDD, 0x0004_0003_0002_0001];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.xmm[0][0], 0xAAAA_BBBB_CCCC_DDDD, "low half copied");
+    assert_eq!(ctx.xmm[0][1], 0x0001_0002_0003_0004);
+}
+
+//  RCPPS / RSQRTPS / RCPSS / RSQRTSS - approximate, so compared with a
+//  tolerance well inside the architectural 1.5 * 2^-12 relative error bound.
+
+#[test]
+fn test_rcpps_and_rsqrtps() {
+    // rcpps xmm0, xmm1; ret  ->  0F 53 C1  C3
+    let bytes = [0x0F, 0x53, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[1] = [pack_f32(1.0, 2.0), pack_f32(4.0, -8.0)];
+    let ctx = run_test(&bytes, ctx);
+    let got = [unpack_f32(ctx.xmm[0][0]), unpack_f32(ctx.xmm[0][1])];
+    for (got, want) in [
+        (got[0].0, 1.0f32),
+        (got[0].1, 0.5),
+        (got[1].0, 0.25),
+        (got[1].1, -0.125),
+    ] {
+        assert!(
+            (got - want).abs() <= want.abs() * 4e-4,
+            "rcpps {got} vs {want}"
+        );
+    }
+
+    // rsqrtps xmm0, xmm1; ret  ->  0F 52 C1  C3
+    let bytes = [0x0F, 0x52, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[1] = [pack_f32(1.0, 4.0), pack_f32(16.0, 64.0)];
+    let ctx = run_test(&bytes, ctx);
+    let got = [unpack_f32(ctx.xmm[0][0]), unpack_f32(ctx.xmm[0][1])];
+    for (got, want) in [
+        (got[0].0, 1.0f32),
+        (got[0].1, 0.5),
+        (got[1].0, 0.25),
+        (got[1].1, 0.125),
+    ] {
+        assert!((got - want).abs() <= want * 4e-4, "rsqrtps {got} vs {want}");
+    }
+}
+
+#[test]
+fn test_rcpss_scalar_preserves_high_lanes() {
+    // rcpss xmm0, xmm1; ret  ->  F3 0F 53 C1  C3
+    let bytes = [0xF3, 0x0F, 0x53, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [pack_f32(99.0, 7.0), 0x1111_2222_3333_4444];
+    ctx.xmm[1] = [pack_f32(4.0, 0.0), 0];
+    let ctx = run_test(&bytes, ctx);
+    let (l0, l1) = unpack_f32(ctx.xmm[0][0]);
+    assert!((l0 - 0.25).abs() <= 1e-4, "rcpss lane 0 = {l0}");
+    assert_eq!(l1, 7.0, "lane 1 preserved");
+    assert_eq!(ctx.xmm[0][1], 0x1111_2222_3333_4444);
+}
+
+//  MOVSLDUP / MOVSHDUP / MOVNT* stores
+
+#[test]
+fn test_movsldup_movshdup() {
+    // movsldup xmm0, xmm1; ret  ->  F3 0F 12 C1  C3
+    let bytes = [0xF3, 0x0F, 0x12, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[1] = [pack_i32(0, 1), pack_i32(2, 3)];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(unpack_i32(ctx.xmm[0][0]), (0, 0));
+    assert_eq!(unpack_i32(ctx.xmm[0][1]), (2, 2));
+
+    // movshdup xmm0, xmm1; ret  ->  F3 0F 16 C1  C3
+    let bytes = [0xF3, 0x0F, 0x16, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[1] = [pack_i32(0, 1), pack_i32(2, 3)];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(unpack_i32(ctx.xmm[0][0]), (1, 1));
+    assert_eq!(unpack_i32(ctx.xmm[0][1]), (3, 3));
+}
+
+#[test]
+fn test_movntdq_store() {
+    // movntdq [rdi], xmm0; ret  ->  66 0F E7 07  C3
+    let bytes = [0x66, 0x0F, 0xE7, 0x07, 0xC3];
+    let mut buf = [0u64; 2];
+    let mut ctx = RegisterContext::default();
+    ctx.rdi = buf.as_mut_ptr() as u64;
+    ctx.xmm[0] = [0x1234_5678_9ABC_DEF0, 0xFEED_FACE_CAFE_F00D];
+    let _ = run_test(&bytes, ctx);
+    assert_eq!(buf, [0x1234_5678_9ABC_DEF0, 0xFEED_FACE_CAFE_F00D]);
+}
+
+/// The new packed conversions and shuffles under the vector XMM representation,
+/// where the lo/hi accessors take a different path.
+#[test]
+fn test_conversions_and_shuffles_vector_xmm() {
+    // cvtpd2ps xmm0, xmm1
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [0xFFFF_FFFF_FFFF_FFFF, 0xFFFF_FFFF_FFFF_FFFF];
+    ctx.xmm[1] = [1.5f64.to_bits(), (-2.25f64).to_bits()];
+    let ctx = run_test_vec(&[0x66, 0x0F, 0x5A, 0xC1, 0xC3], ctx);
+    assert_eq!(unpack_f32(ctx.xmm[0][0]), (1.5, -2.25));
+    assert_eq!(ctx.xmm[0][1], 0);
+
+    // cvttps2dq xmm0, xmm1
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[1] = [pack_f32(1.9, -1.9), pack_f32(3.0, -4.0)];
+    let ctx = run_test_vec(&[0xF3, 0x0F, 0x5B, 0xC1, 0xC3], ctx);
+    assert_eq!(unpack_i32(ctx.xmm[0][0]), (1, -1));
+    assert_eq!(unpack_i32(ctx.xmm[0][1]), (3, -4));
+
+    // shufps xmm0, xmm1, 0x1B
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [pack_i32(0, 1), pack_i32(2, 3)];
+    ctx.xmm[1] = [pack_i32(10, 11), pack_i32(12, 13)];
+    let ctx = run_test_vec(&[0x0F, 0xC6, 0xC1, 0x1B, 0xC3], ctx);
+    assert_eq!(unpack_i32(ctx.xmm[0][0]), (3, 2));
+    assert_eq!(unpack_i32(ctx.xmm[0][1]), (11, 10));
+
+    // cmpps xmm0, xmm1, 1 (LT)
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [pack_f32(1.0, 5.0), pack_f32(1.0, 5.0)];
+    ctx.xmm[1] = [pack_f32(2.0, 5.0), pack_f32(2.0, 5.0)];
+    let ctx = run_test_vec(&[0x0F, 0xC2, 0xC1, 0x01, 0xC3], ctx);
+    assert_eq!(ctx.xmm[0], [T32, T32]);
+}

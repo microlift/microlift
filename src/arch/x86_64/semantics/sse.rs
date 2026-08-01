@@ -1510,46 +1510,19 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// CVTTSS2SI - convert a scalar single-precision float to a signed integer,
-    /// truncating toward zero.
+    /// CVTSS2SI / CVTTSS2SI - convert a scalar single-precision float to a
+    /// signed integer, rounding to nearest-even (`CVTSS2SI`) or truncating
+    /// toward zero (`CVTTSS2SI`).
     ///
-    /// - `CVTTSS2SI r32, xmm/m32`: `dst = (i32)trunc(src)`
-    /// - `CVTTSS2SI r64, xmm/m32` (REX.W): `dst = (i64)trunc(src)`
-    ///
-    /// When the truncated value is unrepresentable - NaN, an infinity, or simply
-    /// out of range - x86 produces the *integer indefinite* value (`INT_MIN` for
-    /// the destination width) rather than saturating. Cranelift's
-    /// `fcvt_to_sint_sat` already yields `INT_MIN` for the too-negative side, so
-    /// only the "NaN or too positive" side needs patching, which is exactly the
-    /// `UnorderedOrGreaterThanOrEqual` predicate against `2^(width-1)`.
-    pub(super) fn handle_cvttss2si(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let dst_reg = self.operand_register(instruction, 0);
-        let (ty, limit, indefinite) = match dst_reg.size() {
-            4 => (types::I32, 2147483648.0f32, i32::MIN as u32 as i64),
-            8 => (types::I64, 9223372036854775808.0f32, i64::MIN),
-            other => {
-                return Err(MicroliftError::UnsupportedInstruction {
-                    mnemonic: format!("cvttss2si-dst-size-{}", other),
-                });
-            }
-        };
-
-        let src_bits = self.read_scalar_f32_bits(instruction, 1, "cvttss2si")?;
-        let x = self
-            .builder
-            .ins()
-            .bitcast(types::F32, MemFlagsData::new(), src_bits);
-
-        let sat = self.builder.ins().fcvt_to_sint_sat(ty, x);
-        let limit = self.builder.ins().f32const(limit);
-        let invalid = self
-            .builder
-            .ins()
-            .fcmp(FloatCC::UnorderedOrGreaterThanOrEqual, x, limit);
-        let indefinite = self.builder.ins().iconst(ty, indefinite);
-        let res = self.builder.ins().select(invalid, indefinite, sat);
-
-        self.set_reg_val(dst_reg, res)
+    /// - `CVT[T]SS2SI r32, xmm/m32`: `dst = (i32)round(src)`
+    /// - `CVT[T]SS2SI r64, xmm/m32` (REX.W): `dst = (i64)round(src)`
+    pub(super) fn handle_cvtss2si(
+        &mut self,
+        instruction: &Instruction,
+        truncate: bool,
+    ) -> crate::Result<()> {
+        let who = if truncate { "cvttss2si" } else { "cvtss2si" };
+        self.scalar_fp_to_si(instruction, types::F32, truncate, who)
     }
 
     /// UCOMISD / COMISD - compare the low scalar doubles of two operands and set
@@ -2308,39 +2281,17 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// CVTTSD2SI - convert a scalar double-precision float to a signed integer,
-    /// truncating toward zero.
+    /// CVTSD2SI / CVTTSD2SI - convert a scalar double-precision float to a
+    /// signed integer, rounding to nearest-even or truncating toward zero.
     ///
-    /// The double-precision twin of [`Self::handle_cvttss2si`], including the
-    /// integer-indefinite patch-up for NaN / out-of-range inputs.
-    pub(super) fn handle_cvttsd2si(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let dst_reg = self.operand_register(instruction, 0);
-        let (ty, limit, indefinite) = match dst_reg.size() {
-            4 => (types::I32, 2147483648.0f64, i32::MIN as u32 as i64),
-            8 => (types::I64, 9223372036854775808.0f64, i64::MIN),
-            other => {
-                return Err(MicroliftError::UnsupportedInstruction {
-                    mnemonic: format!("cvttsd2si-dst-size-{}", other),
-                });
-            }
-        };
-
-        let src_bits = self.read_scalar_f64_bits(instruction, 1)?;
-        let x = self
-            .builder
-            .ins()
-            .bitcast(types::F64, MemFlagsData::new(), src_bits);
-
-        let sat = self.builder.ins().fcvt_to_sint_sat(ty, x);
-        let limit = self.builder.ins().f64const(limit);
-        let invalid = self
-            .builder
-            .ins()
-            .fcmp(FloatCC::UnorderedOrGreaterThanOrEqual, x, limit);
-        let indefinite = self.builder.ins().iconst(ty, indefinite);
-        let res = self.builder.ins().select(invalid, indefinite, sat);
-
-        self.set_reg_val(dst_reg, res)
+    /// The double-precision twin of [`Self::handle_cvtss2si`].
+    pub(super) fn handle_cvtsd2si(
+        &mut self,
+        instruction: &Instruction,
+        truncate: bool,
+    ) -> crate::Result<()> {
+        let who = if truncate { "cvttsd2si" } else { "cvtsd2si" };
+        self.scalar_fp_to_si(instruction, types::F64, truncate, who)
     }
 
     /// CVTSS2SD - widen the source's low single to a double in `dst[63:0]`;
@@ -2376,6 +2327,502 @@ impl<'a> Lifter<'a> {
             .ins()
             .bitcast(types::I32, MemFlagsData::new(), r);
         self.merge_xmm_dword0(dst_idx, bits);
+        Ok(())
+    }
+
+    //  Packed conversions (CVTPD2PS and friends) plus the lane shuffles,
+    //  compares and approximate reciprocals compilers emit around them.
+
+    /// Split a 64-bit XMM half into its two dwords, as `I32` values.
+    fn split_dwords(&mut self, half: Value) -> (Value, Value) {
+        let d0 = self.builder.ins().ireduce(types::I32, half);
+        let upper = self.builder.ins().ushr_imm(half, 32);
+        let d1 = self.builder.ins().ireduce(types::I32, upper);
+        (d0, d1)
+    }
+
+    /// Pack two `I32` dwords into a 64-bit XMM half (`d0` becomes bits[31:0]).
+    fn pack_dwords(&mut self, d0: Value, d1: Value) -> Value {
+        let d0 = self.builder.ins().uextend(types::I64, d0);
+        let d1 = self.builder.ins().uextend(types::I64, d1);
+        let d1 = self.builder.ins().ishl_imm(d1, 32);
+        self.builder.ins().bor(d0, d1)
+    }
+
+    /// Convert one float to a signed integer with x86's out-of-range behaviour.
+    ///
+    /// `x` is an `F32` or `F64`; `ty` is `I32` or `I64`. When the result is
+    /// unrepresentable - NaN, an infinity, or simply out of range - x86 produces
+    /// the *integer indefinite* value (`INT_MIN` for the destination width)
+    /// rather than saturating. Cranelift's `fcvt_to_sint_sat` already yields
+    /// `INT_MIN` for the too-negative side, so only the "NaN or too positive"
+    /// side needs patching, which is exactly the
+    /// `UnorderedOrGreaterThanOrEqual` predicate against `2^(width-1)`.
+    ///
+    /// `truncate` selects the `CVTT*` (toward zero) forms; the plain `CVT*`
+    /// forms round per MXCSR.RC, whose reset value - the only rounding mode this
+    /// lifter models - is round-to-nearest-even, i.e. Cranelift's `nearest`.
+    fn fp_to_sint_x86(&mut self, x: Value, ty: Type, truncate: bool) -> Value {
+        let src_ty = self.builder.func.dfg.value_type(x);
+        let x = if truncate {
+            x
+        } else {
+            self.builder.ins().nearest(x)
+        };
+
+        let sat = self.builder.ins().fcvt_to_sint_sat(ty, x);
+        let (limit_f, indefinite) = if ty == types::I32 {
+            (2147483648.0f64, i32::MIN as u32 as i64)
+        } else {
+            (9223372036854775808.0f64, i64::MIN)
+        };
+        let limit = if src_ty == types::F32 {
+            self.builder.ins().f32const(limit_f as f32)
+        } else {
+            self.builder.ins().f64const(limit_f)
+        };
+
+        let invalid = self
+            .builder
+            .ins()
+            .fcmp(FloatCC::UnorderedOrGreaterThanOrEqual, x, limit);
+        let indefinite = self.builder.ins().iconst(ty, indefinite);
+        self.builder.ins().select(invalid, indefinite, sat)
+    }
+
+    /// Shared body of `CVT[T]SS2SI` / `CVT[T]SD2SI`: convert the source's low
+    /// scalar float to the GPR destination's width.
+    fn scalar_fp_to_si(
+        &mut self,
+        instruction: &Instruction,
+        src_ty: Type,
+        truncate: bool,
+        who: &str,
+    ) -> crate::Result<()> {
+        let dst_reg = self.operand_register(instruction, 0);
+        let ty = match dst_reg.size() {
+            4 => types::I32,
+            8 => types::I64,
+            other => {
+                return Err(MicroliftError::UnsupportedInstruction {
+                    mnemonic: format!("{}-dst-size-{}", who, other),
+                });
+            }
+        };
+
+        let src_bits = if src_ty == types::F32 {
+            self.read_scalar_f32_bits(instruction, 1, who)?
+        } else {
+            self.read_scalar_f64_bits(instruction, 1)?
+        };
+        let x = self
+            .builder
+            .ins()
+            .bitcast(src_ty, MemFlagsData::new(), src_bits);
+
+        let res = self.fp_to_sint_x86(x, ty, truncate);
+        self.set_reg_val(dst_reg, res)
+    }
+
+    /// Convert the `f64` in `bits` (an `I64`) to an `f32`, returning its `I32`
+    /// bit pattern.
+    fn f64_bits_to_f32_bits(&mut self, bits: Value) -> Value {
+        let x = self
+            .builder
+            .ins()
+            .bitcast(types::F64, MemFlagsData::new(), bits);
+        let r = self.builder.ins().fdemote(types::F32, x);
+        self.builder
+            .ins()
+            .bitcast(types::I32, MemFlagsData::new(), r)
+    }
+
+    /// Convert the `f32` in `bits` (an `I32`) to an `f64`, returning its `I64`
+    /// bit pattern.
+    fn f32_bits_to_f64_bits(&mut self, bits: Value) -> Value {
+        let x = self
+            .builder
+            .ins()
+            .bitcast(types::F32, MemFlagsData::new(), bits);
+        let r = self.builder.ins().fpromote(types::F64, x);
+        self.builder
+            .ins()
+            .bitcast(types::I64, MemFlagsData::new(), r)
+    }
+
+    /// Read the low 64 bits of the `xmm/m64` source of the "half-width source"
+    /// conversions (`CVTPS2PD`, `CVTDQ2PD`), which touch only 8 bytes of memory.
+    fn read_low_qword_src(&mut self, instruction: &Instruction, who: &str) -> crate::Result<Value> {
+        match self.operand_kind(instruction, 1) {
+            OpKind::Register => {
+                let idx = self.xmm_operand_index(instruction, 1, who)?;
+                Ok(self.get_xmm_lo(idx))
+            }
+            OpKind::Memory => {
+                let ptr = self.get_mem_ptr(instruction, 1)?;
+                Ok(self
+                    .builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::new(), ptr, 0))
+            }
+            other => Err(MicroliftError::UnsupportedInstruction {
+                mnemonic: format!("{}-src-{:?}", who, other),
+            }),
+        }
+    }
+
+    /// CVTPD2PS - narrow two packed doubles to two singles in `dst[63:0]`.
+    ///
+    /// Note the asymmetry with the scalar `CVTSD2SS`: because the result is
+    /// narrower than the source, bits[127:64] of the destination are **zeroed**,
+    /// not preserved.
+    pub(super) fn handle_cvtpd2ps(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, "cvtpd2ps")?;
+        let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
+
+        let d0 = self.f64_bits_to_f32_bits(src_lo);
+        let d1 = self.f64_bits_to_f32_bits(src_hi);
+        let res_lo = self.pack_dwords(d0, d1);
+        let zero = self.builder.ins().iconst(types::I64, 0);
+
+        self.set_xmm_lo(dst_idx, res_lo);
+        self.set_xmm_hi(dst_idx, zero);
+        Ok(())
+    }
+
+    /// CVTPS2PD - widen the two singles in the source's low 64 bits (`xmm/m64`)
+    /// to two doubles filling the whole destination.
+    pub(super) fn handle_cvtps2pd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, "cvtps2pd")?;
+        let src = self.read_low_qword_src(instruction, "cvtps2pd")?;
+        let (s0, s1) = self.split_dwords(src);
+
+        let res_lo = self.f32_bits_to_f64_bits(s0);
+        let res_hi = self.f32_bits_to_f64_bits(s1);
+
+        self.set_xmm_lo(dst_idx, res_lo);
+        self.set_xmm_hi(dst_idx, res_hi);
+        Ok(())
+    }
+
+    /// CVTDQ2PS - convert four packed signed dwords to four singles.
+    pub(super) fn handle_cvtdq2ps(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, "cvtdq2ps")?;
+        let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
+
+        let mut halves = [src_lo, src_hi];
+        for half in &mut halves {
+            let (a, b) = self.split_dwords(*half);
+            let a = self.sint32_to_f32_bits(a);
+            let b = self.sint32_to_f32_bits(b);
+            *half = self.pack_dwords(a, b);
+        }
+
+        self.set_xmm_lo(dst_idx, halves[0]);
+        self.set_xmm_hi(dst_idx, halves[1]);
+        Ok(())
+    }
+
+    /// Convert the signed `I32` in `v` to an `f32`, returning its `I32` bits.
+    fn sint32_to_f32_bits(&mut self, v: Value) -> Value {
+        let f = self.builder.ins().fcvt_from_sint(types::F32, v);
+        self.builder
+            .ins()
+            .bitcast(types::I32, MemFlagsData::new(), f)
+    }
+
+    /// CVTPS2DQ / CVTTPS2DQ - convert four packed singles to four signed dwords,
+    /// rounding to nearest-even or truncating toward zero.
+    pub(super) fn handle_cvtps2dq(
+        &mut self,
+        instruction: &Instruction,
+        truncate: bool,
+    ) -> crate::Result<()> {
+        let who = if truncate { "cvttps2dq" } else { "cvtps2dq" };
+        let dst_idx = self.xmm_operand_index(instruction, 0, who)?;
+        let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
+
+        let mut halves = [src_lo, src_hi];
+        for half in &mut halves {
+            let (a, b) = self.split_dwords(*half);
+            let a = self.f32_bits_to_sint32(a, truncate);
+            let b = self.f32_bits_to_sint32(b, truncate);
+            *half = self.pack_dwords(a, b);
+        }
+
+        self.set_xmm_lo(dst_idx, halves[0]);
+        self.set_xmm_hi(dst_idx, halves[1]);
+        Ok(())
+    }
+
+    /// Convert the `f32` bit pattern in `bits` (an `I32`) to a signed `I32`.
+    fn f32_bits_to_sint32(&mut self, bits: Value, truncate: bool) -> Value {
+        let x = self
+            .builder
+            .ins()
+            .bitcast(types::F32, MemFlagsData::new(), bits);
+        self.fp_to_sint_x86(x, types::I32, truncate)
+    }
+
+    /// CVTDQ2PD - convert the two signed dwords in the source's low 64 bits
+    /// (`xmm/m64`) to two doubles filling the whole destination.
+    pub(super) fn handle_cvtdq2pd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, "cvtdq2pd")?;
+        let src = self.read_low_qword_src(instruction, "cvtdq2pd")?;
+        let (s0, s1) = self.split_dwords(src);
+
+        let mut out = [s0, s1];
+        for v in &mut out {
+            let f = self.builder.ins().fcvt_from_sint(types::F64, *v);
+            *v = self
+                .builder
+                .ins()
+                .bitcast(types::I64, MemFlagsData::new(), f);
+        }
+
+        self.set_xmm_lo(dst_idx, out[0]);
+        self.set_xmm_hi(dst_idx, out[1]);
+        Ok(())
+    }
+
+    /// CVTPD2DQ / CVTTPD2DQ - convert two packed doubles to two signed dwords in
+    /// `dst[63:0]`, rounding to nearest-even or truncating toward zero.
+    ///
+    /// As with [`Self::handle_cvtpd2ps`], the narrowing result zeroes
+    /// bits[127:64] of the destination.
+    pub(super) fn handle_cvtpd2dq(
+        &mut self,
+        instruction: &Instruction,
+        truncate: bool,
+    ) -> crate::Result<()> {
+        let who = if truncate { "cvttpd2dq" } else { "cvtpd2dq" };
+        let dst_idx = self.xmm_operand_index(instruction, 0, who)?;
+        let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
+
+        let mut out = [src_lo, src_hi];
+        for v in &mut out {
+            let x = self
+                .builder
+                .ins()
+                .bitcast(types::F64, MemFlagsData::new(), *v);
+            *v = self.fp_to_sint_x86(x, types::I32, truncate);
+        }
+        let res_lo = self.pack_dwords(out[0], out[1]);
+        let zero = self.builder.ins().iconst(types::I64, 0);
+
+        self.set_xmm_lo(dst_idx, res_lo);
+        self.set_xmm_hi(dst_idx, zero);
+        Ok(())
+    }
+
+    /// The comparison predicate of a `CMPPS` / `CMPPD` / `CMPSS` / `CMPSD`
+    /// `imm8`, as a Cranelift condition.
+    ///
+    /// Only the low three bits are defined for the legacy SSE encodings. The
+    /// negated predicates (`NEQ`, `NLT`, `NLE`) are true for unordered operands,
+    /// which is exactly what Cranelift's `Unordered*` conditions express.
+    fn cmp_predicate(imm: u8) -> FloatCC {
+        match imm & 0b111 {
+            0 => FloatCC::Equal,                         // EQ  (ordered)
+            1 => FloatCC::LessThan,                      // LT  (ordered)
+            2 => FloatCC::LessThanOrEqual,               // LE  (ordered)
+            3 => FloatCC::Unordered,                     // UNORD
+            4 => FloatCC::NotEqual,                      // NEQ (unordered)
+            5 => FloatCC::UnorderedOrGreaterThanOrEqual, // NLT
+            6 => FloatCC::UnorderedOrGreaterThan,        // NLE
+            _ => FloatCC::Ordered,                       // ORD
+        }
+    }
+
+    /// The lane operation of the `CMP*` family: an all-ones mask when the
+    /// predicate holds, all-zeros otherwise.
+    ///
+    /// The mask is bitcast back to the lane's float type so this can reuse the
+    /// shared `f32`/`f64` lane plumbing, which expects a float result and
+    /// bitcasts it to bits again; the round trip folds away.
+    fn fp_cmp_mask(cc: FloatCC) -> impl Fn(&mut FunctionBuilder<'a>, Value, Value) -> Value {
+        move |b, x, y| {
+            let fty = b.func.dfg.value_type(x);
+            let ity = if fty == types::F32 {
+                types::I32
+            } else {
+                types::I64
+            };
+            let c = b.ins().fcmp(cc, x, y);
+            let ones = b.ins().iconst(ity, -1);
+            let zeros = b.ins().iconst(ity, 0);
+            let mask = b.ins().select(c, ones, zeros);
+            b.ins().bitcast(fty, MemFlagsData::new(), mask)
+        }
+    }
+
+    /// CMPPS - packed single-precision compare; each lane becomes all-ones or
+    /// all-zeros according to the `imm8` predicate.
+    pub(super) fn handle_cmpps(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let cc = Self::cmp_predicate(instruction.immediate8());
+        self.packed_single_arith(instruction, "cmpps", Self::fp_cmp_mask(cc))
+    }
+
+    /// CMPPD - packed double-precision compare.
+    pub(super) fn handle_cmppd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let cc = Self::cmp_predicate(instruction.immediate8());
+        self.packed_double_arith(instruction, "cmppd", Self::fp_cmp_mask(cc))
+    }
+
+    /// CMPSS - scalar single-precision compare; bits[127:32] of the destination
+    /// are preserved.
+    pub(super) fn handle_cmpss(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let cc = Self::cmp_predicate(instruction.immediate8());
+        self.scalar_single_arith(instruction, "cmpss", Self::fp_cmp_mask(cc))
+    }
+
+    /// CMPSD (SSE2 form) - scalar double-precision compare; the high 64 bits of
+    /// the destination are preserved.
+    pub(super) fn handle_cmpsd_sse(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let cc = Self::cmp_predicate(instruction.immediate8());
+        self.scalar_double_arith(instruction, "cmpsd", Self::fp_cmp_mask(cc))
+    }
+
+    /// SHUFPS - the destination's low two dwords are selected from the
+    /// destination, its high two from the source, two `imm8` bits each.
+    pub(super) fn handle_shufps(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, "shufps")?;
+        let dst_lo = self.get_xmm_lo(dst_idx);
+        let dst_hi = self.get_xmm_hi(dst_idx);
+        let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
+
+        let (d0, d1) = self.split_dwords(dst_lo);
+        let (d2, d3) = self.split_dwords(dst_hi);
+        let (s0, s1) = self.split_dwords(src_lo);
+        let (s2, s3) = self.split_dwords(src_hi);
+        let d = [d0, d1, d2, d3];
+        let s = [s0, s1, s2, s3];
+
+        let imm = instruction.immediate8();
+        let sel = |n: u8| ((imm >> (2 * n)) & 0b11) as usize;
+        let (r0, r1, r2, r3) = (d[sel(0)], d[sel(1)], s[sel(2)], s[sel(3)]);
+
+        let res_lo = self.pack_dwords(r0, r1);
+        let res_hi = self.pack_dwords(r2, r3);
+        self.set_xmm_lo(dst_idx, res_lo);
+        self.set_xmm_hi(dst_idx, res_hi);
+        Ok(())
+    }
+
+    /// SHUFPD - the destination's low quadword is selected from the destination
+    /// by `imm8[0]`, its high quadword from the source by `imm8[1]`.
+    pub(super) fn handle_shufpd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, "shufpd")?;
+        let dst_lo = self.get_xmm_lo(dst_idx);
+        let dst_hi = self.get_xmm_hi(dst_idx);
+        let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
+
+        let imm = instruction.immediate8();
+        let res_lo = if imm & 1 != 0 { dst_hi } else { dst_lo };
+        let res_hi = if imm & 2 != 0 { src_hi } else { src_lo };
+
+        self.set_xmm_lo(dst_idx, res_lo);
+        self.set_xmm_hi(dst_idx, res_hi);
+        Ok(())
+    }
+
+    /// PSHUFLW / PSHUFHW - shuffle the four words of one half of `xmm2/m128`
+    /// into the same half of `xmm1` (two `imm8` bits per destination word); the
+    /// other half is copied through unchanged.
+    pub(super) fn handle_pshuflhw(
+        &mut self,
+        instruction: &Instruction,
+        high: bool,
+    ) -> crate::Result<()> {
+        let who = if high { "pshufhw" } else { "pshuflw" };
+        let dst_idx = self.xmm_operand_index(instruction, 0, who)?;
+        let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
+
+        let shuffled = if high { src_hi } else { src_lo };
+        let words: Vec<Value> = (0..4)
+            .map(|i| self.extract_lane(shuffled, i * 16, 16, false))
+            .collect();
+
+        let imm = instruction.immediate8();
+        let mut acc = self.builder.ins().iconst(types::I64, 0);
+        for out in 0..4u8 {
+            let w = words[((imm >> (2 * out)) & 0b11) as usize];
+            let placed = if out == 0 {
+                w
+            } else {
+                self.builder.ins().ishl_imm(w, i64::from(out) * 16)
+            };
+            acc = self.builder.ins().bor(acc, placed);
+        }
+
+        if high {
+            self.set_xmm_lo(dst_idx, src_lo);
+            self.set_xmm_hi(dst_idx, acc);
+        } else {
+            self.set_xmm_lo(dst_idx, acc);
+            self.set_xmm_hi(dst_idx, src_hi);
+        }
+        Ok(())
+    }
+
+    /// The lane operation of `RCP*` / `RSQRT*`, applied to the *source* lane
+    /// (`y`) - these are unary instructions expressed through the shared binary
+    /// lane plumbing, so the destination lane `x` is ignored.
+    ///
+    /// Hardware computes an approximation with a relative error up to
+    /// `1.5 * 2^-12`; the exact quotient emitted here is within that bound but
+    /// will not be bit-identical to a real CPU. Compilers only emit these under
+    /// fast-math, where that difference is already licensed.
+    fn fp_reciprocal(sqrt: bool) -> impl Fn(&mut FunctionBuilder<'a>, Value, Value) -> Value {
+        move |b, _x, y| {
+            let y = if sqrt { b.ins().sqrt(y) } else { y };
+            let one = b.ins().f32const(1.0);
+            b.ins().fdiv(one, y)
+        }
+    }
+
+    /// RCPPS / RSQRTPS - packed approximate reciprocal (of the square root) of
+    /// all four single-precision lanes of the source.
+    pub(super) fn handle_rcpps(
+        &mut self,
+        instruction: &Instruction,
+        sqrt: bool,
+    ) -> crate::Result<()> {
+        let who = if sqrt { "rsqrtps" } else { "rcpps" };
+        self.packed_single_arith(instruction, who, Self::fp_reciprocal(sqrt))
+    }
+
+    /// RCPSS / RSQRTSS - scalar approximate reciprocal (of the square root);
+    /// bits[127:32] of the destination are preserved.
+    pub(super) fn handle_rcpss(
+        &mut self,
+        instruction: &Instruction,
+        sqrt: bool,
+    ) -> crate::Result<()> {
+        let who = if sqrt { "rsqrtss" } else { "rcpss" };
+        self.scalar_single_arith(instruction, who, Self::fp_reciprocal(sqrt))
+    }
+
+    /// MOVSLDUP / MOVSHDUP - duplicate the source's even (`sldup`) or odd
+    /// (`shdup`) dwords: `[d0,d0,d2,d2]` or `[d1,d1,d3,d3]`.
+    pub(super) fn handle_movsldup(
+        &mut self,
+        instruction: &Instruction,
+        odd: bool,
+    ) -> crate::Result<()> {
+        let who = if odd { "movshdup" } else { "movsldup" };
+        let dst_idx = self.xmm_operand_index(instruction, 0, who)?;
+        let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
+
+        let mut halves = [src_lo, src_hi];
+        for half in &mut halves {
+            let (even, oddv) = self.split_dwords(*half);
+            let d = if odd { oddv } else { even };
+            *half = self.pack_dwords(d, d);
+        }
+
+        self.set_xmm_lo(dst_idx, halves[0]);
+        self.set_xmm_hi(dst_idx, halves[1]);
         Ok(())
     }
 }
