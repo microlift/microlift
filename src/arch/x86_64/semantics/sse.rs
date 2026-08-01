@@ -1128,6 +1128,50 @@ impl<'a> Lifter<'a> {
         }
     }
 
+    /// Read the low 32 bits (a scalar `f32`'s raw bits, as an `I32`) of a source
+    /// operand.
+    ///
+    /// Memory sources load only 4 bytes, which is correct for the `m32` operands
+    /// of scalar-single instructions (`ADDSS`, `MULSS`, ...). Register sources
+    /// must be XMM - no scalar-single instruction takes a GPR operand.
+    fn read_scalar_f32_bits(
+        &mut self,
+        instruction: &Instruction,
+        op_index: u32,
+        who: &str,
+    ) -> crate::Result<Value> {
+        match self.operand_kind(instruction, op_index) {
+            OpKind::Register => {
+                let idx = self.xmm_operand_index(instruction, op_index, who)?;
+                let lo = self.get_xmm_lo(idx);
+                Ok(self.builder.ins().ireduce(types::I32, lo))
+            }
+            OpKind::Memory => {
+                let ptr = self.get_mem_ptr(instruction, op_index)?;
+                Ok(self
+                    .builder
+                    .ins()
+                    .load(types::I32, MemFlagsData::new(), ptr, 0))
+            }
+            other => Err(MicroliftError::UnsupportedInstruction {
+                mnemonic: format!("scalar-f32-src-op{}-{:?}", op_index, other),
+            }),
+        }
+    }
+
+    /// Replace bits[31:0] of XMM `idx` with `bits32` (an `I32`), leaving
+    /// bits[127:32] untouched - the merge behaviour every scalar-single
+    /// destination write shares.
+    fn merge_xmm_dword0(&mut self, idx: u8, bits32: Value) {
+        let bits = self.builder.ins().uextend(types::I64, bits32);
+        let dst_lo = self.get_xmm_lo(idx);
+        let mask = self.builder.ins().iconst(types::I64, !0xFFFF_FFFFi64);
+        let cleared = self.builder.ins().band(dst_lo, mask);
+        let merged = self.builder.ins().bor(cleared, bits);
+        // The high quadword is preserved (no write needed).
+        self.set_xmm_lo(idx, merged);
+    }
+
     /// PUNPCKLDQ - interleave the low doublewords of dst and src.
     ///
     /// The result's four dwords are `[dst.d0, src.d0, dst.d1, src.d1]`, so only
@@ -1164,24 +1208,14 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// SUBPD - packed double-precision subtract of both 64-bit lanes.
-    pub(super) fn handle_subpd(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let dst_idx = self.xmm_operand_index(instruction, 0, "subpd")?;
-        let dst_lo = self.get_xmm_lo(dst_idx);
-        let dst_hi = self.get_xmm_hi(dst_idx);
-        let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
-
-        let res_lo = self.fsub_f64_bits(dst_lo, src_lo);
-        let res_hi = self.fsub_f64_bits(dst_hi, src_hi);
-
-        self.set_xmm_lo(dst_idx, res_lo);
-        self.set_xmm_hi(dst_idx, res_hi);
-        Ok(())
-    }
-
-    /// Subtract two `f64` values given as raw `I64` bit patterns, returning the
-    /// difference's bits.
-    fn fsub_f64_bits(&mut self, a_bits: Value, b_bits: Value) -> Value {
+    /// Apply `op` to two `f64` values given as raw `I64` bit patterns, returning
+    /// the result's bits.
+    fn f64_bits_arith(
+        &mut self,
+        a_bits: Value,
+        b_bits: Value,
+        op: &impl Fn(&mut FunctionBuilder<'a>, Value, Value) -> Value,
+    ) -> Value {
         let a = self
             .builder
             .ins()
@@ -1190,10 +1224,57 @@ impl<'a> Lifter<'a> {
             .builder
             .ins()
             .bitcast(types::F64, MemFlagsData::new(), b_bits);
-        let r = self.builder.ins().fsub(a, b);
+        let r = op(&mut self.builder, a, b);
         self.builder
             .ins()
             .bitcast(types::I64, MemFlagsData::new(), r)
+    }
+
+    /// Apply `op` to the two packed `f32` lanes held in a 64-bit half of an XMM
+    /// register (lane 0 = bits[31:0], lane 1 = bits[63:32]), returning the
+    /// repacked 64-bit result.
+    fn f32_pair_arith(
+        &mut self,
+        a_bits: Value,
+        b_bits: Value,
+        op: &impl Fn(&mut FunctionBuilder<'a>, Value, Value) -> Value,
+    ) -> Value {
+        let a0 = self.builder.ins().ireduce(types::I32, a_bits);
+        let b0 = self.builder.ins().ireduce(types::I32, b_bits);
+        let a1_64 = self.builder.ins().ushr_imm(a_bits, 32);
+        let b1_64 = self.builder.ins().ushr_imm(b_bits, 32);
+        let a1 = self.builder.ins().ireduce(types::I32, a1_64);
+        let b1 = self.builder.ins().ireduce(types::I32, b1_64);
+
+        let r0 = self.f32_bits_arith(a0, b0, op);
+        let r1 = self.f32_bits_arith(a1, b1, op);
+
+        let r0_64 = self.builder.ins().uextend(types::I64, r0);
+        let r1_64 = self.builder.ins().uextend(types::I64, r1);
+        let r1_shifted = self.builder.ins().ishl_imm(r1_64, 32);
+        self.builder.ins().bor(r0_64, r1_shifted)
+    }
+
+    /// Apply `op` to two `f32` values given as raw `I32` bit patterns, returning
+    /// the result's bits.
+    fn f32_bits_arith(
+        &mut self,
+        a_bits: Value,
+        b_bits: Value,
+        op: &impl Fn(&mut FunctionBuilder<'a>, Value, Value) -> Value,
+    ) -> Value {
+        let a = self
+            .builder
+            .ins()
+            .bitcast(types::F32, MemFlagsData::new(), a_bits);
+        let b = self
+            .builder
+            .ins()
+            .bitcast(types::F32, MemFlagsData::new(), b_bits);
+        let r = op(&mut self.builder, a, b);
+        self.builder
+            .ins()
+            .bitcast(types::I32, MemFlagsData::new(), r)
     }
 
     /// Shared implementation for the scalar double-precision arithmetic
@@ -1206,28 +1287,80 @@ impl<'a> Lifter<'a> {
         &mut self,
         instruction: &Instruction,
         who: &str,
-        op: impl FnOnce(&mut FunctionBuilder<'a>, Value, Value) -> Value,
+        op: impl Fn(&mut FunctionBuilder<'a>, Value, Value) -> Value,
     ) -> crate::Result<()> {
         let dst_idx = self.xmm_operand_index(instruction, 0, who)?;
         let dst_lo = self.get_xmm_lo(dst_idx);
         let src_lo = self.read_scalar_f64_bits(instruction, 1)?;
-
-        let a = self
-            .builder
-            .ins()
-            .bitcast(types::F64, MemFlagsData::new(), dst_lo);
-        let b = self
-            .builder
-            .ins()
-            .bitcast(types::F64, MemFlagsData::new(), src_lo);
-        let r = op(&mut self.builder, a, b);
-        let res_lo = self
-            .builder
-            .ins()
-            .bitcast(types::I64, MemFlagsData::new(), r);
+        let res_lo = self.f64_bits_arith(dst_lo, src_lo, &op);
 
         // hi 64 bits are preserved (no write needed).
         self.set_xmm_lo(dst_idx, res_lo);
+        Ok(())
+    }
+
+    /// Shared implementation for the packed double-precision arithmetic
+    /// instructions (`ADDPD` / `SUBPD` / ...): apply `op` to both 64-bit lanes.
+    fn packed_double_arith(
+        &mut self,
+        instruction: &Instruction,
+        who: &str,
+        op: impl Fn(&mut FunctionBuilder<'a>, Value, Value) -> Value,
+    ) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, who)?;
+        let dst_lo = self.get_xmm_lo(dst_idx);
+        let dst_hi = self.get_xmm_hi(dst_idx);
+        let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
+
+        let res_lo = self.f64_bits_arith(dst_lo, src_lo, &op);
+        let res_hi = self.f64_bits_arith(dst_hi, src_hi, &op);
+
+        self.set_xmm_lo(dst_idx, res_lo);
+        self.set_xmm_hi(dst_idx, res_hi);
+        Ok(())
+    }
+
+    /// Shared implementation for the scalar single-precision arithmetic
+    /// instructions (`ADDSS` / `SUBSS` / `MULSS` / `DIVSS`): apply `op` to the
+    /// low 32-bit lanes of dst and src, preserving bits[127:32] of dst.
+    ///
+    /// `op` receives the two operands as `F32` values and returns the `F32`
+    /// result.
+    fn scalar_single_arith(
+        &mut self,
+        instruction: &Instruction,
+        who: &str,
+        op: impl Fn(&mut FunctionBuilder<'a>, Value, Value) -> Value,
+    ) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, who)?;
+        let dst_lo = self.get_xmm_lo(dst_idx);
+        let dst_bits = self.builder.ins().ireduce(types::I32, dst_lo);
+        let src_bits = self.read_scalar_f32_bits(instruction, 1, who)?;
+
+        let res = self.f32_bits_arith(dst_bits, src_bits, &op);
+        self.merge_xmm_dword0(dst_idx, res);
+        Ok(())
+    }
+
+    /// Shared implementation for the packed single-precision arithmetic
+    /// instructions (`MULPS` / `ADDPS` / ...): apply `op` to all four 32-bit
+    /// lanes.
+    fn packed_single_arith(
+        &mut self,
+        instruction: &Instruction,
+        who: &str,
+        op: impl Fn(&mut FunctionBuilder<'a>, Value, Value) -> Value,
+    ) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, who)?;
+        let dst_lo = self.get_xmm_lo(dst_idx);
+        let dst_hi = self.get_xmm_hi(dst_idx);
+        let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
+
+        let res_lo = self.f32_pair_arith(dst_lo, src_lo, &op);
+        let res_hi = self.f32_pair_arith(dst_hi, src_hi, &op);
+
+        self.set_xmm_lo(dst_idx, res_lo);
+        self.set_xmm_hi(dst_idx, res_hi);
         Ok(())
     }
 
@@ -1247,6 +1380,138 @@ impl<'a> Lifter<'a> {
     /// the high 64 bits of the destination are preserved.
     pub(super) fn handle_divsd(&mut self, instruction: &Instruction) -> crate::Result<()> {
         self.scalar_double_arith(instruction, "divsd", |b, x, y| b.ins().fdiv(x, y))
+    }
+
+    /// ADDPD - packed double-precision add of both 64-bit lanes.
+    pub(super) fn handle_addpd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.packed_double_arith(instruction, "addpd", |b, x, y| b.ins().fadd(x, y))
+    }
+
+    /// SUBPD - packed double-precision subtract of both 64-bit lanes.
+    pub(super) fn handle_subpd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.packed_double_arith(instruction, "subpd", |b, x, y| b.ins().fsub(x, y))
+    }
+
+    /// ADDSS - scalar single-precision add of the low 32 bits; bits[127:32] of
+    /// the destination are preserved.
+    pub(super) fn handle_addss(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.scalar_single_arith(instruction, "addss", |b, x, y| b.ins().fadd(x, y))
+    }
+
+    /// SUBSS - scalar single-precision subtract of the low 32 bits (`dst - src`);
+    /// bits[127:32] of the destination are preserved.
+    pub(super) fn handle_subss(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.scalar_single_arith(instruction, "subss", |b, x, y| b.ins().fsub(x, y))
+    }
+
+    /// MULSS - scalar single-precision multiply of the low 32 bits; bits[127:32]
+    /// of the destination are preserved.
+    pub(super) fn handle_mulss(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.scalar_single_arith(instruction, "mulss", |b, x, y| b.ins().fmul(x, y))
+    }
+
+    /// DIVSS - scalar single-precision divide of the low 32 bits (`dst / src`);
+    /// bits[127:32] of the destination are preserved.
+    pub(super) fn handle_divss(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.scalar_single_arith(instruction, "divss", |b, x, y| b.ins().fdiv(x, y))
+    }
+
+    /// MULPS - packed single-precision multiply of all four 32-bit lanes.
+    pub(super) fn handle_mulps(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.packed_single_arith(instruction, "mulps", |b, x, y| b.ins().fmul(x, y))
+    }
+
+    /// CVTSI2SS - convert a signed integer to a scalar single-precision float.
+    ///
+    /// - `CVTSI2SS xmm, r/m32`: `dst[31:0] = (f32)(i32)src`
+    /// - `CVTSI2SS xmm, r/m64` (REX.W): `dst[31:0] = (f32)(i64)src`
+    ///
+    /// Bits [127:32] of the destination are preserved.
+    pub(super) fn handle_cvtsi2ss(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, "cvtsi2ss")?;
+
+        let src = match self.operand_kind(instruction, 1) {
+            OpKind::Register => {
+                let reg = self.operand_register(instruction, 1);
+                self.get_reg_val(reg)?
+            }
+            OpKind::Memory => {
+                let size = instruction.memory_size().size();
+                let ty = match size {
+                    4 => types::I32,
+                    8 => types::I64,
+                    other => {
+                        return Err(MicroliftError::UnsupportedInstruction {
+                            mnemonic: format!("cvtsi2ss-mem-size-{}", other),
+                        });
+                    }
+                };
+                let ptr = self.get_mem_ptr(instruction, 1)?;
+                self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0)
+            }
+            other => {
+                return Err(MicroliftError::UnsupportedInstruction {
+                    mnemonic: format!("cvtsi2ss-src-{:?}", other),
+                });
+            }
+        };
+
+        let src_ty = self.builder.func.dfg.value_type(src);
+        if src_ty != types::I32 && src_ty != types::I64 {
+            return Err(MicroliftError::UnsupportedInstruction {
+                mnemonic: format!("cvtsi2ss-src-width-{}", src_ty.bits()),
+            });
+        }
+
+        let f = self.builder.ins().fcvt_from_sint(types::F32, src);
+        let bits32 = self
+            .builder
+            .ins()
+            .bitcast(types::I32, MemFlagsData::new(), f);
+        self.merge_xmm_dword0(dst_idx, bits32);
+        Ok(())
+    }
+
+    /// CVTTSS2SI - convert a scalar single-precision float to a signed integer,
+    /// truncating toward zero.
+    ///
+    /// - `CVTTSS2SI r32, xmm/m32`: `dst = (i32)trunc(src)`
+    /// - `CVTTSS2SI r64, xmm/m32` (REX.W): `dst = (i64)trunc(src)`
+    ///
+    /// When the truncated value is unrepresentable - NaN, an infinity, or simply
+    /// out of range - x86 produces the *integer indefinite* value (`INT_MIN` for
+    /// the destination width) rather than saturating. Cranelift's
+    /// `fcvt_to_sint_sat` already yields `INT_MIN` for the too-negative side, so
+    /// only the "NaN or too positive" side needs patching, which is exactly the
+    /// `UnorderedOrGreaterThanOrEqual` predicate against `2^(width-1)`.
+    pub(super) fn handle_cvttss2si(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst_reg = self.operand_register(instruction, 0);
+        let (ty, limit, indefinite) = match dst_reg.size() {
+            4 => (types::I32, 2147483648.0f32, i32::MIN as u32 as i64),
+            8 => (types::I64, 9223372036854775808.0f32, i64::MIN),
+            other => {
+                return Err(MicroliftError::UnsupportedInstruction {
+                    mnemonic: format!("cvttss2si-dst-size-{}", other),
+                });
+            }
+        };
+
+        let src_bits = self.read_scalar_f32_bits(instruction, 1, "cvttss2si")?;
+        let x = self
+            .builder
+            .ins()
+            .bitcast(types::F32, MemFlagsData::new(), src_bits);
+
+        let sat = self.builder.ins().fcvt_to_sint_sat(ty, x);
+        let limit = self.builder.ins().f32const(limit);
+        let invalid = self
+            .builder
+            .ins()
+            .fcmp(FloatCC::UnorderedOrGreaterThanOrEqual, x, limit);
+        let indefinite = self.builder.ins().iconst(ty, indefinite);
+        let res = self.builder.ins().select(invalid, indefinite, sat);
+
+        self.set_reg_val(dst_reg, res)
     }
 
     /// UCOMISD / COMISD - compare the low scalar doubles of two operands and set

@@ -1697,3 +1697,469 @@ fn test_packed_add_sub_roundtrip() {
         "paddd+psubd roundtrip",
     );
 }
+
+//  CVTSI2SS
+
+/// Raw bits of `v as f32`, as they should appear in `xmm[dst][0]`'s low dword.
+fn f32_bits(v: f32) -> u64 {
+    v.to_bits() as u64
+}
+
+#[test]
+fn test_cvtsi2ss_r32() {
+    // cvtsi2ss xmm0, eax; ret   ->   F3 0F 2A C0  C3
+    let bytes = [0xF3, 0x0F, 0x2A, 0xC0, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.rax = 42;
+    ctx.xmm[0] = [0xAAAA_BBBB_CCCC_DDDD, 0x1111_2222_3333_4444];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(
+        ctx.xmm[0][0],
+        0xAAAA_BBBB_0000_0000 | f32_bits(42.0),
+        "cvtsi2ss r32: low dword converted, bits[63:32] preserved"
+    );
+    assert_eq!(
+        ctx.xmm[0][1], 0x1111_2222_3333_4444,
+        "cvtsi2ss must preserve bits[127:64]"
+    );
+}
+
+#[test]
+fn test_cvtsi2ss_r32_negative() {
+    // The source is *signed*: 0xFFFFFFFF as i32 is -1, not 4294967295.
+    // cvtsi2ss xmm0, eax; ret
+    let bytes = [0xF3, 0x0F, 0x2A, 0xC0, 0xC3];
+    let mut ctx = RegisterContext::default();
+    // Upper 32 bits of rax must be ignored entirely.
+    ctx.rax = 0xDEAD_BEEF_FFFF_FFFF;
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.xmm[0][0] as u32 as u64, f32_bits(-1.0));
+}
+
+#[test]
+fn test_cvtsi2ss_r64() {
+    // cvtsi2ss xmm0, rax; ret   ->   F3 48 0F 2A C0  C3
+    let bytes = [0xF3, 0x48, 0x0F, 0x2A, 0xC0, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.rax = (-123_456_789_012i64) as u64;
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.xmm[0][0], f32_bits(-123_456_789_012i64 as f32));
+}
+
+#[test]
+fn test_cvtsi2ss_r64_rounds_to_nearest_even() {
+    // 2^24 + 1 is not representable in f32; the default rounding mode rounds it
+    // back down to 2^24.
+    // cvtsi2ss xmm0, rax; ret
+    let bytes = [0xF3, 0x48, 0x0F, 0x2A, 0xC0, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.rax = (1u64 << 24) + 1;
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.xmm[0][0], f32_bits(16_777_216.0));
+}
+
+#[test]
+fn test_cvtsi2ss_m32() {
+    // cvtsi2ss xmm0, dword ptr [rdi]; ret   ->   F3 0F 2A 07  C3
+    let bytes = [0xF3, 0x0F, 0x2A, 0x07, 0xC3];
+    let val: i32 = -7;
+    let mut ctx = RegisterContext::default();
+    ctx.rdi = &val as *const i32 as u64;
+    ctx.xmm[0] = [0x0123_4567_89AB_CDEF, 0xFFFF_FFFF_FFFF_FFFF];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.xmm[0][0], 0x0123_4567_0000_0000 | f32_bits(-7.0));
+    assert_eq!(ctx.xmm[0][1], 0xFFFF_FFFF_FFFF_FFFF);
+}
+
+#[test]
+fn test_cvtsi2ss_m64() {
+    // cvtsi2ss xmm0, qword ptr [rdi]; ret   ->   F3 48 0F 2A 07  C3
+    let bytes = [0xF3, 0x48, 0x0F, 0x2A, 0x07, 0xC3];
+    let val: i64 = 1 << 40;
+    let mut ctx = RegisterContext::default();
+    ctx.rdi = &val as *const i64 as u64;
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.xmm[0][0], f32_bits((1i64 << 40) as f32));
+}
+
+#[test]
+fn test_cvtsi2ss_vector_xmm() {
+    // Same as `test_cvtsi2ss_r32` but with the native-vector XMM backing.
+    // cvtsi2ss xmm3, ecx; ret   ->   F3 0F 2A D9  C3
+    let bytes = [0xF3, 0x0F, 0x2A, 0xD9, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.rcx = 42;
+    ctx.xmm[3] = [0xAAAA_BBBB_CCCC_DDDD, 0x1111_2222_3333_4444];
+    let ctx = run_test_vec(&bytes, ctx);
+    assert_eq!(ctx.xmm[3][0], 0xAAAA_BBBB_0000_0000 | f32_bits(42.0));
+    assert_eq!(ctx.xmm[3][1], 0x1111_2222_3333_4444);
+}
+
+//  Scalar single-precision arithmetic: ADDSS / SUBSS / MULSS / DIVSS
+
+/// Pack two `f32`s into one 64-bit XMM half (lane 0 in the low dword).
+fn pack_f32(l0: f32, l1: f32) -> u64 {
+    (l0.to_bits() as u64) | ((l1.to_bits() as u64) << 32)
+}
+
+/// Run a scalar-single op on `xmm0 <- xmm1` and return the resulting `xmm[0]`.
+///
+/// `xmm0` and `xmm1` are seeded so every bit outside lane 0 is distinctive,
+/// letting the caller assert bits[127:32] of the destination survive.
+fn run_scalar_single(bytes: &[u8], a: f32, b: f32) -> [u64; 2] {
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [
+        pack_f32(a, f32::from_bits(0xAAAA_AAAA)),
+        0x1111_2222_3333_4444,
+    ];
+    ctx.xmm[1] = [
+        pack_f32(b, f32::from_bits(0xBBBB_BBBB)),
+        0x9999_9999_9999_9999,
+    ];
+    run_test(bytes, ctx).xmm[0]
+}
+
+/// Assert a scalar-single op produced `expected` in lane 0 and touched nothing
+/// else in the destination.
+fn check_scalar_single(got: [u64; 2], expected: f32, what: &str) {
+    assert_eq!(
+        got[0],
+        pack_f32(expected, f32::from_bits(0xAAAA_AAAA)),
+        "{what}: lane 0 result, bits[63:32] preserved"
+    );
+    assert_eq!(
+        got[1], 0x1111_2222_3333_4444,
+        "{what}: bits[127:64] preserved"
+    );
+}
+
+#[test]
+fn test_addss_reg_reg() {
+    // addss xmm0, xmm1; ret   ->   F3 0F 58 C1  C3
+    let got = run_scalar_single(&[0xF3, 0x0F, 0x58, 0xC1, 0xC3], 1.5, 2.25);
+    check_scalar_single(got, 3.75, "addss");
+}
+
+#[test]
+fn test_subss_reg_reg_is_dst_minus_src() {
+    // subss xmm0, xmm1; ret   ->   F3 0F 5C C1  C3
+    // Asymmetric operands pin down the operand order.
+    let got = run_scalar_single(&[0xF3, 0x0F, 0x5C, 0xC1, 0xC3], 1.5, 10.0);
+    check_scalar_single(got, -8.5, "subss");
+}
+
+#[test]
+fn test_mulss_reg_reg() {
+    // mulss xmm0, xmm1; ret   ->   F3 0F 59 C1  C3
+    let got = run_scalar_single(&[0xF3, 0x0F, 0x59, 0xC1, 0xC3], 1.5, 3.0);
+    check_scalar_single(got, 4.5, "mulss");
+}
+
+#[test]
+fn test_divss_reg_reg_is_dst_over_src() {
+    // divss xmm0, xmm1; ret   ->   F3 0F 5E C1  C3
+    let got = run_scalar_single(&[0xF3, 0x0F, 0x5E, 0xC1, 0xC3], 7.0, 2.0);
+    check_scalar_single(got, 3.5, "divss");
+}
+
+#[test]
+fn test_divss_by_zero_is_infinity() {
+    // IEEE division by zero yields an infinity, not a trap.
+    // divss xmm0, xmm1; ret
+    let got = run_scalar_single(&[0xF3, 0x0F, 0x5E, 0xC1, 0xC3], 1.0, 0.0);
+    check_scalar_single(got, f32::INFINITY, "divss by zero");
+}
+
+#[test]
+fn test_mulss_inexact_operands_round_like_f32() {
+    // 0.1 is not representable in binary; the product must match what native
+    // f32 multiplication produces, bit for bit.
+    // mulss xmm0, xmm1; ret
+    let got = run_scalar_single(&[0xF3, 0x0F, 0x59, 0xC1, 0xC3], 0.1, 3.0);
+    check_scalar_single(got, 0.1f32 * 3.0f32, "mulss inexact operands");
+}
+
+#[test]
+fn test_addss_rounds_at_single_precision() {
+    // 2^24 + 1 has no f32 representation: the add must saturate the 24-bit
+    // significand back to 2^24 rather than keeping the extra bit in a wider
+    // intermediate lane.
+    // addss xmm0, xmm1; ret
+    let got = run_scalar_single(&[0xF3, 0x0F, 0x58, 0xC1, 0xC3], 16_777_216.0, 1.0);
+    check_scalar_single(got, 16_777_216.0, "addss single-precision rounding");
+}
+
+#[test]
+fn test_mulss_load_from_mem() {
+    // mulss xmm0, dword ptr [rdi]; ret   ->   F3 0F 59 07  C3
+    let bytes = [0xF3, 0x0F, 0x59, 0x07, 0xC3];
+    let val: f32 = 3.0;
+    let mut ctx = RegisterContext::default();
+    ctx.rdi = &val as *const f32 as u64;
+    ctx.xmm[0] = [
+        pack_f32(1.5, f32::from_bits(0xAAAA_AAAA)),
+        0x1111_2222_3333_4444,
+    ];
+    let got = run_test(&bytes, ctx).xmm[0];
+    check_scalar_single(got, 4.5, "mulss m32");
+}
+
+#[test]
+fn test_addss_vector_xmm() {
+    // Same op under the native-vector XMM backing, on a non-zero register pair.
+    // addss xmm2, xmm1; ret   ->   F3 0F 58 D1  C3
+    let bytes = [0xF3, 0x0F, 0x58, 0xD1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[2] = [
+        pack_f32(1.5, f32::from_bits(0xAAAA_AAAA)),
+        0x1111_2222_3333_4444,
+    ];
+    ctx.xmm[1] = [pack_f32(2.25, 0.0), 0x9999_9999_9999_9999];
+    let got = run_test_vec(&bytes, ctx).xmm[2];
+    check_scalar_single(got, 3.75, "addss (vector xmm)");
+}
+
+//  Packed arithmetic: MULPS / ADDPD
+
+/// 16-byte-aligned backing store for an `m128` memory operand.
+///
+/// The payload is only ever read by the lifted code through its address, which
+/// Rust cannot see - hence the `dead_code` allowance.
+#[repr(align(16))]
+struct Aligned128(#[allow(dead_code)] [u64; 2]);
+
+#[test]
+fn test_mulps_reg_reg_all_four_lanes() {
+    // mulps xmm0, xmm1; ret   ->   0F 59 C1  C3
+    let bytes = [0x0F, 0x59, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [pack_f32(1.5, 2.0), pack_f32(-3.0, 0.5)];
+    ctx.xmm[1] = [pack_f32(2.0, 4.0), pack_f32(3.0, 8.0)];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.xmm[0][0], pack_f32(3.0, 8.0), "mulps lanes 0,1");
+    assert_eq!(ctx.xmm[0][1], pack_f32(-9.0, 4.0), "mulps lanes 2,3");
+}
+
+#[test]
+fn test_mulps_load_from_mem() {
+    // mulps xmm0, xmmword ptr [rdi]; ret   ->   0F 59 07  C3
+    let bytes = [0x0F, 0x59, 0x07, 0xC3];
+    let src = Aligned128([pack_f32(2.0, 4.0), pack_f32(3.0, 8.0)]);
+    let mut ctx = RegisterContext::default();
+    ctx.rdi = &src as *const Aligned128 as u64;
+    ctx.xmm[0] = [pack_f32(1.5, 2.0), pack_f32(-3.0, 0.5)];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.xmm[0][0], pack_f32(3.0, 8.0), "mulps m128 lanes 0,1");
+    assert_eq!(ctx.xmm[0][1], pack_f32(-9.0, 4.0), "mulps m128 lanes 2,3");
+}
+
+#[test]
+fn test_mulps_vector_xmm() {
+    // mulps xmm0, xmm1; ret, under the native-vector XMM backing.
+    let bytes = [0x0F, 0x59, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [pack_f32(1.5, 2.0), pack_f32(-3.0, 0.5)];
+    ctx.xmm[1] = [pack_f32(2.0, 4.0), pack_f32(3.0, 8.0)];
+    let ctx = run_test_vec(&bytes, ctx);
+    assert_eq!(ctx.xmm[0][0], pack_f32(3.0, 8.0));
+    assert_eq!(ctx.xmm[0][1], pack_f32(-9.0, 4.0));
+}
+
+#[test]
+fn test_addpd_reg_reg_both_lanes() {
+    // addpd xmm0, xmm1; ret   ->   66 0F 58 C1  C3
+    let bytes = [0x66, 0x0F, 0x58, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [1.5f64.to_bits(), (-3.0f64).to_bits()];
+    ctx.xmm[1] = [2.25f64.to_bits(), 0.5f64.to_bits()];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.xmm[0][0], 3.75f64.to_bits(), "addpd low lane");
+    assert_eq!(ctx.xmm[0][1], (-2.5f64).to_bits(), "addpd high lane");
+}
+
+#[test]
+fn test_addpd_load_from_mem() {
+    // addpd xmm0, xmmword ptr [rdi]; ret   ->   66 0F 58 07  C3
+    let bytes = [0x66, 0x0F, 0x58, 0x07, 0xC3];
+    let src = Aligned128([2.25f64.to_bits(), 0.5f64.to_bits()]);
+    let mut ctx = RegisterContext::default();
+    ctx.rdi = &src as *const Aligned128 as u64;
+    ctx.xmm[0] = [1.5f64.to_bits(), (-3.0f64).to_bits()];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.xmm[0][0], 3.75f64.to_bits());
+    assert_eq!(ctx.xmm[0][1], (-2.5f64).to_bits());
+}
+
+#[test]
+fn test_addpd_vector_xmm() {
+    // addpd xmm0, xmm1; ret, under the native-vector XMM backing.
+    let bytes = [0x66, 0x0F, 0x58, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [1.5f64.to_bits(), (-3.0f64).to_bits()];
+    ctx.xmm[1] = [2.25f64.to_bits(), 0.5f64.to_bits()];
+    let ctx = run_test_vec(&bytes, ctx);
+    assert_eq!(ctx.xmm[0][0], 3.75f64.to_bits());
+    assert_eq!(ctx.xmm[0][1], (-2.5f64).to_bits());
+}
+
+#[test]
+fn test_addpd_subpd_roundtrip() {
+    // addpd xmm0, xmm1; subpd xmm0, xmm1; ret - exact for these operands.
+    let bytes = [0x66, 0x0F, 0x58, 0xC1, 0x66, 0x0F, 0x5C, 0xC1, 0xC3];
+    let start = [1.5f64.to_bits(), (-3.0f64).to_bits()];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = start;
+    ctx.xmm[1] = [2.25f64.to_bits(), 0.5f64.to_bits()];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.xmm[0], start, "addpd+subpd must be an identity here");
+}
+
+//  CVTTSS2SI
+
+/// x86's "integer indefinite" results, produced whenever a truncated float is
+/// unrepresentable in the destination.
+const INDEF32: u64 = 0x8000_0000;
+const INDEF64: u64 = 0x8000_0000_0000_0000;
+
+/// Run a `cvttss2si <reg>, xmm0` form with `v` in lane 0 of xmm0, returning rax.
+///
+/// rax is pre-seeded with garbage so the 32-bit form's zero-extension of the
+/// upper half is observable, and the unused parts of xmm0 are non-zero so a
+/// handler reading the wrong lane would show up.
+fn run_cvttss2si(bytes: &[u8], v: f32) -> u64 {
+    let mut ctx = RegisterContext::default();
+    ctx.rax = 0xDEAD_BEEF_DEAD_BEEF;
+    ctx.xmm[0] = [
+        pack_f32(v, f32::from_bits(0xAAAA_AAAA)),
+        0x1111_2222_3333_4444,
+    ];
+    run_test(bytes, ctx).rax
+}
+
+/// `cvttss2si eax, xmm0 ; ret`
+const CVTTSS2SI_EAX: [u8; 5] = [0xF3, 0x0F, 0x2C, 0xC0, 0xC3];
+/// `cvttss2si rax, xmm0 ; ret`
+const CVTTSS2SI_RAX: [u8; 6] = [0xF3, 0x48, 0x0F, 0x2C, 0xC0, 0xC3];
+
+#[test]
+fn test_cvttss2si_r32_truncates_toward_zero() {
+    // Truncation, not rounding: both magnitudes drop their fraction.
+    assert_eq!(run_cvttss2si(&CVTTSS2SI_EAX, 2.9), 2);
+    assert_eq!(run_cvttss2si(&CVTTSS2SI_EAX, 2.1), 2);
+    assert_eq!(run_cvttss2si(&CVTTSS2SI_EAX, -2.9), (-2i32) as u32 as u64);
+    assert_eq!(run_cvttss2si(&CVTTSS2SI_EAX, -0.5), 0);
+}
+
+#[test]
+fn test_cvttss2si_r32_zero_extends_into_rax() {
+    // Writing a 32-bit destination clears the upper 32 bits of the GPR.
+    assert_eq!(run_cvttss2si(&CVTTSS2SI_EAX, 7.0), 7);
+}
+
+#[test]
+fn test_cvttss2si_r32_range_boundaries() {
+    // -2^31 is exactly representable and in range; +2^31 is one past the top.
+    assert_eq!(run_cvttss2si(&CVTTSS2SI_EAX, -2147483648.0), INDEF32);
+    assert_eq!(run_cvttss2si(&CVTTSS2SI_EAX, 2147483648.0), INDEF32);
+    // The largest f32 strictly below 2^31 still converts normally.
+    assert_eq!(
+        run_cvttss2si(&CVTTSS2SI_EAX, 2147483520.0),
+        2147483520u32 as u64
+    );
+}
+
+#[test]
+fn test_cvttss2si_r32_invalid_gives_integer_indefinite() {
+    // x86 returns INT_MIN for NaN and both infinities - it does *not* saturate
+    // the way Rust's `as` cast or Cranelift's fcvt_to_sint_sat would.
+    assert_eq!(run_cvttss2si(&CVTTSS2SI_EAX, f32::NAN), INDEF32);
+    assert_eq!(run_cvttss2si(&CVTTSS2SI_EAX, -f32::NAN), INDEF32);
+    assert_eq!(run_cvttss2si(&CVTTSS2SI_EAX, f32::INFINITY), INDEF32);
+    assert_eq!(run_cvttss2si(&CVTTSS2SI_EAX, f32::NEG_INFINITY), INDEF32);
+    assert_eq!(run_cvttss2si(&CVTTSS2SI_EAX, 1e10), INDEF32);
+    assert_eq!(run_cvttss2si(&CVTTSS2SI_EAX, -1e10), INDEF32);
+}
+
+#[test]
+fn test_cvttss2si_r64() {
+    assert_eq!(run_cvttss2si(&CVTTSS2SI_RAX, 2.9), 2);
+    assert_eq!(run_cvttss2si(&CVTTSS2SI_RAX, -2.9), (-2i64) as u64);
+    // Out of range for 32 bits, comfortably in range for 64.
+    assert_eq!(run_cvttss2si(&CVTTSS2SI_RAX, 1e10), 10_000_000_000);
+    assert_eq!(
+        run_cvttss2si(&CVTTSS2SI_RAX, -1e10),
+        (-10_000_000_000i64) as u64
+    );
+    // 2^62 is exactly representable in f32.
+    assert_eq!(
+        run_cvttss2si(&CVTTSS2SI_RAX, 4611686018427387904.0),
+        1u64 << 62
+    );
+}
+
+#[test]
+fn test_cvttss2si_r64_invalid_gives_integer_indefinite() {
+    assert_eq!(run_cvttss2si(&CVTTSS2SI_RAX, f32::NAN), INDEF64);
+    assert_eq!(run_cvttss2si(&CVTTSS2SI_RAX, f32::INFINITY), INDEF64);
+    assert_eq!(run_cvttss2si(&CVTTSS2SI_RAX, f32::NEG_INFINITY), INDEF64);
+    assert_eq!(run_cvttss2si(&CVTTSS2SI_RAX, 1e30), INDEF64);
+    assert_eq!(run_cvttss2si(&CVTTSS2SI_RAX, -1e30), INDEF64);
+    // -2^63 is exactly representable but still one past the bottom of the range
+    // once truncated, so it too yields the indefinite value.
+    assert_eq!(
+        run_cvttss2si(&CVTTSS2SI_RAX, -9223372036854775808.0),
+        INDEF64
+    );
+}
+
+#[test]
+fn test_cvttss2si_m32() {
+    // cvttss2si ecx, dword ptr [rdi]; ret   ->   F3 0F 2C 0F  C3
+    let bytes = [0xF3, 0x0F, 0x2C, 0x0F, 0xC3];
+    let val: f32 = -12.75;
+    let mut ctx = RegisterContext::default();
+    ctx.rdi = &val as *const f32 as u64;
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.rcx, (-12i32) as u32 as u64, "cvttss2si m32 truncates");
+}
+
+#[test]
+fn test_cvttss2si_m32_r64() {
+    // cvttss2si rcx, dword ptr [rdi]; ret   ->   F3 48 0F 2C 0F  C3
+    let bytes = [0xF3, 0x48, 0x0F, 0x2C, 0x0F, 0xC3];
+    let val: f32 = 1e10;
+    let mut ctx = RegisterContext::default();
+    ctx.rdi = &val as *const f32 as u64;
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.rcx, 10_000_000_000);
+}
+
+#[test]
+fn test_cvttss2si_vector_xmm() {
+    // cvttss2si ecx, xmm3; ret   ->   F3 0F 2C CB  C3
+    let bytes = [0xF3, 0x0F, 0x2C, 0xCB, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[3] = [
+        pack_f32(-2.9, f32::from_bits(0xAAAA_AAAA)),
+        0x1111_2222_3333_4444,
+    ];
+    let ctx = run_test_vec(&bytes, ctx);
+    assert_eq!(ctx.rcx, (-2i32) as u32 as u64);
+}
+
+#[test]
+fn test_cvtsi2ss_cvttss2si_roundtrip() {
+    // cvtsi2ss xmm0, eax ; cvttss2si eax, xmm0 ; ret
+    // Integers below 2^24 survive the round trip exactly.
+    let bytes = [
+        0xF3, 0x0F, 0x2A, 0xC0, // cvtsi2ss xmm0, eax
+        0xF3, 0x0F, 0x2C, 0xC0, // cvttss2si eax, xmm0
+        0xC3,
+    ];
+    for v in [0i32, 1, -1, 12345, -12345, 16_777_215, -16_777_215] {
+        let mut ctx = RegisterContext::default();
+        ctx.rax = v as u32 as u64;
+        let ctx = run_test(&bytes, ctx);
+        assert_eq!(ctx.rax, v as u32 as u64, "roundtrip of {v}");
+    }
+}

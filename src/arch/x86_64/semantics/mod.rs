@@ -102,11 +102,23 @@ impl<'a> Lifter<'a> {
             Mnemonic::Unpckhpd => self.handle_unpckhpd(instruction),
 
             // SSE2 - scalar / packed double-precision arithmetic
+            Mnemonic::Addpd => self.handle_addpd(instruction),
             Mnemonic::Subpd => self.handle_subpd(instruction),
             Mnemonic::Addsd => self.handle_addsd(instruction),
             Mnemonic::Mulsd => self.handle_mulsd(instruction),
             Mnemonic::Divsd => self.handle_divsd(instruction),
             Mnemonic::Ucomisd | Mnemonic::Comisd => self.handle_ucomisd(instruction),
+
+            // SSE - scalar / packed single-precision arithmetic
+            Mnemonic::Addss => self.handle_addss(instruction),
+            Mnemonic::Subss => self.handle_subss(instruction),
+            Mnemonic::Mulss => self.handle_mulss(instruction),
+            Mnemonic::Divss => self.handle_divss(instruction),
+            Mnemonic::Mulps => self.handle_mulps(instruction),
+
+            // SSE - integer <-> floating-point conversion
+            Mnemonic::Cvtsi2ss => self.handle_cvtsi2ss(instruction),
+            Mnemonic::Cvttss2si => self.handle_cvttss2si(instruction),
 
             // SSE / SSE2 - XMM logic
             Mnemonic::Xorps | Mnemonic::Xorpd => self.handle_xorps(instruction),
