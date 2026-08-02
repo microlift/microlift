@@ -20,8 +20,46 @@ use crate::MicroliftError;
 use crate::arch::x86_64::semantics::helpers::xmm_register_index;
 use crate::arch::x86_64::semantics::sse_vec::{B, PackedFpOp};
 use crate::lifter::{Lifter, X86Flag};
+use cranelift::codegen::ir::immediates::{Ieee32, Ieee64};
 use cranelift::prelude::*;
 use iced_x86::{Instruction, OpKind};
+
+/// x86's single-precision *floating indefinite*: the QNaN an SSE instruction
+/// produces when it generates a NaN of its own (as opposed to propagating an
+/// operand's). Note the set sign bit - that is what distinguishes it from the
+/// AArch64 default NaN, and why it cannot be left to the host FPU.
+pub(super) const F32_INDEFINITE: Ieee32 = Ieee32::with_bits(0xFFC0_0000);
+
+/// The double-precision [`F32_INDEFINITE`].
+pub(super) const F64_INDEFINITE: Ieee64 = Ieee64::with_bits(0xFFF8_0000_0000_0000);
+
+/// Square root of one `F32` or `F64` with x86's NaN behaviour.
+///
+/// For a negative operand the result is a NaN the instruction *generates*
+/// rather than propagates, and the two ISAs disagree on its sign: x86 yields
+/// the floating indefinite (see [`F32_INDEFINITE`]) while the AArch64 default
+/// NaN is positive. A bare Cranelift `sqrt` lets the *host* FPU pick, so lifted
+/// code produces the wrong bits on a non-x86 host; the indefinite is
+/// materialised explicitly instead.
+///
+/// Only the strict `x < 0` case is patched, which is exactly the input set that
+/// generates a NaN: `-0.0` still gives `-0.0`, and a NaN operand falls through
+/// to `sqrt`, which propagates it - quieting a signalling NaN - with its sign
+/// and payload intact, as x86 does.
+///
+/// A free function rather than a [`Lifter`] method so it can be passed directly
+/// as the `op` closure of the packed lane plumbing, which is handed only the
+/// builder.
+pub(super) fn fp_sqrt_x86(b: &mut FunctionBuilder, x: Value) -> Value {
+    let r = b.ins().sqrt(x);
+    let (zero, indefinite) = if b.func.dfg.value_type(x) == types::F32 {
+        (b.ins().f32const(0.0f32), b.ins().f32const(F32_INDEFINITE))
+    } else {
+        (b.ins().f64const(0.0f64), b.ins().f64const(F64_INDEFINITE))
+    };
+    let negative = b.ins().fcmp(FloatCC::LessThan, x, zero);
+    b.ins().select(negative, indefinite, r)
+}
 
 /// Lane width of a packed-integer SSE operation - the `b`/`w`/`d`/`q` suffix
 /// of mnemonics like `PADDB` / `PADDW` / `PADDD` / `PADDQ`.
@@ -2253,7 +2291,7 @@ impl<'a> Lifter<'a> {
             .builder
             .ins()
             .bitcast(types::F64, MemFlagsData::new(), src_bits);
-        let r = self.builder.ins().sqrt(x);
+        let r = fp_sqrt_x86(&mut self.builder, x);
         let bits = self
             .builder
             .ins()
@@ -2271,7 +2309,7 @@ impl<'a> Lifter<'a> {
             .builder
             .ins()
             .bitcast(types::F32, MemFlagsData::new(), src_bits);
-        let r = self.builder.ins().sqrt(x);
+        let r = fp_sqrt_x86(&mut self.builder, x);
         let bits = self
             .builder
             .ins()
@@ -2290,7 +2328,9 @@ impl<'a> Lifter<'a> {
         let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
         // The unary op is expressed as a binary one that ignores its second
         // argument, reusing the shared bit-level plumbing.
-        let sqrt = |b: &mut FunctionBuilder<'a>, x: Value, _y: Value| b.ins().sqrt(x);
+        // The unary op is expressed as a binary one that ignores its second
+        // argument, reusing the shared bit-level plumbing.
+        let sqrt = |b: &mut FunctionBuilder<'a>, x: Value, _y: Value| fp_sqrt_x86(b, x);
         let res_lo = self.f64_bits_arith(src_lo, src_lo, &sqrt);
         let res_hi = self.f64_bits_arith(src_hi, src_hi, &sqrt);
         self.set_xmm_lo(dst_idx, res_lo);
@@ -2306,7 +2346,7 @@ impl<'a> Lifter<'a> {
         }
         let dst_idx = self.xmm_operand_index(instruction, 0, "sqrtps")?;
         let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
-        let sqrt = |b: &mut FunctionBuilder<'a>, x: Value, _y: Value| b.ins().sqrt(x);
+        let sqrt = |b: &mut FunctionBuilder<'a>, x: Value, _y: Value| fp_sqrt_x86(b, x);
         let res_lo = self.f32_pair_arith(src_lo, src_lo, &sqrt);
         let res_hi = self.f32_pair_arith(src_hi, src_hi, &sqrt);
         self.set_xmm_lo(dst_idx, res_lo);

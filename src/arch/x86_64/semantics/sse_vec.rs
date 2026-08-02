@@ -22,6 +22,7 @@
 //! exactly Cranelift's `shuffle`. One mask builder per instruction replaces
 //! each hand-rolled mask/shift/OR chain.
 
+use super::sse::{F32_INDEFINITE, F64_INDEFINITE};
 use crate::lifter::Lifter;
 use cranelift::codegen::ir::ConstantData;
 use cranelift::prelude::*;
@@ -230,6 +231,31 @@ impl<'a> Lifter<'a> {
         self.builder.ins().bitselect(invalid, indefinite, sat)
     }
 
+    /// Lane-wise square root with x86's NaN behaviour.
+    ///
+    /// The vector twin of [`fp_sqrt_x86`](super::sse::fp_sqrt_x86): a negative
+    /// lane must produce x86's floating indefinite, which is sign-set, rather
+    /// than whatever default NaN the host FPU picks. As with the MIN/MAX forms
+    /// the per-lane choice is a `bitselect` on the compare's all-ones mask.
+    fn vec_fp_sqrt_x86(&mut self, x: Value) -> Value {
+        let fty = self.builder.func.dfg.value_type(x);
+        let r = self.builder.ins().sqrt(x);
+
+        let (zero, indefinite) = if fty.lane_type() == types::F32 {
+            let z = self.builder.ins().f32const(0.0f32);
+            (z, self.builder.ins().f32const(F32_INDEFINITE))
+        } else {
+            let z = self.builder.ins().f64const(0.0f64);
+            (z, self.builder.ins().f64const(F64_INDEFINITE))
+        };
+        let zero = self.builder.ins().splat(fty, zero);
+        let indefinite = self.builder.ins().splat(fty, indefinite);
+
+        let negative = self.vec_fcmp(FloatCC::LessThan, x, zero);
+        let negative = self.vec_bitcast(negative, fty);
+        self.builder.ins().bitselect(negative, indefinite, r)
+    }
+
     /// Emit a packed floating-point op over whole 128-bit vectors, when XMM
     /// registers are vector-backed.
     ///
@@ -262,7 +288,7 @@ impl<'a> Lifter<'a> {
             PackedFpOp::Sub => self.builder.ins().fsub(a, b),
             PackedFpOp::Mul => self.builder.ins().fmul(a, b),
             PackedFpOp::Div => self.builder.ins().fdiv(a, b),
-            PackedFpOp::Sqrt => self.builder.ins().sqrt(b),
+            PackedFpOp::Sqrt => self.vec_fp_sqrt_x86(b),
             PackedFpOp::Min | PackedFpOp::Max => {
                 let cc = if matches!(op, PackedFpOp::Min) {
                     FloatCC::LessThan

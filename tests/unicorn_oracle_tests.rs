@@ -554,16 +554,22 @@ const PACKED_OPERANDS: &[([u64; 2], [u64; 2])] = &[
 /// destination ranges freely over signed
 /// zeros, NaNs, infinities, negatives and denormals. That asymmetry is
 /// deliberate: it keeps every case free of an operation that *generates* a
-/// fresh default NaN (`0/0`, `inf-inf`, `0*inf`, `sqrt(-x)`).
+/// fresh default NaN (`0/0`, `inf-inf`, `0*inf`).
 ///
 /// Generated default NaNs are excluded because x86 and AArch64 disagree on
 /// their sign - x86's integer/floating indefinite is `0xFFF8_0000_0000_0000`,
 /// the AArch64 default NaN is `0x7FF8_0000_0000_0000` - and Microlift lowers
-/// these ops to Cranelift `fdiv`/`fsub`/`sqrt`, so the *host* FPU picks the
-/// sign. That divergence is pre-existing and general (untouched instructions
-/// such as `DIVSD` show it identically); it is not a property of the
-/// instructions added here. *Propagated* input NaNs keep their exact bits and
-/// are covered - the NaN destinations below flow through every op.
+/// these ops to Cranelift `fdiv`/`fsub`, so the *host* FPU picks the sign.
+/// That divergence is general, not a property of any one instruction:
+/// `DIVSD`, `SUBPS` and the rest show it identically.
+///
+/// `sqrt(-x)` used to be on that list and no longer is: the SQRT handlers
+/// materialise x86's indefinite themselves rather than deferring to the host,
+/// so [`sse_sqrt_negative_agrees`] covers negative operands directly. The same
+/// treatment would lift the restriction for the others.
+///
+/// *Propagated* input NaNs keep their exact bits and are covered here - the NaN
+/// destinations below flow through every op.
 const FLOAT_OPERANDS: &[([u64; 2], [u64; 2])] = &[
     // 1.0 / 2.0 (f64) destinations against 2.0 / 1.0 sources
     (
@@ -660,6 +666,62 @@ fn sse_minmax_selection_agrees() {
                 diff.is_empty(),
                 "{name} {dst:#018x?},{src:#018x?} diverged: {diff:?}"
             );
+        }
+    }
+}
+
+/// Sources for the SQRT differential, centred on the negative inputs whose
+/// result is a *generated* NaN.
+///
+/// `sqrt(-x)` is the one case where the general default-NaN caveat on
+/// [`FLOAT_OPERANDS`] would otherwise bite: on an AArch64 host the FPU's
+/// default NaN is `0x7FF8_..`, while x86 produces the indefinite `0xFFF8_..`.
+/// The SQRT handlers therefore materialise x86's indefinite themselves instead
+/// of letting the host FPU pick, and these operands are the proof - every lane
+/// is exercised as both an `f32` quadruple and an `f64` pair.
+const SQRT_OPERANDS: &[[u64; 2]] = &[
+    // negative normals: -1.0 / -2.0 as f64, and -1.0 / -2.0 / -0.5 / -4.0 f32
+    [0xBFF0_0000_0000_0000, 0xC000_0000_0000_0000],
+    [0xC000_0000_BF80_0000, 0xC080_0000_BF00_0000],
+    // negative zero (result is -0.0, not a NaN) beside a negative normal
+    [0x8000_0000_0000_0000, 0xBF80_0000_8000_0000],
+    // negative infinity, and negative denormals
+    [0xFFF0_0000_0000_0000, 0x8000_0001_8000_0001],
+    // NaNs: propagated unchanged, sign and payload intact, never replaced
+    [0x7FF8_0000_DEAD_BEEF, 0xFFF8_0000_CAFE_BABE],
+    // signalling NaNs, which the instruction quiets rather than indefinites
+    [0x7FF4_0000_0000_0001, 0xFFA0_0000_FFA0_0000],
+    // positive values alongside, so the non-NaN path stays covered here too
+    [0x4000_0000_0000_0000, 0x4080_0000_3F80_0000],
+    // mixed sign per f32 lane: only the negative lanes may become indefinite
+    [0x3F80_0000_BF80_0000, 0xBF00_0000_4000_0000],
+];
+
+/// SQRTPS/SQRTPD/SQRTSS/SQRTSD against negative inputs.
+///
+/// Split out from [`sse_float_arith_agrees`] for the same reason
+/// [`sse_minmax_selection_agrees`] is: it needs operands that suite
+/// deliberately excludes. See [`SQRT_OPERANDS`].
+#[test]
+fn sse_sqrt_negative_agrees() {
+    let ops: &[(&str, &[u8])] = &[
+        ("sqrtps", &[0x0F, 0x51, 0xC1, 0xC3]),
+        ("sqrtpd", &[0x66, 0x0F, 0x51, 0xC1, 0xC3]),
+        ("sqrtss", &[0xF3, 0x0F, 0x51, 0xC1, 0xC3]),
+        ("sqrtsd", &[0xF2, 0x0F, 0x51, 0xC1, 0xC3]),
+    ];
+    for (name, code) in ops {
+        for &src in SQRT_OPERANDS {
+            // The destination is a distinct pattern so a handler that wrote the
+            // wrong lane, or failed to preserve the scalar forms' upper bits,
+            // shows up as a divergence rather than a coincidental match.
+            let mut init = CpuState::zeroed();
+            init.xmm[0] = [0x1234_5678_9ABC_DEF0, 0x0FED_CBA9_8765_4321];
+            init.xmm[1] = src;
+            let diff =
+                differential_unicorn(code, CODE_VA, &init, &[], BUDGET, DiffOptions::default())
+                    .expect("clean halt");
+            assert!(diff.is_empty(), "{name} {src:#018x?} diverged: {diff:?}");
         }
     }
 }
