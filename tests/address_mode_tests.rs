@@ -39,6 +39,9 @@ fn relative_rip_relative_lea_tracks_image_base() {
         .at(LIFT_BASE)
         .image_base(RELOC_BASE)
         .address_mode(AddressMode::ImageBaseRelative)
+        // Unicorn maps the code at its lift-time VA and has no notion of a
+        // relocation base, so a deliberately relocated result is not diffable.
+        .no_unicorn()
         .run();
 
     assert_eq!(out.ctx.rax, RELOC_BASE + 0x17);
@@ -61,6 +64,9 @@ fn direct_out_of_region_jmp_reports_lift_time_va() {
         .at(LIFT_BASE)
         .image_base(RELOC_BASE)
         .address_mode(AddressMode::ImageBaseRelative)
+        // Unicorn maps the code at its lift-time VA and has no notion of a
+        // relocation base, so a deliberately relocated result is not diffable.
+        .no_unicorn()
         .run();
 
     assert_eq!(out.ctx.rip, RELOC_BASE + 0x10);
@@ -91,6 +97,9 @@ fn direct_call_pushes_lift_time_return_address() {
         .at(LIFT_BASE)
         .image_base(RELOC_BASE)
         .address_mode(AddressMode::ImageBaseRelative)
+        // Unicorn maps the code at its lift-time VA and has no notion of a
+        // relocation base, so a deliberately relocated result is not diffable.
+        .no_unicorn()
         .run();
 
     assert_eq!(out.ctx.rax, RELOC_BASE + 5);
