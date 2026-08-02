@@ -49,4 +49,29 @@ proptest! {
             );
         }
     }
+
+    /// `AddressMode::Direct` bakes lift-time VAs in as constants instead of
+    /// rebasing them onto `image_base`. When the image is loaded exactly where
+    /// it was lifted - which `LiftTest` does by default - the two must be
+    /// indistinguishable, PC included.
+    #[test]
+    fn address_modes_agree_at_lift_base(op in any_alu_op(), a in any::<u64>(), b in any::<u64>()) {
+        let bytes = alu_snippet(op, a, b);
+
+        let run = |mode| {
+            fingerprint(
+                &LiftTest::new(&bytes)
+                    .address_mode(mode)
+                    .run()
+                    .ctx,
+            )
+        };
+
+        prop_assert_eq!(
+            run(AddressMode::Direct),
+            run(AddressMode::ImageBaseRelative),
+            "address-mode divergence for {:?} {:#x},{:#x}",
+            op, a, b
+        );
+    }
 }

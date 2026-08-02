@@ -5,7 +5,6 @@
 //! (V registers are synced once FP/SIMD semantics land).
 
 use crate::arch::aarch64::Lifter64;
-use crate::arch::aarch64::context::Aarch64RegisterContext;
 use crate::arch::aarch64::regs::{Aarch64RegState, Nzcv};
 use crate::core::exit::ExitReason;
 use cranelift::prelude::*;
@@ -159,13 +158,7 @@ impl<'a> Lifter64<'a> {
         );
         self.builder.def_var(self.state.tpidr_el0, tpidr_val);
 
-        let image_base_offset = std::mem::offset_of!(Aarch64RegisterContext, image_base) as i32;
-        let image_base_val = self.builder.ins().load(
-            types::I64,
-            MemFlagsData::trusted(),
-            ctx_ptr,
-            image_base_offset,
-        );
+        let image_base_val = self.image_base_at_entry(ctx_ptr);
         self.builder.def_var(self.state.image_base, image_base_val);
 
         self.state.dirty_gprs.clear();

@@ -9,5 +9,6 @@ pub use crate::arch::x86_64::Lifter;
 pub use crate::arch::x86_64::regs::{RegisterState, X86Flag};
 pub use crate::core::abi::{ArgLocation, CallAbi, GuestReg, StackArgs};
 pub use crate::core::{
-    ExecutionMode, FastCall, FastCallTarget, FastImport, GuestArch, LiftEngine, LifterConfig,
+    AddressMode, ExecutionMode, FastCall, FastCallTarget, FastImport, GuestArch, LiftEngine,
+    LifterConfig,
 };

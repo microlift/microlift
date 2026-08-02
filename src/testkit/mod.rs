@@ -18,7 +18,7 @@
 use crate::arch::x86_64::X86_64;
 use crate::backend::CraneliftBackend;
 use crate::context::{ExitReason, MemorySegment, RegisterContext};
-use crate::core::{ExecutionMode, LifterConfig, lift_to_function};
+use crate::core::{AddressMode, ExecutionMode, LifterConfig, lift_to_function};
 use cranelift_codegen::settings::{self, Configurable};
 
 pub mod oracle;
@@ -163,6 +163,15 @@ impl<'a> LiftTest<'a> {
     /// Toggle native `I64X2` XMM variables (`config.use_vector_xmm`).
     pub fn vector_xmm(mut self, on: bool) -> Self {
         self.config.use_vector_xmm = on;
+        self
+    }
+
+    /// Select how guest virtual addresses are materialized
+    /// (`config.address_mode`). Under [`AddressMode::Direct`] the seeded
+    /// `image_base` is ignored by the lifted code, and the PC in the exit state
+    /// is a plain lift-time VA.
+    pub fn address_mode(mut self, mode: AddressMode) -> Self {
+        self.config.address_mode = mode;
         self
     }
 
@@ -599,4 +608,5 @@ pub fn run_test(bytes: &[u8], ctx: RegisterContext) -> RegisterContext {
 pub mod prelude {
     pub use super::{Harness, LiftTest, Opt, RetAddr, RunOutcome, TestError, run_test};
     pub use crate::context::{ExitReason, RegisterContext};
+    pub use crate::core::AddressMode;
 }

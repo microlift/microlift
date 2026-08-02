@@ -478,11 +478,8 @@ impl<'a> Lifter<'a> {
         size: usize,
         reason: ExitReason,
     ) -> crate::Result<()> {
-        // RIP at the instruction itself, computed relative to the image base so
-        // it stays correct under relocation.
-        let offset = instruction.ip().wrapping_sub(self.lift_base);
-        let image_base = self.builder.use_var(self.state.image_base);
-        let rip_at = self.builder.ins().iadd_imm_s(image_base, offset as i64);
+        // RIP at the instruction itself (I/O string ops re-execute).
+        let rip_at = self.runtime_addr(instruction.ip());
 
         self.sync_to_context(Some(rip_at), reason)?;
         self.write_exit_code(size as u32);

@@ -558,9 +558,7 @@ impl<'a> Lifter64<'a> {
     fn handle_adr(&mut self, instr: &A64Instr, op0: Operand) -> crate::Result<()> {
         let (d, _, _) = decode_reg(op0).ok_or_else(|| Self::bad_operand("adr", op0))?;
         let off = self.branch_target_offset(instr)?;
-        let image_base = self.builder.use_var(self.state.image_base);
-        let pc_offset = instr.ip.wrapping_sub(self.lift_base);
-        let runtime_pc = self.builder.ins().iadd_imm_s(image_base, pc_offset as i64);
+        let runtime_pc = self.runtime_addr(instr.ip);
         let result = self.builder.ins().iadd_imm_s(runtime_pc, off);
         self.write_reg_val(d, false, types::I64, result);
         Ok(())
@@ -569,15 +567,14 @@ impl<'a> Lifter64<'a> {
     /// `ADRP Rd, label`: form the runtime address of the 4 KiB page that is
     /// `imm` pages away from the page containing this instruction.
     ///
-    /// The page is computed against the *runtime* PC (`image_base + region
-    /// offset`) so the result stays correct under ASLR rather than baking in the
-    /// lift-time virtual address.
+    /// The page is computed against the *runtime* PC, so under the default
+    /// [`AddressMode::ImageBaseRelative`](crate::core::AddressMode) the result
+    /// stays correct under ASLR rather than baking in the lift-time virtual
+    /// address.
     fn handle_adrp(&mut self, instr: &A64Instr, op0: Operand) -> crate::Result<()> {
         let (d, _, _) = decode_reg(op0).ok_or_else(|| Self::bad_operand("adrp", op0))?;
         let off = self.branch_target_offset(instr)?;
-        let image_base = self.builder.use_var(self.state.image_base);
-        let pc_offset = instr.ip.wrapping_sub(self.lift_base);
-        let runtime_pc = self.builder.ins().iadd_imm_s(image_base, pc_offset as i64);
+        let runtime_pc = self.runtime_addr(instr.ip);
         let page = self.builder.ins().band_imm_u(runtime_pc, !0xFFFi64);
         let result = self.builder.ins().iadd_imm_s(page, off);
         self.write_reg_val(d, false, types::I64, result);
@@ -802,9 +799,7 @@ impl<'a> Lifter64<'a> {
 
         // The return address (and PC resume point) is the next instruction:
         // current_ip already points there.
-        let image_base = self.builder.use_var(self.state.image_base);
-        let ret_offset = self.current_ip.wrapping_sub(self.lift_base);
-        let ret_addr = self.builder.ins().iadd_imm_s(image_base, ret_offset as i64);
+        let ret_addr = self.runtime_current_ip();
         self.write_reg_val(30, false, types::I64, ret_addr);
 
         // Ensure the resume block exists so the entry dispatch can route back.

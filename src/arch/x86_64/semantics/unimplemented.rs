@@ -65,23 +65,18 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Compute the absolute address of `instruction` itself as a Cranelift
-    /// value (`image_base + region offset`), so the reported PC stays correct
-    /// when the guest image is relocated.
+    /// Compute the run-time address of `instruction` itself as a Cranelift
+    /// value, per the configured
+    /// [`AddressMode`](crate::core::AddressMode).
     fn rip_at(&mut self, instruction: &Instruction) -> Value {
-        let offset = instruction.ip().wrapping_sub(self.lift_base);
-        let image_base = self.builder.use_var(self.state.image_base);
-        self.builder.ins().iadd_imm_s(image_base, offset as i64)
+        self.runtime_addr(instruction.ip())
     }
 
-    /// Compute the absolute address of the instruction *following* `instruction`
-    /// as a Cranelift value (`image_base + region offset`). This is the resume
-    /// point a software interrupt would push as its return address.
+    /// Compute the run-time address of the instruction *following*
+    /// `instruction`. This is the resume point a software interrupt would push
+    /// as its return address.
     fn rip_after(&mut self, instruction: &Instruction) -> Value {
-        let next_ip = instruction.next_ip();
-        let offset = next_ip.wrapping_sub(self.lift_base);
-        let image_base = self.builder.use_var(self.state.image_base);
-        self.builder.ins().iadd_imm_s(image_base, offset as i64)
+        self.runtime_addr(instruction.next_ip())
     }
 
     /// Emit an `Interrupt` VM exit for vector `vector`, syncing guest state and
@@ -113,10 +108,7 @@ impl<'a> Lifter<'a> {
     }
 
     pub(super) fn handle_cpuid(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let next_ip = instruction.next_ip();
-        let offset = next_ip.wrapping_sub(self.lift_base);
-        let image_base = self.builder.use_var(self.state.image_base);
-        let rip_after = self.builder.ins().iadd_imm_s(image_base, offset as i64);
+        let rip_after = self.rip_after(instruction);
         self.sync_to_context(Some(rip_after), ExitReason::Cpuid)?;
         self.builder.ins().return_(&[]);
         self.block_terminated = true;
@@ -124,10 +116,7 @@ impl<'a> Lifter<'a> {
     }
 
     pub(super) fn handle_xgetbv(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let next_ip = instruction.next_ip();
-        let offset = next_ip.wrapping_sub(self.lift_base);
-        let image_base = self.builder.use_var(self.state.image_base);
-        let rip_after = self.builder.ins().iadd_imm_s(image_base, offset as i64);
+        let rip_after = self.rip_after(instruction);
         self.sync_to_context(Some(rip_after), ExitReason::Xgetbv)?;
         self.builder.ins().return_(&[]);
         self.block_terminated = true;
@@ -139,10 +128,7 @@ impl<'a> Lifter<'a> {
     /// instruction *after* `RDTSC` and the host populates `rax`/`rdx` with the
     /// 64-bit counter (low 32 bits in `rax`, high 32 in `rdx`) before resuming.
     pub(super) fn handle_rdtsc(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let next_ip = instruction.next_ip();
-        let offset = next_ip.wrapping_sub(self.lift_base);
-        let image_base = self.builder.use_var(self.state.image_base);
-        let rip_after = self.builder.ins().iadd_imm_s(image_base, offset as i64);
+        let rip_after = self.rip_after(instruction);
         self.sync_to_context(Some(rip_after), ExitReason::Rdtsc)?;
         self.builder.ins().return_(&[]);
         self.block_terminated = true;

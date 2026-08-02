@@ -6,10 +6,7 @@ impl<'a> Lifter<'a> {
     pub(super) fn handle_syscall(&mut self, instruction: &Instruction) -> crate::Result<()> {
         match self.config.execution_mode {
             ExecutionMode::Jit => {
-                let next_ip = instruction.next_ip();
-                let offset = next_ip.wrapping_sub(self.lift_base);
-                let image_base = self.builder.use_var(self.state.image_base);
-                let rip_after = self.builder.ins().iadd_imm_s(image_base, offset as i64);
+                let rip_after = self.runtime_addr(instruction.next_ip());
 
                 self.sync_to_context(Some(rip_after), crate::context::ExitReason::Syscall)?;
                 self.builder.ins().return_(&[]);
@@ -47,10 +44,7 @@ impl<'a> Lifter<'a> {
                 self.builder.ins().jump(resume_block, &[]);
 
                 self.builder.switch_to_block(exit_block);
-                let next_ip = instruction.next_ip();
-                let offset = next_ip.wrapping_sub(self.lift_base);
-                let image_base = self.builder.use_var(self.state.image_base);
-                let rip_after = self.builder.ins().iadd_imm_s(image_base, offset as i64);
+                let rip_after = self.runtime_addr(instruction.next_ip());
                 self.sync_to_context(Some(rip_after), crate::context::ExitReason::Syscall)?;
                 self.builder.ins().return_(&[]);
 

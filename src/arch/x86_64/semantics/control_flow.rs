@@ -55,10 +55,9 @@ impl<'a> Lifter<'a> {
     /// Emit a switch-based indirect jump dispatch for a runtime target value.
     /// Jumps to any known block whose offset matches; otherwise exits the VM.
     pub fn emit_runtime_indirect_jump(&mut self, target_val: Value) -> crate::Result<()> {
-        let image_base = self.builder.use_var(self.state.image_base);
-        // Convert absolute target address -> region offset
-        let sub_base = self.builder.ins().isub(target_val, image_base);
-        let target_offset = self.builder.ins().iadd_imm_s(sub_base, self.lift_base as i64);
+        // Convert the run-time target address back into lift-time VA space,
+        // which is what the block map is keyed on.
+        let target_offset = self.to_lift_va(target_val);
 
         let mut switch = cranelift_frontend::Switch::new();
         for (&offset, &block) in &self.blocks {
@@ -164,11 +163,7 @@ impl<'a> Lifter<'a> {
     fn emit_return_dispatch(&mut self, target_ip: Value) -> crate::Result<()> {
         // Internal Dispatch via Switch
         let mut switch = cranelift_frontend::Switch::new();
-        let image_base = self.builder.use_var(self.state.image_base);
-
-        // target_offset = target_ip - image_base + lift_base
-        let sub_base = self.builder.ins().isub(target_ip, image_base);
-        let target_offset = self.builder.ins().iadd_imm_s(sub_base, self.lift_base as i64);
+        let target_offset = self.to_lift_va(target_ip);
 
         for (&offset, &block) in &self.blocks {
             switch.set_entry(offset as u128, block);
@@ -230,12 +225,7 @@ impl<'a> Lifter<'a> {
                 if target < self.lift_base || target >= self.lift_end {
                     self.get_block(self.current_ip);
 
-                    let image_base = self.builder.use_var(self.state.image_base);
-                    let callee_offset = target.wrapping_sub(self.lift_base);
-                    let rebased_callee = self
-                        .builder
-                        .ins()
-                        .iadd_imm_s(image_base, callee_offset as i64);
+                    let rebased_callee = self.runtime_addr(target);
 
                     let ctx_ptr = self.builder.use_var(self.state.context_ptr);
                     let va_offset =
@@ -249,8 +239,7 @@ impl<'a> Lifter<'a> {
 
                     // Push the return address onto the guest stack exactly as a
                     // real CALL does, so the callee can RET correctly.
-                    let ret_offset = self.current_ip.wrapping_sub(self.lift_base);
-                    let ret_addr = self.builder.ins().iadd_imm_s(image_base, ret_offset as i64);
+                    let ret_addr = self.runtime_current_ip();
                     let rsp = self.get_reg_val(Register::RSP)?;
                     let new_rsp = self.builder.ins().iadd_imm_s(rsp, -8);
                     self.set_reg_val(Register::RSP, new_rsp)?;
@@ -269,9 +258,7 @@ impl<'a> Lifter<'a> {
                 let next_ip = instruction.next_ip();
                 self.get_block(next_ip);
 
-                let image_base = self.builder.use_var(self.state.image_base);
-                let offset = self.current_ip.wrapping_sub(self.lift_base);
-                let ret_addr = self.builder.ins().iadd_imm_s(image_base, offset as i64);
+                let ret_addr = self.runtime_current_ip();
 
                 let rsp = self.get_reg_val(Register::RSP)?;
                 let new_rsp = self.builder.ins().iadd_imm_s(rsp, -8);

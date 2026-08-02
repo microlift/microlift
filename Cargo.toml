@@ -116,6 +116,10 @@ name = "rip_tests"
 required-features = ["testkit"]
 
 [[test]]
+name = "address_mode_tests"
+required-features = ["testkit"]
+
+[[test]]
 name = "liveness_sync_test"
 required-features = ["testkit"]
 

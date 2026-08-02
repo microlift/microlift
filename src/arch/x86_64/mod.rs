@@ -29,6 +29,10 @@ impl GuestArch for X86_64 {
     type Instr = Instruction;
     type RegState = RegisterState;
 
+    fn image_base_offset() -> i32 {
+        std::mem::offset_of!(RegisterContext, image_base) as i32
+    }
+
     fn pc_offset() -> i32 {
         std::mem::offset_of!(RegisterContext, rip) as i32
     }

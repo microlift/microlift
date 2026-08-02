@@ -740,9 +740,7 @@ impl<'a> Lifter<'a> {
     /// Emit a divide-error (#DE) VM exit: sync guest state with the PC pointing
     /// *at* the faulting `DIV`/`IDIV` (faults re-execute) and return to the host.
     fn emit_divide_error(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let offset = instruction.ip().wrapping_sub(self.lift_base);
-        let image_base = self.builder.use_var(self.state.image_base);
-        let rip_at = self.builder.ins().iadd_imm_s(image_base, offset as i64);
+        let rip_at = self.runtime_addr(instruction.ip());
         self.sync_to_context(Some(rip_at), ExitReason::DivideError)?;
         self.builder.ins().return_(&[]);
         self.block_terminated = true;

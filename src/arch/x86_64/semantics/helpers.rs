@@ -88,12 +88,10 @@ impl<'a> Lifter<'a> {
     }
 
     pub fn get_reg_val(&mut self, reg: Register) -> crate::Result<Value> {
-        // RIP is handled specially: reconcile it dynamically using the
-        // image_base (loaded from context) + offset formula.
+        // RIP is handled specially: it names the address of the next
+        // instruction, materialized per the configured `AddressMode`.
         if reg == Register::RIP {
-            let base = self.builder.use_var(self.state.image_base);
-            let offset = self.current_ip.wrapping_sub(self.lift_base);
-            return Ok(self.builder.ins().iadd_imm_s(base, offset as i64));
+            return Ok(self.runtime_current_ip());
         }
 
         let base_reg = get_base_reg_64(reg);
@@ -303,12 +301,10 @@ impl<'a> Lifter<'a> {
         };
 
         let mut ptr = if base_reg == Register::RIP {
-            // RIP-relative: iced-x86 sets 'disp' to the absolute target address (as decoded).
-            // We reconcile this target address to our dynamic 'image_base'.
-            let target_rip = disp;
-            let offset = target_rip.wrapping_sub(self.lift_base);
-            let image_base = self.builder.use_var(self.state.image_base);
-            self.builder.ins().iadd_imm_s(image_base, offset as i64)
+            // RIP-relative: iced-x86 sets 'disp' to the absolute target address
+            // (as decoded), i.e. a lift-time VA. Materialize it per the
+            // configured `AddressMode`.
+            self.runtime_addr(disp)
         } else if base_reg != Register::None {
             let v = self.get_reg_val(base_reg)?;
             widen64(self, v)

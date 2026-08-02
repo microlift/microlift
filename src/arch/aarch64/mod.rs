@@ -28,6 +28,10 @@ impl GuestArch for Aarch64 {
     type Instr = A64Instr;
     type RegState = Aarch64RegState;
 
+    fn image_base_offset() -> i32 {
+        std::mem::offset_of!(Aarch64RegisterContext, image_base) as i32
+    }
+
     fn pc_offset() -> i32 {
         std::mem::offset_of!(Aarch64RegisterContext, pc) as i32
     }

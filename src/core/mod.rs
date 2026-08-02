@@ -50,6 +50,8 @@ pub trait GuestArch: Sized {
     fn exit_reason_offset() -> i32;
     /// Byte offset of the `exit_code` control field.
     fn exit_code_offset() -> i32;
+    /// Byte offset of the `image_base` relocation field.
+    fn image_base_offset() -> i32;
 
     // --- universal SSA variables held inside the register file ---
 
@@ -320,9 +322,43 @@ pub enum ExecutionMode {
     RuntimeAssisted,
 }
 
+/// How the lifted code forms guest virtual addresses (RIP-relative operands,
+/// PC values written on a VM exit, pushed return addresses, and the dispatch
+/// that maps a runtime address back to a block).
+///
+/// Every such address is a *lift-time* VA - one the decoder saw, somewhere in
+/// `[lift_base, lift_end)` or a branch/call target outside it. This mode picks
+/// how that VA is materialized at run time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AddressMode {
+    /// Addresses are formed as `image_base + (va - lift_base)`, with
+    /// `image_base` loaded from the guest context at region entry, and mapped
+    /// back with the inverse. The lifted artifact therefore stays correct when
+    /// the guest image is loaded at a different base than it was lifted at,
+    /// which is what makes it safe to cache compiled code on disk and reuse it
+    /// across runs (and what `RuntimeAssisted` output requires).
+    #[default]
+    ImageBaseRelative,
+    /// Addresses are baked in as constants: a lift-time VA becomes an `iconst`
+    /// and the reverse mapping is the identity. Cheaper - the per-address `add`
+    /// and the entry load of `image_base` disappear, and constant addresses fold
+    /// into the addressing modes of the host instructions - but the resulting
+    /// code is only valid at the base it was lifted for.
+    ///
+    /// Appropriate for an in-process JIT that lifts an image already mapped at
+    /// its final address and re-lifts on the next run. `RegisterContext::image_base`
+    /// is then ignored: the PC the host reads on exit, and the PC it sets to
+    /// resume, are plain lift-time VAs.
+    Direct,
+}
+
 #[derive(Debug, Clone)]
 pub struct LifterConfig {
     pub execution_mode: ExecutionMode,
+    /// How guest virtual addresses are materialized. See [`AddressMode`];
+    /// defaults to [`AddressMode::ImageBaseRelative`], which is required for
+    /// relocatable/cacheable artifacts.
+    pub address_mode: AddressMode,
     pub syscall_handler_call_conv: CallConv,
     pub segments: Vec<MemorySegment>,
     pub interpreter_fallback: bool,
@@ -385,6 +421,7 @@ impl Default for LifterConfig {
     fn default() -> Self {
         Self {
             execution_mode: ExecutionMode::Jit,
+            address_mode: AddressMode::ImageBaseRelative,
             syscall_handler_call_conv: CallConv::SystemV,
             segments: Vec::new(),
             interpreter_fallback: false,
@@ -749,6 +786,70 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             .store(MemFlagsData::trusted(), val, ctx_ptr, A::exit_code_offset());
     }
 
+    /// The value the `image_base` variable is defined to at region entry.
+    ///
+    /// Under [`AddressMode::ImageBaseRelative`] that is the relocation base the
+    /// host put in the context. Under [`AddressMode::Direct`] it is the constant
+    /// `lift_base`, which makes the identity `image_base + (va - lift_base) == va`
+    /// hold: the load disappears, and anything still written in terms of
+    /// `image_base` (rather than [`Self::runtime_addr`]) folds to the right
+    /// constant instead of silently producing a relocated address.
+    pub fn image_base_at_entry(&mut self, ctx_ptr: Value) -> Value {
+        match self.config.address_mode {
+            AddressMode::ImageBaseRelative => self.builder.ins().load(
+                types::I64,
+                MemFlagsData::trusted(),
+                ctx_ptr,
+                A::image_base_offset(),
+            ),
+            AddressMode::Direct => {
+                let base = self.lift_base;
+                self.builder.ins().iconst(types::I64, base as i64)
+            }
+        }
+    }
+
+    /// Materialize the run-time address of the lift-time virtual address `va`.
+    ///
+    /// This is the one place a guest VA becomes a Cranelift value: RIP-relative
+    /// operands, PCs reported on a VM exit, pushed return addresses, and
+    /// out-of-region callee addresses all go through it. See [`AddressMode`] for
+    /// what the two representations mean; the inverse is [`Self::to_lift_va`].
+    pub fn runtime_addr(&mut self, va: u64) -> Value {
+        match self.config.address_mode {
+            AddressMode::ImageBaseRelative => {
+                let image_base = self.builder.use_var(A::image_base_var(&self.state));
+                let offset = va.wrapping_sub(self.lift_base);
+                self.builder.ins().iadd_imm_s(image_base, offset as i64)
+            }
+            AddressMode::Direct => self.builder.ins().iconst(types::I64, va as i64),
+        }
+    }
+
+    /// The run-time address of the instruction *after* the one being lifted -
+    /// i.e. of [`Self::current_ip`], the resume point for a re-enterable exit.
+    pub fn runtime_current_ip(&mut self) -> Value {
+        self.runtime_addr(self.current_ip)
+    }
+
+    /// Map a run-time address value back into lift-time VA space, so it can be
+    /// compared against (or switched on) the addresses the decoder saw.
+    ///
+    /// The inverse of [`Self::runtime_addr`]: under
+    /// [`AddressMode::ImageBaseRelative`] this is
+    /// `addr - image_base + lift_base`; under [`AddressMode::Direct`] the
+    /// run-time address already *is* the lift-time VA, so it is the identity.
+    pub fn to_lift_va(&mut self, addr: Value) -> Value {
+        match self.config.address_mode {
+            AddressMode::ImageBaseRelative => {
+                let image_base = self.builder.use_var(A::image_base_var(&self.state));
+                let rel = self.builder.ins().isub(addr, image_base);
+                self.builder.ins().iadd_imm_s(rel, self.lift_base as i64)
+            }
+            AddressMode::Direct => addr,
+        }
+    }
+
     /// Write the PC and exit_reason to the context. Shared by all sync paths.
     pub fn flush_rip_and_reason(
         &mut self,
@@ -760,9 +861,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         let pc_val = if let Some(p) = pc {
             p
         } else {
-            let image_base = self.builder.use_var(A::image_base_var(&self.state));
-            let offset = self.current_ip.wrapping_sub(self.lift_base);
-            self.builder.ins().iadd_imm_s(image_base, offset as i64)
+            self.runtime_current_ip()
         };
         self.builder
             .ins()
@@ -915,16 +1014,14 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                 ctx_ptr_val,
                 A::pc_offset(),
             );
-            let image_base_val = self.builder.use_var(A::image_base_var(&self.state));
-            let relative_pc = self.builder.ins().isub(pc_val, image_base_val);
+            let entry_va = self.to_lift_va(pc_val);
 
             let mut switch = Switch::new();
             for (&offset, &block) in &self.blocks {
-                let relative_offset = offset.wrapping_sub(self.lift_base);
-                switch.set_entry(relative_offset.into(), block);
+                switch.set_entry(offset.into(), block);
             }
 
-            switch.emit(&mut self.builder, relative_pc, start_block);
+            switch.emit(&mut self.builder, entry_va, start_block);
         }
 
         // Phase 2: emit each block by walking instructions from its leader,

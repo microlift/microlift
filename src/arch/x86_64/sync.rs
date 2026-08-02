@@ -5,7 +5,6 @@
 //! `LiftEngine<'a, X86_64>`); the `GuestArch` trait impl delegates to them.
 
 use crate::arch::x86_64::Lifter;
-use crate::arch::x86_64::context::RegisterContext;
 use crate::arch::x86_64::regs::{GPR_ORDER, RegisterState, X86Flag};
 use crate::core::bridge::RegMask;
 use crate::core::exit::ExitReason;
@@ -405,13 +404,7 @@ impl<'a> Lifter<'a> {
             self.builder.def_var(var, val);
         }
 
-        let image_base_offset = std::mem::offset_of!(RegisterContext, image_base) as i32;
-        let image_base_val = self.builder.ins().load(
-            types::I64,
-            MemFlagsData::trusted(),
-            ctx_ptr,
-            image_base_offset,
-        );
+        let image_base_val = self.image_base_at_entry(ctx_ptr);
         self.builder.def_var(self.state.image_base, image_base_val);
 
         if self.state.use_vector_xmm {
