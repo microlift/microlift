@@ -255,6 +255,7 @@ fn test_runtime_assisted_fast_call_strlen() {
         func,
         &aot_imports,
         settings::Flags::new(settings::builder()),
+        &[],
     )
     .expect("JIT compilation with fast imports failed");
 
@@ -378,6 +379,7 @@ fn test_runtime_assisted_fast_call_two_imports() {
         func,
         &aot_imports,
         settings::Flags::new(settings::builder()),
+        &[],
     )
     .expect("JIT compilation with fast imports failed");
 

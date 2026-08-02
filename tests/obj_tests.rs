@@ -165,7 +165,7 @@ fn test_execute_emitted_host_function() {
         *(ctx.rsp as *mut u64) = 0xFFFF_FFFF_FFFF_FFFF;
     }
 
-    let mut backend = CraneliftBackend::with_flags(flags).expect("backend init failed");
+    let mut backend = CraneliftBackend::with_flags(flags, &[]).expect("backend init failed");
     drop(lifter);
     let code_ptr = backend.compile(func).expect("compilation failed");
 

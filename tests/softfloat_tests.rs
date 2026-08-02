@@ -233,7 +233,7 @@ fn test_kernels_lower_under_optimization() {
     let mut fb = settings::builder();
     fb.set("opt_level", "speed").unwrap();
     let flags = settings::Flags::new(fb);
-    let mut backend = CraneliftBackend::with_flags(flags).expect("backend");
+    let mut backend = CraneliftBackend::with_flags(flags, &[]).expect("backend");
     backend
         .compile(func)
         .expect("all kernels must lower at opt_level=speed");

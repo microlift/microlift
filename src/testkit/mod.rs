@@ -239,7 +239,7 @@ impl<'a> LiftTest<'a> {
             .map_err(TestError::Lift)?;
 
         let mut backend =
-            CraneliftBackend::with_flags(self.opt.flags()).map_err(TestError::Compile)?;
+            CraneliftBackend::with_flags(self.opt.flags(), &[]).map_err(TestError::Compile)?;
         let code_ptr = backend.compile(func).map_err(TestError::Compile)?;
 
         // The guest stack is a heap `Vec`; its backing allocation address is
