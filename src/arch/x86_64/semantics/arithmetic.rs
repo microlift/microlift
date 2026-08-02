@@ -446,12 +446,12 @@ impl<'a> Lifter<'a> {
                         // Result in AX; AH=hi8, AL=lo8
                         let lo_64 = self.builder.ins().uextend(types::I64, lo);
                         let hi_64 = self.builder.ins().uextend(types::I64, hi);
-                        let hi_shifted = self.builder.ins().ishl_imm(hi_64, 8);
+                        let hi_shifted = self.builder.ins().ishl_imm_u(hi_64, 8);
                         let ax_val = self.builder.ins().bor(lo_64, hi_shifted);
                         let ax16 = self.builder.ins().ireduce(types::I16, ax_val);
                         self.set_reg_val(Register::AX, ax16)?;
                         // CF/OF set if AH != sign extension of AL
-                        let sign_ext = self.builder.ins().sshr_imm(lo, 7);
+                        let sign_ext = self.builder.ins().sshr_imm_u(lo, 7);
                         let sign_ext8 = self.builder.ins().ireduce(types::I8, sign_ext);
                         let of_cf = self.builder.ins().icmp(IntCC::NotEqual, sign_ext8, hi);
                         self.set_flag(crate::lifter::X86Flag::Carry, of_cf)?;
@@ -467,7 +467,7 @@ impl<'a> Lifter<'a> {
                 self.set_reg_val(hi_reg, hi)?;
 
                 // CF/OF: set if hi != sign extension of lo
-                let sign_ext = self.builder.ins().sshr_imm(lo, (size * 8 - 1) as i64);
+                let sign_ext = self.builder.ins().sshr_imm_u(lo, (size * 8 - 1) as i64);
                 let of_cf = self.builder.ins().icmp(IntCC::NotEqual, sign_ext, hi);
                 self.set_flag(crate::lifter::X86Flag::Carry, of_cf)?;
                 self.set_flag(crate::lifter::X86Flag::Overflow, of_cf)?;
@@ -481,7 +481,7 @@ impl<'a> Lifter<'a> {
                 self.write_operand(instruction, 0, result)?;
                 // OF/CF: set if result != sign-extended truncation
                 let hi = self.builder.ins().smulhi(dst, src);
-                let sign_ext = self.builder.ins().sshr_imm(result, (size * 8 - 1) as i64);
+                let sign_ext = self.builder.ins().sshr_imm_u(result, (size * 8 - 1) as i64);
                 let of_cf = self.builder.ins().icmp(IntCC::NotEqual, sign_ext, hi);
                 self.set_flag(crate::lifter::X86Flag::Carry, of_cf)?;
                 self.set_flag(crate::lifter::X86Flag::Overflow, of_cf)?;
@@ -495,7 +495,7 @@ impl<'a> Lifter<'a> {
                 self.write_operand(instruction, 0, result)?;
                 // OF/CF
                 let hi = self.builder.ins().smulhi(src, imm);
-                let sign_ext = self.builder.ins().sshr_imm(result, (size * 8 - 1) as i64);
+                let sign_ext = self.builder.ins().sshr_imm_u(result, (size * 8 - 1) as i64);
                 let of_cf = self.builder.ins().icmp(IntCC::NotEqual, sign_ext, hi);
                 self.set_flag(crate::lifter::X86Flag::Carry, of_cf)?;
                 self.set_flag(crate::lifter::X86Flag::Overflow, of_cf)?;
@@ -527,12 +527,12 @@ impl<'a> Lifter<'a> {
                 let hi = self.builder.ins().umulhi(al, src);
                 let lo_64 = self.builder.ins().uextend(types::I64, lo);
                 let hi_64 = self.builder.ins().uextend(types::I64, hi);
-                let hi_shifted = self.builder.ins().ishl_imm(hi_64, 8);
+                let hi_shifted = self.builder.ins().ishl_imm_u(hi_64, 8);
                 let ax_val = self.builder.ins().bor(lo_64, hi_shifted);
                 let ax16 = self.builder.ins().ireduce(types::I16, ax_val);
                 self.set_reg_val(Register::AX, ax16)?;
                 // CF/OF set if AH != 0
-                let of_cf = self.builder.ins().icmp_imm(IntCC::NotEqual, hi, 0);
+                let of_cf = self.builder.ins().icmp_imm_s(IntCC::NotEqual, hi, 0);
                 self.set_flag(crate::lifter::X86Flag::Carry, of_cf)?;
                 self.set_flag(crate::lifter::X86Flag::Overflow, of_cf)?;
             }
@@ -581,7 +581,7 @@ impl<'a> Lifter<'a> {
         let hi = self.get_reg_val(high)?;
         let lo_w = self.builder.ins().uextend(work_ty, lo);
         let hi_w = self.builder.ins().uextend(work_ty, hi);
-        let hi_shifted = self.builder.ins().ishl_imm(hi_w, shift);
+        let hi_shifted = self.builder.ins().ishl_imm_u(hi_w, shift);
         Ok(self.builder.ins().bor(hi_shifted, lo_w))
     }
 
@@ -660,7 +660,7 @@ impl<'a> Lifter<'a> {
         let de_block = self.builder.create_block();
 
         // Guard 1: divide by zero.
-        let div0 = self.builder.ins().icmp_imm(IntCC::Equal, divisor_n, 0);
+        let div0 = self.builder.ins().icmp_imm_s(IntCC::Equal, divisor_n, 0);
         let after_div0 = self.builder.create_block();
         self.builder
             .ins()
@@ -709,8 +709,8 @@ impl<'a> Lifter<'a> {
             let q_back = self.builder.ins().sextend(work_ty, q_trunc);
             self.builder.ins().icmp(IntCC::NotEqual, q_back, quot)
         } else {
-            let hi = self.builder.ins().ushr_imm(quot, n);
-            self.builder.ins().icmp_imm(IntCC::NotEqual, hi, 0)
+            let hi = self.builder.ins().ushr_imm_u(quot, n);
+            self.builder.ins().icmp_imm_s(IntCC::NotEqual, hi, 0)
         };
         let after_ovf = self.builder.create_block();
         self.builder
@@ -742,7 +742,7 @@ impl<'a> Lifter<'a> {
     fn emit_divide_error(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let offset = instruction.ip().wrapping_sub(self.lift_base);
         let image_base = self.builder.use_var(self.state.image_base);
-        let rip_at = self.builder.ins().iadd_imm(image_base, offset as i64);
+        let rip_at = self.builder.ins().iadd_imm_s(image_base, offset as i64);
         self.sync_to_context(Some(rip_at), ExitReason::DivideError)?;
         self.builder.ins().return_(&[]);
         self.block_terminated = true;
@@ -792,7 +792,7 @@ impl<'a> Lifter<'a> {
         let k = self.builder.block_params(loop_b)[0];
         let q = self.builder.block_params(loop_b)[1];
         let r = self.builder.block_params(loop_b)[2];
-        let done = self.builder.ins().icmp_imm(IntCC::Equal, k, 128);
+        let done = self.builder.ins().icmp_imm_s(IntCC::Equal, k, 128);
         self.builder.ins().brif(
             done,
             exit,
@@ -809,7 +809,7 @@ impl<'a> Lifter<'a> {
         let onetwentyseven = self.builder.ins().iconst(types::I64, 127);
         let bit_pos = self.builder.ins().isub(onetwentyseven, k); // 127 - k
         // r = (r << 1) | ((n >> bit_pos) & 1)
-        let r_shifted = self.builder.ins().ishl_imm(r, 1);
+        let r_shifted = self.builder.ins().ishl_imm_u(r, 1);
         let n_bit_raw = self.builder.ins().ushr(n, bit_pos);
         let n_bit = self.builder.ins().band(n_bit_raw, one);
         let r_new = self.builder.ins().bor(r_shifted, n_bit);
@@ -823,7 +823,7 @@ impl<'a> Lifter<'a> {
         let q_bit = self.builder.ins().ishl(one, bit_pos);
         let q_set = self.builder.ins().bor(q, q_bit);
         let q_out = self.builder.ins().select(ge, q_set, q);
-        let k_next = self.builder.ins().iadd_imm(k, 1);
+        let k_next = self.builder.ins().iadd_imm_s(k, 1);
         self.builder
             .ins()
             .jump(loop_b, &[k_next.into(), q_out.into(), r_out.into()]);
@@ -861,21 +861,21 @@ impl<'a> Lifter<'a> {
     /// CWD - DX:AX = sign_extend(AX)  (DX = 0 or 0xFFFF)
     pub(super) fn handle_cwd(&mut self, _instruction: &Instruction) -> crate::Result<()> {
         let ax = self.get_reg_val(Register::AX)?;
-        let dx = self.builder.ins().sshr_imm(ax, 15);
+        let dx = self.builder.ins().sshr_imm_u(ax, 15);
         self.set_reg_val(Register::DX, dx)
     }
 
     /// CDQ - EDX:EAX = sign_extend(EAX)  (EDX = 0 or 0xFFFFFFFF)
     pub(super) fn handle_cdq(&mut self, _instruction: &Instruction) -> crate::Result<()> {
         let eax = self.get_reg_val(Register::EAX)?;
-        let edx = self.builder.ins().sshr_imm(eax, 31);
+        let edx = self.builder.ins().sshr_imm_u(eax, 31);
         self.set_reg_val(Register::EDX, edx)
     }
 
     /// CQO - RDX:RAX = sign_extend(RAX)  (RDX = 0 or -1)
     pub(super) fn handle_cqo(&mut self, _instruction: &Instruction) -> crate::Result<()> {
         let rax = self.get_reg_val(Register::RAX)?;
-        let rdx = self.builder.ins().sshr_imm(rax, 63);
+        let rdx = self.builder.ins().sshr_imm_u(rax, 63);
         self.set_reg_val(Register::RDX, rdx)
     }
 }

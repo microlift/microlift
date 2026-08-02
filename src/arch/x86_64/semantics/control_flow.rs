@@ -58,7 +58,7 @@ impl<'a> Lifter<'a> {
         let image_base = self.builder.use_var(self.state.image_base);
         // Convert absolute target address -> region offset
         let sub_base = self.builder.ins().isub(target_val, image_base);
-        let target_offset = self.builder.ins().iadd_imm(sub_base, self.lift_base as i64);
+        let target_offset = self.builder.ins().iadd_imm_s(sub_base, self.lift_base as i64);
 
         let mut switch = cranelift_frontend::Switch::new();
         for (&offset, &block) in &self.blocks {
@@ -145,9 +145,9 @@ impl<'a> Lifter<'a> {
         // Pop the return offset, then the discarded CS selector for a far
         // return, then any `imm16` argument bytes.
         let popped_bytes = if pop_cs { slot_size * 2 } else { slot_size };
-        let mut new_rsp = self.builder.ins().iadd_imm(rsp, popped_bytes);
+        let mut new_rsp = self.builder.ins().iadd_imm_s(rsp, popped_bytes);
         if imm > 0 {
-            new_rsp = self.builder.ins().iadd_imm(new_rsp, imm as i64);
+            new_rsp = self.builder.ins().iadd_imm_s(new_rsp, imm as i64);
         }
         self.set_reg_val(Register::RSP, new_rsp)?;
 
@@ -168,7 +168,7 @@ impl<'a> Lifter<'a> {
 
         // target_offset = target_ip - image_base + lift_base
         let sub_base = self.builder.ins().isub(target_ip, image_base);
-        let target_offset = self.builder.ins().iadd_imm(sub_base, self.lift_base as i64);
+        let target_offset = self.builder.ins().iadd_imm_s(sub_base, self.lift_base as i64);
 
         for (&offset, &block) in &self.blocks {
             switch.set_entry(offset as u128, block);
@@ -235,7 +235,7 @@ impl<'a> Lifter<'a> {
                     let rebased_callee = self
                         .builder
                         .ins()
-                        .iadd_imm(image_base, callee_offset as i64);
+                        .iadd_imm_s(image_base, callee_offset as i64);
 
                     let ctx_ptr = self.builder.use_var(self.state.context_ptr);
                     let va_offset =
@@ -250,9 +250,9 @@ impl<'a> Lifter<'a> {
                     // Push the return address onto the guest stack exactly as a
                     // real CALL does, so the callee can RET correctly.
                     let ret_offset = self.current_ip.wrapping_sub(self.lift_base);
-                    let ret_addr = self.builder.ins().iadd_imm(image_base, ret_offset as i64);
+                    let ret_addr = self.builder.ins().iadd_imm_s(image_base, ret_offset as i64);
                     let rsp = self.get_reg_val(Register::RSP)?;
-                    let new_rsp = self.builder.ins().iadd_imm(rsp, -8);
+                    let new_rsp = self.builder.ins().iadd_imm_s(rsp, -8);
                     self.set_reg_val(Register::RSP, new_rsp)?;
                     self.builder
                         .ins()
@@ -271,10 +271,10 @@ impl<'a> Lifter<'a> {
 
                 let image_base = self.builder.use_var(self.state.image_base);
                 let offset = self.current_ip.wrapping_sub(self.lift_base);
-                let ret_addr = self.builder.ins().iadd_imm(image_base, offset as i64);
+                let ret_addr = self.builder.ins().iadd_imm_s(image_base, offset as i64);
 
                 let rsp = self.get_reg_val(Register::RSP)?;
-                let new_rsp = self.builder.ins().iadd_imm(rsp, -8);
+                let new_rsp = self.builder.ins().iadd_imm_s(rsp, -8);
                 self.set_reg_val(Register::RSP, new_rsp)?;
                 self.builder
                     .ins()
@@ -399,7 +399,7 @@ impl<'a> Lifter<'a> {
             .builder
             .ins()
             .load(types::I64, MemFlagsData::new(), rsp, 0);
-        let new_rsp = self.builder.ins().iadd_imm(rsp, 8);
+        let new_rsp = self.builder.ins().iadd_imm_s(rsp, 8);
         self.set_reg_val(Register::RSP, new_rsp)?;
 
         match (bridge, fast) {
@@ -800,7 +800,7 @@ impl<'a> Lifter<'a> {
             Code::Jecxz_rel8_32 => self.get_reg_val(Register::ECX)?,
             _ => self.get_reg_val(Register::RCX)?,
         };
-        let cond = self.builder.ins().icmp_imm(IntCC::Equal, counter, 0);
+        let cond = self.builder.ins().icmp_imm_s(IntCC::Equal, counter, 0);
         self.handle_conditional_branch(instruction, cond)
     }
 
@@ -846,7 +846,7 @@ impl<'a> Lifter<'a> {
             .iconst(size_to_type(counter_reg.size()), 1);
         let decremented = self.builder.ins().isub(counter, one);
         self.set_reg_val(counter_reg, decremented)?;
-        Ok(self.builder.ins().icmp_imm(IntCC::NotEqual, decremented, 0))
+        Ok(self.builder.ins().icmp_imm_s(IntCC::NotEqual, decremented, 0))
     }
 
     /// LOOP - decrement the counter; branch while it is nonzero.
@@ -871,7 +871,7 @@ impl<'a> Lifter<'a> {
         let zf = self
             .builder
             .use_var(self.state.flags[&crate::lifter::X86Flag::Zero]);
-        let zf_clear = self.builder.ins().icmp_imm(IntCC::Equal, zf, 0);
+        let zf_clear = self.builder.ins().icmp_imm_s(IntCC::Equal, zf, 0);
         let cond = self.builder.ins().band(nonzero, zf_clear);
         self.handle_conditional_branch(instruction, cond)
     }
@@ -898,7 +898,7 @@ impl<'a> Lifter<'a> {
         let zf = self
             .builder
             .use_var(self.state.flags[&crate::lifter::X86Flag::Zero]);
-        let cond = self.builder.ins().icmp_imm(IntCC::Equal, zf, 0);
+        let cond = self.builder.ins().icmp_imm_s(IntCC::Equal, zf, 0);
         self.handle_cmov_cond(instruction, cond)
     }
 
@@ -913,7 +913,7 @@ impl<'a> Lifter<'a> {
         let cf = self
             .builder
             .use_var(self.state.flags[&crate::lifter::X86Flag::Carry]);
-        let cond = self.builder.ins().icmp_imm(IntCC::Equal, cf, 0);
+        let cond = self.builder.ins().icmp_imm_s(IntCC::Equal, cf, 0);
         self.handle_cmov_cond(instruction, cond)
     }
 
@@ -936,7 +936,7 @@ impl<'a> Lifter<'a> {
             .builder
             .use_var(self.state.flags[&crate::lifter::X86Flag::Zero]);
         let cf_or_zf = self.builder.ins().bor(cf, zf);
-        let cond = self.builder.ins().icmp_imm(IntCC::Equal, cf_or_zf, 0);
+        let cond = self.builder.ins().icmp_imm_s(IntCC::Equal, cf_or_zf, 0);
         self.handle_cmov_cond(instruction, cond)
     }
 
@@ -959,7 +959,7 @@ impl<'a> Lifter<'a> {
             .builder
             .use_var(self.state.flags[&crate::lifter::X86Flag::Overflow]);
         let sf_xor = self.builder.ins().bxor(sf, of);
-        let cond = self.builder.ins().icmp_imm(IntCC::Equal, sf_xor, 0);
+        let cond = self.builder.ins().icmp_imm_s(IntCC::Equal, sf_xor, 0);
         self.handle_cmov_cond(instruction, cond)
     }
 
@@ -990,7 +990,7 @@ impl<'a> Lifter<'a> {
             .use_var(self.state.flags[&crate::lifter::X86Flag::Overflow]);
         let sf_xor = self.builder.ins().bxor(sf, of);
         let not_g = self.builder.ins().bor(zf, sf_xor);
-        let cond = self.builder.ins().icmp_imm(IntCC::Equal, not_g, 0);
+        let cond = self.builder.ins().icmp_imm_s(IntCC::Equal, not_g, 0);
         self.handle_cmov_cond(instruction, cond)
     }
 
@@ -1005,7 +1005,7 @@ impl<'a> Lifter<'a> {
         let sf = self
             .builder
             .use_var(self.state.flags[&crate::lifter::X86Flag::Sign]);
-        let cond = self.builder.ins().icmp_imm(IntCC::Equal, sf, 0);
+        let cond = self.builder.ins().icmp_imm_s(IntCC::Equal, sf, 0);
         self.handle_cmov_cond(instruction, cond)
     }
 
@@ -1020,7 +1020,7 @@ impl<'a> Lifter<'a> {
         let of = self
             .builder
             .use_var(self.state.flags[&crate::lifter::X86Flag::Overflow]);
-        let cond = self.builder.ins().icmp_imm(IntCC::Equal, of, 0);
+        let cond = self.builder.ins().icmp_imm_s(IntCC::Equal, of, 0);
         self.handle_cmov_cond(instruction, cond)
     }
 
@@ -1035,7 +1035,7 @@ impl<'a> Lifter<'a> {
         let pf = self
             .builder
             .use_var(self.state.flags[&crate::lifter::X86Flag::Parity]);
-        let cond = self.builder.ins().icmp_imm(IntCC::Equal, pf, 0);
+        let cond = self.builder.ins().icmp_imm_s(IntCC::Equal, pf, 0);
         self.handle_cmov_cond(instruction, cond)
     }
 

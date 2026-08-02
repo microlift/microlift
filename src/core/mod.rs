@@ -762,7 +762,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         } else {
             let image_base = self.builder.use_var(A::image_base_var(&self.state));
             let offset = self.current_ip.wrapping_sub(self.lift_base);
-            self.builder.ins().iadd_imm(image_base, offset as i64)
+            self.builder.ins().iadd_imm_s(image_base, offset as i64)
         };
         self.builder
             .ins()

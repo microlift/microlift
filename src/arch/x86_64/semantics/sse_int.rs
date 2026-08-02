@@ -67,11 +67,11 @@ impl<'a> Lifter<'a> {
         let mut halves = [zero, zero];
         for (i, &lane) in lanes.iter().enumerate() {
             let shift = ((i % per_half) as u32 * bits) as i64;
-            let masked = self.builder.ins().band_imm(lane, mask);
+            let masked = self.builder.ins().band_imm_u(lane, mask);
             let placed = if shift == 0 {
                 masked
             } else {
-                self.builder.ins().ishl_imm(masked, shift)
+                self.builder.ins().ishl_imm_u(masked, shift)
             };
             halves[i / per_half] = self.builder.ins().bor(halves[i / per_half], placed);
         }
@@ -118,7 +118,7 @@ impl<'a> Lifter<'a> {
                 } else {
                     self.builder.ins().uextend(types::I64, val)
                 };
-                Ok(self.builder.ins().band_imm(val, lane_mask(bits)))
+                Ok(self.builder.ins().band_imm_u(val, lane_mask(bits)))
             }
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, op_index)?;
@@ -159,19 +159,19 @@ impl<'a> Lifter<'a> {
             let ctl = if i < 8 { ctl_lo } else { ctl_hi };
             let index = self.extract_lane(ctl, i64::from((i % 8) * 8), 8, false);
 
-            let byte_shift = self.builder.ins().band_imm(index, 7);
-            let bit_shift = self.builder.ins().ishl_imm(byte_shift, 3);
+            let byte_shift = self.builder.ins().band_imm_u(index, 7);
+            let bit_shift = self.builder.ins().ishl_imm_u(byte_shift, 3);
             let from_lo = self.builder.ins().ushr(dst_lo, bit_shift);
-            let from_lo = self.builder.ins().band_imm(from_lo, 0xFF);
+            let from_lo = self.builder.ins().band_imm_u(from_lo, 0xFF);
             let from_hi = self.builder.ins().ushr(dst_hi, bit_shift);
-            let from_hi = self.builder.ins().band_imm(from_hi, 0xFF);
+            let from_hi = self.builder.ins().band_imm_u(from_hi, 0xFF);
 
             // Bit 3 of the index picks the half; bit 7 forces a zero byte.
-            let pick_hi_bit = self.builder.ins().band_imm(index, 8);
-            let pick_hi = self.builder.ins().icmp_imm(IntCC::NotEqual, pick_hi_bit, 0);
+            let pick_hi_bit = self.builder.ins().band_imm_u(index, 8);
+            let pick_hi = self.builder.ins().icmp_imm_s(IntCC::NotEqual, pick_hi_bit, 0);
             let byte = self.builder.ins().select(pick_hi, from_hi, from_lo);
-            let clear_bit = self.builder.ins().band_imm(index, 0x80);
-            let clear = self.builder.ins().icmp_imm(IntCC::NotEqual, clear_bit, 0);
+            let clear_bit = self.builder.ins().band_imm_u(index, 0x80);
+            let clear = self.builder.ins().icmp_imm_s(IntCC::NotEqual, clear_bit, 0);
             bytes.push(self.builder.ins().select(clear, zero, byte));
         }
 
@@ -219,12 +219,12 @@ impl<'a> Lifter<'a> {
         let shift = i64::from(bit % 64);
         let low = match words.get(index) {
             Some(&w) if shift == 0 => return w,
-            Some(&w) => self.builder.ins().ushr_imm(w, shift),
+            Some(&w) => self.builder.ins().ushr_imm_u(w, shift),
             None => return self.builder.ins().iconst(types::I64, 0),
         };
         match words.get(index + 1) {
             Some(&w) => {
-                let high = self.builder.ins().ishl_imm(w, 64 - shift);
+                let high = self.builder.ins().ishl_imm_u(w, 64 - shift);
                 self.builder.ins().bor(low, high)
             }
             None => low,
@@ -251,7 +251,7 @@ impl<'a> Lifter<'a> {
             .into_iter()
             .map(|x| {
                 let neg = self.builder.ins().ineg(x);
-                let is_neg = self.builder.ins().icmp_imm(IntCC::SignedLessThan, x, 0);
+                let is_neg = self.builder.ins().icmp_imm_s(IntCC::SignedLessThan, x, 0);
                 self.builder.ins().select(is_neg, neg, x)
             })
             .collect();
@@ -284,9 +284,9 @@ impl<'a> Lifter<'a> {
             .zip(b)
             .map(|(x, s)| {
                 let neg = self.builder.ins().ineg(x);
-                let is_neg = self.builder.ins().icmp_imm(IntCC::SignedLessThan, s, 0);
+                let is_neg = self.builder.ins().icmp_imm_s(IntCC::SignedLessThan, s, 0);
                 let signed = self.builder.ins().select(is_neg, neg, x);
-                let is_zero = self.builder.ins().icmp_imm(IntCC::Equal, s, 0);
+                let is_zero = self.builder.ins().icmp_imm_s(IntCC::Equal, s, 0);
                 self.builder.ins().select(is_zero, zero, signed)
             })
             .collect();
@@ -430,9 +430,9 @@ impl<'a> Lifter<'a> {
             .zip(b)
             .map(|(x, y)| {
                 let p = self.builder.ins().imul(x, y);
-                let shifted = self.builder.ins().sshr_imm(p, 14);
-                let rounded = self.builder.ins().iadd_imm(shifted, 1);
-                self.builder.ins().sshr_imm(rounded, 1)
+                let shifted = self.builder.ins().sshr_imm_u(p, 14);
+                let rounded = self.builder.ins().iadd_imm_s(shifted, 1);
+                self.builder.ins().sshr_imm_u(rounded, 1)
             })
             .collect();
 
@@ -459,7 +459,7 @@ impl<'a> Lifter<'a> {
                 let y = self.extract_lane(b, shift, 8, false);
                 let diff = self.builder.ins().isub(x, y);
                 let neg = self.builder.ins().ineg(diff);
-                let is_neg = self.builder.ins().icmp_imm(IntCC::SignedLessThan, diff, 0);
+                let is_neg = self.builder.ins().icmp_imm_s(IntCC::SignedLessThan, diff, 0);
                 let abs = self.builder.ins().select(is_neg, neg, diff);
                 acc = self.builder.ins().iadd(acc, abs);
             }
@@ -571,11 +571,11 @@ impl<'a> Lifter<'a> {
         let cleared = self
             .builder
             .ins()
-            .band_imm(half, !(lane_mask(bits) << shift));
+            .band_imm_u(half, !(lane_mask(bits) << shift));
         let placed = if shift == 0 {
             value
         } else {
-            self.builder.ins().ishl_imm(value, shift)
+            self.builder.ins().ishl_imm_u(value, shift)
         };
         let merged = self.builder.ins().bor(cleared, placed);
 
@@ -664,8 +664,8 @@ impl<'a> Lifter<'a> {
         let mut out = Vec::with_capacity(2);
         for (half, (d, s)) in [(dst_lo, src_lo), (dst_hi, src_hi)].into_iter().enumerate() {
             let mask = masks[half] as i64;
-            let kept = self.builder.ins().band_imm(d, !mask);
-            let taken = self.builder.ins().band_imm(s, mask);
+            let kept = self.builder.ins().band_imm_u(d, !mask);
+            let taken = self.builder.ins().band_imm_u(s, mask);
             out.push(self.builder.ins().bor(kept, taken));
         }
 
@@ -700,7 +700,7 @@ impl<'a> Lifter<'a> {
             .zip(s)
             .zip(m)
             .map(|((x, y), mask)| {
-                let take_src = self.builder.ins().icmp_imm(IntCC::SignedLessThan, mask, 0);
+                let take_src = self.builder.ins().icmp_imm_s(IntCC::SignedLessThan, mask, 0);
                 self.builder.ins().select(take_src, y, x)
             })
             .collect();
@@ -723,13 +723,13 @@ impl<'a> Lifter<'a> {
         let and_lo = self.builder.ins().band(src_lo, dst_lo);
         let and_hi = self.builder.ins().band(src_hi, dst_hi);
         let and_all = self.builder.ins().bor(and_lo, and_hi);
-        let zf = self.builder.ins().icmp_imm(IntCC::Equal, and_all, 0);
+        let zf = self.builder.ins().icmp_imm_s(IntCC::Equal, and_all, 0);
 
         // band_not(x, y) = x & ~y.
         let andn_lo = self.builder.ins().band_not(src_lo, dst_lo);
         let andn_hi = self.builder.ins().band_not(src_hi, dst_hi);
         let andn_all = self.builder.ins().bor(andn_lo, andn_hi);
-        let cf = self.builder.ins().icmp_imm(IntCC::Equal, andn_all, 0);
+        let cf = self.builder.ins().icmp_imm_s(IntCC::Equal, andn_all, 0);
 
         self.set_flag(X86Flag::Zero, zf)?;
         self.set_flag(X86Flag::Carry, cf)?;

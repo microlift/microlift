@@ -571,7 +571,7 @@ impl<'a> Lifter<'a> {
                         // Replace bits[31:0] of dst_lo with src_lo[31:0]; preserve bits[63:32].
                         let mask = self.builder.ins().iconst(types::I64, !0xFFFF_FFFFi64);
                         let cleared = self.builder.ins().band(dst_lo, mask);
-                        let src32 = self.builder.ins().band_imm(src_lo, 0xFFFF_FFFF);
+                        let src32 = self.builder.ins().band_imm_u(src_lo, 0xFFFF_FFFF);
                         let merged_lo = self.builder.ins().bor(cleared, src32);
                         // hi 64 bits of dst are preserved (no write needed).
                         self.set_xmm_lo(dst_idx, merged_lo);
@@ -890,9 +890,9 @@ impl<'a> Lifter<'a> {
                 }
                 let c = c.min(bits - 1) as i64;
                 match op {
-                    PackedShiftOp::Srl => self.builder.ins().ushr_imm(a, c),
-                    PackedShiftOp::Sll => self.builder.ins().ishl_imm(a, c),
-                    PackedShiftOp::Sra => self.builder.ins().sshr_imm(a, c),
+                    PackedShiftOp::Srl => self.builder.ins().ushr_imm_u(a, c),
+                    PackedShiftOp::Sll => self.builder.ins().ishl_imm_u(a, c),
+                    PackedShiftOp::Sra => self.builder.ins().sshr_imm_u(a, c),
                 }
             }
             ShiftCount::Dynamic(cv) => {
@@ -961,7 +961,7 @@ impl<'a> Lifter<'a> {
                 let too_big =
                     self.builder
                         .ins()
-                        .icmp_imm(IntCC::UnsignedGreaterThan, cv, bits as i64 - 1);
+                        .icmp_imm_s(IntCC::UnsignedGreaterThan, cv, bits as i64 - 1);
                 self.builder.ins().select(too_big, zero, shifted)
             }
         }
@@ -1000,11 +1000,11 @@ impl<'a> Lifter<'a> {
                 let lane_keep = if left { (lane << c) & lane } else { lane >> c };
                 let mask = replicate_lane_mask(lane_keep, bits) as i64;
                 let shifted = if left {
-                    self.builder.ins().ishl_imm(a, c)
+                    self.builder.ins().ishl_imm_u(a, c)
                 } else {
-                    self.builder.ins().ushr_imm(a, c)
+                    self.builder.ins().ushr_imm_u(a, c)
                 };
-                self.builder.ins().band_imm(shifted, mask)
+                self.builder.ins().band_imm_u(shifted, mask)
             }
             ShiftCount::Dynamic(cv) => {
                 // Build the same mask at runtime: shift the lowest lane's mask,
@@ -1012,13 +1012,13 @@ impl<'a> Lifter<'a> {
                 let lane_const = self.builder.ins().iconst(types::I64, lane as i64);
                 let mut mask = if left {
                     let s = self.builder.ins().ishl(lane_const, cv);
-                    self.builder.ins().band_imm(s, lane as i64)
+                    self.builder.ins().band_imm_u(s, lane as i64)
                 } else {
                     self.builder.ins().ushr(lane_const, cv)
                 };
                 let mut shift = bits;
                 while shift < 64 {
-                    let up = self.builder.ins().ishl_imm(mask, shift as i64);
+                    let up = self.builder.ins().ishl_imm_u(mask, shift as i64);
                     mask = self.builder.ins().bor(mask, up);
                     shift *= 2;
                 }
@@ -1040,19 +1040,19 @@ impl<'a> Lifter<'a> {
 
         // The four source dwords, each isolated into the low 32 bits of an I64.
         let dwords = [
-            self.builder.ins().band_imm(src_lo, 0xFFFF_FFFF),
-            self.builder.ins().ushr_imm(src_lo, 32),
-            self.builder.ins().band_imm(src_hi, 0xFFFF_FFFF),
-            self.builder.ins().ushr_imm(src_hi, 32),
+            self.builder.ins().band_imm_u(src_lo, 0xFFFF_FFFF),
+            self.builder.ins().ushr_imm_u(src_lo, 32),
+            self.builder.ins().band_imm_u(src_hi, 0xFFFF_FFFF),
+            self.builder.ins().ushr_imm_u(src_hi, 32),
         ];
 
         let imm = instruction.immediate8();
         let pick = |j: u32| dwords[((imm >> (2 * j)) & 0b11) as usize];
         let (r0, r1, r2, r3) = (pick(0), pick(1), pick(2), pick(3));
 
-        let r1_hi = self.builder.ins().ishl_imm(r1, 32);
+        let r1_hi = self.builder.ins().ishl_imm_u(r1, 32);
         let res_lo = self.builder.ins().bor(r0, r1_hi);
-        let r3_hi = self.builder.ins().ishl_imm(r3, 32);
+        let r3_hi = self.builder.ins().ishl_imm_u(r3, 32);
         let res_hi = self.builder.ins().bor(r2, r3_hi);
 
         self.set_xmm_lo(dst_idx, res_lo);
@@ -1268,7 +1268,7 @@ impl<'a> Lifter<'a> {
                 let placed = if pos == 0 {
                     val
                 } else {
-                    self.builder.ins().ishl_imm(val, pos)
+                    self.builder.ins().ishl_imm_u(val, pos)
                 };
                 acc[half] = self.builder.ins().bor(acc[half], placed);
             }
@@ -1312,8 +1312,8 @@ impl<'a> Lifter<'a> {
     ) -> Value {
         let a0 = self.builder.ins().ireduce(types::I32, a_bits);
         let b0 = self.builder.ins().ireduce(types::I32, b_bits);
-        let a1_64 = self.builder.ins().ushr_imm(a_bits, 32);
-        let b1_64 = self.builder.ins().ushr_imm(b_bits, 32);
+        let a1_64 = self.builder.ins().ushr_imm_u(a_bits, 32);
+        let b1_64 = self.builder.ins().ushr_imm_u(b_bits, 32);
         let a1 = self.builder.ins().ireduce(types::I32, a1_64);
         let b1 = self.builder.ins().ireduce(types::I32, b1_64);
 
@@ -1322,7 +1322,7 @@ impl<'a> Lifter<'a> {
 
         let r0_64 = self.builder.ins().uextend(types::I64, r0);
         let r1_64 = self.builder.ins().uextend(types::I64, r1);
-        let r1_shifted = self.builder.ins().ishl_imm(r1_64, 32);
+        let r1_shifted = self.builder.ins().ishl_imm_u(r1_64, 32);
         self.builder.ins().bor(r0_64, r1_shifted)
     }
 
@@ -1649,11 +1649,11 @@ impl<'a> Lifter<'a> {
             return self.builder.ins().iadd(a, b);
         }
         let high = width.lane_sign_mask();
-        let a_low = self.builder.ins().band_imm(a, !high);
-        let b_low = self.builder.ins().band_imm(b, !high);
+        let a_low = self.builder.ins().band_imm_u(a, !high);
+        let b_low = self.builder.ins().band_imm_u(b, !high);
         let sum = self.builder.ins().iadd(a_low, b_low);
         let xor = self.builder.ins().bxor(a, b);
-        let high_bits = self.builder.ins().band_imm(xor, high);
+        let high_bits = self.builder.ins().band_imm_u(xor, high);
         self.builder.ins().bxor(sum, high_bits)
     }
 
@@ -1670,7 +1670,7 @@ impl<'a> Lifter<'a> {
         let high_imm = width.lane_sign_mask();
         let high = self.builder.ins().iconst(types::I64, high_imm);
         let a_high_set = self.builder.ins().bor(a, high);
-        let b_low = self.builder.ins().band_imm(b, !high_imm);
+        let b_low = self.builder.ins().band_imm_u(b, !high_imm);
         let diff = self.builder.ins().isub(a_high_set, b_low);
         let xor = self.builder.ins().bxor(a, b);
         // band_not(high, xor) = high & ~(a ^ b) = ((a ^ ~b) & high)
@@ -1721,11 +1721,11 @@ impl<'a> Lifter<'a> {
             // unsigned forms too (unsigned lanes widen to non-negative I64s).
             let low_clamped = self.builder.ins().smax(raw, min);
             let clamped = self.builder.ins().smin(low_clamped, max);
-            let lane_val = self.builder.ins().band_imm(clamped, lane_mask);
+            let lane_val = self.builder.ins().band_imm_u(clamped, lane_mask);
             let placed = if shift == 0 {
                 lane_val
             } else {
-                self.builder.ins().ishl_imm(lane_val, shift)
+                self.builder.ins().ishl_imm_u(lane_val, shift)
             };
             acc = self.builder.ins().bor(acc, placed);
         }
@@ -1746,20 +1746,20 @@ impl<'a> Lifter<'a> {
             let aligned = if left == 0 {
                 v
             } else {
-                self.builder.ins().ishl_imm(v, left)
+                self.builder.ins().ishl_imm_u(v, left)
             };
-            self.builder.ins().sshr_imm(aligned, 64 - lane_bits as i64)
+            self.builder.ins().sshr_imm_u(aligned, 64 - lane_bits as i64)
         } else {
             let shifted = if shift == 0 {
                 v
             } else {
-                self.builder.ins().ushr_imm(v, shift)
+                self.builder.ins().ushr_imm_u(v, shift)
             };
             let mask = match lane_bits {
                 64 => return shifted,
                 bits => ((1u64 << bits) - 1) as i64,
             };
-            self.builder.ins().band_imm(shifted, mask)
+            self.builder.ins().band_imm_u(shifted, mask)
         }
     }
 
@@ -1879,11 +1879,11 @@ impl<'a> Lifter<'a> {
             let x = self.extract_lane(a, shift, lane_bits, signed);
             let y = self.extract_lane(b, shift, lane_bits, signed);
             let r = self.lane_op_64(x, y, op, lane_bits);
-            let lane_val = self.builder.ins().band_imm(r, lane_mask);
+            let lane_val = self.builder.ins().band_imm_u(r, lane_mask);
             let placed = if shift == 0 {
                 lane_val
             } else {
-                self.builder.ins().ishl_imm(lane_val, shift)
+                self.builder.ins().ishl_imm_u(lane_val, shift)
             };
             acc = self.builder.ins().bor(acc, placed);
         }
@@ -1918,17 +1918,17 @@ impl<'a> Lifter<'a> {
             PackedLaneOp::MaxS => self.builder.ins().smax(x, y),
             PackedLaneOp::Avg => {
                 let sum = self.builder.ins().iadd(x, y);
-                let rounded = self.builder.ins().iadd_imm(sum, 1);
-                self.builder.ins().ushr_imm(rounded, 1)
+                let rounded = self.builder.ins().iadd_imm_s(sum, 1);
+                self.builder.ins().ushr_imm_u(rounded, 1)
             }
             PackedLaneOp::MulLow => self.builder.ins().imul(x, y),
             PackedLaneOp::MulHighS => {
                 let p = self.builder.ins().imul(x, y);
-                self.builder.ins().sshr_imm(p, lane_bits as i64)
+                self.builder.ins().sshr_imm_u(p, lane_bits as i64)
             }
             PackedLaneOp::MulHighU => {
                 let p = self.builder.ins().imul(x, y);
-                self.builder.ins().ushr_imm(p, lane_bits as i64)
+                self.builder.ins().ushr_imm_u(p, lane_bits as i64)
             }
         }
     }
@@ -1956,12 +1956,12 @@ impl<'a> Lifter<'a> {
             for lane in 0..per_half {
                 let sign_bit = (lane * lane_bits + lane_bits - 1) as i64;
                 let out = half as u32 * per_half + lane;
-                let shifted = self.builder.ins().ushr_imm(v, sign_bit);
-                let bit = self.builder.ins().band_imm(shifted, 1);
+                let shifted = self.builder.ins().ushr_imm_u(v, sign_bit);
+                let bit = self.builder.ins().band_imm_u(shifted, 1);
                 let placed = if out == 0 {
                     bit
                 } else {
-                    self.builder.ins().ishl_imm(bit, out as i64)
+                    self.builder.ins().ishl_imm_u(bit, out as i64)
                 };
                 acc = self.builder.ins().bor(acc, placed);
             }
@@ -2002,24 +2002,24 @@ impl<'a> Lifter<'a> {
             let bits = (count * 8) as i64;
             match (left, bits < 64) {
                 (true, true) => {
-                    let hi_shifted = self.builder.ins().ishl_imm(hi, bits);
-                    let carry = self.builder.ins().ushr_imm(lo, 64 - bits);
+                    let hi_shifted = self.builder.ins().ishl_imm_u(hi, bits);
+                    let carry = self.builder.ins().ushr_imm_u(lo, 64 - bits);
                     let new_hi = self.builder.ins().bor(hi_shifted, carry);
-                    (self.builder.ins().ishl_imm(lo, bits), new_hi)
+                    (self.builder.ins().ishl_imm_u(lo, bits), new_hi)
                 }
                 (true, false) => {
                     let zero = self.builder.ins().iconst(types::I64, 0);
-                    (zero, self.builder.ins().ishl_imm(lo, bits - 64))
+                    (zero, self.builder.ins().ishl_imm_u(lo, bits - 64))
                 }
                 (false, true) => {
-                    let lo_shifted = self.builder.ins().ushr_imm(lo, bits);
-                    let carry = self.builder.ins().ishl_imm(hi, 64 - bits);
+                    let lo_shifted = self.builder.ins().ushr_imm_u(lo, bits);
+                    let carry = self.builder.ins().ishl_imm_u(hi, 64 - bits);
                     let new_lo = self.builder.ins().bor(lo_shifted, carry);
-                    (new_lo, self.builder.ins().ushr_imm(hi, bits))
+                    (new_lo, self.builder.ins().ushr_imm_u(hi, bits))
                 }
                 (false, false) => {
                     let zero = self.builder.ins().iconst(types::I64, 0);
-                    (self.builder.ins().ushr_imm(hi, bits - 64), zero)
+                    (self.builder.ins().ushr_imm_u(hi, bits - 64), zero)
                 }
             }
         };
@@ -2342,7 +2342,7 @@ impl<'a> Lifter<'a> {
     /// Split a 64-bit XMM half into its two dwords, as `I32` values.
     fn split_dwords(&mut self, half: Value) -> (Value, Value) {
         let d0 = self.builder.ins().ireduce(types::I32, half);
-        let upper = self.builder.ins().ushr_imm(half, 32);
+        let upper = self.builder.ins().ushr_imm_u(half, 32);
         let d1 = self.builder.ins().ireduce(types::I32, upper);
         (d0, d1)
     }
@@ -2351,7 +2351,7 @@ impl<'a> Lifter<'a> {
     fn pack_dwords(&mut self, d0: Value, d1: Value) -> Value {
         let d0 = self.builder.ins().uextend(types::I64, d0);
         let d1 = self.builder.ins().uextend(types::I64, d1);
-        let d1 = self.builder.ins().ishl_imm(d1, 32);
+        let d1 = self.builder.ins().ishl_imm_u(d1, 32);
         self.builder.ins().bor(d0, d1)
     }
 
@@ -2756,7 +2756,7 @@ impl<'a> Lifter<'a> {
             let placed = if out == 0 {
                 w
             } else {
-                self.builder.ins().ishl_imm(w, i64::from(out) * 16)
+                self.builder.ins().ishl_imm_u(w, i64::from(out) * 16)
             };
             acc = self.builder.ins().bor(acc, placed);
         }

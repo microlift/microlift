@@ -93,7 +93,7 @@ impl<'a> Lifter<'a> {
         if reg == Register::RIP {
             let base = self.builder.use_var(self.state.image_base);
             let offset = self.current_ip.wrapping_sub(self.lift_base);
-            return Ok(self.builder.ins().iadd_imm(base, offset as i64));
+            return Ok(self.builder.ins().iadd_imm_s(base, offset as i64));
         }
 
         let base_reg = get_base_reg_64(reg);
@@ -105,7 +105,7 @@ impl<'a> Lifter<'a> {
             if size == 8 {
                 Ok(full_val)
             } else if is_high_8 {
-                let shifted = self.builder.ins().ushr_imm(full_val, 8);
+                let shifted = self.builder.ins().ushr_imm_u(full_val, 8);
                 Ok(self.builder.ins().ireduce(types::I8, shifted))
             } else {
                 let ty = size_to_type(size);
@@ -140,7 +140,7 @@ impl<'a> Lifter<'a> {
             } else if is_high_8 {
                 // AH, BH, CH, DH: bits 8-15
                 let val_64 = self.builder.ins().uextend(types::I64, val);
-                let shifted_val = self.builder.ins().ishl_imm(val_64, 8);
+                let shifted_val = self.builder.ins().ishl_imm_u(val_64, 8);
                 let mask = self.builder.ins().iconst(types::I64, !0xFF00u64 as i64);
                 let cleared = self.builder.ins().band(old_val, mask);
                 self.builder.ins().bor(cleared, shifted_val)
@@ -308,7 +308,7 @@ impl<'a> Lifter<'a> {
             let target_rip = disp;
             let offset = target_rip.wrapping_sub(self.lift_base);
             let image_base = self.builder.use_var(self.state.image_base);
-            self.builder.ins().iadd_imm(image_base, offset as i64)
+            self.builder.ins().iadd_imm_s(image_base, offset as i64)
         } else if base_reg != Register::None {
             let v = self.get_reg_val(base_reg)?;
             widen64(self, v)
@@ -320,7 +320,7 @@ impl<'a> Lifter<'a> {
             let index_val = self.get_reg_val(index_reg)?;
             let index_val = widen64(self, index_val);
             let scaled_index = if scale > 1 {
-                self.builder.ins().imul_imm(index_val, scale as i64)
+                self.builder.ins().imul_imm_s(index_val, scale as i64)
             } else {
                 index_val
             };
@@ -330,13 +330,13 @@ impl<'a> Lifter<'a> {
         // Only add displacement if it was NOT RIP-relative.
         // For RIP-relative, the target address is already our 'ptr'.
         if base_reg != Register::RIP && disp != 0 {
-            ptr = self.builder.ins().iadd_imm(ptr, disp as i64);
+            ptr = self.builder.ins().iadd_imm_s(ptr, disp as i64);
         }
 
         // 32-bit addressing truncates the effective address to 32 bits (then
         // zero-extends) before any segment base is applied.
         if addr32 {
-            ptr = self.builder.ins().band_imm(ptr, 0xFFFF_FFFF);
+            ptr = self.builder.ins().band_imm_u(ptr, 0xFFFF_FFFF);
         }
 
         // Add FS or GS segment base. In x86-64 long mode DS/ES/SS/CS have

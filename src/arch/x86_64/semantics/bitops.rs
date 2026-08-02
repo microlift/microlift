@@ -401,7 +401,7 @@ impl<'a> Lifter<'a> {
         let cf_bit = self.builder.ins().band(result, one);
         self.set_rotate_cf(cf_bit, count)?;
         // OF (defined only for count == 1): MSB(result) ^ CF.
-        let msb = self.builder.ins().ushr_imm(result, (size * 8 - 1) as i64);
+        let msb = self.builder.ins().ushr_imm_u(result, (size * 8 - 1) as i64);
         let of1 = self.builder.ins().bxor(msb, cf_bit);
         self.set_rotate_of(of1, count)?;
         Ok(())
@@ -419,10 +419,10 @@ impl<'a> Lifter<'a> {
         let result = self.builder.ins().bor(right, left);
         self.write_operand(instruction, 0, result)?;
         // CF = MSB of result (the bit that rotated out of bit 0).
-        let cf_bit = self.builder.ins().ushr_imm(result, (size * 8 - 1) as i64);
+        let cf_bit = self.builder.ins().ushr_imm_u(result, (size * 8 - 1) as i64);
         self.set_rotate_cf(cf_bit, count)?;
         // OF (defined only for count == 1): XOR of the two top bits of result.
-        let next = self.builder.ins().ushr_imm(result, (size * 8 - 2) as i64);
+        let next = self.builder.ins().ushr_imm_u(result, (size * 8 - 2) as i64);
         let one = self.builder.ins().iconst(ty, 1);
         let next = self.builder.ins().band(next, one);
         let of1 = self.builder.ins().bxor(cf_bit, next);
@@ -440,7 +440,7 @@ impl<'a> Lifter<'a> {
         } else {
             self.builder.ins().ireduce(types::I8, cf_bit)
         };
-        let is_zero = self.builder.ins().icmp_imm(IntCC::Equal, count, 0);
+        let is_zero = self.builder.ins().icmp_imm_s(IntCC::Equal, count, 0);
         let final_cf = self.builder.ins().select(is_zero, old_cf, new_cf);
         self.set_flag(X86Flag::Carry, final_cf)
     }
@@ -456,7 +456,7 @@ impl<'a> Lifter<'a> {
         } else {
             self.builder.ins().ireduce(types::I8, of_bit)
         };
-        let is_one = self.builder.ins().icmp_imm(IntCC::Equal, count, 1);
+        let is_one = self.builder.ins().icmp_imm_s(IntCC::Equal, count, 1);
         let final_of = self.builder.ins().select(is_one, new_of, old_of);
         self.set_flag(X86Flag::Overflow, final_of)
     }
@@ -557,8 +557,8 @@ impl<'a> Lifter<'a> {
 
         // OF (defined only for count == 1): XOR of the two most-significant bits
         // of the result. set_rotate_of leaves OF unchanged for any other count.
-        let msb = self.builder.ins().ushr_imm(result, n - 1);
-        let next = self.builder.ins().ushr_imm(result, n - 2);
+        let msb = self.builder.ins().ushr_imm_u(result, n - 1);
+        let next = self.builder.ins().ushr_imm_u(result, n - 2);
         let one = self.builder.ins().iconst(ty, 1);
         let next = self.builder.ins().band(next, one);
         let of1 = self.builder.ins().bxor(msb, next);
@@ -593,7 +593,7 @@ impl<'a> Lifter<'a> {
         let xval = {
             let v = self.builder.ins().uextend(work_ty, val);
             let cfw = self.builder.ins().uextend(work_ty, cf);
-            let cf_hi = self.builder.ins().ishl_imm(cfw, n);
+            let cf_hi = self.builder.ins().ishl_imm_u(cfw, n);
             self.builder.ins().bor(v, cf_hi)
         };
         let count_w = self.builder.ins().uextend(work_ty, count);
@@ -628,7 +628,7 @@ impl<'a> Lifter<'a> {
 
         // OF (defined only for count == 1): MSB(result) XOR CF (the CF after the
         // rotate). set_rotate_of leaves OF unchanged for any other count.
-        let msb = self.builder.ins().ushr_imm(result, n - 1);
+        let msb = self.builder.ins().ushr_imm_u(result, n - 1);
         let cf_ty = self.builder.ins().ireduce(ty, cf_bit);
         let of1 = self.builder.ins().bxor(msb, cf_ty);
         self.set_rotate_of(of1, count)?;
@@ -691,7 +691,7 @@ impl<'a> Lifter<'a> {
         // A masked count of 0 leaves the destination unchanged. The formula
         // above would compute `dst | src` there, because `src >> N` re-masks
         // the shift amount modulo the operand width and becomes `src >> 0`.
-        let is_zero = self.builder.ins().icmp_imm(IntCC::Equal, count, 0);
+        let is_zero = self.builder.ins().icmp_imm_s(IntCC::Equal, count, 0);
         let result = self.builder.ins().select(is_zero, dst, combined);
 
         self.write_operand(instruction, 0, result)?;
@@ -725,7 +725,7 @@ impl<'a> Lifter<'a> {
         let combined = self.builder.ins().bor(shifted_src, shifted_dst);
 
         // A masked count of 0 leaves the destination unchanged (see SHLD).
-        let is_zero = self.builder.ins().icmp_imm(IntCC::Equal, count, 0);
+        let is_zero = self.builder.ins().icmp_imm_s(IntCC::Equal, count, 0);
         let result = self.builder.ins().select(is_zero, dst, combined);
 
         self.write_operand(instruction, 0, result)?;
@@ -807,8 +807,8 @@ impl<'a> Lifter<'a> {
                         let word = self
                             .builder
                             .ins()
-                            .sshr_imm(idx64, bits.trailing_zeros() as i64);
-                        let byte_off = self.builder.ins().imul_imm(word, size as i64);
+                            .sshr_imm_u(idx64, bits.trailing_zeros() as i64);
+                        let byte_off = self.builder.ins().imul_imm_s(word, size as i64);
                         ptr = self.builder.ins().iadd(ptr, byte_off);
                         let mask = self.builder.ins().iconst(ty, bits - 1);
                         self.builder.ins().band(idx, mask)
@@ -900,7 +900,7 @@ impl<'a> Lifter<'a> {
         let size = self.operand_size(instruction, 1)?;
         let src = self.read_operand(instruction, 1, size)?;
         // ZF = 1 if src == 0
-        let zf = self.builder.ins().icmp_imm(IntCC::Equal, src, 0);
+        let zf = self.builder.ins().icmp_imm_s(IntCC::Equal, src, 0);
         self.set_flag(X86Flag::Zero, zf)?;
         // Result: count trailing zeros. For src == 0 the destination is
         // architecturally undefined on Intel but left unchanged on AMD (and,
@@ -966,7 +966,7 @@ impl<'a> Lifter<'a> {
         let size = self.operand_size(instruction, 1)?;
         let src = self.read_operand(instruction, 1, size)?;
         // ZF = 1 if src == 0
-        let zf = self.builder.ins().icmp_imm(IntCC::Equal, src, 0);
+        let zf = self.builder.ins().icmp_imm_s(IntCC::Equal, src, 0);
         self.set_flag(X86Flag::Zero, zf)?;
         // BSR: index of highest set bit = (size*8-1) - clz(src). For src == 0
         // leave the destination unchanged (see handle_bsf).

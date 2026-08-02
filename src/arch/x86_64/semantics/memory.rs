@@ -141,7 +141,7 @@ impl<'a> Lifter<'a> {
         };
 
         let rsp = self.get_reg_val(Register::RSP)?;
-        let new_rsp = self.builder.ins().iadd_imm(rsp, -(push_size as i64));
+        let new_rsp = self.builder.ins().iadd_imm_s(rsp, -(push_size as i64));
         self.set_reg_val(Register::RSP, new_rsp)?;
         self.builder
             .ins()
@@ -163,7 +163,7 @@ impl<'a> Lifter<'a> {
         let rsp = self.get_reg_val(Register::RSP)?;
         let val = self.builder.ins().load(ty, MemFlagsData::new(), rsp, 0);
 
-        let new_rsp = self.builder.ins().iadd_imm(rsp, pop_size as i64);
+        let new_rsp = self.builder.ins().iadd_imm_s(rsp, pop_size as i64);
         self.set_reg_val(Register::RSP, new_rsp)?;
 
         match op0 {
@@ -194,7 +194,7 @@ impl<'a> Lifter<'a> {
             .ins()
             .load(types::I64, MemFlagsData::new(), rbp, 0);
         self.set_reg_val(Register::RBP, old_rbp)?;
-        let new_rsp = self.builder.ins().iadd_imm(rbp, 8);
+        let new_rsp = self.builder.ins().iadd_imm_s(rbp, 8);
         self.set_reg_val(Register::RSP, new_rsp)?;
         Ok(())
     }
@@ -273,7 +273,7 @@ impl<'a> Lifter<'a> {
         let df = self.builder.use_var(self.state.flags[&X86Flag::Direction]);
         let pos = self.builder.ins().iconst(ty, element_size as i64);
         let neg = self.builder.ins().iconst(ty, -(element_size as i64));
-        let df_set = self.builder.ins().icmp_imm(IntCC::NotEqual, df, 0);
+        let df_set = self.builder.ins().icmp_imm_s(IntCC::NotEqual, df, 0);
         let delta = self.builder.ins().select(df_set, neg, pos);
         let new = self.builder.ins().iadd(cur, delta);
         self.set_reg_val(reg, new)
@@ -310,7 +310,7 @@ impl<'a> Lifter<'a> {
 
         // header: skip the whole loop when the count is already zero.
         let count = self.get_reg_val(count_reg)?;
-        let is_zero = self.builder.ins().icmp_imm(IntCC::Equal, count, 0);
+        let is_zero = self.builder.ins().icmp_imm_s(IntCC::Equal, count, 0);
         self.builder
             .ins()
             .brif(is_zero, done_block, &[], body_block, &[]);
@@ -319,9 +319,9 @@ impl<'a> Lifter<'a> {
         self.builder.switch_to_block(body_block);
         body(self, size, addr_size)?;
         let cur = self.get_reg_val(count_reg)?;
-        let dec = self.builder.ins().iadd_imm(cur, -1);
+        let dec = self.builder.ins().iadd_imm_s(cur, -1);
         self.set_reg_val(count_reg, dec)?;
-        let nonzero = self.builder.ins().icmp_imm(IntCC::NotEqual, dec, 0);
+        let nonzero = self.builder.ins().icmp_imm_s(IntCC::NotEqual, dec, 0);
         self.builder
             .ins()
             .brif(nonzero, body_block, &[], done_block, &[]);
@@ -482,7 +482,7 @@ impl<'a> Lifter<'a> {
         // it stays correct under relocation.
         let offset = instruction.ip().wrapping_sub(self.lift_base);
         let image_base = self.builder.use_var(self.state.image_base);
-        let rip_at = self.builder.ins().iadd_imm(image_base, offset as i64);
+        let rip_at = self.builder.ins().iadd_imm_s(image_base, offset as i64);
 
         self.sync_to_context(Some(rip_at), reason)?;
         self.write_exit_code(size as u32);
@@ -503,13 +503,13 @@ impl<'a> Lifter<'a> {
             let raw = self.builder.use_var(self.state.flags[&flag]);
             let wide = self.builder.ins().uextend(types::I64, raw);
             // Flags are logically 1-bit; mask defensively before positioning.
-            let one_bit = self.builder.ins().band_imm(wide, 1);
-            let positioned = self.builder.ins().ishl_imm(one_bit, bit as i64);
+            let one_bit = self.builder.ins().band_imm_u(wide, 1);
+            let positioned = self.builder.ins().ishl_imm_u(one_bit, bit as i64);
             rflags = self.builder.ins().bor(rflags, positioned);
         }
 
         let rsp = self.get_reg_val(Register::RSP)?;
-        let new_rsp = self.builder.ins().iadd_imm(rsp, -8);
+        let new_rsp = self.builder.ins().iadd_imm_s(rsp, -8);
         self.set_reg_val(Register::RSP, new_rsp)?;
         self.builder
             .ins()
@@ -526,13 +526,13 @@ impl<'a> Lifter<'a> {
             .builder
             .ins()
             .load(types::I64, MemFlagsData::new(), rsp, 0);
-        let new_rsp = self.builder.ins().iadd_imm(rsp, 8);
+        let new_rsp = self.builder.ins().iadd_imm_s(rsp, 8);
         self.set_reg_val(Register::RSP, new_rsp)?;
 
         for (flag, bit) in RFLAGS_FLAG_BITS {
             // bit value = (rflags >> bit) & 1, narrowed to the I8 flag storage.
-            let shifted = self.builder.ins().ushr_imm(rflags, bit as i64);
-            let one_bit = self.builder.ins().band_imm(shifted, 1);
+            let shifted = self.builder.ins().ushr_imm_u(rflags, bit as i64);
+            let one_bit = self.builder.ins().band_imm_u(shifted, 1);
             let val = self.builder.ins().ireduce(types::I8, one_bit);
             self.set_flag(flag, val)?;
         }

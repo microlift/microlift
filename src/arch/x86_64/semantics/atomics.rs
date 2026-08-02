@@ -120,7 +120,7 @@ impl<'a> Lifter<'a> {
         let edx = self.get_reg_val(Register::EDX)?; // I32
         let eax64 = self.builder.ins().uextend(types::I64, eax);
         let edx64 = self.builder.ins().uextend(types::I64, edx);
-        let edx_hi = self.builder.ins().ishl_imm(edx64, 32);
+        let edx_hi = self.builder.ins().ishl_imm_u(edx64, 32);
         let expected = self.builder.ins().bor(edx_hi, eax64);
 
         // Build replacement (ECX:EBX) as a single I64.
@@ -128,7 +128,7 @@ impl<'a> Lifter<'a> {
         let ecx = self.get_reg_val(Register::ECX)?; // I32
         let ebx64 = self.builder.ins().uextend(types::I64, ebx);
         let ecx64 = self.builder.ins().uextend(types::I64, ecx);
-        let ecx_hi = self.builder.ins().ishl_imm(ecx64, 32);
+        let ecx_hi = self.builder.ins().ishl_imm_u(ecx64, 32);
         let replacement = self.builder.ins().bor(ecx_hi, ebx64);
 
         let old = self
@@ -141,7 +141,7 @@ impl<'a> Lifter<'a> {
 
         // On failure, load old value into EDX:EAX.
         let old_eax32 = self.builder.ins().ireduce(types::I32, old);
-        let old_edx_shifted = self.builder.ins().ushr_imm(old, 32);
+        let old_edx_shifted = self.builder.ins().ushr_imm_u(old, 32);
         let old_edx32 = self.builder.ins().ireduce(types::I32, old_edx_shifted);
         let new_eax = self.builder.ins().select(succeeded, eax, old_eax32);
         let new_edx = self.builder.ins().select(succeeded, edx, old_edx32);
@@ -433,10 +433,10 @@ impl<'a> Lifter<'a> {
                 let word = self
                     .builder
                     .ins()
-                    .sshr_imm(idx64, bits.trailing_zeros() as i64);
-                let byte_off = self.builder.ins().imul_imm(word, size as i64);
+                    .sshr_imm_u(idx64, bits.trailing_zeros() as i64);
+                let byte_off = self.builder.ins().imul_imm_s(word, size as i64);
                 ptr = self.builder.ins().iadd(ptr, byte_off);
-                self.builder.ins().band_imm(idx, bits - 1)
+                self.builder.ins().band_imm_u(idx, bits - 1)
             }
             OpKind::Immediate8 => self
                 .builder

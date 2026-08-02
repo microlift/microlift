@@ -35,47 +35,47 @@ const QNAN_MANT: i64 = 0xC000_0000_0000_0000u64 as i64;
 const QNAN_SE: i64 = 0xFFFF;
 
 fn sign_of(b: &mut FunctionBuilder, se: Value) -> Value {
-    let s = b.ins().ushr_imm(se, 15);
-    b.ins().band_imm(s, 1)
+    let s = b.ins().ushr_imm_u(se, 15);
+    b.ins().band_imm_u(s, 1)
 }
 
 fn exp_of(b: &mut FunctionBuilder, se: Value) -> Value {
-    b.ins().band_imm(se, EXP_MAX)
+    b.ins().band_imm_u(se, EXP_MAX)
 }
 
 fn frac_of(b: &mut FunctionBuilder, mant: Value) -> Value {
-    b.ins().band_imm(mant, FRAC_MASK)
+    b.ins().band_imm_u(mant, FRAC_MASK)
 }
 
 fn is_exp_max(b: &mut FunctionBuilder, se: Value) -> Value {
     let e = exp_of(b, se);
-    b.ins().icmp_imm(IntCC::Equal, e, EXP_MAX)
+    b.ins().icmp_imm_s(IntCC::Equal, e, EXP_MAX)
 }
 
 fn is_nan(b: &mut FunctionBuilder, mant: Value, se: Value) -> Value {
     let em = is_exp_max(b, se);
     let f = frac_of(b, mant);
-    let fnz = b.ins().icmp_imm(IntCC::NotEqual, f, 0);
+    let fnz = b.ins().icmp_imm_s(IntCC::NotEqual, f, 0);
     b.ins().band(em, fnz)
 }
 
 fn is_inf(b: &mut FunctionBuilder, mant: Value, se: Value) -> Value {
     let em = is_exp_max(b, se);
     let f = frac_of(b, mant);
-    let fz = b.ins().icmp_imm(IntCC::Equal, f, 0);
+    let fz = b.ins().icmp_imm_s(IntCC::Equal, f, 0);
     b.ins().band(em, fz)
 }
 
 fn is_zero(b: &mut FunctionBuilder, mant: Value, se: Value) -> Value {
     let e = exp_of(b, se);
-    let ez = b.ins().icmp_imm(IntCC::Equal, e, 0);
-    let mz = b.ins().icmp_imm(IntCC::Equal, mant, 0);
+    let ez = b.ins().icmp_imm_s(IntCC::Equal, e, 0);
+    let mz = b.ins().icmp_imm_s(IntCC::Equal, mant, 0);
     b.ins().band(ez, mz)
 }
 
 /// Assemble a `se` field (I32) from a sign bit (0/1) and biased exponent.
 fn compose_se(b: &mut FunctionBuilder, sign: Value, exp: Value) -> Value {
-    let s = b.ins().ishl_imm(sign, 15);
+    let s = b.ins().ishl_imm_u(sign, 15);
     b.ins().bor(s, exp)
 }
 
@@ -105,7 +105,7 @@ fn signed_zero(b: &mut FunctionBuilder, sign: Value) -> (Value, Value) {
 fn round_significand(b: &mut FunctionBuilder, sig: Value, inc: Value) -> (Value, Value) {
     let sig_r = b.ins().iadd(sig, inc);
     // Overflow only when sig was all-ones and inc==1, wrapping to 0.
-    let carry = b.ins().icmp_imm(IntCC::Equal, sig_r, 0);
+    let carry = b.ins().icmp_imm_s(IntCC::Equal, sig_r, 0);
     let msb = b.ins().iconst(types::I64, INT_BIT);
     let sig_final = b.ins().select(carry, msb, sig_r);
     let exp_carry = b.ins().uextend(types::I32, carry);
@@ -172,8 +172,8 @@ fn clamp_over_under(
 ) -> (Value, Value) {
     let overflow = b
         .ins()
-        .icmp_imm(IntCC::SignedGreaterThanOrEqual, exp, EXP_MAX);
-    let underflow = b.ins().icmp_imm(IntCC::SignedLessThanOrEqual, exp, 0);
+        .icmp_imm_s(IntCC::SignedGreaterThanOrEqual, exp, EXP_MAX);
+    let underflow = b.ins().icmp_imm_s(IntCC::SignedLessThanOrEqual, exp, 0);
     let (im, ise) = inf(b, sign);
     let (zm, zse) = signed_zero(b, sign);
     let m = b.ins().select(overflow, im, nm);
@@ -211,13 +211,13 @@ pub fn emit_f80_mul(
     let prod = b.ins().imul(pa, pb);
 
     // top = 1 when the product reached bit 127.
-    let top128 = b.ins().ushr_imm(prod, 127);
+    let top128 = b.ins().ushr_imm_u(prod, 127);
     let top = b.ins().ireduce(types::I32, top128);
 
     // Extract the 64-bit significand: shift = 63 + top so the integer bit lands
     // at bit 63 of the low word.
     let top128_ext = b.ins().uextend(types::I128, top);
-    let extract_shift = b.ins().iadd_imm(top128_ext, 63);
+    let extract_shift = b.ins().iadd_imm_s(top128_ext, 63);
     let sig128 = b.ins().ushr(prod, extract_shift);
     let sig = b.ins().ireduce(types::I64, sig128);
 
@@ -226,18 +226,18 @@ pub fn emit_f80_mul(
     let one128 = b.ins().uextend(types::I128, one64);
     let mask = {
         let sh = b.ins().ishl(one128, extract_shift);
-        b.ins().iadd_imm(sh, -1)
+        b.ins().iadd_imm_s(sh, -1)
     };
     let rem = b.ins().band(prod, mask);
     let half = {
-        let hs = b.ins().iadd_imm(extract_shift, -1);
+        let hs = b.ins().iadd_imm_s(extract_shift, -1);
         b.ins().ishl(one128, hs)
     };
     let gt = b.ins().icmp(IntCC::UnsignedGreaterThan, rem, half);
     let eq = b.ins().icmp(IntCC::Equal, rem, half);
     let odd = {
-        let o = b.ins().band_imm(sig, 1);
-        b.ins().icmp_imm(IntCC::NotEqual, o, 0)
+        let o = b.ins().band_imm_u(sig, 1);
+        b.ins().icmp_imm_s(IntCC::NotEqual, o, 0)
     };
     let tie = b.ins().band(eq, odd);
     let round_up = b.ins().bor(gt, tie);
@@ -246,7 +246,7 @@ pub fn emit_f80_mul(
 
     // Biased result exponent: ea + eb - bias + top + carry.
     let esum = b.ins().iadd(exp_a, exp_b);
-    let esum = b.ins().iadd_imm(esum, -BIAS);
+    let esum = b.ins().iadd_imm_s(esum, -BIAS);
     let esum = b.ins().iadd(esum, top);
     let exp = b.ins().iadd(esum, exp_carry);
 
@@ -288,7 +288,7 @@ fn udivmod128(b: &mut FunctionBuilder, n: Value, d: Value) -> (Value, Value) {
     let k = b.block_params(loop_b)[0];
     let q = b.block_params(loop_b)[1];
     let r = b.block_params(loop_b)[2];
-    let done = b.ins().icmp_imm(IntCC::Equal, k, 128);
+    let done = b.ins().icmp_imm_s(IntCC::Equal, k, 128);
     b.ins().brif(
         done,
         exit,
@@ -303,7 +303,7 @@ fn udivmod128(b: &mut FunctionBuilder, n: Value, d: Value) -> (Value, Value) {
     let r = b.block_params(body)[2];
     let c127 = b.ins().iconst(types::I64, 127);
     let bit_pos = b.ins().isub(c127, k);
-    let r_sh = b.ins().ishl_imm(r, 1);
+    let r_sh = b.ins().ishl_imm_u(r, 1);
     let n_bit = {
         let nb = b.ins().ushr(n, bit_pos);
         b.ins().band(nb, one)
@@ -315,7 +315,7 @@ fn udivmod128(b: &mut FunctionBuilder, n: Value, d: Value) -> (Value, Value) {
     let q_bit = b.ins().ishl(one, bit_pos);
     let q_set = b.ins().bor(q, q_bit);
     let q_out = b.ins().select(ge, q_set, q);
-    let k_next = b.ins().iadd_imm(k, 1);
+    let k_next = b.ins().iadd_imm_s(k, 1);
     b.ins()
         .jump(loop_b, &[k_next.into(), q_out.into(), r_out.into()]);
 
@@ -353,19 +353,19 @@ pub fn emit_f80_div(
     // Q in (2^63, 2^65).
     let num = {
         let a128 = b.ins().uextend(types::I128, am);
-        b.ins().ishl_imm(a128, 64)
+        b.ins().ishl_imm_u(a128, 64)
     };
     let den = b.ins().uextend(types::I128, bm);
     let (q, r) = udivmod128(b, num, den);
 
     let q_small = b.ins().ireduce(types::I64, q);
-    let q_big_128 = b.ins().ushr_imm(q, 1);
+    let q_big_128 = b.ins().ushr_imm_u(q, 1);
     let q_big = b.ins().ireduce(types::I64, q_big_128);
     // is_big when Q >= 2^64 (bit 64 or higher set).
     let is_big = {
-        let hi = b.ins().ushr_imm(q, 64);
+        let hi = b.ins().ushr_imm_u(q, 64);
         let hi = b.ins().ireduce(types::I64, hi);
-        b.ins().icmp_imm(IntCC::NotEqual, hi, 0)
+        b.ins().icmp_imm_s(IntCC::NotEqual, hi, 0)
     };
     let sig = b.ins().select(is_big, q_big, q_small);
 
@@ -379,18 +379,18 @@ pub fn emit_f80_div(
         };
         b.ins().icmp(IntCC::NotEqual, r, z128)
     };
-    let guard_big = b.ins().band_imm(q_small, 1);
-    let guard_big = b.ins().icmp_imm(IntCC::NotEqual, guard_big, 0);
+    let guard_big = b.ins().band_imm_u(q_small, 1);
+    let guard_big = b.ins().icmp_imm_s(IntCC::NotEqual, guard_big, 0);
     let sig_odd = {
-        let o = b.ins().band_imm(sig, 1);
-        b.ins().icmp_imm(IntCC::NotEqual, o, 0)
+        let o = b.ins().band_imm_u(sig, 1);
+        b.ins().icmp_imm_s(IntCC::NotEqual, o, 0)
     };
     let round_big = {
         let sticky_or_odd = b.ins().bor(r_nz, sig_odd);
         b.ins().band(guard_big, sticky_or_odd)
     };
     let round_small = {
-        let two_r = b.ins().ishl_imm(r, 1);
+        let two_r = b.ins().ishl_imm_u(r, 1);
         let gt = b.ins().icmp(IntCC::UnsignedGreaterThan, two_r, den);
         let eq = b.ins().icmp(IntCC::Equal, two_r, den);
         let tie = b.ins().band(eq, sig_odd);
@@ -402,7 +402,7 @@ pub fn emit_f80_div(
 
     // Biased result exponent: ea - eb + (bias - 1) + is_big + carry.
     let ediff = b.ins().isub(exp_a, exp_b);
-    let ediff = b.ins().iadd_imm(ediff, BIAS - 1);
+    let ediff = b.ins().iadd_imm_s(ediff, BIAS - 1);
     let big_adj = b.ins().uextend(types::I32, is_big);
     let ediff = b.ins().iadd(ediff, big_adj);
     let exp = b.ins().iadd(ediff, exp_carry);
@@ -456,15 +456,15 @@ pub fn emit_f80_div(
 /// Count leading zeros of a 128-bit value, returned as an `I64`.
 fn clz128(b: &mut FunctionBuilder, x: Value) -> Value {
     let hi = {
-        let h = b.ins().ushr_imm(x, 64);
+        let h = b.ins().ushr_imm_u(x, 64);
         b.ins().ireduce(types::I64, h)
     };
     let lo = b.ins().ireduce(types::I64, x);
-    let hi_nz = b.ins().icmp_imm(IntCC::NotEqual, hi, 0);
+    let hi_nz = b.ins().icmp_imm_s(IntCC::NotEqual, hi, 0);
     let clz_hi = b.ins().clz(hi);
     let clz_lo = {
         let c = b.ins().clz(lo);
-        b.ins().iadd_imm(c, 64)
+        b.ins().iadd_imm_s(c, 64)
     };
     b.ins().select(hi_nz, clz_hi, clz_lo)
 }
@@ -500,23 +500,23 @@ pub fn emit_f80_add(
     // Mantissas in the high 64 bits of a 128-bit word (64 guard bits below).
     let hi128 = {
         let h = b.ins().uextend(types::I128, hi_m);
-        b.ins().ishl_imm(h, 64)
+        b.ins().ishl_imm_u(h, 64)
     };
     let lo128 = {
         let l = b.ins().uextend(types::I128, lo_m);
-        b.ins().ishl_imm(l, 64)
+        b.ins().ishl_imm_u(l, 64)
     };
 
     let one64 = b.ins().iconst(types::I64, 1);
     let one128 = b.ins().uextend(types::I128, one64);
-    let bit127 = b.ins().ishl_imm(one128, 127);
+    let bit127 = b.ins().ishl_imm_u(one128, 127);
     let mask64 = {
-        let s = b.ins().ishl_imm(one128, 64);
-        b.ins().iadd_imm(s, -1)
+        let s = b.ins().ishl_imm_u(one128, 64);
+        b.ins().iadd_imm_s(s, -1)
     };
 
     // Align `lo` right by `d` (capped at 127), accumulating a sticky bit.
-    let big_shift = b.ins().icmp_imm(IntCC::SignedGreaterThan, d, 127);
+    let big_shift = b.ins().icmp_imm_s(IntCC::SignedGreaterThan, d, 127);
     let d_cap = {
         let c127 = b.ins().iconst(types::I32, 127);
         b.ins().select(big_shift, c127, d)
@@ -525,11 +525,11 @@ pub fn emit_f80_add(
     let lo_shifted = b.ins().ushr(lo128, d_cap128);
     let lost_mask = {
         let s = b.ins().ishl(one128, d_cap128);
-        b.ins().iadd_imm(s, -1)
+        b.ins().iadd_imm_s(s, -1)
     };
     let lost = b.ins().band(lo128, lost_mask);
-    let lost_nz = b.ins().icmp_imm(IntCC::NotEqual, lost, 0);
-    let lo_all_nz = b.ins().icmp_imm(IntCC::NotEqual, lo128, 0);
+    let lost_nz = b.ins().icmp_imm_s(IntCC::NotEqual, lost, 0);
+    let lo_all_nz = b.ins().icmp_imm_s(IntCC::NotEqual, lo128, 0);
     let sticky = b.ins().select(big_shift, lo_all_nz, lost_nz);
     let zero128 = {
         let z = b.ins().iconst(types::I64, 0);
@@ -544,7 +544,7 @@ pub fn emit_f80_add(
     // ---- effective addition ----
     let sum = b.ins().iadd(hi128, lo_aligned);
     let carry = b.ins().icmp(IntCC::UnsignedLessThan, sum, hi128);
-    let sum_shr1 = b.ins().ushr_imm(sum, 1);
+    let sum_shr1 = b.ins().ushr_imm_u(sum, 1);
     let sum_lost = b.ins().band(sum, one128);
     let sum_carry = {
         let s = b.ins().bor(sum_shr1, bit127);
@@ -583,7 +583,7 @@ pub fn emit_f80_add(
 
     // Round at the bit-64 boundary (round-to-nearest-even).
     let keep = {
-        let k = b.ins().ushr_imm(res128, 64);
+        let k = b.ins().ushr_imm_u(res128, 64);
         b.ins().ireduce(types::I64, k)
     };
     let round_bits = {
@@ -594,8 +594,8 @@ pub fn emit_f80_add(
     let gt = b.ins().icmp(IntCC::UnsignedGreaterThan, round_bits, half);
     let eq = b.ins().icmp(IntCC::Equal, round_bits, half);
     let odd = {
-        let o = b.ins().band_imm(keep, 1);
-        b.ins().icmp_imm(IntCC::NotEqual, o, 0)
+        let o = b.ins().band_imm_u(keep, 1);
+        b.ins().icmp_imm_s(IntCC::NotEqual, o, 0)
     };
     let tie = b.ins().band(eq, odd);
     let round_up = b.ins().bor(gt, tie);
@@ -607,7 +607,7 @@ pub fn emit_f80_add(
     let (nm, nse) = clamp_over_under(b, res_sign, final_exp, sig_r, nse);
 
     // Exact cancellation (effective subtraction to zero) -> +0.
-    let not_same = b.ins().bxor_imm(same_sign, 1);
+    let not_same = b.ins().bxor_imm_u(same_sign, 1);
     let cancel = b.ins().band(not_same, diff_zero);
     let zero_m = b.ins().iconst(types::I64, 0);
     let zero_se = b.ins().iconst(types::I32, 0);
@@ -642,7 +642,7 @@ pub fn emit_f80_sub(
     bm: Value,
     bse: Value,
 ) -> (Value, Value) {
-    let neg_bse = b.ins().bxor_imm(bse, 0x8000);
+    let neg_bse = b.ins().bxor_imm_u(bse, 0x8000);
     emit_f80_add(b, am, ase, bm, neg_bse)
 }
 
@@ -659,7 +659,7 @@ fn isqrt128(b: &mut FunctionBuilder, n0: Value) -> (Value, Value) {
         let o = b.ins().iconst(types::I64, 1);
         b.ins().uextend(i128, o)
     };
-    let bit0 = b.ins().ishl_imm(one, 126); // 4^63, the largest power of four < 2^128
+    let bit0 = b.ins().ishl_imm_u(one, 126); // 4^63, the largest power of four < 2^128
 
     let loop_b = b.create_block();
     b.append_block_param(loop_b, i128); // n
@@ -698,10 +698,10 @@ fn isqrt128(b: &mut FunctionBuilder, n0: Value) -> (Value, Value) {
         .icmp(IntCC::UnsignedGreaterThanOrEqual, n, res_plus_bit);
     let n_sub = b.ins().isub(n, res_plus_bit);
     let n_new = b.ins().select(ge, n_sub, n);
-    let res_shr = b.ins().ushr_imm(res, 1);
+    let res_shr = b.ins().ushr_imm_u(res, 1);
     let res_add = b.ins().iadd(res_shr, bit);
     let res_new = b.ins().select(ge, res_add, res_shr);
-    let bit_new = b.ins().ushr_imm(bit, 2);
+    let bit_new = b.ins().ushr_imm_u(bit, 2);
     b.ins()
         .jump(loop_b, &[n_new.into(), res_new.into(), bit_new.into()]);
 
@@ -721,13 +721,13 @@ pub fn emit_f80_sqrt(b: &mut FunctionBuilder, am: Value, ase: Value) -> (Value, 
     let a_nan = is_nan(b, am, ase);
     let a_inf = is_inf(b, am, ase);
     let a_zero = is_zero(b, am, ase);
-    let is_neg = b.ins().icmp_imm(IntCC::Equal, sign, 1);
+    let is_neg = b.ins().icmp_imm_s(IntCC::Equal, sign, 1);
 
     // Radicand scaled into 128 bits. The shift makes the effective exponent even
     // so the result exponent is exact: 64 for even biased exponent, 63 for odd.
     let even = {
-        let lsb = b.ins().band_imm(ebiased, 1);
-        b.ins().icmp_imm(IntCC::Equal, lsb, 0)
+        let lsb = b.ins().band_imm_u(ebiased, 1);
+        b.ins().icmp_imm_s(IntCC::Equal, lsb, 0)
     };
     let k = {
         let k64 = b.ins().iconst(types::I32, 64);
@@ -751,13 +751,13 @@ pub fn emit_f80_sqrt(b: &mut FunctionBuilder, am: Value, ase: Value) -> (Value, 
     // Result biased exponent: (ebiased - 16384)/2 + 16383 (even) or
     // (ebiased - 16383)/2 + 16383 (odd); `base` is even in both cases.
     let base = {
-        let be = b.ins().iadd_imm(ebiased, -16384);
-        let bo = b.ins().iadd_imm(ebiased, -16383);
+        let be = b.ins().iadd_imm_s(ebiased, -16384);
+        let bo = b.ins().iadd_imm_s(ebiased, -16383);
         b.ins().select(even, be, bo)
     };
     let er = {
-        let h = b.ins().sshr_imm(base, 1);
-        b.ins().iadd_imm(h, 16383)
+        let h = b.ins().sshr_imm_u(base, 1);
+        b.ins().iadd_imm_s(h, 16383)
     };
     let exp = b.ins().iadd(er, exp_carry);
 
@@ -770,7 +770,7 @@ pub fn emit_f80_sqrt(b: &mut FunctionBuilder, am: Value, ase: Value) -> (Value, 
     let pos = b.ins().iconst(types::I32, 0);
     let (im, ise) = inf(b, pos); // +inf
     let neg_nonzero = {
-        let nz = b.ins().bxor_imm(a_zero, 1);
+        let nz = b.ins().bxor_imm_u(a_zero, 1);
         b.ins().band(is_neg, nz)
     };
 
@@ -815,7 +815,7 @@ pub fn emit_f80_cmp(
     let exp_b = exp_of(b, bse);
     let mag = |b: &mut FunctionBuilder, exp: Value, mant: Value| -> Value {
         let e128 = b.ins().uextend(types::I128, exp);
-        let e_hi = b.ins().ishl_imm(e128, 64);
+        let e_hi = b.ins().ishl_imm_u(e128, 64);
         let m128 = b.ins().uextend(types::I128, mant);
         b.ins().bor(e_hi, m128)
     };
@@ -827,12 +827,12 @@ pub fn emit_f80_cmp(
     let mag_gt = b.ins().icmp(IntCC::UnsignedGreaterThan, mag_a, mag_b);
     let mag_eq = b.ins().icmp(IntCC::Equal, mag_a, mag_b);
 
-    let a_is_neg = b.ins().icmp_imm(IntCC::Equal, sa_eff, 1);
+    let a_is_neg = b.ins().icmp_imm_s(IntCC::Equal, sa_eff, 1);
     // Same sign: positive -> lt by magnitude; negative -> lt by reversed magnitude.
     let same_sign_lt = b.ins().select(a_is_neg, mag_gt, mag_lt);
     // Different signs: a < b iff a is the negative one.
     let lt = b.ins().select(signs_diff, a_is_neg, same_sign_lt);
-    let not_signs_diff = b.ins().bxor_imm(signs_diff, 1);
+    let not_signs_diff = b.ins().bxor_imm_u(signs_diff, 1);
     let eq = b.ins().band(not_signs_diff, mag_eq);
 
     (unord, eq, lt)

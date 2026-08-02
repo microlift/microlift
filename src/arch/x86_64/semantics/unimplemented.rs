@@ -71,7 +71,7 @@ impl<'a> Lifter<'a> {
     fn rip_at(&mut self, instruction: &Instruction) -> Value {
         let offset = instruction.ip().wrapping_sub(self.lift_base);
         let image_base = self.builder.use_var(self.state.image_base);
-        self.builder.ins().iadd_imm(image_base, offset as i64)
+        self.builder.ins().iadd_imm_s(image_base, offset as i64)
     }
 
     /// Compute the absolute address of the instruction *following* `instruction`
@@ -81,7 +81,7 @@ impl<'a> Lifter<'a> {
         let next_ip = instruction.next_ip();
         let offset = next_ip.wrapping_sub(self.lift_base);
         let image_base = self.builder.use_var(self.state.image_base);
-        self.builder.ins().iadd_imm(image_base, offset as i64)
+        self.builder.ins().iadd_imm_s(image_base, offset as i64)
     }
 
     /// Emit an `Interrupt` VM exit for vector `vector`, syncing guest state and
@@ -116,7 +116,7 @@ impl<'a> Lifter<'a> {
         let next_ip = instruction.next_ip();
         let offset = next_ip.wrapping_sub(self.lift_base);
         let image_base = self.builder.use_var(self.state.image_base);
-        let rip_after = self.builder.ins().iadd_imm(image_base, offset as i64);
+        let rip_after = self.builder.ins().iadd_imm_s(image_base, offset as i64);
         self.sync_to_context(Some(rip_after), ExitReason::Cpuid)?;
         self.builder.ins().return_(&[]);
         self.block_terminated = true;
@@ -127,7 +127,7 @@ impl<'a> Lifter<'a> {
         let next_ip = instruction.next_ip();
         let offset = next_ip.wrapping_sub(self.lift_base);
         let image_base = self.builder.use_var(self.state.image_base);
-        let rip_after = self.builder.ins().iadd_imm(image_base, offset as i64);
+        let rip_after = self.builder.ins().iadd_imm_s(image_base, offset as i64);
         self.sync_to_context(Some(rip_after), ExitReason::Xgetbv)?;
         self.builder.ins().return_(&[]);
         self.block_terminated = true;
@@ -142,7 +142,7 @@ impl<'a> Lifter<'a> {
         let next_ip = instruction.next_ip();
         let offset = next_ip.wrapping_sub(self.lift_base);
         let image_base = self.builder.use_var(self.state.image_base);
-        let rip_after = self.builder.ins().iadd_imm(image_base, offset as i64);
+        let rip_after = self.builder.ins().iadd_imm_s(image_base, offset as i64);
         self.sync_to_context(Some(rip_after), ExitReason::Rdtsc)?;
         self.builder.ins().return_(&[]);
         self.block_terminated = true;

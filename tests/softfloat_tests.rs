@@ -29,6 +29,16 @@ fn bits(mant: u64, se: u16) -> u128 {
     (mant as u128) | ((se as u128) << 64)
 }
 
+/// Host frontend config, required by `FunctionBuilder::finalize`. These wrappers
+/// are JIT-compiled for the host, matching what `CraneliftBackend` builds below.
+fn host_frontend_config() -> isa::TargetFrontendConfig {
+    cranelift_native::builder()
+        .expect("host isa builder")
+        .finish(settings::Flags::new(settings::builder()))
+        .expect("host isa")
+        .frontend_config()
+}
+
 /// JIT-compile `op` over the two operands and return the raw 80-bit result.
 fn jit_binop(op: Op, a: u128, b: u128) -> u128 {
     let mut func = Function::with_name_signature(
@@ -60,7 +70,7 @@ fn jit_binop(op: Op, a: u128, b: u128) -> u128 {
     builder.ins().store(MemFlagsData::new(), rm, out, 0);
     builder.ins().store(MemFlagsData::new(), rse64, out, 8);
     builder.ins().return_(&[]);
-    builder.finalize();
+    builder.finalize(host_frontend_config());
 
     let mut backend = CraneliftBackend::new().expect("backend");
     let code = backend.compile(func).expect("compile");
@@ -96,13 +106,13 @@ fn jit_cmp(a: u128, b: u128) -> (bool, bool, bool) {
     let unord = builder.ins().uextend(types::I64, unord);
     let lt = builder.ins().uextend(types::I64, lt);
     let eq = builder.ins().uextend(types::I64, eq);
-    let unord = builder.ins().ishl_imm(unord, 2);
-    let lt = builder.ins().ishl_imm(lt, 1);
+    let unord = builder.ins().ishl_imm_u(unord, 2);
+    let lt = builder.ins().ishl_imm_u(lt, 1);
     let code = builder.ins().bor(unord, lt);
     let code = builder.ins().bor(code, eq);
     builder.ins().store(MemFlagsData::new(), code, out, 0);
     builder.ins().return_(&[]);
-    builder.finalize();
+    builder.finalize(host_frontend_config());
 
     let mut backend = CraneliftBackend::new().expect("backend");
     let cptr = backend.compile(func).expect("compile");
@@ -142,7 +152,7 @@ fn jit_sqrt(a: u128) -> u128 {
     builder.ins().store(MemFlagsData::new(), rm, out, 0);
     builder.ins().store(MemFlagsData::new(), rse64, out, 8);
     builder.ins().return_(&[]);
-    builder.finalize();
+    builder.finalize(host_frontend_config());
     let mut backend = CraneliftBackend::new().expect("backend");
     let cptr = backend.compile(func).expect("compile");
     let f: extern "C" fn(u64, u64, *mut u64) = unsafe { std::mem::transmute(cptr) };
@@ -228,7 +238,7 @@ fn test_kernels_lower_under_optimization() {
     builder.ins().store(MemFlagsData::new(), acc_m, out, 0);
     builder.ins().store(MemFlagsData::new(), acc_s64, out, 8);
     builder.ins().return_(&[]);
-    builder.finalize();
+    builder.finalize(host_frontend_config());
 
     let mut fb = settings::builder();
     fb.set("opt_level", "speed").unwrap();

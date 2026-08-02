@@ -10,7 +10,7 @@ impl<'a> Lifter<'a> {
 
     /// Invert a boolean I8 flag (0→1, 1→0) using an equality compare.
     fn bool_not(&mut self, val: Value) -> Value {
-        self.builder.ins().icmp_imm(IntCC::Equal, val, 0)
+        self.builder.ins().icmp_imm_s(IntCC::Equal, val, 0)
     }
 
     // SETE / SETZ: ZF=1

@@ -165,10 +165,10 @@ impl<'a> Lifter64<'a> {
             Operand::RegShift(style, amount, _sz, n) => {
                 let base = self.read_reg_val(n, false, ty);
                 Ok(match style {
-                    ShiftStyle::LSL => self.builder.ins().ishl_imm(base, amount as i64),
-                    ShiftStyle::LSR => self.builder.ins().ushr_imm(base, amount as i64),
-                    ShiftStyle::ASR => self.builder.ins().sshr_imm(base, amount as i64),
-                    ShiftStyle::ROR => self.builder.ins().rotr_imm(base, amount as i64),
+                    ShiftStyle::LSL => self.builder.ins().ishl_imm_u(base, amount as i64),
+                    ShiftStyle::LSR => self.builder.ins().ushr_imm_u(base, amount as i64),
+                    ShiftStyle::ASR => self.builder.ins().sshr_imm_u(base, amount as i64),
+                    ShiftStyle::ROR => self.builder.ins().rotr_imm_u(base, amount as i64),
                     _ => {
                         return Err(MicroliftError::UnsupportedInstruction {
                             mnemonic: format!("shift-{style:?}"),
@@ -201,9 +201,9 @@ impl<'a> Lifter64<'a> {
         let n = self
             .builder
             .ins()
-            .icmp_imm(IntCC::SignedLessThan, result, 0);
+            .icmp_imm_s(IntCC::SignedLessThan, result, 0);
         self.set_flag(Nzcv::N, n);
-        let z = self.builder.ins().icmp_imm(IntCC::Equal, result, 0);
+        let z = self.builder.ins().icmp_imm_s(IntCC::Equal, result, 0);
         self.set_flag(Nzcv::Z, z);
         let _ = ty;
     }
@@ -238,8 +238,8 @@ impl<'a> Lifter64<'a> {
             let not_axb = self.builder.ins().bnot(a_xor_b);
             self.builder.ins().band(not_axb, a_xor_r)
         };
-        let v_top = self.builder.ins().ushr_imm(v_term, shift);
-        let v_bit = self.builder.ins().band_imm(v_top, 1);
+        let v_top = self.builder.ins().ushr_imm_u(v_term, shift);
+        let v_bit = self.builder.ins().band_imm_u(v_top, 1);
         self.set_flag(Nzcv::V, v_bit);
     }
 
@@ -274,7 +274,7 @@ impl<'a> Lifter64<'a> {
         };
         let old = self.read_reg_val(d, false, ty);
         let mask = !(0xFFFFu64 << shift);
-        let cleared = self.builder.ins().band_imm(old, mask as i64);
+        let cleared = self.builder.ins().band_imm_u(old, mask as i64);
         let insert = self.builder.ins().iconst(ty, (imm << shift) as i64);
         let new = self.builder.ins().bor(cleared, insert);
         self.write_reg_val(d, false, ty, new);
@@ -416,7 +416,7 @@ impl<'a> Lifter64<'a> {
         let a = self.read_source(op1, ty)?;
         let b = self.read_source(op2, ty)?;
         let b_xform = match variant {
-            CsVariant::Inc => self.builder.ins().iadd_imm(b, 1),
+            CsVariant::Inc => self.builder.ins().iadd_imm_s(b, 1),
             CsVariant::Inv => self.builder.ins().bnot(b),
             CsVariant::Neg => self.builder.ins().ineg(b),
         };
@@ -468,7 +468,7 @@ impl<'a> Lifter64<'a> {
         let n = self.read_source(op1, ty)?;
         let m = self.read_source(op2, ty)?;
 
-        let div_by_zero = self.builder.ins().icmp_imm(IntCC::Equal, m, 0);
+        let div_by_zero = self.builder.ins().icmp_imm_s(IntCC::Equal, m, 0);
 
         if signed {
             // Detect the INT_MIN / -1 overflow: numerator == INT_MIN && divisor == -1.
@@ -477,8 +477,8 @@ impl<'a> Lifter64<'a> {
             } else {
                 i32::MIN as i64
             };
-            let n_is_min = self.builder.ins().icmp_imm(IntCC::Equal, n, int_min);
-            let m_is_neg1 = self.builder.ins().icmp_imm(IntCC::Equal, m, -1);
+            let n_is_min = self.builder.ins().icmp_imm_s(IntCC::Equal, n, int_min);
+            let m_is_neg1 = self.builder.ins().icmp_imm_s(IntCC::Equal, m, -1);
             let overflow = self.builder.ins().band(n_is_min, m_is_neg1);
             // Force the divisor to 1 whenever dividing would trap, then patch the
             // result: 0 for divide-by-zero, INT_MIN for the overflow case.
@@ -560,8 +560,8 @@ impl<'a> Lifter64<'a> {
         let off = self.branch_target_offset(instr)?;
         let image_base = self.builder.use_var(self.state.image_base);
         let pc_offset = instr.ip.wrapping_sub(self.lift_base);
-        let runtime_pc = self.builder.ins().iadd_imm(image_base, pc_offset as i64);
-        let result = self.builder.ins().iadd_imm(runtime_pc, off);
+        let runtime_pc = self.builder.ins().iadd_imm_s(image_base, pc_offset as i64);
+        let result = self.builder.ins().iadd_imm_s(runtime_pc, off);
         self.write_reg_val(d, false, types::I64, result);
         Ok(())
     }
@@ -577,9 +577,9 @@ impl<'a> Lifter64<'a> {
         let off = self.branch_target_offset(instr)?;
         let image_base = self.builder.use_var(self.state.image_base);
         let pc_offset = instr.ip.wrapping_sub(self.lift_base);
-        let runtime_pc = self.builder.ins().iadd_imm(image_base, pc_offset as i64);
-        let page = self.builder.ins().band_imm(runtime_pc, !0xFFFi64);
-        let result = self.builder.ins().iadd_imm(page, off);
+        let runtime_pc = self.builder.ins().iadd_imm_s(image_base, pc_offset as i64);
+        let page = self.builder.ins().band_imm_u(runtime_pc, !0xFFFi64);
+        let result = self.builder.ins().iadd_imm_s(page, off);
         self.write_reg_val(d, false, types::I64, result);
         Ok(())
     }
@@ -594,13 +594,13 @@ impl<'a> Lifter64<'a> {
         match op {
             Operand::RegPreIndex(base, imm, writeback) => {
                 let base_val = self.read_addr_base(base);
-                let addr = self.builder.ins().iadd_imm(base_val, imm as i64);
+                let addr = self.builder.ins().iadd_imm_s(base_val, imm as i64);
                 let wb = if writeback { Some((base, addr)) } else { None };
                 Ok((addr, wb))
             }
             Operand::RegPostIndex(base, imm) => {
                 let base_val = self.read_addr_base(base);
-                let new_base = self.builder.ins().iadd_imm(base_val, imm as i64);
+                let new_base = self.builder.ins().iadd_imm_s(base_val, imm as i64);
                 // Access happens at the original base; writeback updates it.
                 Ok((base_val, Some((base, new_base))))
             }
@@ -608,7 +608,7 @@ impl<'a> Lifter64<'a> {
                 let base_val = self.read_addr_base(base);
                 let idx_val = self.read_reg_val(index, false, types::I64);
                 let scaled = match style {
-                    ShiftStyle::LSL => self.builder.ins().ishl_imm(idx_val, amount as i64),
+                    ShiftStyle::LSL => self.builder.ins().ishl_imm_u(idx_val, amount as i64),
                     _ => idx_val,
                 };
                 let addr = self.builder.ins().iadd(base_val, scaled);
@@ -714,7 +714,7 @@ impl<'a> Lifter64<'a> {
         let (t, sz, _) = decode_reg(op0).ok_or_else(|| Self::bad_operand("cbz", op0))?;
         let ty = size_ty(sz);
         let val = self.read_reg_val(t, false, ty);
-        let is_zero = self.builder.ins().icmp_imm(IntCC::Equal, val, 0);
+        let is_zero = self.builder.ins().icmp_imm_s(IntCC::Equal, val, 0);
 
         let target = self.branch_target(instr)?;
         let taken = self.get_block_with_kind(target, TransferKind::ConditionalJump);
@@ -745,8 +745,8 @@ impl<'a> Lifter64<'a> {
             _ => return Err(Self::bad_operand("tbz", op1)),
         };
         let val = self.read_reg_val(t, false, types::I64);
-        let masked = self.builder.ins().band_imm(val, 1i64 << bit);
-        let is_zero = self.builder.ins().icmp_imm(IntCC::Equal, masked, 0);
+        let masked = self.builder.ins().band_imm_u(val, 1i64 << bit);
+        let is_zero = self.builder.ins().icmp_imm_s(IntCC::Equal, masked, 0);
 
         let target = self.branch_target(instr)?;
         let taken = self.get_block_with_kind(target, TransferKind::ConditionalJump);
@@ -804,7 +804,7 @@ impl<'a> Lifter64<'a> {
         // current_ip already points there.
         let image_base = self.builder.use_var(self.state.image_base);
         let ret_offset = self.current_ip.wrapping_sub(self.lift_base);
-        let ret_addr = self.builder.ins().iadd_imm(image_base, ret_offset as i64);
+        let ret_addr = self.builder.ins().iadd_imm_s(image_base, ret_offset as i64);
         self.write_reg_val(30, false, types::I64, ret_addr);
 
         // Ensure the resume block exists so the entry dispatch can route back.
@@ -900,7 +900,7 @@ impl<'a> Lifter64<'a> {
             3 => v, // VS: V==1
             4 => {
                 // HI: C==1 && Z==0
-                let z0 = self.builder.ins().icmp_imm(IntCC::Equal, z, 0);
+                let z0 = self.builder.ins().icmp_imm_s(IntCC::Equal, z, 0);
                 self.builder.ins().band(c, z0)
             }
             5 => {
@@ -909,7 +909,7 @@ impl<'a> Lifter64<'a> {
             }
             6 => {
                 // GT: Z==0 && N==V
-                let z0 = self.builder.ins().icmp_imm(IntCC::Equal, z, 0);
+                let z0 = self.builder.ins().icmp_imm_s(IntCC::Equal, z, 0);
                 let nv = self.builder.ins().icmp(IntCC::Equal, n, v);
                 self.builder.ins().band(z0, nv)
             }
