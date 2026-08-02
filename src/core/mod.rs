@@ -9,10 +9,12 @@
 //! X86_64>`, re-exported from `crate::lifter` for source compatibility.
 
 pub mod abi;
+pub mod bridge;
 pub mod exit;
 
 use crate::arch::{ControlFlow, ControlFlowKind, InstructionEffects};
 use crate::core::abi::CallAbi;
+use crate::core::bridge::{BridgeImport, ImportKind, ImportRegistry};
 use crate::core::exit::{ExitReason, MemorySegment, TransferKind};
 use crate::function_traits::{DynamicSymbol, FunctionArgumentType};
 use crate::os::get_host_calling_conv;
@@ -23,6 +25,7 @@ use cranelift_codegen::ir::{
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch, Variable};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// A guest instruction-set frontend.
 ///
@@ -208,6 +211,79 @@ pub(crate) fn build_import_sig(
     sig
 }
 
+/// Build the [`FastCall`] data for one fast import, declaring the callee's
+/// signature (and, in `RuntimeAssisted` mode, its external function and
+/// `aot_imports` entry) on the way.
+///
+/// Returns `None` when the import cannot be fast-called at all - it is variadic,
+/// or its registered ABI cannot place every argument - in which case the caller
+/// falls back to the slow `ImportedFunctionCall` exit.
+///
+/// Shared by config-time prebuilding and the lazy path taken for imports the
+/// [`ImportRegistry`] reports mid-lift, so both produce identical IR and both
+/// respect the one-`FuncRef`-per-symbol-name invariant `aot_imports` depends on.
+fn build_fast_call(
+    builder: &mut FunctionBuilder,
+    execution_mode: ExecutionMode,
+    aot_imports: &mut Vec<(&'static str, *const u8, Signature)>,
+    fast_call_by_name: &mut HashMap<&'static str, FastCall>,
+    import: &FastImport,
+) -> Option<FastCall> {
+    let sym = &import.symbol;
+    // Variadic functions, and functions with arguments the registered ABI
+    // cannot place, are demoted to slow calls.
+    if sym.is_ellipsis_function || !import.abi.can_fast_call(&sym.arg_types) {
+        return None;
+    }
+    // The signature describes the *host* callee; the ABI descriptor describes
+    // where the guest left the arguments.
+    let host_cc = import
+        .abi
+        .host_call_conv
+        .unwrap_or_else(get_host_calling_conv);
+    Some(match execution_mode {
+        ExecutionMode::Jit => {
+            let sig = build_import_sig(&sym.arg_types, host_cc);
+            FastCall {
+                target: FastCallTarget::Absolute {
+                    sig_ref: builder.import_signature(sig),
+                    fn_ptr: sym.value as i64,
+                },
+                arg_types: sym.arg_types.clone(),
+                abi: import.abi.clone(),
+            }
+        }
+        ExecutionMode::RuntimeAssisted => match fast_call_by_name.get(sym.name) {
+            Some(existing) => existing.clone(),
+            None => {
+                let index = aot_imports.len() as u32;
+                let sig = build_import_sig(&sym.arg_types, host_cc);
+                let sig_ref = builder.import_signature(sig.clone());
+                let user_name = builder
+                    .func
+                    .declare_imported_user_function(UserExternalName {
+                        namespace: 0,
+                        index,
+                    });
+                let func_ref = builder.import_function(ExtFuncData {
+                    name: ExternalName::user(user_name),
+                    signature: sig_ref,
+                    colocated: false,
+                    patchable: false,
+                });
+                aot_imports.push((sym.name, sym.value as *const u8, sig));
+                let fast_call = FastCall {
+                    target: FastCallTarget::Relocatable(func_ref),
+                    arg_types: sym.arg_types.clone(),
+                    abi: import.abi.clone(),
+                };
+                fast_call_by_name.insert(sym.name, fast_call.clone());
+                fast_call
+            }
+        },
+    })
+}
+
 /// A registered fast-call import: the host function to call, plus the guest
 /// calling convention its call sites use.
 #[derive(Debug, Clone)]
@@ -251,15 +327,38 @@ pub struct LifterConfig {
     pub segments: Vec<MemorySegment>,
     pub interpreter_fallback: bool,
     pub emit_resume_blocks: bool,
-    /// Registered import addresses.
+    /// Statically registered import addresses.
     ///
-    /// - Key: virtual address of the imported function as it appears in the code
-    ///   being lifted.
-    /// - Value: `Some(import)` -> attempt a fast inline call, reading arguments
-    ///   from wherever the import's [`CallAbi`] says the guest put them (skipped
-    ///   for variadic functions). `None` -> always emit an
-    ///   `ImportedFunctionCall` exit.
-    pub imports: HashMap<u64, Option<FastImport>>,
+    /// Key: virtual address of the imported function as it appears in the code
+    /// being lifted. Value: how that address is reached (see [`ImportKind`]).
+    ///
+    /// This map is a snapshot taken when the config is built. Addresses that
+    /// only become imports *later* (a `dlopen`ed image, a lazily bound stub)
+    /// belong in [`import_registry`](Self::import_registry) instead, which the
+    /// engine queries while lifting.
+    pub imports: HashMap<u64, ImportKind>,
+    /// A live view of which addresses are imports, queried per call site at lift
+    /// time rather than snapshotted here.
+    ///
+    /// Consulted only for addresses absent from [`imports`](Self::imports), so
+    /// an explicit registration always wins. See [`ImportRegistry`] for why this
+    /// is what makes `dlopen`/`dlsym` calls work without re-plumbing anything.
+    pub import_registry: Option<Arc<dyn ImportRegistry>>,
+    /// Optional bridge for indirect calls whose target is only known at run
+    /// time (`CALL reg` / `CALL [mem]` to an unregistered address).
+    ///
+    /// When set, an indirect call becomes a call to
+    /// `extern "C" fn(*mut RegisterContext, target: u64) -> u32` instead of an
+    /// [`ExitReason::IndirectCall`] VM exit: the runtime does its own dispatch
+    /// (imported function? another guest image? a `dlsym`ed pointer?) on the
+    /// host side and returns 0 when it handled the call inline, or non-zero when
+    /// the target is guest code and a real exit is required.
+    ///
+    /// On the non-zero path the context already describes a well-formed
+    /// `IndirectCall` exit (callee in `imported_function_va`, PC at the
+    /// instruction after the call, stack pointer unchanged); the bridge may
+    /// overwrite `exit_reason`/`exit_code` to say something else.
+    pub indirect_call_bridge: Option<BridgeImport>,
     /// When `true`, vector registers are stored as native `I64X2` SSA variables
     /// and whole-register handlers take a vector fast path. When `false` (the
     /// default) they are stored as scalar lo/hi 64-bit pairs, which avoids
@@ -291,6 +390,8 @@ impl Default for LifterConfig {
             interpreter_fallback: false,
             emit_resume_blocks: false,
             imports: HashMap::new(),
+            import_registry: None,
+            indirect_call_bridge: None,
             use_vector_xmm: false,
             analysis_mode: false,
         }
@@ -309,13 +410,50 @@ impl LifterConfig {
     /// Imports are demoted to slow `ImportedFunctionCall` exits when they are
     /// variadic, or when `abi` cannot place all of their arguments.
     pub fn register_fast_import(&mut self, va: u64, symbol: DynamicSymbol, abi: CallAbi) {
-        self.imports.insert(va, Some(FastImport { symbol, abi }));
+        self.imports
+            .insert(va, ImportKind::Fast(FastImport { symbol, abi }));
     }
 
     /// Register an import address with no fast-call metadata. Every call to this
     /// address produces an `ImportedFunctionCall` VM exit.
     pub fn register_slow_import(&mut self, va: u64) {
-        self.imports.insert(va, None);
+        self.imports.insert(va, ImportKind::Slow);
+    }
+
+    /// Register an import reached through a runtime-supplied bridge.
+    ///
+    /// Strictly more general than [`register_fast_import`](Self::register_fast_import):
+    /// it drops the requirement that the callee's signature be expressible in
+    /// [`FunctionArgumentType`]/[`CallAbi`], which is what forces
+    /// struct-by-value, callback-takers and variadics onto the slow exit path
+    /// today. It is also cheaper than the slow exit in the common case, since a
+    /// bridge that returns 0 continues inline with no VM exit at all.
+    ///
+    /// `register_fast_import` remains the right thing for imports whose
+    /// signature *is* describable - it emits a direct call with no context sync.
+    ///
+    /// See [`crate::core::bridge`] for the calling contract.
+    ///
+    /// Both bridge targets embed a host address in the emitted code (directly,
+    /// or as the address of the slot to load from), so unlike a
+    /// `RuntimeAssisted` fast import a bridge produces no named relocation.
+    /// That is the intent - a bridge belongs to the running runtime - but it
+    /// means AOT output containing one is only valid for a process that maps
+    /// the bridge (or its slot) at the same address.
+    pub fn register_bridge_import(&mut self, va: u64, bridge: BridgeImport) {
+        self.imports.insert(va, ImportKind::Bridge(bridge));
+    }
+
+    /// Install the live import view queried at lift time. See
+    /// [`ImportRegistry`].
+    pub fn set_import_registry(&mut self, registry: Arc<dyn ImportRegistry>) {
+        self.import_registry = Some(registry);
+    }
+
+    /// Install the bridge used for runtime-resolved indirect calls. See
+    /// [`indirect_call_bridge`](Self::indirect_call_bridge).
+    pub fn set_indirect_call_bridge(&mut self, bridge: BridgeImport) {
+        self.indirect_call_bridge = Some(bridge);
     }
 }
 
@@ -339,14 +477,33 @@ pub struct LiftEngine<'a, A: GuestArch = crate::arch::x86_64::X86_64> {
     /// Designated address for controlled VM exit via RET.
     pub exit_trampoline_address: u64,
     pub syscall_handler_sig: Option<SigRef>,
-    /// Pre-built fast-call data for registered non-variadic imports, keyed by
-    /// import VA. The execution mode decides whether the target is absolute
-    /// (`Jit`) or relocatable (`RuntimeAssisted`).
+    /// Fast-call data for registered non-variadic imports, keyed by import VA.
+    /// The execution mode decides whether the target is absolute (`Jit`) or
+    /// relocatable (`RuntimeAssisted`).
+    ///
+    /// Pre-built for [`LifterConfig::imports`]; filled in lazily (and cached
+    /// here) for imports the [`ImportRegistry`] reports while lifting.
     pub fast_calls: HashMap<u64, FastCall>,
+    /// The same imported symbol may be registered at several virtual addresses
+    /// (e.g. its PLT stub and its GOT slot). In `RuntimeAssisted` mode every
+    /// distinct symbol becomes one [`Self::aot_imports`] entry / object
+    /// relocation target, so a single `FuncRef` is reused per symbol name;
+    /// emitting the name twice would collide when the object backend
+    /// deduplicates imports and break the `FuncId(i) == i` invariant. The whole
+    /// `FastCall` is reused so the arguments marshaled at every site match the
+    /// one signature that was declared.
+    fast_call_by_name: HashMap<&'static str, FastCall>,
+    /// Cached signature of the bridge ABI
+    /// (`extern "C" fn(*mut RegisterContext, u64) -> u32`), created on first
+    /// use.
+    bridge_sig: Option<SigRef>,
     /// Ordered external functions for object/JIT backends. Index `i` corresponds
     /// to `ExternalName::user(0, i)`. Entry = `(symbol_name, fn_ptr, signature)`.
     pub aot_imports: Vec<(&'static str, *const u8, Signature)>,
-    /// All registered import virtual addresses (both fast and slow).
+    /// Virtual addresses registered in [`LifterConfig::imports`], whatever their
+    /// kind. Addresses that only the [`ImportRegistry`] knows about are *not*
+    /// here (a registry is not enumerable) - use
+    /// [`is_import`](Self::is_import), which consults both.
     pub import_vas: HashSet<u64>,
     /// Records what kind of transfer targets each unvisited (out-of-region)
     /// block, so `finish()` can emit the correct `TransferKind`.
@@ -383,78 +540,28 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             }
         };
 
-        // Build fast-call data for every registered non-variadic import.
+        // Build fast-call data for every statically registered non-variadic
+        // import. Imports the `ImportRegistry` reports are built the same way,
+        // lazily, when a call site referencing them is lifted.
         let mut fast_calls: HashMap<u64, FastCall> = HashMap::new();
         let mut aot_imports: Vec<(&'static str, *const u8, Signature)> = Vec::new();
         let mut import_vas: HashSet<u64> = HashSet::new();
-        // The same imported symbol may be registered at several virtual
-        // addresses (e.g. its PLT stub and its GOT slot). In `RuntimeAssisted`
-        // mode every distinct symbol becomes one `aot_imports` entry / object
-        // relocation target, so reuse a single `FuncRef` per symbol name;
-        // emitting the name twice would collide when the object backend
-        // deduplicates imports and break the `FuncId(i) == i` invariant.
-        // Keyed by symbol name; the whole `FastCall` is reused so the arguments
-        // marshaled at every site match the one signature that was declared.
         let mut fast_call_by_name: HashMap<&'static str, FastCall> = HashMap::new();
 
-        for (&va, opt_import) in &config.imports {
+        for (&va, kind) in &config.imports {
             import_vas.insert(va);
-            let Some(import) = opt_import else { continue };
-            let sym = &import.symbol;
-            // Variadic functions, and functions with arguments the registered
-            // ABI cannot place, are demoted to slow calls.
-            if sym.is_ellipsis_function || !import.abi.can_fast_call(&sym.arg_types) {
+            let ImportKind::Fast(import) = kind else {
                 continue;
-            }
-            // The signature describes the *host* callee; the ABI descriptor
-            // describes where the guest left the arguments.
-            let host_cc = import
-                .abi
-                .host_call_conv
-                .unwrap_or_else(get_host_calling_conv);
-            let fast_call = match config.execution_mode {
-                ExecutionMode::Jit => {
-                    let sig = build_import_sig(&sym.arg_types, host_cc);
-                    FastCall {
-                        target: FastCallTarget::Absolute {
-                            sig_ref: builder.import_signature(sig),
-                            fn_ptr: sym.value as i64,
-                        },
-                        arg_types: sym.arg_types.clone(),
-                        abi: import.abi.clone(),
-                    }
-                }
-                ExecutionMode::RuntimeAssisted => match fast_call_by_name.get(sym.name) {
-                    Some(existing) => existing.clone(),
-                    None => {
-                        let index = aot_imports.len() as u32;
-                        let sig = build_import_sig(&sym.arg_types, host_cc);
-                        let sig_ref = builder.import_signature(sig.clone());
-                        let user_name =
-                            builder
-                                .func
-                                .declare_imported_user_function(UserExternalName {
-                                    namespace: 0,
-                                    index,
-                                });
-                        let func_ref = builder.import_function(ExtFuncData {
-                            name: ExternalName::user(user_name),
-                            signature: sig_ref,
-                            colocated: false,
-                            patchable: false,
-                        });
-                        aot_imports.push((sym.name, sym.value as *const u8, sig));
-                        let fast_call = FastCall {
-                            target: FastCallTarget::Relocatable(func_ref),
-                            arg_types: sym.arg_types.clone(),
-                            abi: import.abi.clone(),
-                        };
-                        fast_call_by_name.insert(sym.name, fast_call.clone());
-                        fast_call
-                    }
-                },
             };
-            fast_calls.insert(va, fast_call);
+            if let Some(fast_call) = build_fast_call(
+                &mut builder,
+                config.execution_mode,
+                &mut aot_imports,
+                &mut fast_call_by_name,
+                import,
+            ) {
+                fast_calls.insert(va, fast_call);
+            }
         }
 
         Self {
@@ -471,6 +578,8 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             exit_trampoline_address: 0xFFFF_FFFF_FFFF_FFFF,
             syscall_handler_sig,
             fast_calls,
+            fast_call_by_name,
+            bridge_sig: None,
             aot_imports,
             import_vas,
             block_transfer_kinds: HashMap::new(),
@@ -515,6 +624,76 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             colocated: false,
             patchable: false,
         })
+    }
+
+    /// How the address `va` is reached, or `None` if it is not an import.
+    ///
+    /// Checks [`LifterConfig::imports`] first, then the
+    /// [`ImportRegistry`](crate::core::bridge::ImportRegistry) if one is
+    /// installed - so an explicit registration always wins over the live view.
+    ///
+    /// This is queried per call site *while lifting*, not snapshotted when the
+    /// engine is constructed, which is what lets a region lifted after a
+    /// `dlopen` see the newly bound stubs.
+    pub fn lookup_import(&self, va: u64) -> Option<ImportKind> {
+        if let Some(kind) = self.config.imports.get(&va) {
+            return Some(kind.clone());
+        }
+        self.config
+            .import_registry
+            .as_ref()
+            .and_then(|r| r.lookup(va))
+    }
+
+    /// Whether `va` is a registered import under either source.
+    pub fn is_import(&self, va: u64) -> bool {
+        self.config.imports.contains_key(&va)
+            || self
+                .config
+                .import_registry
+                .as_ref()
+                .is_some_and(|r| r.lookup(va).is_some())
+    }
+
+    /// The [`FastCall`] for import `va`, building and caching it on first use if
+    /// the import came from the registry rather than the config map. `None`
+    /// means the import has no fast-call metadata, is variadic, or has arguments
+    /// its ABI cannot place - all of which fall back to the slow exit.
+    pub fn fast_call_for(&mut self, va: u64) -> Option<FastCall> {
+        if let Some(fc) = self.fast_calls.get(&va) {
+            return Some(fc.clone());
+        }
+        // Not prebuilt: either not a fast import at all, or one the registry
+        // only just reported. Only the latter is worth building.
+        let ImportKind::Fast(import) = self.lookup_import(va)? else {
+            return None;
+        };
+        let fast_call = build_fast_call(
+            &mut self.builder,
+            self.config.execution_mode,
+            &mut self.aot_imports,
+            &mut self.fast_call_by_name,
+            &import,
+        )?;
+        self.fast_calls.insert(va, fast_call.clone());
+        Some(fast_call)
+    }
+
+    /// The signature every bridge is called through:
+    /// `extern "C" fn(*mut RegisterContext, u64) -> u32`. Created on first use.
+    pub fn bridge_sig(&mut self) -> SigRef {
+        match self.bridge_sig {
+            Some(sig) => sig,
+            None => {
+                let mut sig = Signature::new(get_host_calling_conv());
+                sig.params.push(AbiParam::new(types::I64)); // *mut RegisterContext
+                sig.params.push(AbiParam::new(types::I64)); // import VA / target
+                sig.returns.push(AbiParam::new(types::I32)); // 0 = handled
+                let sig_ref = self.builder.import_signature(sig);
+                self.bridge_sig = Some(sig_ref);
+                sig_ref
+            }
+        }
     }
 
     /// Ordered external functions needed for AOT/JIT backends in
@@ -677,7 +856,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                 }
                 ControlFlowKind::Call { static_target } => {
                     if let Some(target) = static_target {
-                        if !self.import_vas.contains(&target)
+                        if !self.is_import(target)
                             && target >= self.lift_base
                             && target < self.lift_end
                         {

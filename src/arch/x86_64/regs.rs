@@ -21,6 +21,37 @@ pub enum X86Flag {
     Direction,
 }
 
+/// The 16 general-purpose registers in architectural encoding order.
+///
+/// This is also the bit order of [`RegMask::gprs`](crate::core::bridge::RegMask)
+/// for this guest: bit `i` selects `GPR_ORDER[i]`.
+pub const GPR_ORDER: [Register; 16] = [
+    Register::RAX,
+    Register::RCX,
+    Register::RDX,
+    Register::RBX,
+    Register::RSP,
+    Register::RBP,
+    Register::RSI,
+    Register::RDI,
+    Register::R8,
+    Register::R9,
+    Register::R10,
+    Register::R11,
+    Register::R12,
+    Register::R13,
+    Register::R14,
+    Register::R15,
+];
+
+/// The [`GPR_ORDER`] index of `reg`'s full 64-bit form, or `None` if `reg` is
+/// not a general-purpose register. Sub-registers map to their containing GPR
+/// (`EAX`, `AX`, `AL` and `AH` all give `RAX`'s index).
+pub fn gpr_index(reg: Register) -> Option<u8> {
+    let full = reg.full_register();
+    GPR_ORDER.iter().position(|&r| r == full).map(|i| i as u8)
+}
+
 /// Mapping of x86 registers to Cranelift variables, plus dirty-bit tracking.
 pub struct RegisterState {
     pub gprs: HashMap<Register, Variable>,
@@ -53,26 +84,7 @@ impl RegisterState {
     pub fn new(builder: &mut FunctionBuilder, use_vector_xmm: bool) -> Self {
         let mut gprs = HashMap::new();
 
-        let qword_gprs = [
-            Register::RAX,
-            Register::RCX,
-            Register::RDX,
-            Register::RBX,
-            Register::RSP,
-            Register::RBP,
-            Register::RSI,
-            Register::RDI,
-            Register::R8,
-            Register::R9,
-            Register::R10,
-            Register::R11,
-            Register::R12,
-            Register::R13,
-            Register::R14,
-            Register::R15,
-        ];
-
-        for &reg in &qword_gprs {
+        for &reg in &GPR_ORDER {
             let var = builder.declare_var(types::I64);
             gprs.insert(reg, var);
         }

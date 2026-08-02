@@ -3,6 +3,7 @@ use crate::arch::x86_64::abi::x86_reg;
 use crate::arch::x86_64::semantics::helpers::size_to_type;
 use crate::context::{ExitReason, RegisterContext, TransferKind};
 use crate::core::abi::ArgLocation;
+use crate::core::bridge::ImportKind;
 use crate::core::{FastCall, FastCallTarget, fat_to_cl_type};
 use crate::function_traits::FunctionArgumentType;
 use crate::lifter::Lifter;
@@ -14,6 +15,16 @@ impl<'a> Lifter<'a> {
         match instruction.op0_kind() {
             OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
                 let target = instruction.near_branch_target();
+                // A `JMP` to a known import is a tail call: the guest's stub
+                // jumps straight into the imported function, which then returns
+                // to *our* caller. Handle it here rather than exiting to a host
+                // that has to re-recognise the stub before every region entry.
+                if !self.config.analysis_mode
+                    && self.is_import(target)
+                    && self.emit_import_tail_jump(target)?
+                {
+                    return Ok(());
+                }
                 let target_block = self.get_block_with_kind(target, TransferKind::DirectJump);
                 self.builder.ins().jump(target_block, &[]);
                 self.block_terminated = true;
@@ -140,6 +151,17 @@ impl<'a> Lifter<'a> {
         }
         self.set_reg_val(Register::RSP, new_rsp)?;
 
+        self.emit_return_dispatch(target_ip)
+    }
+
+    /// Transfer control to a popped return address: dispatch into the region if
+    /// it names a known block, otherwise exit - cleanly via the trampoline, or
+    /// as an `UnknownJump`/`Return` for anything else.
+    ///
+    /// Split out of [`Self::emit_return`] so an import tail `JMP` can perform
+    /// exactly the return its callee's `RET` would have, after the stack pointer
+    /// has already been adjusted.
+    fn emit_return_dispatch(&mut self, target_ip: Value) -> crate::Result<()> {
         // Internal Dispatch via Switch
         let mut switch = cranelift_frontend::Switch::new();
         let image_base = self.builder.use_var(self.state.image_base);
@@ -195,7 +217,7 @@ impl<'a> Lifter<'a> {
             OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
                 let target = instruction.near_branch_target();
 
-                if self.import_vas.contains(&target) {
+                if self.is_import(target) {
                     // Registered import - fast-call or slow VM exit.
                     return self.emit_import_call(target);
                 }
@@ -272,7 +294,7 @@ impl<'a> Lifter<'a> {
                     && instruction.memory_index() == Register::None
                 {
                     let slot_va = instruction.memory_displacement64();
-                    if self.import_vas.contains(&slot_va) {
+                    if self.is_import(slot_va) {
                         return self.emit_import_call(slot_va);
                     }
                 }
@@ -330,13 +352,74 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Dispatch a call to a registered import address: either emit a fast
-    /// inline call or a slow `ImportedFunctionCall` VM exit.
+    /// Dispatch a call to a registered import address: a runtime bridge, a fast
+    /// inline call, or a slow `ImportedFunctionCall` VM exit, in that order of
+    /// preference.
     fn emit_import_call(&mut self, import_va: u64) -> crate::Result<()> {
-        match self.fast_calls.get(&import_va).cloned() {
+        if let Some(ImportKind::Bridge(bridge)) = self.lookup_import(import_va) {
+            // A bridge that exits parks the resume PC at the next instruction,
+            // so that address needs a block to come back to.
+            self.get_block(self.current_ip);
+            let callee = self.builder.ins().iconst(types::I64, import_va as i64);
+            return self.emit_bridge_call(&bridge, callee, None, ExitReason::ImportedFunctionCall);
+        }
+        match self.fast_call_for(import_va) {
             Some(fast_call) => self.emit_fast_import_call(fast_call),
             None => self.emit_import_slow_exit(import_va),
         }
+    }
+
+    /// Emit an import reached by tail `JMP`: perform the call inline, then the
+    /// return the imported function's own `RET` would have performed.
+    ///
+    /// Returns `false` when the import has no inline form (a slow import, or a
+    /// fast one whose ABI cannot place its arguments), leaving the caller to
+    /// emit the ordinary out-of-region jump exit - a slow import cannot be
+    /// tail-jumped inline, because the host would have to service the call and
+    /// then perform a return the lifted code never described.
+    ///
+    /// The return address is popped *before* the call, which puts the stack in
+    /// exactly the state the callee's ABI expects: stack arguments at `RSP+0`,
+    /// as at any other call site the fast path replaces.
+    fn emit_import_tail_jump(&mut self, import_va: u64) -> crate::Result<bool> {
+        let bridge = match self.lookup_import(import_va) {
+            Some(ImportKind::Bridge(b)) => Some(b),
+            _ => None,
+        };
+        let fast = match bridge {
+            Some(_) => None,
+            None => self.fast_call_for(import_va),
+        };
+        if bridge.is_none() && fast.is_none() {
+            return Ok(false);
+        }
+
+        let rsp = self.get_reg_val(Register::RSP)?;
+        let ret_ip = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), rsp, 0);
+        let new_rsp = self.builder.ins().iadd_imm(rsp, 8);
+        self.set_reg_val(Register::RSP, new_rsp)?;
+
+        match (bridge, fast) {
+            (Some(bridge), _) => {
+                let callee = self.builder.ins().iconst(types::I64, import_va as i64);
+                // If the bridge exits, the guest is architecturally *past* the
+                // stub already: resume at the popped return address.
+                self.emit_bridge_call(
+                    &bridge,
+                    callee,
+                    Some(ret_ip),
+                    ExitReason::ImportedFunctionCall,
+                )?;
+            }
+            (None, Some(fast_call)) => self.emit_fast_import_call(fast_call)?,
+            (None, None) => unreachable!("checked above"),
+        }
+
+        self.emit_return_dispatch(ret_ip)?;
+        Ok(true)
     }
 
     /// Emit an `ImportedFunctionCall` VM exit for a direct import call.
@@ -370,6 +453,15 @@ impl<'a> Lifter<'a> {
     /// the contract the host must uphold when dispatching the callee.
     fn emit_indirect_call_exit(&mut self, target_val: Value) -> crate::Result<()> {
         self.get_block(self.current_ip);
+
+        // With an indirect-call bridge installed the runtime does its own
+        // dispatch on the host side and usually handles the call inline, so
+        // every `dlsym`ed function pointer, `call *%r12` and TLS bootstrap costs
+        // a call rather than a VM exit. The bridge still returns non-zero to
+        // demand the exit below when the target turns out to be guest code.
+        if let Some(bridge) = self.config.indirect_call_bridge.clone() {
+            return self.emit_bridge_call(&bridge, target_val, None, ExitReason::IndirectCall);
+        }
 
         let ctx_ptr = self.builder.use_var(self.state.context_ptr);
         let va_offset = std::mem::offset_of!(RegisterContext, imported_function_va) as i32;

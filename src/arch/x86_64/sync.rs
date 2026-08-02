@@ -6,12 +6,189 @@
 
 use crate::arch::x86_64::Lifter;
 use crate::arch::x86_64::context::RegisterContext;
-use crate::arch::x86_64::regs::{RegisterState, X86Flag};
+use crate::arch::x86_64::regs::{GPR_ORDER, RegisterState, X86Flag};
+use crate::core::bridge::RegMask;
 use crate::core::exit::ExitReason;
 use cranelift::prelude::*;
 use iced_x86::Register;
 
 impl<'a> Lifter<'a> {
+    /// Store exactly the registers in `mask` into the `RegisterContext`, and
+    /// nothing else - no PC, no `exit_reason`, no `exit_code`.
+    ///
+    /// This is the write half of a [`BridgeEffects`](crate::core::bridge::BridgeEffects)
+    /// mask. Read its doc comment before using this anywhere new: it is sound
+    /// *because* the mask is declared by the callee and applied at a single call
+    /// site, not inferred from emission order the way the removed-in-spirit
+    /// [`Self::sync_to_context_selective`] does it. Do not try to derive a mask
+    /// from `state.dirty_*`.
+    pub fn sync_regs_masked(&mut self, mask: RegMask) -> crate::Result<()> {
+        if self.config.analysis_mode || mask.is_empty() {
+            return Ok(());
+        }
+        let ctx_ptr = self.builder.use_var(self.state.context_ptr);
+
+        for (i, &reg) in GPR_ORDER.iter().enumerate() {
+            if !mask.has_gpr(i as u8) {
+                continue;
+            }
+            let var = self.state.gprs[&reg];
+            let val = self.builder.use_var(var);
+            let offset = RegisterState::get_gpr_offset(reg)?;
+            self.builder
+                .ins()
+                .store(MemFlagsData::trusted(), val, ctx_ptr, offset);
+        }
+
+        if mask.flags {
+            for (&flag, &var) in &self.state.flags {
+                let val = self.builder.use_var(var);
+                let offset = RegisterState::get_flag_offset(flag)?;
+                self.builder
+                    .ins()
+                    .store(MemFlagsData::trusted(), val, ctx_ptr, offset);
+            }
+        }
+
+        for i in 0u8..16 {
+            if !mask.has_vec(i) {
+                continue;
+            }
+            if self.state.use_vector_xmm {
+                let val = self.builder.use_var(self.state.xmms_vec[&i]);
+                self.builder.ins().store(
+                    MemFlagsData::new().with_notrap(),
+                    val,
+                    ctx_ptr,
+                    RegisterState::get_xmm_vec_offset(i),
+                );
+            } else {
+                let lo_val = self.builder.use_var(self.state.xmms_lo[&i]);
+                let hi_val = self.builder.use_var(self.state.xmms_hi[&i]);
+                self.builder.ins().store(
+                    MemFlagsData::trusted(),
+                    lo_val,
+                    ctx_ptr,
+                    RegisterState::get_xmm_offset(i, false),
+                );
+                self.builder.ins().store(
+                    MemFlagsData::trusted(),
+                    hi_val,
+                    ctx_ptr,
+                    RegisterState::get_xmm_offset(i, true),
+                );
+            }
+        }
+
+        if mask.segment_bases {
+            let fs_base_val = self.builder.use_var(self.state.fs_base);
+            self.builder.ins().store(
+                MemFlagsData::trusted(),
+                fs_base_val,
+                ctx_ptr,
+                RegisterState::get_fs_base_offset(),
+            );
+            let gs_base_val = self.builder.use_var(self.state.gs_base);
+            self.builder.ins().store(
+                MemFlagsData::trusted(),
+                gs_base_val,
+                ctx_ptr,
+                RegisterState::get_gs_base_offset(),
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Reload exactly the registers in `mask` from the `RegisterContext` back
+    /// into their SSA variables. The read half of a
+    /// [`BridgeEffects`](crate::core::bridge::BridgeEffects) mask; registers
+    /// outside `mask` keep the SSA values they had before the call.
+    ///
+    /// `image_base` is deliberately not reloaded: it is fixed for the lifetime
+    /// of a region and a bridge has no business changing it.
+    pub fn load_regs_masked(&mut self, mask: RegMask) -> crate::Result<()> {
+        if self.config.analysis_mode || mask.is_empty() {
+            return Ok(());
+        }
+        let ctx_ptr = self.builder.use_var(self.state.context_ptr);
+
+        for (i, &reg) in GPR_ORDER.iter().enumerate() {
+            if !mask.has_gpr(i as u8) {
+                continue;
+            }
+            let offset = RegisterState::get_gpr_offset(reg)?;
+            let val = self
+                .builder
+                .ins()
+                .load(types::I64, MemFlagsData::trusted(), ctx_ptr, offset);
+            let var = self.state.gprs[&reg];
+            self.builder.def_var(var, val);
+        }
+
+        if mask.flags {
+            let flags: Vec<(X86Flag, Variable)> =
+                self.state.flags.iter().map(|(&f, &v)| (f, v)).collect();
+            for (flag, var) in flags {
+                let offset = RegisterState::get_flag_offset(flag)?;
+                let val =
+                    self.builder
+                        .ins()
+                        .load(types::I8, MemFlagsData::trusted(), ctx_ptr, offset);
+                self.builder.def_var(var, val);
+            }
+        }
+
+        for i in 0u8..16 {
+            if !mask.has_vec(i) {
+                continue;
+            }
+            if self.state.use_vector_xmm {
+                let val = self.builder.ins().load(
+                    types::I64X2,
+                    MemFlagsData::new().with_notrap(),
+                    ctx_ptr,
+                    RegisterState::get_xmm_vec_offset(i),
+                );
+                self.builder.def_var(self.state.xmms_vec[&i], val);
+            } else {
+                let lo_val = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::trusted(),
+                    ctx_ptr,
+                    RegisterState::get_xmm_offset(i, false),
+                );
+                let hi_val = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::trusted(),
+                    ctx_ptr,
+                    RegisterState::get_xmm_offset(i, true),
+                );
+                self.builder.def_var(self.state.xmms_lo[&i], lo_val);
+                self.builder.def_var(self.state.xmms_hi[&i], hi_val);
+            }
+        }
+
+        if mask.segment_bases {
+            let fs_base_val = self.builder.ins().load(
+                types::I64,
+                MemFlagsData::trusted(),
+                ctx_ptr,
+                RegisterState::get_fs_base_offset(),
+            );
+            self.builder.def_var(self.state.fs_base, fs_base_val);
+            let gs_base_val = self.builder.ins().load(
+                types::I64,
+                MemFlagsData::trusted(),
+                ctx_ptr,
+                RegisterState::get_gs_base_offset(),
+            );
+            self.builder.def_var(self.state.gs_base, gs_base_val);
+        }
+
+        Ok(())
+    }
+
     /// Full sync - writes all GPRs, flags, XMMs and segment bases back to the
     /// `RegisterContext`. Used on context reload paths and unvisited exit stubs.
     pub fn sync_to_context(&mut self, pc: Option<Value>, reason: ExitReason) -> crate::Result<()> {

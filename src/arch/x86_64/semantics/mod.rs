@@ -6,6 +6,7 @@
 pub mod arithmetic;
 pub mod atomics;
 pub mod bitops;
+pub mod bridge;
 pub mod control_flow;
 pub mod flags;
 pub mod fpu;

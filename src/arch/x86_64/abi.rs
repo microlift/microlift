@@ -5,7 +5,10 @@
 //! by [`CallAbi`] and `iced_x86::Register`.
 
 use crate::MicroliftError;
-use crate::core::abi::{CallAbi, GuestReg, StackArgs};
+use crate::arch::x86_64::regs::gpr_index;
+use crate::core::abi::{ArgLocation, CallAbi, GuestReg, StackArgs};
+use crate::core::bridge::{BridgeEffects, RegMask};
+use crate::function_traits::FunctionArgumentType;
 use iced_x86::Register;
 
 impl From<Register> for GuestReg {
@@ -19,6 +22,87 @@ pub fn x86_reg(reg: GuestReg) -> crate::Result<Register> {
     Register::try_from(reg.0 as usize).map_err(|_| {
         MicroliftError::UnsupportedRegister(format!("invalid guest register id {}", reg.0))
     })
+}
+
+/// Build a [`RegMask`] over the named x86-64 general-purpose registers.
+///
+/// Sub-registers select their containing 64-bit register (`EDI` and `DIL` both
+/// mean `RDI`), since that is the granularity the register file - and therefore
+/// the context sync - works at. Non-GPR operands are ignored; use
+/// [`xmm_mask`] for vector registers.
+///
+/// ```
+/// use iced_x86::Register;
+/// use microlift::arch::x86_64::abi::gpr_mask;
+///
+/// // `int foo(int, char *)` under SysV: arguments in EDI and RSI.
+/// let reads = gpr_mask(&[Register::EDI, Register::RSI]);
+/// assert!(reads.has_gpr(7) && reads.has_gpr(6));
+/// ```
+pub fn gpr_mask(regs: &[Register]) -> RegMask {
+    let mut mask = RegMask::NONE;
+    for &reg in regs {
+        if let Some(idx) = gpr_index(reg) {
+            mask = mask.with_gpr(idx);
+        }
+    }
+    mask
+}
+
+/// Build a [`RegMask`] over the named XMM register indices (`0` = `XMM0`).
+pub fn xmm_mask(indices: &[u8]) -> RegMask {
+    let mut mask = RegMask::NONE;
+    for &idx in indices {
+        mask = mask.with_vec(idx);
+    }
+    mask
+}
+
+/// The [`BridgeEffects`] for a bridge that follows a described guest calling
+/// convention: it reads the argument registers `abi` would place `arg_types`
+/// in, and clobbers the return register plus the flags.
+///
+/// A convenience for the common case - it is *not* a safety net. It cannot know
+/// about a callee that reads memory the guest owns, walks a varargs list, or
+/// (like most real C functions) clobbers the caller-saved registers the guest
+/// still cares about, so start from [`BridgeEffects::full`] and narrow
+/// deliberately if you are not sure. `None` when `abi` cannot place every
+/// argument, which is exactly when a hand-written mask is required.
+pub fn abi_bridge_effects(
+    abi: &CallAbi,
+    arg_types: &[FunctionArgumentType],
+) -> Option<BridgeEffects> {
+    let mut reads = RegMask::NONE;
+    for (_, loc) in abi.place_args(arg_types)? {
+        match loc {
+            ArgLocation::IntReg(r) => {
+                if let Some(idx) = gpr_index(x86_reg(r).ok()?) {
+                    reads = reads.with_gpr(idx);
+                }
+            }
+            ArgLocation::FpReg(i) => reads = reads.with_vec(i),
+            // Stack arguments are read through the guest stack pointer, which
+            // `sync_regs_masked` always stores anyway.
+            ArgLocation::Stack(_) => {}
+        }
+    }
+    let mut writes = RegMask::NONE.with_flags();
+    if let Some(ret) = arg_types
+        .first()
+        .copied()
+        .and_then(|t| abi.return_location(t))
+    {
+        match ret {
+            ArgLocation::IntReg(r) => {
+                if let Some(idx) = gpr_index(x86_reg(r).ok()?) {
+                    writes = writes.with_gpr(idx);
+                }
+            }
+            ArgLocation::FpReg(i) => writes = writes.with_vec(i),
+            ArgLocation::Stack(_) => return None,
+        }
+    }
+    Some(BridgeEffects::new(reads, writes))
 }
 
 /// Both x86-64 ABIs pass spilled arguments in 8-byte stack slots.
