@@ -5,18 +5,25 @@
 //! and widening arithmetic, the pack/unpack narrowing pairs, lane insert and
 //! extract, sign/zero-extending widening, blends and `PTEST`.
 //!
-//! Everything here is expressed on the `(lo, hi)` 64-bit half pair, which
-//! [`Lifter::get_xmm_lo`](crate::lifter::Lifter::get_xmm_lo) and friends provide
-//! under both XMM backing representations, so the same expansion serves scalar
-//! and vector mode. The lanes are widened into full `I64`s
-//! ([`Lifter::xmm_lanes`]), operated on there - where nothing can overflow at
-//! the widths x86 defines these ops - and repacked
+//! The portable expansion here is expressed on the `(lo, hi)` 64-bit half pair,
+//! which [`Lifter::get_xmm_lo`](crate::lifter::Lifter::get_xmm_lo) and friends
+//! provide under both XMM backing representations. The lanes are widened into
+//! full `I64`s ([`Lifter::xmm_lanes`]), operated on there - where nothing can
+//! overflow at the widths x86 defines these ops - and repacked
 //! ([`Lifter::pack_xmm_lanes`]). Cranelift folds the resulting mask/shift/OR
 //! chains, so the emitted IR is far larger than the machine code it lowers to.
+//!
+//! Most handlers additionally take a native fast path when XMM registers are
+//! vector-backed, since these expansions run to hundreds of IR instructions for
+//! something the host does in one. `PMADDWD`, `PMADDUBSW`, `PSADBW` and the
+//! horizontal `PHADD*` / `PHSUB*` forms deliberately have none: their
+//! cross-lane accumulation has no portable Cranelift expansion that beats the
+//! scalar one. See [`sse_vec`](super::sse_vec).
 
 use crate::MicroliftError;
 use crate::arch::x86_64::semantics::helpers::size_to_type;
 use crate::arch::x86_64::semantics::sse::PackedWidth;
+use crate::arch::x86_64::semantics::sse_vec::B;
 use crate::lifter::{Lifter, X86Flag};
 use cranelift::prelude::*;
 use iced_x86::{Instruction, OpKind};
@@ -149,6 +156,26 @@ impl<'a> Lifter<'a> {
     /// expansion is a handful of ops per byte rather than a 16-way select tree.
     pub(super) fn handle_pshufb(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let dst_idx = self.xmm_operand_index(instruction, 0, "pshufb")?;
+
+        if self.vec_mode() {
+            let dst = self.get_xmm_vec(dst_idx);
+            let ctl = self.read_xmm_src_vec(instruction, 1)?;
+            let dst = self.vec_bitcast(dst, types::I8X16);
+            let ctl = self.vec_bitcast(ctl, types::I8X16);
+            // Cranelift's `swizzle` zeroes any index outside 0..15, whereas x86
+            // only zeroes on the index's high bit and otherwise selects with
+            // `index & 0x0F`. Masking with 0x8F reconciles the two: it folds the
+            // don't-care bits 4..6 away and leaves the zeroing indices as
+            // 0x80..0x8F, which are out of `swizzle`'s range.
+            let keep = self.builder.ins().iconst(types::I8, 0x8F);
+            let keep = self.builder.ins().splat(types::I8X16, keep);
+            let ctl = self.builder.ins().band(ctl, keep);
+            let r = self.builder.ins().swizzle(dst, ctl);
+            let r = self.vec_bitcast(r, types::I64X2);
+            self.set_xmm_vec(dst_idx, r);
+            return Ok(());
+        }
+
         let dst_lo = self.get_xmm_lo(dst_idx);
         let dst_hi = self.get_xmm_hi(dst_idx);
         let (ctl_lo, ctl_hi) = self.read_xmm_src(instruction, 1)?;
@@ -189,11 +216,43 @@ impl<'a> Lifter<'a> {
     /// result, and 32 or more clear it.
     pub(super) fn handle_palignr(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let dst_idx = self.xmm_operand_index(instruction, 0, "palignr")?;
+        let count = u32::from(instruction.immediate8());
+
+        if self.vec_mode() {
+            // The 256-bit temporary is `src` in bytes 0-15 and `dst` in bytes
+            // 16-31, so for a count below 16 the window spans both operands and
+            // the mask is simply `i + count`. From 16 up it has left `src`
+            // entirely, so the operands become `dst` and a zero vector.
+            let r = if count >= 32 {
+                self.vec_zero()
+            } else if count < 16 {
+                let src = self.read_xmm_src_vec(instruction, 1)?;
+                let dst = self.get_xmm_vec(dst_idx);
+                let mut mask = [0u8; 16];
+                for (i, m) in mask.iter_mut().enumerate() {
+                    *m = (i as u32 + count) as u8;
+                }
+                self.vec_shuffle(src, dst, mask)
+            } else {
+                let dst = self.get_xmm_vec(dst_idx);
+                let zero = self.vec_zero();
+                let mut mask = [B; 16];
+                for (i, m) in mask.iter_mut().enumerate() {
+                    let from = i as u32 + count - 16;
+                    if from < 16 {
+                        *m = from as u8;
+                    }
+                }
+                self.vec_shuffle(dst, zero, mask)
+            };
+            self.set_xmm_vec(dst_idx, r);
+            return Ok(());
+        }
+
         let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
         let dst_lo = self.get_xmm_lo(dst_idx);
         let dst_hi = self.get_xmm_hi(dst_idx);
 
-        let count = u32::from(instruction.immediate8());
         let (res_lo, res_hi) = if count >= 32 {
             let zero = self.builder.ins().iconst(types::I64, 0);
             (zero, zero)
@@ -243,6 +302,19 @@ impl<'a> Lifter<'a> {
         width: PackedWidth,
     ) -> crate::Result<()> {
         let dst_idx = self.xmm_operand_index(instruction, 0, "pabs")?;
+
+        if self.vec_mode() {
+            let ty = width.vector_type();
+            let src = self.read_xmm_src_vec(instruction, 1)?;
+            let a = self.vec_bitcast(src, ty);
+            // `iabs` wraps the most negative lane back to itself, which is what
+            // hardware does.
+            let r = self.builder.ins().iabs(a);
+            let r = self.vec_bitcast(r, types::I64X2);
+            self.set_xmm_vec(dst_idx, r);
+            return Ok(());
+        }
+
         let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
         let bits = width.bits();
         let lanes = self.xmm_lanes(src_lo, src_hi, bits, true);
@@ -271,6 +343,28 @@ impl<'a> Lifter<'a> {
         width: PackedWidth,
     ) -> crate::Result<()> {
         let dst_idx = self.xmm_operand_index(instruction, 0, "psign")?;
+
+        if self.vec_mode() {
+            let ty = width.vector_type();
+            let dst = self.get_xmm_vec(dst_idx);
+            let src = self.read_xmm_src_vec(instruction, 1)?;
+            let a = self.vec_bitcast(dst, ty);
+            let s = self.vec_bitcast(src, ty);
+            // Negate where the source lane is negative, then zero where it is
+            // zero. Vector `icmp` yields an all-ones/all-zeros lane mask, so the
+            // two choices are `bitselect`s.
+            let neg = self.builder.ins().ineg(a);
+            let zero = self.builder.ins().iconst(ty.lane_type(), 0);
+            let zero = self.builder.ins().splat(ty, zero);
+            let is_neg = self.builder.ins().icmp(IntCC::SignedLessThan, s, zero);
+            let signed = self.builder.ins().bitselect(is_neg, neg, a);
+            let is_zero = self.builder.ins().icmp(IntCC::Equal, s, zero);
+            let r = self.builder.ins().bitselect(is_zero, zero, signed);
+            let r = self.vec_bitcast(r, types::I64X2);
+            self.set_xmm_vec(dst_idx, r);
+            return Ok(());
+        }
+
         let dst_lo = self.get_xmm_lo(dst_idx);
         let dst_hi = self.get_xmm_hi(dst_idx);
         let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
@@ -347,6 +441,30 @@ impl<'a> Lifter<'a> {
     ) -> crate::Result<()> {
         let who = if signed { "pmuldq" } else { "pmuludq" };
         let dst_idx = self.xmm_operand_index(instruction, 0, who)?;
+
+        if self.vec_mode() {
+            let dst = self.get_xmm_vec(dst_idx);
+            let src = self.read_xmm_src_vec(instruction, 1)?;
+            // Reduce each 64-bit lane to its even (low) dword, extended to the
+            // full lane, then a plain 64-bit lane multiply is the product.
+            let ext = |s: &mut Self, v: Value| {
+                let v = s.vec_bitcast(v, types::I64X2);
+                if signed {
+                    let up = s.builder.ins().ishl_imm_u(v, 32);
+                    s.builder.ins().sshr_imm_u(up, 32)
+                } else {
+                    let m = s.builder.ins().iconst(types::I64, 0xFFFF_FFFF);
+                    let m = s.builder.ins().splat(types::I64X2, m);
+                    s.builder.ins().band(v, m)
+                }
+            };
+            let a = ext(self, dst);
+            let b = ext(self, src);
+            let r = self.builder.ins().imul(a, b);
+            self.set_xmm_vec(dst_idx, r);
+            return Ok(());
+        }
+
         let dst_lo = self.get_xmm_lo(dst_idx);
         let dst_hi = self.get_xmm_hi(dst_idx);
         let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
@@ -393,6 +511,10 @@ impl<'a> Lifter<'a> {
     /// PMADDUBSW - multiply *unsigned* destination bytes by *signed* source
     /// bytes and add adjacent products into signed word lanes, saturating.
     pub(super) fn handle_pmaddubsw(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        // No vector fast path: the pairwise multiply-accumulate has no portable
+        // Cranelift expansion (`x86_pmaddubsw` exists but lowers on x86 only),
+        // and open-coding the cross-lane adds is no cheaper than the scalar
+        // lane expansion below.
         let dst_idx = self.xmm_operand_index(instruction, 0, "pmaddubsw")?;
         let dst_lo = self.get_xmm_lo(dst_idx);
         let dst_hi = self.get_xmm_hi(dst_idx);
@@ -419,6 +541,16 @@ impl<'a> Lifter<'a> {
     /// `(((a * b) >> 14) + 1) >> 1`.
     pub(super) fn handle_pmulhrsw(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let dst_idx = self.xmm_operand_index(instruction, 0, "pmulhrsw")?;
+
+        if self.vec_mode() {
+            let dst = self.get_xmm_vec(dst_idx);
+            let src = self.read_xmm_src_vec(instruction, 1)?;
+            let r = self.vec_mulhrsw(dst, src);
+            let r = self.vec_bitcast(r, types::I64X2);
+            self.set_xmm_vec(dst_idx, r);
+            return Ok(());
+        }
+
         let dst_lo = self.get_xmm_lo(dst_idx);
         let dst_hi = self.get_xmm_hi(dst_idx);
         let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
@@ -484,6 +616,26 @@ impl<'a> Lifter<'a> {
         signed: bool,
     ) -> crate::Result<()> {
         let dst_idx = self.xmm_operand_index(instruction, 0, "pack")?;
+
+        if self.vec_mode() {
+            let ty = width.vector_type();
+            let dst = self.get_xmm_vec(dst_idx);
+            let src = self.read_xmm_src_vec(instruction, 1)?;
+            let a = self.vec_bitcast(dst, ty);
+            let b = self.vec_bitcast(src, ty);
+            // `snarrow`/`unarrow` concatenate with the first operand's narrowed
+            // lanes low, which is where the destination's belong. Both read
+            // their inputs as signed, matching the x86 `PACKUS*` definition.
+            let r = if signed {
+                self.builder.ins().snarrow(a, b)
+            } else {
+                self.builder.ins().unarrow(a, b)
+            };
+            let r = self.vec_bitcast(r, types::I64X2);
+            self.set_xmm_vec(dst_idx, r);
+            return Ok(());
+        }
+
         let dst_lo = self.get_xmm_lo(dst_idx);
         let dst_hi = self.get_xmm_hi(dst_idx);
         let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
@@ -522,6 +674,38 @@ impl<'a> Lifter<'a> {
         let who = if signed { "pmovsx" } else { "pmovzx" };
         let dst_idx = self.xmm_operand_index(instruction, 0, who)?;
         let lanes = 128 / dst_bits;
+
+        if self.vec_mode() {
+            // Both widening ops read only the low half of their input, so the
+            // consumed bytes just have to land there - which is where a register
+            // source already has them, and where `scalar_to_vector` puts a
+            // narrow memory load.
+            let v = match self.operand_kind(instruction, 1) {
+                OpKind::Register => {
+                    let src_idx = self.xmm_operand_index(instruction, 1, who)?;
+                    self.get_xmm_vec(src_idx)
+                }
+                _ => {
+                    let packed = self.read_scalar_src(instruction, 1, lanes * src_bits, who)?;
+                    self.builder.ins().scalar_to_vector(types::I64X2, packed)
+                }
+            };
+
+            // A 4x or 8x widening is a chain of 2x steps.
+            let mut v = self.vec_bitcast(v, Self::vec_int_type(src_bits));
+            let mut bits = src_bits;
+            while bits < dst_bits {
+                v = if signed {
+                    self.builder.ins().swiden_low(v)
+                } else {
+                    self.builder.ins().uwiden_low(v)
+                };
+                bits *= 2;
+            }
+            let r = self.vec_bitcast(v, types::I64X2);
+            self.set_xmm_vec(dst_idx, r);
+            return Ok(());
+        }
 
         let packed = match self.operand_kind(instruction, 1) {
             // A register source keeps every consumed byte in its low half.
@@ -645,6 +829,22 @@ impl<'a> Lifter<'a> {
         width: PackedWidth,
     ) -> crate::Result<()> {
         let dst_idx = self.xmm_operand_index(instruction, 0, "blend")?;
+
+        if self.vec_mode() {
+            // A lift-time constant lane selection between two operands is just
+            // a constant shuffle.
+            let imm = u32::from(instruction.immediate8());
+            let lanes = 128 / width.bits();
+            let dst = self.get_xmm_vec(dst_idx);
+            let src = self.read_xmm_src_vec(instruction, 1)?;
+            let mask = Self::lane_shuffle_mask(width.bits(), |j| {
+                if imm & (1 << j) != 0 { lanes + j } else { j }
+            });
+            let r = self.vec_shuffle(dst, src, mask);
+            self.set_xmm_vec(dst_idx, r);
+            return Ok(());
+        }
+
         let dst_lo = self.get_xmm_lo(dst_idx);
         let dst_hi = self.get_xmm_hi(dst_idx);
         let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
@@ -683,6 +883,25 @@ impl<'a> Lifter<'a> {
         width: PackedWidth,
     ) -> crate::Result<()> {
         let dst_idx = self.xmm_operand_index(instruction, 0, "blendv")?;
+
+        if self.vec_mode() {
+            let ty = width.vector_type();
+            let dst = self.get_xmm_vec(dst_idx);
+            let src = self.read_xmm_src_vec(instruction, 1)?;
+            let mask = self.get_xmm_vec(0);
+            let dst = self.vec_bitcast(dst, ty);
+            let src = self.vec_bitcast(src, ty);
+            let mask = self.vec_bitcast(mask, ty);
+            // `bitselect` is bit-granular but x86 selects per lane on the mask
+            // lane's *sign bit*, so broadcast that bit across its lane first.
+            let bits = i64::from(width.bits()) - 1;
+            let mask = self.builder.ins().sshr_imm_u(mask, bits);
+            let r = self.builder.ins().bitselect(mask, src, dst);
+            let r = self.vec_bitcast(r, types::I64X2);
+            self.set_xmm_vec(dst_idx, r);
+            return Ok(());
+        }
+
         let dst_lo = self.get_xmm_lo(dst_idx);
         let dst_hi = self.get_xmm_hi(dst_idx);
         let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
@@ -716,6 +935,22 @@ impl<'a> Lifter<'a> {
     /// written.
     pub(super) fn handle_ptest(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let dst_idx = self.xmm_operand_index(instruction, 0, "ptest")?;
+
+        if self.vec_mode() {
+            let dst = self.get_xmm_vec(dst_idx);
+            let src = self.read_xmm_src_vec(instruction, 1)?;
+            // `vany_true` is a whole-register "is any bit set" reduction, which
+            // is exactly the test both flags need - negated.
+            let and = self.builder.ins().band(src, dst);
+            let any = self.builder.ins().vany_true(and);
+            let zf = self.builder.ins().icmp_imm_s(IntCC::Equal, any, 0);
+            // band_not(x, y) = x & ~y.
+            let andn = self.builder.ins().band_not(src, dst);
+            let any_n = self.builder.ins().vany_true(andn);
+            let cf = self.builder.ins().icmp_imm_s(IntCC::Equal, any_n, 0);
+            return self.write_ptest_flags(zf, cf);
+        }
+
         let dst_lo = self.get_xmm_lo(dst_idx);
         let dst_hi = self.get_xmm_hi(dst_idx);
         let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
@@ -730,7 +965,11 @@ impl<'a> Lifter<'a> {
         let andn_hi = self.builder.ins().band_not(src_hi, dst_hi);
         let andn_all = self.builder.ins().bor(andn_lo, andn_hi);
         let cf = self.builder.ins().icmp_imm_s(IntCC::Equal, andn_all, 0);
+        self.write_ptest_flags(zf, cf)
+    }
 
+    /// Publish `PTEST`'s flag result: ZF and CF as computed, AF/OF/PF/SF cleared.
+    fn write_ptest_flags(&mut self, zf: Value, cf: Value) -> crate::Result<()> {
         self.set_flag(X86Flag::Zero, zf)?;
         self.set_flag(X86Flag::Carry, cf)?;
         let zero = self.builder.ins().iconst(types::I8, 0);

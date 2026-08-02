@@ -144,3 +144,7 @@ required-features = ["fuzzing"]
 [[test]]
 name = "fuzz_vsa"
 required-features = ["fuzzing"]
+
+[[test]]
+name = "sse_vec_equiv_tests"
+required-features = ["testkit"]

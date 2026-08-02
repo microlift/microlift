@@ -7,15 +7,18 @@
 //!  - vector: a single native `I64X2` SSA variable per register, which
 //!    lowers directly to host XMM registers on x86-64.
 //!
-//! Whole-register bitwise handlers (movaps / xorps / andps / orps /
-//! andnps and their `pd`/integer aliases) take a vector fast path when
-//! the option is enabled; scalar move/extract helpers fall back to lo/hi
-//! lane access via [`crate::lifter::Lifter::get_xmm_lo`] /
-//! [`crate::lifter::Lifter::get_xmm_hi`] which transparently handle both
+//! The scalar expansion is the authority on semantics and always works.
+//! When the vector representation is enabled, most handlers take a native
+//! fast path instead - see [`sse_vec`](super::sse_vec) for the shared
+//! plumbing and `tests/sse_vec_equiv_tests.rs` for the equivalence proof.
+//! Handlers with no fast path (and every handler in scalar mode) reach
+//! lo/hi lane access via [`crate::lifter::Lifter::get_xmm_lo`] /
+//! [`crate::lifter::Lifter::get_xmm_hi`], which transparently handle both
 //! representations.
 
 use crate::MicroliftError;
 use crate::arch::x86_64::semantics::helpers::xmm_register_index;
+use crate::arch::x86_64::semantics::sse_vec::{B, PackedFpOp};
 use crate::lifter::{Lifter, X86Flag};
 use cranelift::prelude::*;
 use iced_x86::{Instruction, OpKind};
@@ -42,7 +45,7 @@ impl PackedWidth {
     }
 
     /// The 128-bit Cranelift vector type with these lanes.
-    fn vector_type(self) -> Type {
+    pub(super) fn vector_type(self) -> Type {
         match self {
             PackedWidth::Byte => types::I8X16,
             PackedWidth::Word => types::I16X8,
@@ -188,8 +191,11 @@ impl PackedLaneOp {
 
     /// True when Cranelift has a single native vector instruction for this op,
     /// so vector mode can take the fast path instead of expanding lanes.
+    ///
+    /// Every [`PackedLaneOp`] now has one - the high-multiply forms map onto
+    /// the vector-polymorphic `smulhi` / `umulhi`.
     fn has_vector_form(self) -> bool {
-        !matches!(self, PackedLaneOp::MulHighS | PackedLaneOp::MulHighU)
+        true
     }
 }
 
@@ -295,7 +301,7 @@ impl<'a> Lifter<'a> {
     /// - GPR source (e.g. MOVQ xmm, r64): zero-extends 64-bit value
     ///   into lane 0; lane 1 = 0.
     /// - Memory source: single 128-bit unaligned load.
-    fn read_xmm_src_vec(
+    pub(super) fn read_xmm_src_vec(
         &mut self,
         instruction: &Instruction,
         op_index: u32,
@@ -1036,6 +1042,19 @@ impl<'a> Lifter<'a> {
     /// according to `imm8` (2 bits per destination dword select a source dword).
     pub(super) fn handle_pshufd(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let dst_idx = self.xmm_operand_index(instruction, 0, "pshufd")?;
+        let imm = instruction.immediate8();
+
+        if self.vec_mode() {
+            // Every result dword comes from the source, so the shuffle's second
+            // operand is unused - pass the source again rather than materialize
+            // a dead value.
+            let src = self.read_xmm_src_vec(instruction, 1)?;
+            let mask = Self::lane_shuffle_mask(32, |j| u32::from((imm >> (2 * j)) & 0b11));
+            let r = self.vec_shuffle(src, src, mask);
+            self.set_xmm_vec(dst_idx, r);
+            return Ok(());
+        }
+
         let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
 
         // The four source dwords, each isolated into the low 32 bits of an I64.
@@ -1046,7 +1065,6 @@ impl<'a> Lifter<'a> {
             self.builder.ins().ushr_imm_u(src_hi, 32),
         ];
 
-        let imm = instruction.immediate8();
         let pick = |j: u32| dwords[((imm >> (2 * j)) & 0b11) as usize];
         let (r0, r1, r2, r3) = (pick(0), pick(1), pick(2), pick(3));
 
@@ -1236,6 +1254,25 @@ impl<'a> Lifter<'a> {
         high: bool,
     ) -> crate::Result<()> {
         let dst_idx = self.xmm_operand_index(instruction, 0, who)?;
+        let lane_bits = width.bits();
+
+        if self.vec_mode() {
+            // Result lane `2i` is destination lane `off + i`, lane `2i+1` the
+            // source's - `off` selecting which half of each operand feeds the
+            // interleave. Source lanes are numbered past the first operand's.
+            let lanes = 128 / lane_bits;
+            let off = if high { lanes / 2 } else { 0 };
+            let dst = self.get_xmm_vec(dst_idx);
+            let src = self.read_xmm_src_vec(instruction, 1)?;
+            let mask = Self::lane_shuffle_mask(lane_bits, |j| {
+                let lane = off + j / 2;
+                if j % 2 == 0 { lane } else { lanes + lane }
+            });
+            let r = self.vec_shuffle(dst, src, mask);
+            self.set_xmm_vec(dst_idx, r);
+            return Ok(());
+        }
+
         let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
         let (a, b) = if high {
             (self.get_xmm_hi(dst_idx), src_hi)
@@ -1243,7 +1280,6 @@ impl<'a> Lifter<'a> {
             (self.get_xmm_lo(dst_idx), src_lo)
         };
 
-        let lane_bits = width.bits();
         if lane_bits == 64 {
             // A single lane from each operand: no interleaving to do.
             self.set_xmm_lo(dst_idx, a);
@@ -1455,11 +1491,17 @@ impl<'a> Lifter<'a> {
 
     /// ADDPD - packed double-precision add of both 64-bit lanes.
     pub(super) fn handle_addpd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        if self.try_packed_fp_vec(instruction, "addpd", false, PackedFpOp::Add)? {
+            return Ok(());
+        }
         self.packed_double_arith(instruction, "addpd", |b, x, y| b.ins().fadd(x, y))
     }
 
     /// SUBPD - packed double-precision subtract of both 64-bit lanes.
     pub(super) fn handle_subpd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        if self.try_packed_fp_vec(instruction, "subpd", false, PackedFpOp::Sub)? {
+            return Ok(());
+        }
         self.packed_double_arith(instruction, "subpd", |b, x, y| b.ins().fsub(x, y))
     }
 
@@ -1489,6 +1531,9 @@ impl<'a> Lifter<'a> {
 
     /// MULPS - packed single-precision multiply of all four 32-bit lanes.
     pub(super) fn handle_mulps(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        if self.try_packed_fp_vec(instruction, "mulps", true, PackedFpOp::Mul)? {
+            return Ok(());
+        }
         self.packed_single_arith(instruction, "mulps", |b, x, y| b.ins().fmul(x, y))
     }
 
@@ -1614,7 +1659,7 @@ impl<'a> Lifter<'a> {
 
     /// Reinterpret a 128-bit vector value as `ty` (a no-op if it already has
     /// that type). Lane-count changes require an explicit byte order.
-    fn vec_bitcast(&mut self, v: Value, ty: Type) -> Value {
+    pub(super) fn vec_bitcast(&mut self, v: Value, ty: Type) -> Value {
         if self.builder.func.dfg.value_type(v) == ty {
             return v;
         }
@@ -1838,6 +1883,16 @@ impl<'a> Lifter<'a> {
             let ty = width.vector_type();
             let dst = self.get_xmm_vec(dst_idx);
             let src = self.read_xmm_src_vec(instruction, 1)?;
+
+            // The high-multiply forms are 16-bit-lane only and need their own
+            // expansion; everything else is a single native vector op.
+            if let PackedLaneOp::MulHighS | PackedLaneOp::MulHighU = op {
+                let signed = op == PackedLaneOp::MulHighS;
+                let r = self.vec_mulhi_word(dst, src, signed);
+                self.set_xmm_vec(dst_idx, r);
+                return Ok(());
+            }
+
             let a = self.vec_bitcast(dst, ty);
             let b = self.vec_bitcast(src, ty);
             let r = match op {
@@ -1849,7 +1904,7 @@ impl<'a> Lifter<'a> {
                 PackedLaneOp::MaxS => self.builder.ins().smax(a, b),
                 PackedLaneOp::Avg => self.builder.ins().avg_round(a, b),
                 PackedLaneOp::MulLow => self.builder.ins().imul(a, b),
-                PackedLaneOp::MulHighS | PackedLaneOp::MulHighU => unreachable!(),
+                PackedLaneOp::MulHighS | PackedLaneOp::MulHighU => unreachable!("handled above"),
             };
             let r = self.vec_bitcast(r, types::I64X2);
             self.set_xmm_vec(dst_idx, r);
@@ -1947,6 +2002,16 @@ impl<'a> Lifter<'a> {
     ) -> crate::Result<()> {
         let dst_reg = self.operand_register(instruction, 0);
         let src_idx = self.xmm_operand_index(instruction, 1, who)?;
+
+        if self.vec_mode() {
+            // `vhigh_bits` is precisely this instruction: the concatenated sign
+            // bits of every lane.
+            let src = self.get_xmm_vec(src_idx);
+            let v = self.vec_bitcast(src, width.vector_type());
+            let acc = self.builder.ins().vhigh_bits(types::I64, v);
+            return self.write_movmsk_dst(dst_reg, acc);
+        }
+
         let halves = [self.get_xmm_lo(src_idx), self.get_xmm_hi(src_idx)];
 
         let lane_bits = width.bits();
@@ -1967,8 +2032,14 @@ impl<'a> Lifter<'a> {
             }
         }
 
-        // The 32-bit destination form zero-extends to the full GPR anyway, so
-        // both widths just write the same value at their own type.
+        self.write_movmsk_dst(dst_reg, acc)
+    }
+
+    /// Write a gathered `MOVMSK` bitmask (an `I64`) to its GPR destination.
+    ///
+    /// The 32-bit destination form zero-extends to the full GPR anyway, so both
+    /// widths just write the same value at their own type.
+    fn write_movmsk_dst(&mut self, dst_reg: iced_x86::Register, acc: Value) -> crate::Result<()> {
         if dst_reg.size() == 8 {
             self.set_reg_val(dst_reg, acc)
         } else {
@@ -1989,6 +2060,26 @@ impl<'a> Lifter<'a> {
     ) -> crate::Result<()> {
         let who = if left { "pslldq" } else { "psrldq" };
         let dst_idx = self.xmm_operand_index(instruction, 0, who)?;
+
+        if self.vec_mode() {
+            let count = i32::from(instruction.immediate8());
+            let dst = self.get_xmm_vec(dst_idx);
+            let zero = self.vec_zero();
+            // Result byte `i` is destination byte `i -/+ count`, or a zero
+            // byte - byte 0 of the zero operand - when that falls outside the
+            // register. A count above 15 leaves every byte pointing at zero.
+            let mut mask = [B; 16];
+            for (i, m) in mask.iter_mut().enumerate() {
+                let from = if left { i as i32 - count } else { i as i32 + count };
+                if (0..16).contains(&from) {
+                    *m = from as u8;
+                }
+            }
+            let r = self.vec_shuffle(dst, zero, mask);
+            self.set_xmm_vec(dst_idx, r);
+            return Ok(());
+        }
+
         let lo = self.get_xmm_lo(dst_idx);
         let hi = self.get_xmm_hi(dst_idx);
         let count = instruction.immediate8() as u32;
@@ -2040,26 +2131,41 @@ impl<'a> Lifter<'a> {
 
     /// MULPD - packed double-precision multiply of both 64-bit lanes.
     pub(super) fn handle_mulpd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        if self.try_packed_fp_vec(instruction, "mulpd", false, PackedFpOp::Mul)? {
+            return Ok(());
+        }
         self.packed_double_arith(instruction, "mulpd", |b, x, y| b.ins().fmul(x, y))
     }
 
     /// DIVPD - packed double-precision divide of both 64-bit lanes.
     pub(super) fn handle_divpd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        if self.try_packed_fp_vec(instruction, "divpd", false, PackedFpOp::Div)? {
+            return Ok(());
+        }
         self.packed_double_arith(instruction, "divpd", |b, x, y| b.ins().fdiv(x, y))
     }
 
     /// ADDPS - packed single-precision add of all four 32-bit lanes.
     pub(super) fn handle_addps(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        if self.try_packed_fp_vec(instruction, "addps", true, PackedFpOp::Add)? {
+            return Ok(());
+        }
         self.packed_single_arith(instruction, "addps", |b, x, y| b.ins().fadd(x, y))
     }
 
     /// SUBPS - packed single-precision subtract of all four 32-bit lanes.
     pub(super) fn handle_subps(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        if self.try_packed_fp_vec(instruction, "subps", true, PackedFpOp::Sub)? {
+            return Ok(());
+        }
         self.packed_single_arith(instruction, "subps", |b, x, y| b.ins().fsub(x, y))
     }
 
     /// DIVPS - packed single-precision divide of all four 32-bit lanes.
     pub(super) fn handle_divps(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        if self.try_packed_fp_vec(instruction, "divps", true, PackedFpOp::Div)? {
+            return Ok(());
+        }
         self.packed_single_arith(instruction, "divps", |b, x, y| b.ins().fdiv(x, y))
     }
 
@@ -2103,6 +2209,10 @@ impl<'a> Lifter<'a> {
         min: bool,
     ) -> crate::Result<()> {
         let who = if min { "minpd" } else { "maxpd" };
+        let op = if min { PackedFpOp::Min } else { PackedFpOp::Max };
+        if self.try_packed_fp_vec(instruction, who, false, op)? {
+            return Ok(());
+        }
         self.packed_double_arith(instruction, who, Self::fp_min_max(min))
     }
 
@@ -2124,6 +2234,10 @@ impl<'a> Lifter<'a> {
         min: bool,
     ) -> crate::Result<()> {
         let who = if min { "minps" } else { "maxps" };
+        let op = if min { PackedFpOp::Min } else { PackedFpOp::Max };
+        if self.try_packed_fp_vec(instruction, who, true, op)? {
+            return Ok(());
+        }
         self.packed_single_arith(instruction, who, Self::fp_min_max(min))
     }
 
@@ -2169,6 +2283,9 @@ impl<'a> Lifter<'a> {
     /// SQRTPD - packed double-precision square root of both 64-bit lanes of the
     /// source into the destination.
     pub(super) fn handle_sqrtpd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        if self.try_packed_fp_vec(instruction, "sqrtpd", false, PackedFpOp::Sqrt)? {
+            return Ok(());
+        }
         let dst_idx = self.xmm_operand_index(instruction, 0, "sqrtpd")?;
         let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
         // The unary op is expressed as a binary one that ignores its second
@@ -2184,6 +2301,9 @@ impl<'a> Lifter<'a> {
     /// SQRTPS - packed single-precision square root of all four lanes of the
     /// source into the destination.
     pub(super) fn handle_sqrtps(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        if self.try_packed_fp_vec(instruction, "sqrtps", true, PackedFpOp::Sqrt)? {
+            return Ok(());
+        }
         let dst_idx = self.xmm_operand_index(instruction, 0, "sqrtps")?;
         let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
         let sqrt = |b: &mut FunctionBuilder<'a>, x: Value, _y: Value| b.ins().sqrt(x);
@@ -2477,6 +2597,30 @@ impl<'a> Lifter<'a> {
         }
     }
 
+    /// [`Self::read_low_qword_src`] as a 128-bit vector, the consumed quadword
+    /// in lane 0 and lane 1 zeroed.
+    ///
+    /// Used by the "half-width source" conversions in vector mode: their
+    /// `xmm/m64` operand must not be read with a full `m128` load, but every
+    /// vector op that consumes it (`fvpromote_low`, `swiden_low`) looks only at
+    /// the low half anyway.
+    fn read_low_qword_src_vec(
+        &mut self,
+        instruction: &Instruction,
+        who: &str,
+    ) -> crate::Result<Value> {
+        match self.operand_kind(instruction, 1) {
+            OpKind::Register => {
+                let idx = self.xmm_operand_index(instruction, 1, who)?;
+                Ok(self.get_xmm_vec(idx))
+            }
+            _ => {
+                let q = self.read_low_qword_src(instruction, who)?;
+                Ok(self.builder.ins().scalar_to_vector(types::I64X2, q))
+            }
+        }
+    }
+
     /// CVTPD2PS - narrow two packed doubles to two singles in `dst[63:0]`.
     ///
     /// Note the asymmetry with the scalar `CVTSD2SS`: because the result is
@@ -2484,6 +2628,18 @@ impl<'a> Lifter<'a> {
     /// not preserved.
     pub(super) fn handle_cvtpd2ps(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let dst_idx = self.xmm_operand_index(instruction, 0, "cvtpd2ps")?;
+
+        if self.vec_mode() {
+            // `fvdemote` narrows `F64X2` into the low two lanes of an `F32X4`
+            // and zeroes the upper half - exactly this instruction.
+            let src = self.read_xmm_src_vec(instruction, 1)?;
+            let x = self.vec_bitcast(src, types::F64X2);
+            let f = self.builder.ins().fvdemote(x);
+            let r = self.vec_bitcast(f, types::I64X2);
+            self.set_xmm_vec(dst_idx, r);
+            return Ok(());
+        }
+
         let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
 
         let d0 = self.f64_bits_to_f32_bits(src_lo);
@@ -2500,6 +2656,16 @@ impl<'a> Lifter<'a> {
     /// to two doubles filling the whole destination.
     pub(super) fn handle_cvtps2pd(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let dst_idx = self.xmm_operand_index(instruction, 0, "cvtps2pd")?;
+
+        if self.vec_mode() {
+            let src = self.read_low_qword_src_vec(instruction, "cvtps2pd")?;
+            let x = self.vec_bitcast(src, types::F32X4);
+            let f = self.builder.ins().fvpromote_low(x);
+            let r = self.vec_bitcast(f, types::I64X2);
+            self.set_xmm_vec(dst_idx, r);
+            return Ok(());
+        }
+
         let src = self.read_low_qword_src(instruction, "cvtps2pd")?;
         let (s0, s1) = self.split_dwords(src);
 
@@ -2514,6 +2680,16 @@ impl<'a> Lifter<'a> {
     /// CVTDQ2PS - convert four packed signed dwords to four singles.
     pub(super) fn handle_cvtdq2ps(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let dst_idx = self.xmm_operand_index(instruction, 0, "cvtdq2ps")?;
+
+        if self.vec_mode() {
+            let src = self.read_xmm_src_vec(instruction, 1)?;
+            let a = self.vec_bitcast(src, types::I32X4);
+            let f = self.builder.ins().fcvt_from_sint(types::F32X4, a);
+            let r = self.vec_bitcast(f, types::I64X2);
+            self.set_xmm_vec(dst_idx, r);
+            return Ok(());
+        }
+
         let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
 
         let mut halves = [src_lo, src_hi];
@@ -2546,6 +2722,16 @@ impl<'a> Lifter<'a> {
     ) -> crate::Result<()> {
         let who = if truncate { "cvttps2dq" } else { "cvtps2dq" };
         let dst_idx = self.xmm_operand_index(instruction, 0, who)?;
+
+        if self.vec_mode() {
+            let src = self.read_xmm_src_vec(instruction, 1)?;
+            let x = self.vec_bitcast(src, types::F32X4);
+            let r = self.vec_fp_to_sint_x86(x, types::I32X4, truncate);
+            let r = self.vec_bitcast(r, types::I64X2);
+            self.set_xmm_vec(dst_idx, r);
+            return Ok(());
+        }
+
         let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
 
         let mut halves = [src_lo, src_hi];
@@ -2574,6 +2760,19 @@ impl<'a> Lifter<'a> {
     /// (`xmm/m64`) to two doubles filling the whole destination.
     pub(super) fn handle_cvtdq2pd(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let dst_idx = self.xmm_operand_index(instruction, 0, "cvtdq2pd")?;
+
+        if self.vec_mode() {
+            let src = self.read_low_qword_src_vec(instruction, "cvtdq2pd")?;
+            let a = self.vec_bitcast(src, types::I32X4);
+            // Widen the low two dwords to qwords, then convert - `fcvt_from_sint`
+            // is lane-preserving, so the widening is what selects the low half.
+            let w = self.builder.ins().swiden_low(a);
+            let f = self.builder.ins().fcvt_from_sint(types::F64X2, w);
+            let r = self.vec_bitcast(f, types::I64X2);
+            self.set_xmm_vec(dst_idx, r);
+            return Ok(());
+        }
+
         let src = self.read_low_qword_src(instruction, "cvtdq2pd")?;
         let (s0, s1) = self.split_dwords(src);
 
@@ -2666,12 +2865,18 @@ impl<'a> Lifter<'a> {
     /// all-zeros according to the `imm8` predicate.
     pub(super) fn handle_cmpps(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let cc = Self::cmp_predicate(instruction.immediate8());
+        if self.try_packed_fp_vec(instruction, "cmpps", true, PackedFpOp::Cmp(cc))? {
+            return Ok(());
+        }
         self.packed_single_arith(instruction, "cmpps", Self::fp_cmp_mask(cc))
     }
 
     /// CMPPD - packed double-precision compare.
     pub(super) fn handle_cmppd(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let cc = Self::cmp_predicate(instruction.immediate8());
+        if self.try_packed_fp_vec(instruction, "cmppd", false, PackedFpOp::Cmp(cc))? {
+            return Ok(());
+        }
         self.packed_double_arith(instruction, "cmppd", Self::fp_cmp_mask(cc))
     }
 
@@ -2693,6 +2898,23 @@ impl<'a> Lifter<'a> {
     /// destination, its high two from the source, two `imm8` bits each.
     pub(super) fn handle_shufps(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let dst_idx = self.xmm_operand_index(instruction, 0, "shufps")?;
+
+        if self.vec_mode() {
+            let imm = instruction.immediate8();
+            let dst = self.get_xmm_vec(dst_idx);
+            let src = self.read_xmm_src_vec(instruction, 1)?;
+            // The low two dwords are selected from the destination, the high
+            // two from the source (lane numbers 4..7 in the shared mask
+            // builder's cross-operand numbering).
+            let mask = Self::lane_shuffle_mask(32, |j| {
+                let sel = u32::from((imm >> (2 * j)) & 0b11);
+                if j < 2 { sel } else { 4 + sel }
+            });
+            let r = self.vec_shuffle(dst, src, mask);
+            self.set_xmm_vec(dst_idx, r);
+            return Ok(());
+        }
+
         let dst_lo = self.get_xmm_lo(dst_idx);
         let dst_hi = self.get_xmm_hi(dst_idx);
         let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
@@ -2719,6 +2941,25 @@ impl<'a> Lifter<'a> {
     /// by `imm8[0]`, its high quadword from the source by `imm8[1]`.
     pub(super) fn handle_shufpd(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let dst_idx = self.xmm_operand_index(instruction, 0, "shufpd")?;
+
+        if self.vec_mode() {
+            let imm = instruction.immediate8();
+            let dst = self.get_xmm_vec(dst_idx);
+            let src = self.read_xmm_src_vec(instruction, 1)?;
+            // Low qword from the destination by imm[0], high qword from the
+            // source by imm[1] (source qwords are lanes 2 and 3).
+            let mask = Self::lane_shuffle_mask(64, |j| {
+                if j == 0 {
+                    u32::from(imm & 1)
+                } else {
+                    2 + u32::from((imm >> 1) & 1)
+                }
+            });
+            let r = self.vec_shuffle(dst, src, mask);
+            self.set_xmm_vec(dst_idx, r);
+            return Ok(());
+        }
+
         let dst_lo = self.get_xmm_lo(dst_idx);
         let dst_hi = self.get_xmm_hi(dst_idx);
         let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
@@ -2742,6 +2983,25 @@ impl<'a> Lifter<'a> {
     ) -> crate::Result<()> {
         let who = if high { "pshufhw" } else { "pshuflw" };
         let dst_idx = self.xmm_operand_index(instruction, 0, who)?;
+
+        if self.vec_mode() {
+            let imm = instruction.immediate8();
+            let src = self.read_xmm_src_vec(instruction, 1)?;
+            // Only the shuffled half is permuted; the other half is copied
+            // through from the source unchanged. Both come from operand `a`.
+            let base = if high { 4 } else { 0 };
+            let mask = Self::lane_shuffle_mask(16, |j| {
+                if (j >= 4) == high {
+                    base + u32::from((imm >> (2 * (j - base))) & 0b11)
+                } else {
+                    j
+                }
+            });
+            let r = self.vec_shuffle(src, src, mask);
+            self.set_xmm_vec(dst_idx, r);
+            return Ok(());
+        }
+
         let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
 
         let shuffled = if high { src_hi } else { src_lo };
@@ -2795,6 +3055,9 @@ impl<'a> Lifter<'a> {
         sqrt: bool,
     ) -> crate::Result<()> {
         let who = if sqrt { "rsqrtps" } else { "rcpps" };
+        if self.try_packed_fp_vec(instruction, who, true, PackedFpOp::Rcp { sqrt })? {
+            return Ok(());
+        }
         self.packed_single_arith(instruction, who, Self::fp_reciprocal(sqrt))
     }
 
@@ -2818,6 +3081,16 @@ impl<'a> Lifter<'a> {
     ) -> crate::Result<()> {
         let who = if odd { "movshdup" } else { "movsldup" };
         let dst_idx = self.xmm_operand_index(instruction, 0, who)?;
+
+        if self.vec_mode() {
+            let src = self.read_xmm_src_vec(instruction, 1)?;
+            // [d0,d0,d2,d2] or [d1,d1,d3,d3].
+            let mask = Self::lane_shuffle_mask(32, |j| (j & !1) + u32::from(odd));
+            let r = self.vec_shuffle(src, src, mask);
+            self.set_xmm_vec(dst_idx, r);
+            return Ok(());
+        }
+
         let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
 
         let mut halves = [src_lo, src_hi];

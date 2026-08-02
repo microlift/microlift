@@ -16,6 +16,7 @@ pub mod setcc;
 pub mod softfloat;
 pub mod sse;
 pub mod sse_int;
+pub mod sse_vec;
 pub mod syscall;
 pub mod unimplemented;
 
