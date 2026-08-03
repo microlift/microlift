@@ -102,6 +102,23 @@ pub trait GuestArch: Sized {
         crate::cfg::ResolvedTargets::default()
     }
 
+    /// **Experimental.** Recover the successors of indirect branches in `bytes`
+    /// (mapped at `base`) by recognising compiler-emitted jump tables and
+    /// reading them out of `segments`. Keyed by the address of the branch.
+    ///
+    /// Only consulted when
+    /// [`LifterConfig::analyze_jump_tables`](LifterConfig::analyze_jump_tables)
+    /// is set. Results are used purely to *add* block leaders, so a wrong answer
+    /// costs dead code and never correctness - see
+    /// [`crate::arch::x86_64::jumptable`], the one implementation.
+    fn jump_table_targets(
+        _bytes: &[u8],
+        _base: u64,
+        _segments: &[crate::context::MemorySegment],
+    ) -> HashMap<u64, Vec<u64>> {
+        HashMap::new()
+    }
+
     // --- per-instruction lift + state sync (delegate to inherent methods) ---
     fn lift_instruction(lifter: &mut LiftEngine<'_, Self>, i: &Self::Instr) -> crate::Result<()>;
     fn load_state_from_context(lifter: &mut LiftEngine<'_, Self>) -> crate::Result<()>;
@@ -450,6 +467,26 @@ pub struct LifterConfig {
     pub segments: Vec<MemorySegment>,
     pub interpreter_fallback: bool,
     pub emit_resume_blocks: bool,
+    /// **Experimental.** Before emitting IR, try to recover the successors of
+    /// each indirect branch from a compiler-emitted jump table, using
+    /// [`segments`](Self::segments) as the backing store the table is read from
+    /// (the lifted region itself is always readable, so an in-function table
+    /// needs no segment at all).
+    ///
+    /// A `switch` compiled by Clang otherwise costs a VM exit on every
+    /// dispatch: `JMP reg` contributes no static targets, so the case blocks
+    /// never become leaders, never get lifted, and the runtime dispatch switch
+    /// has nothing to match. With this on, the recovered targets are added to
+    /// the leader set and the existing dispatch covers them - the
+    /// [`ExitReason::UnknownJump`] stub survives only as the default arm, for
+    /// targets the analysis did not predict.
+    ///
+    /// Recovered targets are only ever *added* as leaders, and dispatch still
+    /// happens on the address the guest computes at run time, so a mispredicted
+    /// entry lifts unreachable code rather than producing wrong code. Off by
+    /// default because the pattern matching is heuristic and the extra blocks
+    /// are not free. See [`crate::arch::x86_64::jumptable`].
+    pub analyze_jump_tables: bool,
     /// Statically registered import addresses.
     ///
     /// Key: virtual address of the imported function as it appears in the code
@@ -528,6 +565,7 @@ impl Default for LifterConfig {
             segments: Vec::new(),
             interpreter_fallback: false,
             emit_resume_blocks: false,
+            analyze_jump_tables: false,
             imports: HashMap::new(),
             import_registry: None,
             indirect_call_bridge: None,
@@ -663,6 +701,11 @@ pub struct LiftEngine<'a, A: GuestArch = crate::arch::x86_64::X86_64> {
     /// One `FuncRef` per helper symbol, so repeated sites share one call
     /// target (and one entry in [`Self::helpers`]).
     helper_refs: HashMap<&'static str, FuncRef>,
+    /// Successors recovered from jump tables during phase 1, keyed by the
+    /// address of the indirect branch they dispatch. Empty unless
+    /// [`LifterConfig::analyze_jump_tables`] is set. Recorded for inspection -
+    /// leader discovery has already consumed it by the time the lift returns.
+    pub jump_tables: HashMap<u64, Vec<u64>>,
 }
 
 /// A helper under construction: its body plus the `UserExternalName` slot whose
@@ -751,6 +794,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             analysis_call_sig: None,
             helpers: Vec::new(),
             helper_refs: HashMap::new(),
+            jump_tables: HashMap::new(),
         }
     }
 
@@ -1139,6 +1183,21 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             decoded.entry(A::instr_ip(&inst)).or_insert(inst);
         }
 
+        // Experimental: recover jump-table successors so an indirect branch
+        // contributes leaders instead of dead-ending at a VM exit. Run over the
+        // whole region up front - the dispatch sequences it matches are
+        // straight-line, so the linear view it works from is enough, and one
+        // pass is cheaper than re-matching per branch inside the worklist.
+        if self.config.analyze_jump_tables {
+            self.jump_tables = A::jump_table_targets(bytes, ip, &self.config.segments);
+            if self.jump_tables.len() > 0 {
+                println!("tables: {}", self.jump_tables.len());
+                for table in &self.jump_tables {
+                    println!("possible jumps: {}", table.1.len());
+                }
+            }
+        }
+
         let mut leaders: HashSet<u64> = HashSet::from([ip]);
         let mut work: Vec<u64> = decoded.keys().copied().collect();
         work.push(ip);
@@ -1207,7 +1266,21 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                     leaders.insert(next);
                     work.push(next);
                 }
-                ControlFlowKind::Ret | ControlFlowKind::IndirectBranch => {}
+                ControlFlowKind::Ret => {}
+                ControlFlowKind::IndirectBranch => {
+                    // Normally a dead end for discovery. If the jump-table pass
+                    // resolved this branch, its in-region targets are leaders
+                    // like any other branch target; out-of-region ones stay the
+                    // host's problem and keep the exit path they already had.
+                    if let Some(targets) = self.jump_tables.get(&addr) {
+                        for &t in targets {
+                            if t >= self.lift_base && t < self.lift_end {
+                                leaders.insert(t);
+                                work.push(t);
+                            }
+                        }
+                    }
+                }
             }
         }
 

@@ -197,6 +197,13 @@ impl<'a> LiftTest<'a> {
         self
     }
 
+    /// Enable the experimental jump-table recovery pass
+    /// ([`LifterConfig::analyze_jump_tables`]).
+    pub fn analyze_jump_tables(mut self) -> Self {
+        self.config.analyze_jump_tables = true;
+        self
+    }
+
     /// Set the guest stack size in 64-bit words.
     pub fn stack_words(mut self, n: usize) -> Self {
         self.stack_words = n;

@@ -5,6 +5,7 @@
 pub mod abi;
 pub mod context;
 pub mod decode;
+pub mod jumptable;
 pub mod regs;
 pub mod semantics;
 pub mod sync;
@@ -91,6 +92,17 @@ impl GuestArch for X86_64 {
         segments: &[crate::context::MemorySegment],
     ) -> crate::cfg::ResolvedTargets {
         crate::vsa::resolved_indirect_targets(bytes, base, segments)
+    }
+
+    fn jump_table_targets(
+        bytes: &[u8],
+        base: u64,
+        segments: &[crate::context::MemorySegment],
+    ) -> std::collections::HashMap<u64, Vec<u64>> {
+        jumptable::analyze_jump_tables(bytes, base, segments)
+            .into_iter()
+            .map(|(ip, table)| (ip, table.targets))
+            .collect()
     }
 
     fn lift_instruction(lifter: &mut LiftEngine<'_, Self>, i: &Self::Instr) -> crate::Result<()> {

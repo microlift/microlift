@@ -40,6 +40,10 @@ name = "bridge_tests"
 required-features = ["testkit"]
 
 [[test]]
+name = "jump_table_tests"
+required-features = ["testkit"]
+
+[[test]]
 name = "arithmetic_tests"
 required-features = ["testkit"]
 
