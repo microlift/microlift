@@ -21,7 +21,7 @@
 //! scalar one. See [`sse_vec`](super::sse_vec).
 
 use crate::MicroliftError;
-use crate::arch::x86_64::semantics::helpers::size_to_type;
+use crate::arch::x86_64::semantics::helpers::{size_to_type, xmm_register_index};
 use crate::arch::x86_64::semantics::sse::PackedWidth;
 use crate::arch::x86_64::semantics::sse_vec::B;
 use crate::lifter::{Lifter, X86Flag};
@@ -768,6 +768,114 @@ impl<'a> Lifter<'a> {
         } else {
             self.set_xmm_lo(dst_idx, merged);
         }
+        Ok(())
+    }
+
+    /// INSERTPS - insert one dword from an XMM register or a 32-bit memory
+    /// operand, then zero the destination lanes selected by `imm8[3:0]`.
+    ///
+    /// For a register source, `imm8[7:6]` selects the source dword.  Memory
+    /// operands contain only one dword, so those bits have no effect.
+    pub(super) fn handle_insertps(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, "insertps")?;
+        let imm = instruction.immediate8();
+        let src_sel = u32::from(imm >> 6);
+        let dst_sel = u32::from((imm >> 4) & 0b11);
+        let zero_mask = imm & 0x0f;
+
+        if self.vec_mode() {
+            let dst_vec = self.get_xmm_vec(dst_idx);
+            let dst = self.vec_bitcast(dst_vec, types::I32X4);
+            let src = match self.operand_kind(instruction, 1) {
+                OpKind::Register => {
+                    let src_reg = self.operand_register(instruction, 1);
+                    let src_idx = xmm_register_index(src_reg).ok_or_else(|| {
+                        MicroliftError::UnsupportedInstruction {
+                            mnemonic: "insertps-source".to_string(),
+                        }
+                    })?;
+                    let src_vec = self.get_xmm_vec(src_idx);
+                    self.vec_bitcast(src_vec, types::I32X4)
+                }
+                OpKind::Memory => {
+                    let value = self.read_scalar_src(instruction, 1, 32, "insertps")?;
+                    let value = self.builder.ins().ireduce(types::I32, value);
+                    self.builder.ins().scalar_to_vector(types::I32X4, value)
+                }
+                other => {
+                    return Err(MicroliftError::UnsupportedInstruction {
+                        mnemonic: format!("insertps-src-{:?}", other),
+                    });
+                }
+            };
+
+            let value = self.builder.ins().extractlane(src, src_sel as u8);
+            let zero = self.builder.ins().iconst(types::I32, 0);
+            let mut result = dst;
+            for lane in 0..4u8 {
+                let lane_value = if zero_mask & (1 << lane) != 0 {
+                    zero
+                } else if lane == dst_sel as u8 {
+                    value
+                } else {
+                    self.builder.ins().extractlane(result, lane)
+                };
+                result = self.builder.ins().insertlane(result, lane_value, lane);
+            }
+            let result = self.vec_bitcast(result, types::I64X2);
+            self.set_xmm_vec(dst_idx, result);
+            return Ok(());
+        }
+
+        let src = match self.operand_kind(instruction, 1) {
+            OpKind::Register => {
+                let src_reg = self.operand_register(instruction, 1);
+                let src_idx = xmm_register_index(src_reg).ok_or_else(|| {
+                    MicroliftError::UnsupportedInstruction {
+                        mnemonic: "insertps-source".to_string(),
+                    }
+                })?;
+                let half = if src_sel < 2 {
+                    self.get_xmm_lo(src_idx)
+                } else {
+                    self.get_xmm_hi(src_idx)
+                };
+                let shift = i64::from((src_sel & 1) * 32);
+                let shifted = self.builder.ins().ushr_imm_u(half, shift);
+                self.builder.ins().ireduce(types::I32, shifted)
+            }
+            OpKind::Memory => {
+                let value = self.read_scalar_src(instruction, 1, 32, "insertps")?;
+                self.builder.ins().ireduce(types::I32, value)
+            }
+            other => {
+                return Err(MicroliftError::UnsupportedInstruction {
+                    mnemonic: format!("insertps-src-{:?}", other),
+                });
+            }
+        };
+
+        let dst_lo = self.get_xmm_lo(dst_idx);
+        let dst_hi = self.get_xmm_hi(dst_idx);
+        let mut lanes = [self.split_dwords(dst_lo), self.split_dwords(dst_hi)];
+        for lane in 0..4u8 {
+            if zero_mask & (1 << lane) != 0 {
+                lanes[(lane / 2) as usize].0 = self.builder.ins().iconst(types::I32, 0);
+                if lane % 2 != 0 {
+                    lanes[(lane / 2) as usize].1 = self.builder.ins().iconst(types::I32, 0);
+                }
+            } else if lane == dst_sel as u8 {
+                if lane % 2 == 0 {
+                    lanes[(lane / 2) as usize].0 = src;
+                } else {
+                    lanes[(lane / 2) as usize].1 = src;
+                }
+            }
+        }
+        let result_lo = self.pack_dwords(lanes[0].0, lanes[0].1);
+        let result_hi = self.pack_dwords(lanes[1].0, lanes[1].1);
+        self.set_xmm_lo(dst_idx, result_lo);
+        self.set_xmm_hi(dst_idx, result_hi);
         Ok(())
     }
 

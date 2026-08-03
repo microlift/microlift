@@ -3397,6 +3397,46 @@ fn test_pinsrw_vector_mode() {
     assert_eq!(ctx.xmm[0], [0x1111_2222_3333_4444, 0xABCD_6666_7777_8888]);
 }
 
+//  INSERTPS
+
+#[test]
+fn test_insertps_selects_source_and_destination_lanes() {
+    // insertps xmm0, xmm1, 0xB5; ret
+    // source lane 2 -> destination lane 3; zero destination lanes 0 and 2.
+    let bytes = [0x66, 0x0F, 0x3A, 0x21, 0xC1, 0xB5, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [0x3333_3333_2222_2222, 0x5555_5555_4444_4444];
+    ctx.xmm[1] = [0xBBBB_BBBB_AAAA_AAAA, 0xDDDD_DDDD_CCCC_CCCC];
+    let out = run_test(&bytes, ctx);
+    assert_eq!(out.xmm[0], [0x3333_3333_0000_0000, 0xCCCC_CCCC_0000_0000]);
+}
+
+#[test]
+fn test_insertps_zero_mask_overrides_insert_and_vector_mode_agrees() {
+    // Source lane 1 -> destination lane 2, but bit 2 of the zero mask clears
+    // that destination lane after the insert.
+    let bytes = [0x66, 0x0F, 0x3A, 0x21, 0xC1, 0x64, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [0x3333_3333_2222_2222, 0x5555_5555_4444_4444];
+    ctx.xmm[1] = [0xBBBB_BBBB_AAAA_AAAA, 0xDDDD_DDDD_CCCC_CCCC];
+    let scalar = run_test(&bytes, ctx);
+    let vector = run_test_vec(&bytes, ctx);
+    assert_eq!(scalar.xmm[0], [0x3333_3333_2222_2222, 0x5555_5555_0000_0000]);
+    assert_eq!(scalar.xmm, vector.xmm);
+}
+
+#[test]
+fn test_insertps_memory_source_reads_one_dword() {
+    // insertps xmm0, [rax], 0x10; ret -> memory dword into destination lane 1.
+    let bytes = [0x66, 0x0F, 0x3A, 0x21, 0x00, 0x10, 0xC3];
+    let mem = [0xAABB_CCDD_u32, 0xEEEE_FFFF];
+    let mut ctx = RegisterContext::default();
+    ctx.rax = mem.as_ptr() as u64;
+    ctx.xmm[0] = [0x3333_3333_2222_2222, 0x5555_5555_4444_4444];
+    let out = run_test(&bytes, ctx);
+    assert_eq!(out.xmm[0], [0xAABB_CCDD_2222_2222, 0x5555_5555_4444_4444]);
+}
+
 //  RCPPS / RSQRTPS / RCPSS / RSQRTSS - approximate, so compared with a
 //  tolerance well inside the architectural 1.5 * 2^-12 relative error bound.
 

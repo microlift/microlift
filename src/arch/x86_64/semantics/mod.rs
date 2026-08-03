@@ -496,6 +496,7 @@ impl<'a> Lifter<'a> {
             Mnemonic::Pinsrw => self.handle_pinsr(instruction, PackedWidth::Word),
             Mnemonic::Pinsrd => self.handle_pinsr(instruction, PackedWidth::Dword),
             Mnemonic::Pinsrq => self.handle_pinsr(instruction, PackedWidth::Qword),
+            Mnemonic::Insertps => self.handle_insertps(instruction),
             Mnemonic::Pextrb => self.handle_pextr(instruction, PackedWidth::Byte),
             Mnemonic::Pextrw => self.handle_pextr(instruction, PackedWidth::Word),
             Mnemonic::Pextrd => self.handle_pextr(instruction, PackedWidth::Dword),

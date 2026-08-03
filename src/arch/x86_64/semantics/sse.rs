@@ -2500,7 +2500,7 @@ impl<'a> Lifter<'a> {
     //  compares and approximate reciprocals compilers emit around them.
 
     /// Split a 64-bit XMM half into its two dwords, as `I32` values.
-    fn split_dwords(&mut self, half: Value) -> (Value, Value) {
+    pub(super) fn split_dwords(&mut self, half: Value) -> (Value, Value) {
         let d0 = self.builder.ins().ireduce(types::I32, half);
         let upper = self.builder.ins().ushr_imm_u(half, 32);
         let d1 = self.builder.ins().ireduce(types::I32, upper);
@@ -2508,7 +2508,7 @@ impl<'a> Lifter<'a> {
     }
 
     /// Pack two `I32` dwords into a 64-bit XMM half (`d0` becomes bits[31:0]).
-    fn pack_dwords(&mut self, d0: Value, d1: Value) -> Value {
+    pub(super) fn pack_dwords(&mut self, d0: Value, d1: Value) -> Value {
         let d0 = self.builder.ins().uextend(types::I64, d0);
         let d1 = self.builder.ins().uextend(types::I64, d1);
         let d1 = self.builder.ins().ishl_imm_u(d1, 32);
