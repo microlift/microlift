@@ -1236,12 +1236,6 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         // pass is cheaper than re-matching per branch inside the worklist.
         if self.config.analyze_jump_tables {
             self.jump_tables = A::jump_table_targets(bytes, ip, &self.config.segments);
-            if self.jump_tables.len() > 0 {
-                println!("tables: {}", self.jump_tables.len());
-                for table in &self.jump_tables {
-                    println!("possible jumps: {}", table.1.len());
-                }
-            }
         }
 
         let mut leaders: HashSet<u64> = HashSet::from([ip]);
