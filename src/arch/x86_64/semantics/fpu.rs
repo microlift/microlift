@@ -24,7 +24,7 @@
 
 use crate::MicroliftError;
 use crate::arch::x86_64::context::RegisterContext;
-use crate::arch::x86_64::semantics::softfloat;
+use crate::arch::x86_64::semantics::softfloat::{self, F80Kernel};
 use crate::lifter::{Lifter, X86Flag};
 use cranelift::prelude::*;
 use iced_x86::{Instruction, MemorySize, OpKind};
@@ -735,6 +735,46 @@ impl<'a> Lifter<'a> {
         }
     }
 
+    /// Emit one softfloat kernel over raw 80-bit operands, as a call to the
+    /// shared helper function or - when outlining is off - inline at this site.
+    ///
+    /// Both paths run the identical `emit_f80_*` builder; the helper body is
+    /// just that builder wrapped in its own function (see [`F80Kernel`]).
+    fn f80_kernel(&mut self, kernel: F80Kernel, args: &[Value]) -> Vec<Value> {
+        if !self.outline_helpers() {
+            let b = &mut self.builder;
+            let (m, se) = match kernel {
+                F80Kernel::Add => softfloat::emit_f80_add(b, args[0], args[1], args[2], args[3]),
+                F80Kernel::Sub => softfloat::emit_f80_sub(b, args[0], args[1], args[2], args[3]),
+                F80Kernel::Mul => softfloat::emit_f80_mul(b, args[0], args[1], args[2], args[3]),
+                F80Kernel::Div => softfloat::emit_f80_div(b, args[0], args[1], args[2], args[3]),
+                F80Kernel::Sqrt => softfloat::emit_f80_sqrt(b, args[0], args[1]),
+                F80Kernel::Cmp => {
+                    let (unord, eq, lt) =
+                        softfloat::emit_f80_cmp(b, args[0], args[1], args[2], args[3]);
+                    return vec![unord, eq, lt];
+                }
+            };
+            return vec![m, se];
+        }
+
+        // The helper shares the lifted function's calling convention, so the
+        // call needs no ABI bridging.
+        let call_conv = self.builder.func.signature.call_conv;
+        let func_ref = self.outlined_helper(kernel.symbol(), kernel.signature(call_conv), |b| {
+            kernel.build_body(b)
+        });
+        let call = self.builder.ins().call(func_ref, args);
+        self.builder.inst_results(call).to_vec()
+    }
+
+    /// [`f80_kernel`](Self::f80_kernel) for the kernels returning one 80-bit
+    /// value.
+    fn f80_value_kernel(&mut self, kernel: F80Kernel, args: &[Value]) -> F80 {
+        let r = self.f80_kernel(kernel, args);
+        (r[0], r[1])
+    }
+
     /// FADD/FSUB/FSUBR/FMUL/FDIV/FDIVR and their `...P` popping variants, all via
     /// the bit-exact 80-bit software kernels.
     pub(super) fn handle_farith(
@@ -744,15 +784,18 @@ impl<'a> Lifter<'a> {
         pop: bool,
     ) -> crate::Result<()> {
         let (dst_idx, (dm, dse), (sm, sse)) = self.fpu_binop_operands_raw(instruction)?;
-        let bld = &mut self.builder;
-        let (rm, rse) = match op {
-            FpuOp::Add => softfloat::emit_f80_add(bld, dm, dse, sm, sse),
-            FpuOp::Sub => softfloat::emit_f80_sub(bld, dm, dse, sm, sse),
-            FpuOp::Subr => softfloat::emit_f80_sub(bld, sm, sse, dm, dse),
-            FpuOp::Mul => softfloat::emit_f80_mul(bld, dm, dse, sm, sse),
-            FpuOp::Div => softfloat::emit_f80_div(bld, dm, dse, sm, sse),
-            FpuOp::Divr => softfloat::emit_f80_div(bld, sm, sse, dm, dse),
+        // The reverse forms swap the operands rather than needing their own
+        // kernel - `a - b` and `b - a` are the same code with the arguments
+        // exchanged, so both share one helper.
+        let (kernel, args) = match op {
+            FpuOp::Add => (F80Kernel::Add, [dm, dse, sm, sse]),
+            FpuOp::Sub => (F80Kernel::Sub, [dm, dse, sm, sse]),
+            FpuOp::Subr => (F80Kernel::Sub, [sm, sse, dm, dse]),
+            FpuOp::Mul => (F80Kernel::Mul, [dm, dse, sm, sse]),
+            FpuOp::Div => (F80Kernel::Div, [dm, dse, sm, sse]),
+            FpuOp::Divr => (F80Kernel::Div, [sm, sse, dm, dse]),
         };
+        let (rm, rse) = self.f80_value_kernel(kernel, &args);
         self.fpu_write_st_raw(dst_idx, rm, rse);
         if pop {
             self.fpu_pop();
@@ -779,7 +822,7 @@ impl<'a> Lifter<'a> {
     /// FSQRT - square root of `ST(0)` (bit-exact 80-bit).
     pub(super) fn handle_fsqrt(&mut self, _instruction: &Instruction) -> crate::Result<()> {
         let (m, se) = self.fpu_read_st_raw(0);
-        let (rm, rse) = softfloat::emit_f80_sqrt(&mut self.builder, m, se);
+        let (rm, rse) = self.f80_value_kernel(F80Kernel::Sqrt, &[m, se]);
         self.fpu_write_st_raw(0, rm, rse);
         Ok(())
     }
@@ -792,7 +835,8 @@ impl<'a> Lifter<'a> {
         a: (Value, Value),
         b: (Value, Value),
     ) -> (Value, Value, Value) {
-        softfloat::emit_f80_cmp(&mut self.builder, a.0, a.1, b.0, b.1)
+        let r = self.f80_kernel(F80Kernel::Cmp, &[a.0, a.1, b.0, b.1]);
+        (r[0], r[1], r[2])
     }
 
     /// Resolve the raw 80-bit source (and its stack index, if any) of a compare.

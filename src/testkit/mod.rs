@@ -1,6 +1,6 @@
 //! Shared integration-test / fuzz / bench harness.
 //! This module centralizes that pattern behind a small builder API. It is a
-//! thin wrapper over the library's own [`lift_to_function`] entry point plus
+//! thin wrapper over the library's own [`lift_to_code`] entry point plus
 //! [`CraneliftBackend`] - it does not re-implement lifting.
 //!
 //! ```no_run
@@ -18,7 +18,7 @@
 use crate::arch::x86_64::X86_64;
 use crate::backend::CraneliftBackend;
 use crate::context::{ExitReason, MemorySegment, RegisterContext};
-use crate::core::{AddressMode, ExecutionMode, LifterConfig, lift_to_function};
+use crate::core::{AddressMode, ExecutionMode, LifterConfig, lift_to_code};
 use cranelift_codegen::settings::{self, Configurable};
 
 pub mod oracle;
@@ -244,12 +244,12 @@ impl<'a> LiftTest<'a> {
 
     /// Lift and compile, but do not run. Returns a ready-to-enter [`Harness`].
     pub fn compile(self) -> Result<Harness, TestError> {
-        let func = lift_to_function::<X86_64>(self.bytes, self.ip, self.config)
-            .map_err(TestError::Lift)?;
+        let code =
+            lift_to_code::<X86_64>(self.bytes, self.ip, self.config).map_err(TestError::Lift)?;
 
         let mut backend =
             CraneliftBackend::with_flags(self.opt.flags(), &[]).map_err(TestError::Compile)?;
-        let code_ptr = backend.compile(func).map_err(TestError::Compile)?;
+        let code_ptr = backend.compile_lifted(code).map_err(TestError::Compile)?;
 
         // The guest stack is a heap `Vec`; its backing allocation address is
         // stable across moves (only the handle moves), so `rsp` remains valid

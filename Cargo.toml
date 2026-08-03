@@ -152,3 +152,7 @@ required-features = ["fuzzing"]
 [[test]]
 name = "sse_vec_equiv_tests"
 required-features = ["testkit"]
+
+[[test]]
+name = "softfloat_outline_tests"
+required-features = ["testkit"]

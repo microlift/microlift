@@ -1,4 +1,5 @@
 use crate::Result;
+use crate::core::{HelperFunction, LiftedCode};
 use cranelift::prelude::*;
 use cranelift_codegen::ir::Function;
 use cranelift_codegen::settings::Configurable;
@@ -19,6 +20,59 @@ use target_lexicon::Triple;
 ///   the symbol; AOT backends only need the name and signature.
 /// - `signature` - the Cranelift calling-convention signature for the function.
 pub type AotImport = (&'static str, *const u8, Signature);
+
+/// A helper that has been declared but not yet compiled - see
+/// [`declare_externals`] / [`define_helpers`].
+type PendingHelper = (cranelift_module::FuncId, Function);
+
+/// Declare the ordered namespace-0 external functions a [`LiftedCode`]
+/// references, *before* the lifted function itself is declared.
+///
+/// The IR reaches both kinds through `ExternalName::user(0, i)` over one dense
+/// index space: imports occupy `0..imports.len()`, helpers continue from there.
+/// Module `FuncId`s are handed out in declaration order, so declaring them here
+/// in that same order is what makes `FuncId(i) == i` hold.
+///
+/// Helper *bodies* are not compiled here - the returned list goes to
+/// [`define_helpers`] after the lifted function has been defined, which keeps
+/// `lifted_func` first in the emitted `.text` (what
+/// [`ArtifactBackend::compile_to_raw`] hands back as raw code).
+///
+/// The module must be fresh: helper symbols are per-body, so compiling two
+/// lifted regions into one module would redefine them (and shift the index
+/// space out from under the second region's IR).
+fn declare_externals<M: Module>(
+    module: &mut M,
+    imports: &[AotImport],
+    helpers: Vec<HelperFunction>,
+) -> Result<Vec<PendingHelper>> {
+    for &(name, _, ref sig) in imports {
+        module
+            .declare_function(name, Linkage::Import, sig)
+            .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
+    }
+
+    helpers
+        .into_iter()
+        .map(|helper| {
+            let id = module
+                .declare_function(helper.name, Linkage::Local, &helper.func.signature)
+                .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
+            Ok((id, helper.func))
+        })
+        .collect()
+}
+
+/// Compile the helper bodies [`declare_externals`] set aside.
+fn define_helpers<M: Module>(module: &mut M, pending: Vec<PendingHelper>) -> Result<()> {
+    for (id, func) in pending {
+        let mut ctx = cranelift_codegen::Context::for_function(func);
+        module
+            .define_function(id, &mut ctx)
+            .map_err(|e| crate::MicroliftError::CraneliftError(format!("{e:?}")))?;
+    }
+    Ok(())
+}
 
 #[cfg(feature = "disasm")]
 use capstone::prelude::*;
@@ -71,9 +125,27 @@ impl CraneliftBackend {
         Ok(Self { module })
     }
 
-    pub fn compile(&mut self, func: Function) -> Result<*const u8> {
+    /// JIT-compile a full [`LiftedCode`] - the lifted region plus any outlined
+    /// helper functions it calls (the x87 softfloat kernels).
+    ///
+    /// This is the entry point for `Jit`-mode output, and the one to use when
+    /// the region may contain x87 code; [`compile`](Self::compile) takes a bare
+    /// `Function` and so cannot carry helper bodies.
+    ///
+    /// `code.imports` must be empty: a `RuntimeAssisted` region's imports need
+    /// their symbol addresses registered when the module is *built*, which this
+    /// backend's module already was - use
+    /// [`compile_lifted_with_fast_imports`](Self::compile_lifted_with_fast_imports).
+    pub fn compile_lifted(&mut self, code: LiftedCode) -> Result<*const u8> {
+        if !code.imports.is_empty() {
+            return Err(crate::MicroliftError::CraneliftError(
+                "lifted code has relocatable imports; use compile_lifted_with_fast_imports".into(),
+            ));
+        }
+        let pending = declare_externals(&mut self.module, &[], code.helpers)?;
+
         let mut ctx = self.module.make_context();
-        ctx.func = func;
+        ctx.func = code.func;
 
         let id = self
             .module
@@ -83,14 +155,27 @@ impl CraneliftBackend {
         self.module
             .define_function(id, &mut ctx)
             .map_err(|e| crate::MicroliftError::CraneliftError(format!("{e:?}")))?;
-
         self.module.clear_context(&mut ctx);
+
+        define_helpers(&mut self.module, pending)?;
         self.module
             .finalize_definitions()
             .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
 
-        let code = self.module.get_finalized_function(id);
-        Ok(code)
+        Ok(self.module.get_finalized_function(id))
+    }
+
+    /// JIT-compile a single lifted `Function`.
+    ///
+    /// Note this cannot carry outlined helpers; see
+    /// [`compile_lifted`](Self::compile_lifted).
+    pub fn compile(&mut self, func: Function) -> Result<*const u8> {
+        self.compile_lifted(LiftedCode {
+            func,
+            imports: Vec::new(),
+            helpers: Vec::new(),
+            analysis_call_targets: Vec::new(),
+        })
     }
 
     /// JIT-compile a `RuntimeAssisted`-mode function that uses relocatable
@@ -109,30 +194,46 @@ impl CraneliftBackend {
         flags: settings::Flags,
         isa_settings: &[(&str, &str)],
     ) -> Result<*const u8> {
+        Self::compile_lifted_with_fast_imports(
+            LiftedCode {
+                func,
+                imports: imports.to_vec(),
+                helpers: Vec::new(),
+                analysis_call_targets: Vec::new(),
+            },
+            flags,
+            isa_settings,
+        )
+    }
+
+    /// [`compile_with_fast_imports`](Self::compile_with_fast_imports) for a full
+    /// [`LiftedCode`], so a `RuntimeAssisted` region may also carry outlined
+    /// helper functions.
+    pub fn compile_lifted_with_fast_imports(
+        code: LiftedCode,
+        flags: settings::Flags,
+        isa_settings: &[(&str, &str)],
+    ) -> Result<*const u8> {
         let isa = Self::native_isa(flags, isa_settings)?;
 
         let mut jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
-        for &(name, ptr, _) in imports {
+        for &(name, ptr, _) in &code.imports {
             jit_builder.symbol(name, ptr);
         }
         let mut module = JITModule::new(jit_builder);
 
-        // Declare imports first so FuncId(i) == index i in the `imports` slice,
-        // matching ExternalName::user(0, i) baked into the IR.
-        for &(name, _, ref sig) in imports {
-            module
-                .declare_function(name, Linkage::Import, sig)
-                .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
-        }
+        let pending = declare_externals(&mut module, &code.imports, code.helpers)?;
 
         let mut ctx = module.make_context();
-        ctx.func = func;
+        ctx.func = code.func;
         let id = module
             .declare_function("lifted_func", Linkage::Export, &ctx.func.signature)
             .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
         module
             .define_function(id, &mut ctx)
             .map_err(|e| crate::MicroliftError::CraneliftError(format!("{e:?}")))?;
+
+        define_helpers(&mut module, pending)?;
         module
             .finalize_definitions()
             .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
@@ -202,27 +303,45 @@ impl ArtifactBackend {
         flags: Option<settings::Flags>,
         isa_settings: &[(&str, &str)],
     ) -> Result<Vec<u8>> {
+        Self::compile_lifted_to_object(
+            LiftedCode {
+                func,
+                imports: imports.to_vec(),
+                helpers: Vec::new(),
+                analysis_call_targets: Vec::new(),
+            },
+            triple,
+            flags,
+            isa_settings,
+        )
+    }
+
+    /// Compile a full [`LiftedCode`] to a relocatable object file: the lifted
+    /// function, named relocations for its fast-call imports, and a local
+    /// definition of every outlined helper it calls.
+    pub fn compile_lifted_to_object(
+        code: LiftedCode,
+        triple: Option<&str>,
+        flags: Option<settings::Flags>,
+        isa_settings: &[(&str, &str)],
+    ) -> Result<Vec<u8>> {
         let isa = Self::get_isa(triple, flags, isa_settings)?;
         let obj_builder =
             ObjectBuilder::new(isa, "lifted", cranelift_module::default_libcall_names())
                 .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
         let mut module = ObjectModule::new(obj_builder);
 
-        // Declare imports first so FuncId(i) == index i in the `imports` slice,
-        // matching ExternalName::user(0, i) baked into the IR.
-        for &(name, _, ref sig) in imports {
-            module
-                .declare_function(name, Linkage::Import, sig)
-                .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
-        }
+        let pending = declare_externals(&mut module, &code.imports, code.helpers)?;
 
-        let mut ctx = cranelift_codegen::Context::for_function(func);
+        let mut ctx = cranelift_codegen::Context::for_function(code.func);
         let id = module
             .declare_function("lifted_func", Linkage::Export, &ctx.func.signature)
             .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
         module
             .define_function(id, &mut ctx)
             .map_err(|e| crate::MicroliftError::CraneliftError(format!("{e:?}")))?;
+
+        define_helpers(&mut module, pending)?;
 
         let product = module.finish();
         product
@@ -235,26 +354,17 @@ impl ArtifactBackend {
         triple: Option<&str>,
         flags: Option<settings::Flags>,
     ) -> Result<Vec<u8>> {
-        let isa = Self::get_isa(triple, flags, &[])?;
-        let obj_builder =
-            ObjectBuilder::new(isa, "lifted", cranelift_module::default_libcall_names())
-                .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
-
-        let mut module = ObjectModule::new(obj_builder);
-        let mut ctx = cranelift_codegen::Context::for_function(func);
-
-        let id = module
-            .declare_function("lifted_func", Linkage::Export, &ctx.func.signature)
-            .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
-
-        module
-            .define_function(id, &mut ctx)
-            .map_err(|e| crate::MicroliftError::CraneliftError(format!("{e:?}")))?;
-
-        let product = module.finish();
-        Ok(product
-            .emit()
-            .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?)
+        Self::compile_lifted_to_object(
+            LiftedCode {
+                func,
+                imports: Vec::new(),
+                helpers: Vec::new(),
+                analysis_call_targets: Vec::new(),
+            },
+            triple,
+            flags,
+            &[],
+        )
     }
 
     pub fn compile_to_raw(
@@ -262,7 +372,31 @@ impl ArtifactBackend {
         triple: Option<&str>,
         flags: Option<settings::Flags>,
     ) -> Result<Vec<u8>> {
-        let obj_bytes = Self::compile_to_object(func, triple, flags)?;
+        Self::compile_lifted_to_raw(
+            LiftedCode {
+                func,
+                imports: Vec::new(),
+                helpers: Vec::new(),
+                analysis_call_targets: Vec::new(),
+            },
+            triple,
+            flags,
+        )
+    }
+
+    /// [`compile_to_raw`](Self::compile_to_raw) for a full [`LiftedCode`].
+    ///
+    /// Note the extracted `.text` holds the outlined helper bodies as well as
+    /// the lifted function, and the object's symbol table - which says where
+    /// each begins - is what raw extraction throws away. Prefer
+    /// [`compile_lifted_to_object`](Self::compile_lifted_to_object) when the
+    /// region has helpers.
+    pub fn compile_lifted_to_raw(
+        code: LiftedCode,
+        triple: Option<&str>,
+        flags: Option<settings::Flags>,
+    ) -> Result<Vec<u8>> {
+        let obj_bytes = Self::compile_lifted_to_object(code, triple, flags, &[])?;
         let obj = object::File::parse(&*obj_bytes)
             .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
 

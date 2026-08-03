@@ -9,9 +9,15 @@
 //! low bits.
 //!
 //! Writing them as free IR-builders (rather than `Lifter` methods) means the
-//! same body can later be emitted once into a co-located helper function and
-//! `call`ed, without changing the logic (see the "hoist to shared functions"
-//! follow-up).
+//! same body serves two emission strategies without changing the logic:
+//! *inline* at each x87 site, or emitted once into a co-located helper function
+//! that every site `call`s. [`F80Kernel`] names the outlinable kernels and
+//! builds those helper bodies; the engine's outlined-helper table
+//! ([`crate::core::LiftEngine::outlined_helper`]) declares and de-duplicates
+//! them. Outlining is the default - these kernels are hundreds of IR
+//! instructions each (the divide and square root contain 128-bit
+//! shift/subtract loops), so inlining them at every `FMUL`/`FDIV` in a region
+//! bloats the emitted code far past what the instruction cache tolerates.
 //!
 //! Scope and known approximations:
 //!  - Handles normal values, zero, infinity and NaN correctly for `+ - * /` and
@@ -24,6 +30,7 @@
 //!    input payloads bit-for-bit.
 
 use cranelift::prelude::*;
+use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::FunctionBuilder;
 
 const EXP_MAX: i64 = 0x7FFF;
@@ -836,4 +843,128 @@ pub fn emit_f80_cmp(
     let eq = b.ins().band(not_signs_diff, mag_eq);
 
     (unord, eq, lt)
+}
+
+// --- outlinable kernels --------------------------------------------------
+
+/// One 80-bit softfloat kernel, identified so it can be emitted **once** into a
+/// shared helper function and `call`ed from every x87 site that needs it.
+///
+/// The helper body is exactly the corresponding `emit_f80_*` above, wrapped in
+/// a function whose parameters and results are the same raw `(mant: i64,
+/// se: i32)` pairs those builders already take and return - so inline and
+/// outlined emission are bit-identical by construction, not by parallel
+/// maintenance.
+///
+/// Note `Sub` is its own kernel rather than a call into `Add` with a flipped
+/// sign: the sign flip is one `bxor`, so a separate `Subr` call site would pay
+/// a second call for nothing. `FSUBR`/`FDIVR` reuse the `Sub`/`Div` helpers
+/// with their arguments swapped at the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum F80Kernel {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Sqrt,
+    /// Ordered compare, returning the `(unordered, equal, less_than)` triple.
+    Cmp,
+}
+
+/// Every kernel, for callers that want to pre-emit or enumerate them.
+pub const F80_KERNELS: [F80Kernel; 6] = [
+    F80Kernel::Add,
+    F80Kernel::Sub,
+    F80Kernel::Mul,
+    F80Kernel::Div,
+    F80Kernel::Sqrt,
+    F80Kernel::Cmp,
+];
+
+impl F80Kernel {
+    /// The symbol the helper function is declared under. Kept stable and
+    /// namespaced: AOT output containing x87 code carries these as local
+    /// symbols, and two lifted regions linked together must share one copy.
+    pub fn symbol(self) -> &'static str {
+        match self {
+            F80Kernel::Add => "__microlift_f80_add",
+            F80Kernel::Sub => "__microlift_f80_sub",
+            F80Kernel::Mul => "__microlift_f80_mul",
+            F80Kernel::Div => "__microlift_f80_div",
+            F80Kernel::Sqrt => "__microlift_f80_sqrt",
+            F80Kernel::Cmp => "__microlift_f80_cmp",
+        }
+    }
+
+    /// Number of 80-bit operands the kernel takes (each is one `(mant, se)`
+    /// parameter pair).
+    fn operand_count(self) -> usize {
+        match self {
+            F80Kernel::Sqrt => 1,
+            _ => 2,
+        }
+    }
+
+    /// The helper's signature: one `(I64 mant, I32 se)` pair per operand, and
+    /// either an 80-bit result pair or - for [`F80Kernel::Cmp`] - the three
+    /// `I8` predicates.
+    ///
+    /// `call_conv` should match the calling function's, so a call needs no
+    /// convention bridging.
+    pub fn signature(self, call_conv: CallConv) -> Signature {
+        let mut sig = Signature::new(call_conv);
+        for _ in 0..self.operand_count() {
+            sig.params.push(AbiParam::new(types::I64));
+            sig.params.push(AbiParam::new(types::I32));
+        }
+        match self {
+            F80Kernel::Cmp => {
+                for _ in 0..3 {
+                    sig.returns.push(AbiParam::new(types::I8));
+                }
+            }
+            _ => {
+                sig.returns.push(AbiParam::new(types::I64));
+                sig.returns.push(AbiParam::new(types::I32));
+            }
+        }
+        sig
+    }
+
+    /// Emit the kernel's body into `b`, whose function must already have been
+    /// given [`signature`](Self::signature). Creates the entry block, runs the
+    /// matching `emit_f80_*` builder over the parameters, and returns its
+    /// results.
+    ///
+    /// The `emit_f80_*` builders create and seal their own internal blocks (the
+    /// division and square-root loops), and leave the builder positioned in the
+    /// block holding the result, which is where the `return` lands.
+    pub fn build_body(self, b: &mut FunctionBuilder) {
+        let entry = b.create_block();
+        b.append_block_params_for_function_params(entry);
+        b.switch_to_block(entry);
+        b.seal_block(entry);
+        let p: Vec<Value> = b.block_params(entry).to_vec();
+
+        match self {
+            F80Kernel::Cmp => {
+                let (unord, eq, lt) = emit_f80_cmp(b, p[0], p[1], p[2], p[3]);
+                b.ins().return_(&[unord, eq, lt]);
+            }
+            F80Kernel::Sqrt => {
+                let (m, se) = emit_f80_sqrt(b, p[0], p[1]);
+                b.ins().return_(&[m, se]);
+            }
+            _ => {
+                let (m, se) = match self {
+                    F80Kernel::Add => emit_f80_add(b, p[0], p[1], p[2], p[3]),
+                    F80Kernel::Sub => emit_f80_sub(b, p[0], p[1], p[2], p[3]),
+                    F80Kernel::Mul => emit_f80_mul(b, p[0], p[1], p[2], p[3]),
+                    F80Kernel::Div => emit_f80_div(b, p[0], p[1], p[2], p[3]),
+                    F80Kernel::Sqrt | F80Kernel::Cmp => unreachable!("handled above"),
+                };
+                b.ins().return_(&[m, se]);
+            }
+        }
+    }
 }

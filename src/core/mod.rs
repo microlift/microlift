@@ -20,7 +20,8 @@ use crate::function_traits::{DynamicSymbol, FunctionArgumentType};
 use crate::os::get_host_calling_conv;
 use cranelift::prelude::*;
 use cranelift_codegen::ir::{
-    ExtFuncData, ExternalName, FuncRef, Function, SigRef, UserExternalName, UserFuncName,
+    ExtFuncData, ExternalName, FuncRef, Function, SigRef, UserExternalName, UserExternalNameRef,
+    UserFuncName,
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch, Variable};
@@ -111,6 +112,83 @@ pub trait GuestArch: Sized {
     ) -> crate::Result<()>;
 }
 
+/// A helper function emitted *alongside* the lifted region rather than inlined
+/// into it - see [`LiftEngine::outlined_helper`].
+///
+/// It is a complete, self-contained Cranelift function that the lifted code
+/// reaches with an ordinary `call`. Backends must define it with
+/// [`Linkage::Local`](cranelift_module::Linkage::Local) *before* the lifted
+/// function, in the order [`LiftedCode::helpers`] lists them, so its
+/// `FuncId` matches the `ExternalName::user(0, i)` baked into the call.
+#[derive(Debug, Clone)]
+pub struct HelperFunction {
+    /// Symbol the helper is declared under. Unique per helper body.
+    pub name: &'static str,
+    /// The helper's IR.
+    pub func: Function,
+}
+
+/// Everything one lift produces: the region's own function plus the external
+/// functions it references.
+///
+/// The namespace-0 index space `ExternalName::user(0, i)` covers **both**
+/// lists, imports first: index `i < imports.len()` is `imports[i]`, and index
+/// `imports.len() + j` is `helpers[j]`. Backends declare them in exactly that
+/// order so `FuncId(i) == i`.
+pub struct LiftedCode {
+    /// The lifted region: `extern fn(*mut RegisterContext)`.
+    pub func: Function,
+    /// External host symbols the code calls (`RuntimeAssisted` fast imports).
+    /// Same contents as [`LiftEngine::aot_imports`].
+    pub imports: Vec<(&'static str, *const u8, Signature)>,
+    /// Locally-defined helper bodies the code calls, e.g. the outlined x87
+    /// softfloat kernels.
+    pub helpers: Vec<HelperFunction>,
+    /// Analysis-mode call-target map; see
+    /// [`lift_to_function_with_call_targets`].
+    pub analysis_call_targets: Vec<u64>,
+}
+
+/// Lift a region of guest code to a Cranelift [`Function`] plus the external
+/// functions it references.
+///
+/// This is the complete form of [`lift_to_function`], and the one a backend
+/// should use: a region containing x87 arithmetic calls into outlined
+/// softfloat helpers, and those helper bodies come back in
+/// [`LiftedCode::helpers`]. Compiling [`LiftedCode::func`] on its own would
+/// leave those calls unresolved.
+pub fn lift_to_code<A: GuestArch>(
+    bytes: &[u8],
+    ip: u64,
+    config: LifterConfig,
+) -> crate::Result<LiftedCode> {
+    let mut func = Function::with_name_signature(
+        UserFuncName::user(0, 0),
+        Signature::new(get_host_calling_conv()),
+    );
+    // The lifted function takes a single argument: `*mut RegisterContext`.
+    func.signature.params.push(AbiParam::new(types::I64));
+
+    let mut builder_ctx = FunctionBuilderContext::new();
+    let builder = FunctionBuilder::new(&mut func, &mut builder_ctx);
+
+    let mut engine = LiftEngine::<A>::with_config(builder, config);
+    engine.lift(bytes, ip)?;
+    let analysis_call_targets = std::mem::take(&mut engine.analysis_call_targets);
+    let imports = std::mem::take(&mut engine.aot_imports);
+    let helpers = engine.take_helpers();
+
+    // Release the mutable borrow of `func` held by the builder/engine.
+    drop(engine);
+
+    Ok(LiftedCode {
+        func,
+        imports,
+        helpers,
+        analysis_call_targets,
+    })
+}
+
 /// Lift a region of guest code straight to a Cranelift [`Function`].
 ///
 /// This is the one-call entry point for callers that just want IR and do not
@@ -142,6 +220,25 @@ pub fn lift_to_function<A: GuestArch>(
     Ok(lift_to_function_with_call_targets::<A>(bytes, ip, config)?.0)
 }
 
+/// Reduce a [`LiftedCode`] to its main function, erroring if that would drop
+/// helper bodies the function calls.
+///
+/// The single-`Function` entry points predate outlined helpers; rather than
+/// silently hand back IR with unresolvable `call`s, they refuse and name the
+/// two ways out.
+fn require_no_helpers(code: LiftedCode) -> crate::Result<(Function, Vec<u64>)> {
+    if !code.helpers.is_empty() {
+        let names: Vec<&str> = code.helpers.iter().map(|h| h.name).collect();
+        return Err(crate::MicroliftError::CraneliftError(format!(
+            "lifted region calls outlined helper functions ({}), which a bare \
+             `Function` cannot carry - use `lift_to_code` to get them, or set \
+             `LifterConfig::outline_helpers = false` to inline them instead",
+            names.join(", ")
+        )));
+    }
+    Ok((code.func, code.analysis_call_targets))
+}
+
 /// Like [`lift_to_function`], but also returns the analysis-mode call-target map
 /// ([`LiftEngine::analysis_call_targets`]): index `i` is the callee virtual
 /// address referenced by `ExternalName::user(ANALYSIS_CALL_NAMESPACE, i)`, i.e.
@@ -152,24 +249,7 @@ pub fn lift_to_function_with_call_targets<A: GuestArch>(
     ip: u64,
     config: LifterConfig,
 ) -> crate::Result<(Function, Vec<u64>)> {
-    let mut func = Function::with_name_signature(
-        UserFuncName::user(0, 0),
-        Signature::new(get_host_calling_conv()),
-    );
-    // The lifted function takes a single argument: `*mut RegisterContext`.
-    func.signature.params.push(AbiParam::new(types::I64));
-
-    let mut builder_ctx = FunctionBuilderContext::new();
-    let builder = FunctionBuilder::new(&mut func, &mut builder_ctx);
-
-    let mut engine = LiftEngine::<A>::with_config(builder, config);
-    engine.lift(bytes, ip)?;
-    let call_targets = std::mem::take(&mut engine.analysis_call_targets);
-
-    // Release the mutable borrow of `func` held by the builder/engine.
-    drop(engine);
-
-    Ok((func, call_targets))
+    require_no_helpers(lift_to_code::<A>(bytes, ip, config)?)
 }
 
 /// Convert a `FunctionArgumentType` to the corresponding Cranelift IR type.
@@ -360,6 +440,13 @@ pub struct LifterConfig {
     /// relocatable/cacheable artifacts.
     pub address_mode: AddressMode,
     pub syscall_handler_call_conv: CallConv,
+    /// The layout of immutable segments in memory at lift time.
+    /// This helps with value-set analysis based optimizations,
+    /// as we can promote memory values into constants at lift time.
+    /// 
+    /// NOTE: Do NOT use this on writable data! This is assumed to be *immutable*
+    /// memory. There is a `writable` property incase future optimizations permit
+    /// mutable memory to be valid for hints.
     pub segments: Vec<MemorySegment>,
     pub interpreter_fallback: bool,
     pub emit_resume_blocks: bool,
@@ -415,6 +502,21 @@ pub struct LifterConfig {
     /// blocks - far more readable for analysis - but it does **not** write guest
     /// state back to the `RegisterContext`, so it is not suitable for execution.
     pub analysis_mode: bool,
+    /// Emit large shared code sequences - currently the 80-bit x87 softfloat
+    /// kernels - once as helper functions and `call` them, instead of inlining
+    /// a copy at every site. On by default: the kernels run to hundreds of IR
+    /// instructions each, so a region with a handful of x87 ops otherwise
+    /// compiles to code that thrashes the instruction cache.
+    ///
+    /// Turning it **off** yields a single self-contained `Function` again,
+    /// which is what [`lift_to_function`] (as opposed to [`lift_to_code`])
+    /// requires. Doing so is worthwhile for a region with one x87 operation,
+    /// where the call is pure overhead and inlining lets Cranelift fold the
+    /// kernel against known operands.
+    ///
+    /// Ignored under [`analysis_mode`](Self::analysis_mode), which always
+    /// inlines so the inspection IR stays self-contained.
+    pub outline_helpers: bool,
 }
 
 impl Default for LifterConfig {
@@ -431,6 +533,7 @@ impl Default for LifterConfig {
             indirect_call_bridge: None,
             use_vector_xmm: false,
             analysis_mode: false,
+            outline_helpers: true,
         }
     }
 }
@@ -553,7 +656,31 @@ pub struct LiftEngine<'a, A: GuestArch = crate::arch::x86_64::X86_64> {
     pub analysis_call_targets: Vec<u64>,
     /// Cached empty (no-arg, no-result) signature used by analysis-mode `call`s.
     analysis_call_sig: Option<SigRef>,
+    /// Outlined helper functions, in the order they were first called. Their
+    /// namespace-0 indices are provisional until [`Self::finish`] renumbers
+    /// them to sit immediately after the AOT imports.
+    helpers: Vec<HelperEntry>,
+    /// One `FuncRef` per helper symbol, so repeated sites share one call
+    /// target (and one entry in [`Self::helpers`]).
+    helper_refs: HashMap<&'static str, FuncRef>,
 }
+
+/// A helper under construction: its body plus the `UserExternalName` slot whose
+/// index [`LiftEngine::finish`] rewrites once the import count is final.
+struct HelperEntry {
+    name: &'static str,
+    func: Function,
+    name_ref: UserExternalNameRef,
+}
+
+/// Namespace-0 index helpers are declared with before [`LiftEngine::finish`]
+/// renumbers them. Imports are assigned indices densely from 0 as they are
+/// discovered, and a helper's final index depends on how many imports the rest
+/// of the lift turns up - so helpers park up here, far above any plausible
+/// import count, where they cannot collide with a real index (which would make
+/// `declare_imported_user_function` de-duplicate two distinct callees onto one
+/// name).
+const PROVISIONAL_HELPER_INDEX: u32 = 0x8000_0000;
 
 /// Namespace used for the external functions referenced by analysis-mode
 /// `call`s. Distinct from namespace `0` (AOT imports) so the
@@ -622,6 +749,113 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             block_transfer_kinds: HashMap::new(),
             analysis_call_targets: Vec::new(),
             analysis_call_sig: None,
+            helpers: Vec::new(),
+            helper_refs: HashMap::new(),
+        }
+    }
+
+    /// Declare (or reuse) an outlined helper function named `name`, returning a
+    /// `FuncRef` the caller can `call`.
+    ///
+    /// The first call for a given `name` builds the body: a fresh `Function`
+    /// with `signature` is created and handed to `build`, which must fill it
+    /// completely (entry block, body, `return`). Later calls with the same name
+    /// reuse that one definition and its one `FuncRef` - that reuse is the
+    /// whole point, so `name` must identify the body, not the call site.
+    ///
+    /// The helper is *locally defined*, not imported: it comes back in
+    /// [`LiftedCode::helpers`] for the backend to compile. Its namespace-0
+    /// index is provisional until [`Self::finish`], because it has to land
+    /// after however many imports the rest of the lift discovers.
+    pub fn outlined_helper(
+        &mut self,
+        name: &'static str,
+        signature: Signature,
+        build: impl FnOnce(&mut FunctionBuilder),
+    ) -> FuncRef {
+        if let Some(&func_ref) = self.helper_refs.get(name) {
+            return func_ref;
+        }
+
+        // Build the body into a standalone function. The index in the name is
+        // cosmetic here and rewritten alongside the call's in `finish`.
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), signature.clone());
+        let mut helper_ctx = FunctionBuilderContext::new();
+        let mut helper_builder = FunctionBuilder::new(&mut func, &mut helper_ctx);
+        build(&mut helper_builder);
+        // `finalize` only consults the frontend config to lay out stack maps,
+        // which helper bodies never request; the pointer width is nonetheless
+        // the one every backend this crate targets uses.
+        helper_builder.finalize(isa::TargetFrontendConfig {
+            default_call_conv: signature.call_conv,
+            pointer_width: target_lexicon::PointerWidth::U64,
+            page_size_align_log2: 12,
+        });
+
+        let sig_ref = self.builder.import_signature(signature);
+        let name_ref = self
+            .builder
+            .func
+            .declare_imported_user_function(UserExternalName {
+                namespace: 0,
+                index: PROVISIONAL_HELPER_INDEX + self.helpers.len() as u32,
+            });
+        let func_ref = self.builder.import_function(ExtFuncData {
+            name: ExternalName::user(name_ref),
+            signature: sig_ref,
+            // Matches the fast-import path, whose relocations both the JIT and
+            // the object backend are known to resolve.
+            colocated: false,
+            patchable: false,
+        });
+
+        self.helpers.push(HelperEntry {
+            name,
+            func,
+            name_ref,
+        });
+        self.helper_refs.insert(name, func_ref);
+        func_ref
+    }
+
+    /// Whether outlined helpers are in use for this lift. Analysis IR always
+    /// inlines so it stays a single self-contained function.
+    pub fn outline_helpers(&self) -> bool {
+        self.config.outline_helpers && !self.config.analysis_mode
+    }
+
+    /// Take the finished helper bodies out of the engine. Valid only after
+    /// [`Self::finish`] has assigned their final indices; [`lift_to_code`] is
+    /// the normal caller.
+    pub fn take_helpers(&mut self) -> Vec<HelperFunction> {
+        std::mem::take(&mut self.helpers)
+            .into_iter()
+            .map(|h| HelperFunction {
+                name: h.name,
+                func: h.func,
+            })
+            .collect()
+    }
+
+    /// Give each outlined helper its final namespace-0 index, immediately after
+    /// the AOT imports, and rewrite the call sites' `UserExternalName` to match.
+    ///
+    /// This runs at the end of the lift because the import count is only final
+    /// then: [`ImportRegistry`]-supplied imports append to `aot_imports` as
+    /// their call sites are lifted, which can happen after a helper has already
+    /// been declared.
+    fn finalize_helper_indices(&mut self) {
+        let base = self.aot_imports.len() as u32;
+        for (ordinal, helper) in self.helpers.iter_mut().enumerate() {
+            let index = base + ordinal as u32;
+            self.builder.func.params.reset_user_func_name(
+                helper.name_ref,
+                UserExternalName {
+                    namespace: 0,
+                    index,
+                },
+            );
+            helper.func.name = UserFuncName::user(0, index);
         }
     }
 
@@ -1154,6 +1388,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         }
 
         self.builder.seal_all_blocks();
+        self.finalize_helper_indices();
         Ok(())
     }
 }
