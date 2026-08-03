@@ -62,10 +62,29 @@ impl<'a> Lifter<'a> {
             // Atomics / synchronisation
             Mnemonic::Cmpxchg => self.handle_cmpxchg(instruction),
             Mnemonic::Cmpxchg8b => self.handle_cmpxchg8b(instruction),
-            Mnemonic::Mfence | Mnemonic::Sfence | Mnemonic::Lfence => {
+            Mnemonic::Cmpxchg16b => self.handle_cmpxchg16b(instruction),
+            Mnemonic::Mfence | Mnemonic::Sfence | Mnemonic::Lfence | Mnemonic::Serialize => {
                 self.handle_mfence(instruction)
             }
             Mnemonic::Pause => self.handle_pause(instruction),
+            // Cache maintenance. The guest shares the host's coherent view of
+            // memory (guest VA == host VA, no emulated cache), so a flush or a
+            // writeback has nothing to do; ordering still comes from the fences
+            // that surround them.
+            Mnemonic::Clflush | Mnemonic::Clflushopt | Mnemonic::Clwb => {
+                self.handle_nop(instruction)
+            }
+            // Prefetch hints, pure performance advice with no architectural
+            // effect. Common in the lock-free code that surrounds a CAS loop.
+            Mnemonic::Prefetch
+            | Mnemonic::Prefetcht0
+            | Mnemonic::Prefetcht1
+            | Mnemonic::Prefetcht2
+            | Mnemonic::Prefetchnta
+            | Mnemonic::Prefetchw
+            | Mnemonic::Prefetchwt1
+            | Mnemonic::Prefetchit0
+            | Mnemonic::Prefetchit1 => self.handle_nop(instruction),
 
             // CET
             Mnemonic::Endbr64 | Mnemonic::Endbr32 => self.handle_endbr64(instruction),

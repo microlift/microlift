@@ -18,7 +18,7 @@
 use crate::arch::x86_64::X86_64;
 use crate::backend::CraneliftBackend;
 use crate::context::{ExitReason, MemorySegment, RegisterContext};
-use crate::core::{AddressMode, ExecutionMode, LifterConfig, lift_to_code};
+use crate::core::{AddressMode, Atomic128Mode, ExecutionMode, LifterConfig, lift_to_code};
 use cranelift_codegen::settings::{self, Configurable};
 
 pub mod oracle;
@@ -172,6 +172,14 @@ impl<'a> LiftTest<'a> {
     /// is a plain lift-time VA.
     pub fn address_mode(mut self, mode: AddressMode) -> Self {
         self.config.address_mode = mode;
+        self
+    }
+
+    /// Select how a 128-bit guest CAS (`CMPXCHG16B`) is lowered
+    /// (`config.atomic128`). [`Atomic128Mode::Native`] only compiles on an x64
+    /// host with `has_cmpxchg16b`.
+    pub fn atomic128(mut self, mode: Atomic128Mode) -> Self {
+        self.config.atomic128 = mode;
         self
     }
 
@@ -615,5 +623,5 @@ pub fn run_test(bytes: &[u8], ctx: RegisterContext) -> RegisterContext {
 pub mod prelude {
     pub use super::{Harness, LiftTest, Opt, RetAddr, RunOutcome, TestError, run_test};
     pub use crate::context::{ExitReason, RegisterContext};
-    pub use crate::core::AddressMode;
+    pub use crate::core::{AddressMode, Atomic128Mode};
 }

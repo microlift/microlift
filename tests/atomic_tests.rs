@@ -1,3 +1,4 @@
+use microlift::testkit::DEFAULT_LIFT_BASE;
 use microlift::testkit::prelude::*;
 
 #[test]
@@ -405,4 +406,324 @@ fn test_lock_btc() {
     let ctx = run_test(&bytes, ctx);
     assert_eq!(mem_val, 0b0001, "bit 2 should be flipped");
     assert_eq!(ctx.cf, 1, "CF=1: bit was originally set");
+}
+
+/// A 16-byte-aligned pair of qwords, standing in for the `__int128` a guest's
+/// `CMPXCHG16B` operates on. Real hardware raises `#GP` on a misaligned
+/// operand, so the tests use an operand the guest would actually be given.
+#[repr(C, align(16))]
+struct Aligned128 {
+    lo: u64,
+    hi: u64,
+}
+
+/// `lock cmpxchg16b [rdi]` where RDX:RAX matches: the memory takes RCX:RBX,
+/// ZF is set, and RDX:RAX keep the expected value.
+#[test]
+fn test_cmpxchg16b_success() {
+    let mut mem = Aligned128 { lo: 1, hi: 2 };
+    let mut ctx = RegisterContext::default();
+    ctx.rdi = &mut mem as *mut Aligned128 as u64;
+    ctx.rax = 1;
+    ctx.rdx = 2;
+    ctx.rbx = 0xAAAA_BBBB_CCCC_DDDD;
+    ctx.rcx = 0x1111_2222_3333_4444;
+
+    // F0 48 0F C7 0F: lock cmpxchg16b [rdi]
+    let bytes = [0xF0, 0x48, 0x0F, 0xC7, 0x0F, 0xC3];
+    let ctx = run_test(&bytes, ctx);
+
+    assert_eq!(mem.lo, 0xAAAA_BBBB_CCCC_DDDD, "low half takes RBX");
+    assert_eq!(mem.hi, 0x1111_2222_3333_4444, "high half takes RCX");
+    assert_eq!(ctx.zf, 1, "ZF=1 on success");
+    assert_eq!(ctx.rax, 1, "RAX unchanged on success");
+    assert_eq!(ctx.rdx, 2, "RDX unchanged on success");
+}
+
+/// A mismatch in the *high* half alone must still fail the comparison - the
+/// case a lowering that only compares 64 bits would get wrong.
+#[test]
+fn test_cmpxchg16b_failure_high_half() {
+    let mut mem = Aligned128 { lo: 1, hi: 0xDEAD };
+    let mut ctx = RegisterContext::default();
+    ctx.rdi = &mut mem as *mut Aligned128 as u64;
+    ctx.rax = 1;
+    ctx.rdx = 2;
+    ctx.rbx = 99;
+    ctx.rcx = 99;
+
+    let bytes = [0xF0, 0x48, 0x0F, 0xC7, 0x0F, 0xC3];
+    let ctx = run_test(&bytes, ctx);
+
+    assert_eq!(mem.lo, 1, "memory unchanged on failure");
+    assert_eq!(mem.hi, 0xDEAD, "memory unchanged on failure");
+    assert_eq!(ctx.zf, 0, "ZF=0 on failure");
+    assert_eq!(ctx.rax, 1, "RAX loaded with the observed low half");
+    assert_eq!(ctx.rdx, 0xDEAD, "RDX loaded with the observed high half");
+}
+
+/// The low half alone mismatching must fail too.
+#[test]
+fn test_cmpxchg16b_failure_low_half() {
+    let mut mem = Aligned128 { lo: 0xBEEF, hi: 2 };
+    let mut ctx = RegisterContext::default();
+    ctx.rdi = &mut mem as *mut Aligned128 as u64;
+    ctx.rax = 1;
+    ctx.rdx = 2;
+    ctx.rbx = 99;
+    ctx.rcx = 99;
+
+    let bytes = [0xF0, 0x48, 0x0F, 0xC7, 0x0F, 0xC3];
+    let ctx = run_test(&bytes, ctx);
+
+    assert_eq!(mem.lo, 0xBEEF, "memory unchanged on failure");
+    assert_eq!(mem.hi, 2, "memory unchanged on failure");
+    assert_eq!(ctx.zf, 0, "ZF=0 on failure");
+    assert_eq!(ctx.rax, 0xBEEF);
+    assert_eq!(ctx.rdx, 2);
+}
+
+/// Without the LOCK prefix the instruction is still valid (just not atomic) and
+/// must lift to the same architectural result.
+#[test]
+fn test_cmpxchg16b_without_lock_prefix() {
+    let mut mem = Aligned128 { lo: 5, hi: 6 };
+    let mut ctx = RegisterContext::default();
+    ctx.rdi = &mut mem as *mut Aligned128 as u64;
+    ctx.rax = 5;
+    ctx.rdx = 6;
+    ctx.rbx = 7;
+    ctx.rcx = 8;
+
+    // 48 0F C7 0F: cmpxchg16b [rdi]
+    let bytes = [0x48, 0x0F, 0xC7, 0x0F, 0xC3];
+    let ctx = run_test(&bytes, ctx);
+
+    assert_eq!((mem.lo, mem.hi), (7, 8));
+    assert_eq!(ctx.zf, 1);
+}
+
+/// CMPXCHG16B affects ZF only; CF/SF/OF/PF/AF must survive it untouched.
+/// (`CMPXCHG` differs here - it updates all of them as if a `CMP` had run.)
+#[test]
+fn test_cmpxchg16b_leaves_other_flags_alone() {
+    let mut mem = Aligned128 { lo: 0, hi: 0 };
+    let mut ctx = RegisterContext::default();
+    ctx.rdi = &mut mem as *mut Aligned128 as u64;
+    // stc sets CF, then a failing cmpxchg16b must leave it set.
+    ctx.rax = 1; // != mem.lo, so the CAS fails
+    ctx.rdx = 0;
+
+    // F9: stc ; F0 48 0F C7 0F: lock cmpxchg16b [rdi] ; C3
+    let bytes = [0xF9, 0xF0, 0x48, 0x0F, 0xC7, 0x0F, 0xC3];
+    let ctx = run_test(&bytes, ctx);
+
+    assert_eq!(ctx.zf, 0, "ZF=0 on failure");
+    assert_eq!(ctx.cf, 1, "CF must be untouched by CMPXCHG16B");
+}
+
+/// `Atomic128Mode::Native` lowers to a real `lock cmpxchg16b`. It only compiles
+/// on an x64 host (no other Cranelift backend lowers `atomic_cas.i128`), which
+/// is exactly why the mode is opt-in.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn test_cmpxchg16b_native_mode() {
+    let mut mem = Aligned128 { lo: 1, hi: 2 };
+    let mut ctx = RegisterContext::default();
+    ctx.rdi = &mut mem as *mut Aligned128 as u64;
+    ctx.rax = 1;
+    ctx.rdx = 2;
+    ctx.rbx = 30;
+    ctx.rcx = 40;
+
+    let bytes = [0xF0, 0x48, 0x0F, 0xC7, 0x0F, 0xC3];
+    let out = LiftTest::new(&bytes)
+        .ctx(ctx)
+        .atomic128(Atomic128Mode::Native)
+        .run();
+
+    assert_eq!((mem.lo, mem.hi), (30, 40));
+    assert_eq!(out.ctx.zf, 1);
+
+    // ...and the failing case leaves the observed value in RDX:RAX.
+    let mut mem = Aligned128 { lo: 11, hi: 22 };
+    let mut ctx = RegisterContext::default();
+    ctx.rdi = &mut mem as *mut Aligned128 as u64;
+    ctx.rax = 1;
+    ctx.rdx = 2;
+    let out = LiftTest::new(&bytes)
+        .ctx(ctx)
+        .atomic128(Atomic128Mode::Native)
+        .run();
+    assert_eq!((mem.lo, mem.hi), (11, 22), "memory unchanged");
+    assert_eq!(out.ctx.zf, 0);
+    assert_eq!((out.ctx.rax, out.ctx.rdx), (11, 22));
+}
+
+/// `Atomic128Mode::Exit` hands the instruction to the host as an ordinary
+/// unimplemented-instruction exit: memory is untouched, and the PC is already
+/// past the CMPXCHG16B so the host emulates it and resumes.
+#[test]
+fn test_cmpxchg16b_exit_mode() {
+    let mut mem = Aligned128 { lo: 1, hi: 2 };
+    let mut ctx = RegisterContext::default();
+    ctx.rdi = &mut mem as *mut Aligned128 as u64;
+    ctx.rax = 1;
+    ctx.rdx = 2;
+    ctx.rbx = 9;
+    ctx.rcx = 9;
+
+    // 90: nop (so the exit PC is distinguishable from the region entry)
+    let bytes = [0x90, 0xF0, 0x48, 0x0F, 0xC7, 0x0F, 0xC3];
+    let out = LiftTest::new(&bytes)
+        .ctx(ctx)
+        .atomic128(Atomic128Mode::Exit)
+        .run();
+
+    assert_eq!(
+        out.ctx.exit_reason,
+        ExitReason::UnimplementedInstruction as u32
+    );
+    assert_eq!(
+        out.ctx.rip,
+        DEFAULT_LIFT_BASE + 6,
+        "PC is past the CMPXCHG16B (nop + 5-byte instruction)"
+    );
+    assert_eq!((mem.lo, mem.hi), (1, 2), "memory untouched - the host runs it");
+}
+
+/// The shape a compiler emits for a 128-bit compare-exchange loop: save RBX,
+/// load the expected pair, retry the CAS until it succeeds, restore RBX. This
+/// exercises CMPXCHG16B together with the PUSH/POP/JNE/MOV around it.
+#[test]
+fn test_cmpxchg16b_retry_loop() {
+    let mut mem = Aligned128 { lo: 100, hi: 200 };
+    let mut ctx = RegisterContext::default();
+    ctx.rdi = &mut mem as *mut Aligned128 as u64;
+    ctx.rbx = 0xCAFE; // must be preserved across the region
+
+    #[rustfmt::skip]
+    let bytes = [
+        0x53,                                     // push rbx
+        0x48, 0x8B, 0x07,                         // mov rax, [rdi]
+        0x48, 0x8B, 0x57, 0x08,                   // mov rdx, [rdi+8]
+        // .retry:
+        0x48, 0x8D, 0x58, 0x01,                   // lea rbx, [rax+1]
+        0x48, 0x8D, 0x4A, 0x01,                   // lea rcx, [rdx+1]
+        0xF0, 0x48, 0x0F, 0xC7, 0x0F,             // lock cmpxchg16b [rdi]
+        0x75, 0xF1,                               // jne .retry
+        0x5B,                                     // pop rbx
+        0xC3,                                     // ret
+    ];
+    let ctx = run_test(&bytes, ctx);
+
+    assert_eq!((mem.lo, mem.hi), (101, 201), "the increment landed");
+    assert_eq!(ctx.zf, 1, "loop exits with ZF=1");
+    assert_eq!(ctx.rbx, 0xCAFE, "RBX restored by the pop");
+}
+
+/// LOCK ADC / LOCK SBB have no atomic-RMW opcode (the result depends on the
+/// incoming CF), so they lower to a CAS retry loop.
+#[test]
+fn test_lock_adc() {
+    // stc ; lock adc qword [rdi], rsi  ->  mem = 10 + 5 + 1
+    let mut mem_val: u64 = 10;
+    let mut ctx = RegisterContext::default();
+    ctx.rdi = &mut mem_val as *mut u64 as u64;
+    ctx.rsi = 5;
+
+    // F9: stc ; F0 48 11 37: lock adc [rdi], rsi
+    let bytes = [0xF9, 0xF0, 0x48, 0x11, 0x37, 0xC3];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(mem_val, 16, "10 + 5 + CF");
+    assert_eq!(ctx.cf, 0, "no carry out");
+    assert_eq!(ctx.zf, 0);
+}
+
+#[test]
+fn test_lock_adc_carry_out() {
+    // lock adc [rdi], rsi with CF=0 and a sum that wraps: CF out = 1, result 0.
+    let mut mem_val: u64 = u64::MAX;
+    let mut ctx = RegisterContext::default();
+    ctx.rdi = &mut mem_val as *mut u64 as u64;
+    ctx.rsi = 1;
+
+    // F8: clc ; F0 48 11 37: lock adc [rdi], rsi
+    let bytes = [0xF8, 0xF0, 0x48, 0x11, 0x37, 0xC3];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(mem_val, 0);
+    assert_eq!(ctx.cf, 1, "carry out of the wrap");
+    assert_eq!(ctx.zf, 1, "result is zero");
+}
+
+#[test]
+fn test_lock_sbb() {
+    // stc ; lock sbb qword [rdi], rsi  ->  mem = 10 - 5 - 1
+    let mut mem_val: u64 = 10;
+    let mut ctx = RegisterContext::default();
+    ctx.rdi = &mut mem_val as *mut u64 as u64;
+    ctx.rsi = 5;
+
+    // F9: stc ; F0 48 19 37: lock sbb [rdi], rsi
+    let bytes = [0xF9, 0xF0, 0x48, 0x19, 0x37, 0xC3];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(mem_val, 4, "10 - 5 - CF");
+    assert_eq!(ctx.cf, 0, "no borrow out");
+}
+
+#[test]
+fn test_lock_sbb_borrow_out() {
+    // clc ; lock sbb [rdi], rsi with mem < rsi: borrow out, result wraps.
+    let mut mem_val: u64 = 1;
+    let mut ctx = RegisterContext::default();
+    ctx.rdi = &mut mem_val as *mut u64 as u64;
+    ctx.rsi = 2;
+
+    let bytes = [0xF8, 0xF0, 0x48, 0x19, 0x37, 0xC3];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(mem_val, u64::MAX);
+    assert_eq!(ctx.cf, 1, "borrow out");
+}
+
+/// LOCK ADC with an immediate source, at a narrower width.
+#[test]
+fn test_lock_adc_imm_dword() {
+    let mut mem_val: u64 = 0xFFFF_FFFF_0000_000A;
+    let mut ctx = RegisterContext::default();
+    ctx.rdi = &mut mem_val as *mut u64 as u64;
+
+    // F9: stc ; F0 83 17 05: lock adc dword [rdi], 5
+    let bytes = [0xF9, 0xF0, 0x83, 0x17, 0x05, 0xC3];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(
+        mem_val, 0xFFFF_FFFF_0000_0010,
+        "only the low dword is written: 0xA + 5 + CF"
+    );
+    assert_eq!(ctx.cf, 0);
+}
+
+/// Cache maintenance and prefetch hints have no architectural effect here, but
+/// they routinely appear next to atomics and must not abort the lift.
+#[test]
+fn test_cache_hints_are_transparent() {
+    let mut mem_val: u64 = 7;
+    let mut ctx = RegisterContext::default();
+    ctx.rdi = &mut mem_val as *mut u64 as u64;
+
+    #[rustfmt::skip]
+    let bytes = [
+        0x0F, 0x18, 0x0F,             // prefetcht0 [rdi]
+        0x0F, 0x18, 0x07,             // prefetchnta [rdi]
+        0x0F, 0x0D, 0x0F,             // prefetchw [rdi]
+        0x48, 0x8B, 0x07,             // mov rax, [rdi]
+        0x0F, 0xAE, 0x3F,             // clflush [rdi]
+        0x66, 0x0F, 0xAE, 0x3F,       // clflushopt [rdi]
+        0x66, 0x0F, 0xAE, 0x37,       // clwb [rdi]
+        0x0F, 0x01, 0xE8,             // serialize
+        0xC3,                         // ret
+    ];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.exit_reason, ExitReason::Return as u32);
+    assert_eq!(ctx.rax, 7, "the load between the hints still happened");
+    assert_eq!(mem_val, 7);
 }

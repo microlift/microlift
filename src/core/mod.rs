@@ -449,6 +449,48 @@ pub enum AddressMode {
     Direct,
 }
 
+/// How a guest 128-bit compare-and-swap (x86-64 `CMPXCHG16B`) is realized.
+///
+/// Cranelift can express a true 128-bit CAS - `atomic_cas` on `I128` - but only
+/// the x64 backend lowers it, and only when the ISA setting `has_cmpxchg16b` is
+/// enabled (it is off in the baseline `x86-64` feature set, so AOT callers must
+/// pass it through `isa_settings`; `cranelift-native` detects it for the JIT).
+/// On every other backend there is no IR-expressible lock-free 128-bit RMW at
+/// all, so the lifter has to be told what to do instead - hence this knob rather
+/// than a fixed lowering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Atomic128Mode {
+    /// Lower to a plain 128-bit read-modify-write: load both halves, compare,
+    /// store back. Portable to every backend and correct for a single-threaded
+    /// guest, but **not atomic** - another thread can observe or clobber the
+    /// value between the load and the store.
+    ///
+    /// The default, on the same grounds as [`LifterConfig::use_vector_xmm`]
+    /// defaulting off: the portable lowering is the one that compiles
+    /// everywhere. Pick a different mode for a guest that actually shares the
+    /// location across threads.
+    #[default]
+    Emulated,
+    /// Emit `atomic_cas` on `I128`, which the x64 backend lowers to a real
+    /// `lock cmpxchg16b`. Exact and fast, but the compile **fails** on any
+    /// backend that cannot lower it (aarch64, riscv64, s390x) or on an x64 ISA
+    /// built without `has_cmpxchg16b`.
+    Native,
+    /// Do not lower it at all: exit to the host with
+    /// [`ExitReason::UnimplementedInstruction`] so the runtime can perform the
+    /// operation itself (e.g. under a host-side lock). The only option that is
+    /// both portable and correct for a multi-threaded guest, at the cost of a VM
+    /// exit per execution.
+    ///
+    /// Follows the ordinary unimplemented-instruction contract: guest state is
+    /// fully synced, `exit_code` holds the instruction's iced `Code`, and the PC
+    /// is already past the `CMPXCHG16B`, so the host emulates it and resumes
+    /// without adjusting the PC.
+    ///
+    /// [`ExitReason::UnimplementedInstruction`]: crate::context::ExitReason::UnimplementedInstruction
+    Exit,
+}
+
 #[derive(Debug, Clone)]
 pub struct LifterConfig {
     pub execution_mode: ExecutionMode,
@@ -525,6 +567,9 @@ pub struct LifterConfig {
     /// relying on Cranelift's vector lowering and is required for AOT targets
     /// that lack SIMD support (e.g. RISC-V64).
     pub use_vector_xmm: bool,
+    /// How a guest 128-bit compare-and-swap (`CMPXCHG16B`) is lowered. See
+    /// [`Atomic128Mode`]; defaults to the portable, non-atomic emulation.
+    pub atomic128: Atomic128Mode,
     /// Produce *inspection* IR for static analysis rather than runnable IR.
     ///
     /// When `true`, the engine omits the machinery that exists purely to support
@@ -570,6 +615,7 @@ impl Default for LifterConfig {
             import_registry: None,
             indirect_call_bridge: None,
             use_vector_xmm: false,
+            atomic128: Atomic128Mode::default(),
             analysis_mode: false,
             outline_helpers: true,
         }

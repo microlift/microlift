@@ -9,7 +9,10 @@ use microlift::core::abi::CallAbi;
 use microlift::function_traits::{DynamicSymbol, trampoline_func};
 use microlift::lifter::{ExecutionMode, Lifter, LifterConfig};
 use microlift::os::get_host_calling_conv;
-use object::{Object, ObjectSymbol};
+use microlift::arch::x86_64::X86_64;
+use microlift::core::lift_to_function;
+use microlift::lifter::Atomic128Mode;
+use object::{Object, ObjectSection, ObjectSymbol};
 
 #[test]
 fn test_compile_host_object() {
@@ -401,4 +404,92 @@ fn test_compile_runtime_assisted_two_fast_imports_have_relocations() {
         undefined_bare_names.contains(&"host_strcmp"),
         "object must list 'host_strcmp' as undefined; undefined symbols: {undefined_bare_names:?}",
     );
+}
+
+/// `lock cmpxchg16b [rdi]` — the region used by the `Atomic128Mode` AOT tests.
+const CMPXCHG16B_SNIPPET: [u8; 6] = [0xF0, 0x48, 0x0F, 0xC7, 0x0F, 0xC3];
+
+fn lift_cmpxchg16b(mode: Atomic128Mode) -> Function {
+    let config = LifterConfig {
+        atomic128: mode,
+        ..Default::default()
+    };
+    let mut func =
+        lift_to_function::<X86_64>(&CMPXCHG16B_SNIPPET, 0x1000, config).expect("lift failed");
+    // The lifter bakes in the *host* calling convention; override it so these
+    // tests exercise instruction lowering rather than the target's ABI code.
+    func.signature.call_conv = CallConv::SystemV;
+    func
+}
+
+/// The default `Atomic128Mode::Emulated` lowering must reach every backend -
+/// that is the whole reason it is the default. Cranelift has no `atomic_cas` on
+/// `I128` outside x64, so a 128-bit CAS is only portable when it is emulated.
+#[test]
+fn test_cmpxchg16b_emulated_lowers_everywhere() {
+    for triple in [
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+        "riscv64gc-unknown-linux-gnu",
+    ] {
+        ArtifactBackend::compile_to_raw(lift_cmpxchg16b(Atomic128Mode::Emulated), Some(triple), None)
+            .unwrap_or_else(|e| panic!("emulated cmpxchg16b failed to lower for {triple}: {e:?}"));
+    }
+}
+
+/// `Atomic128Mode::Native` must lower to an actual `lock cmpxchg16b` on x86-64.
+/// The ISA setting is required: `has_cmpxchg16b` is off in the baseline
+/// `x86-64` feature set, so AOT callers have to opt in explicitly.
+#[test]
+fn test_cmpxchg16b_native_emits_the_instruction() {
+    let obj = ArtifactBackend::compile_lifted_to_object(
+        microlift::core::LiftedCode {
+            func: lift_cmpxchg16b(Atomic128Mode::Native),
+            imports: Vec::new(),
+            helpers: Vec::new(),
+            analysis_call_targets: Default::default(),
+        },
+        Some("x86_64-unknown-linux-gnu"),
+        None,
+        &[("has_cmpxchg16b", "true")],
+    )
+    .expect("native cmpxchg16b failed to compile for x86-64");
+
+    let file = object::File::parse(&*obj).expect("parse object");
+    let text = file
+        .sections()
+        .find(|s| s.kind() == object::SectionKind::Text)
+        .expect("text section");
+    let bytes = text.data().expect("text data");
+    // F0 48 0F C7 /1 - LOCK CMPXCHG16B m128.
+    assert!(
+        bytes
+            .windows(4)
+            .any(|w| w == [0xF0, 0x48, 0x0F, 0xC7] || w == [0xF0, 0x49, 0x0F, 0xC7]),
+        "expected a real LOCK CMPXCHG16B in the emitted text"
+    );
+}
+
+/// `Atomic128Mode::Native` is opt-in precisely because it does not lower
+/// everywhere: no non-x64 backend has a rule for `atomic_cas.i128`, and even x64
+/// needs `has_cmpxchg16b`. Both must fail as errors rather than succeed
+/// silently or panic.
+#[test]
+fn test_cmpxchg16b_native_requires_backend_support() {
+    let err = ArtifactBackend::compile_to_raw(
+        lift_cmpxchg16b(Atomic128Mode::Native),
+        Some("x86_64-unknown-linux-gnu"),
+        None,
+    );
+    assert!(
+        err.is_err(),
+        "native mode must fail on an x64 ISA without has_cmpxchg16b"
+    );
+
+    let err = ArtifactBackend::compile_to_raw(
+        lift_cmpxchg16b(Atomic128Mode::Native),
+        Some("aarch64-unknown-linux-gnu"),
+        None,
+    );
+    assert!(err.is_err(), "native mode must fail on aarch64");
 }

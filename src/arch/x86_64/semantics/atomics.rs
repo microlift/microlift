@@ -1,14 +1,19 @@
 //! Atomic instruction semantics.
 //!
 //! Covers:
-//! - Memory fence instructions: MFENCE, SFENCE, LFENCE
+//! - Memory fence instructions: MFENCE, SFENCE, LFENCE, SERIALIZE
 //! - PAUSE (spin-wait hint)
-//! - CMPXCHG / CMPXCHG8B
+//! - CMPXCHG / CMPXCHG8B / CMPXCHG16B
 //! - LOCK-prefixed arithmetic and bit operations
+//!
+//! Everything up to 64 bits maps onto Cranelift's `atomic_cas` / `atomic_rmw`,
+//! so the LOCK prefix costs nothing extra and the handler is shared with the
+//! unlocked form. `CMPXCHG16B` is the exception: only the x64 backend can
+//! express a 128-bit CAS, so its lowering is a [`Atomic128Mode`] choice.
 
 use crate::MicroliftError;
 use crate::arch::x86_64::semantics::helpers::size_to_type;
-use crate::lifter::{Lifter, X86Flag};
+use crate::lifter::{Atomic128Mode, Lifter, X86Flag};
 use cranelift::prelude::*;
 use cranelift_codegen::ir::AtomicRmwOp;
 use iced_x86::{Instruction, Mnemonic, OpKind, Register};
@@ -151,6 +156,86 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
+    /// CMPXCHG16B [mem]
+    ///
+    /// Atomically compares RDX:RAX with the 128-bit value at [mem].
+    /// If equal: ZF=1, [mem] <- RCX:RBX.
+    /// Otherwise: ZF=0, RDX:RAX <- [mem].
+    ///
+    /// Only ZF is affected - CF/PF/AF/SF/OF are untouched, unlike `CMPXCHG`,
+    /// which updates all of them as if a `CMP` had run.
+    ///
+    /// The guest's memory operand must be 16-byte aligned or the real CPU
+    /// raises `#GP`; this lifter does not model alignment faults, so a
+    /// misaligned operand is simply performed.
+    ///
+    /// How the 128-bit RMW is realized is a [`Atomic128Mode`] decision, because
+    /// only the x64 Cranelift backend can express one. See that enum for the
+    /// trade-offs; the default is a portable but non-atomic load/compare/store.
+    pub(super) fn handle_cmpxchg16b(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        if instruction.op0_kind() != OpKind::Memory {
+            return Err(MicroliftError::UnsupportedInstruction {
+                mnemonic: format!("cmpxchg16b-dst-{:?}", instruction.op0_kind()),
+            });
+        }
+
+        if self.config.atomic128 == Atomic128Mode::Exit {
+            // The host performs the whole operation and resumes; the PC the
+            // exit records is already past this instruction, per the ordinary
+            // unimplemented-instruction contract.
+            return self.handle_unimplemented_instruction(instruction);
+        }
+
+        let ptr = self.get_mem_ptr(instruction, 0)?;
+        let rax = self.get_reg_val(Register::RAX)?;
+        let rdx = self.get_reg_val(Register::RDX)?;
+        let rbx = self.get_reg_val(Register::RBX)?;
+        let rcx = self.get_reg_val(Register::RCX)?;
+
+        let (old_lo, old_hi, succeeded) = match self.config.atomic128 {
+            Atomic128Mode::Native => {
+                // `iconcat` takes (low, high); the x64 backend lowers an I128
+                // `atomic_cas` straight to `lock cmpxchg16b`.
+                let expected = self.builder.ins().iconcat(rax, rdx);
+                let replacement = self.builder.ins().iconcat(rbx, rcx);
+                let old = self
+                    .builder
+                    .ins()
+                    .atomic_cas(MemFlagsData::new(), ptr, expected, replacement);
+                let succeeded = self.builder.ins().icmp(IntCC::Equal, old, expected);
+                let (lo, hi) = self.builder.ins().isplit(old);
+                (lo, hi, succeeded)
+            }
+            // Emulated: a plain 128-bit read-modify-write as two 64-bit halves.
+            // The store is unconditional, which matches the architectural
+            // behaviour - `CMPXCHG16B` writes the destination even when the
+            // comparison fails (it writes the value back unchanged).
+            _ => {
+                let flags = MemFlagsData::new();
+                let lo = self.builder.ins().load(types::I64, flags, ptr, 0);
+                let hi = self.builder.ins().load(types::I64, flags, ptr, 8);
+                let lo_eq = self.builder.ins().icmp(IntCC::Equal, lo, rax);
+                let hi_eq = self.builder.ins().icmp(IntCC::Equal, hi, rdx);
+                let succeeded = self.builder.ins().band(lo_eq, hi_eq);
+                let new_lo = self.builder.ins().select(succeeded, rbx, lo);
+                let new_hi = self.builder.ins().select(succeeded, rcx, hi);
+                self.builder.ins().store(flags, new_lo, ptr, 0);
+                self.builder.ins().store(flags, new_hi, ptr, 8);
+                (lo, hi, succeeded)
+            }
+        };
+
+        self.set_flag(X86Flag::Zero, succeeded)?;
+        // On failure the observed value lands in RDX:RAX; on success they keep
+        // the expected value they already held.
+        let new_rax = self.builder.ins().select(succeeded, rax, old_lo);
+        let new_rdx = self.builder.ins().select(succeeded, rdx, old_hi);
+        self.set_reg_val(Register::RAX, new_rax)?;
+        self.set_reg_val(Register::RDX, new_rdx)?;
+
+        Ok(())
+    }
+
     /// Dispatcher for instructions carrying a LOCK prefix.
     ///
     /// LOCK is only architecturally valid when the destination is a memory
@@ -162,6 +247,8 @@ impl<'a> Lifter<'a> {
         match instruction.mnemonic() {
             Mnemonic::Add => self.handle_lock_add(instruction),
             Mnemonic::Sub => self.handle_lock_sub(instruction),
+            Mnemonic::Adc => self.handle_lock_adc_sbb(instruction, true),
+            Mnemonic::Sbb => self.handle_lock_adc_sbb(instruction, false),
             Mnemonic::And => self.handle_lock_and(instruction),
             Mnemonic::Or => self.handle_lock_or(instruction),
             Mnemonic::Xor => self.handle_lock_xor(instruction),
@@ -172,6 +259,7 @@ impl<'a> Lifter<'a> {
             // LOCK CMPXCHG reuses handle_cmpxchg which already uses atomic_cas.
             Mnemonic::Cmpxchg => self.handle_cmpxchg(instruction),
             Mnemonic::Cmpxchg8b => self.handle_cmpxchg8b(instruction),
+            Mnemonic::Cmpxchg16b => self.handle_cmpxchg16b(instruction),
             Mnemonic::Neg => self.handle_lock_neg(instruction),
             Mnemonic::Not => self.handle_lock_not(instruction),
             Mnemonic::Bts => self.handle_lock_bts(instruction),
@@ -209,6 +297,87 @@ impl<'a> Lifter<'a> {
         let result = self.builder.ins().isub(old, src);
         self.update_flags_sub(old, src, result, size)?;
         Ok(())
+    }
+
+    /// LOCK ADC / LOCK SBB [mem], src
+    ///
+    /// Neither has an atomic-RMW opcode - the operation depends on the incoming
+    /// CF as well as on the memory value - so both lower to the same
+    /// compare-and-swap retry loop `LOCK NEG` uses: observe the value, compute
+    /// `dst ± src ± CF`, `atomic_cas` it back, and retry with the fresh value if
+    /// another thread got there first.
+    ///
+    /// The incoming CF is loop-invariant and read once in the entry block, which
+    /// dominates the loop, so a retry re-uses it rather than the CF a previous
+    /// iteration would have computed - matching the single-execution semantics.
+    fn handle_lock_adc_sbb(
+        &mut self,
+        instruction: &Instruction,
+        is_adc: bool,
+    ) -> crate::Result<()> {
+        let size = self.operand_size(instruction, 0)?;
+        let ty = size_to_type(size);
+        let ptr = self.get_mem_ptr(instruction, 0)?;
+        let src = self.read_operand(instruction, 1, size)?;
+
+        let cf_i8 = self.builder.use_var(self.state.flags[&X86Flag::Carry]);
+        let cf = if ty == types::I8 {
+            cf_i8
+        } else {
+            self.builder.ins().uextend(ty, cf_i8)
+        };
+
+        // As in `handle_lock_neg`, the loop state is carried in block params so
+        // no `Variable` sealing beyond the engine's final pass is needed.
+        let loop_b = self.builder.create_block();
+        self.builder.append_block_param(loop_b, ty); // observed current value
+        let done_b = self.builder.create_block();
+        self.builder.append_block_param(done_b, ty); // value that was swapped out
+
+        let init = self.builder.ins().atomic_load(ty, MemFlagsData::new(), ptr);
+        self.builder.ins().jump(loop_b, &[init.into()]);
+
+        self.builder.switch_to_block(loop_b);
+        let cur = self.builder.block_params(loop_b)[0];
+        let (result, _) = self.emit_adc_sbb(cur, src, cf, is_adc);
+        let observed = self
+            .builder
+            .ins()
+            .atomic_cas(MemFlagsData::new(), ptr, cur, result);
+        let swapped = self.builder.ins().icmp(IntCC::Equal, observed, cur);
+        self.builder
+            .ins()
+            .brif(swapped, done_b, &[cur.into()], loop_b, &[observed.into()]);
+        self.builder.seal_block(loop_b);
+
+        self.builder.switch_to_block(done_b);
+        self.builder.seal_block(done_b);
+        let old = self.builder.block_params(done_b)[0];
+        let (result, cf_out) = self.emit_adc_sbb(old, src, cf, is_adc);
+        if is_adc {
+            self.update_flags_adc(old, src, result, cf_out, size)
+        } else {
+            self.update_flags_sbb(old, src, result, cf_out, size)
+        }
+    }
+
+    /// `dst + src + cf` (ADC) or `dst - src - cf` (SBB), returning the result
+    /// and the carry/borrow out. Both are computed in two steps so the carry out
+    /// of each half can be OR-ed together, matching the non-locked handlers.
+    fn emit_adc_sbb(&mut self, dst: Value, src: Value, cf: Value, is_adc: bool) -> (Value, Value) {
+        if is_adc {
+            let tmp = self.builder.ins().iadd(dst, src);
+            let c1 = self.builder.ins().icmp(IntCC::UnsignedLessThan, tmp, dst);
+            let result = self.builder.ins().iadd(tmp, cf);
+            let c2 = self.builder.ins().icmp(IntCC::UnsignedLessThan, result, tmp);
+            (result, self.builder.ins().bor(c1, c2))
+        } else {
+            let tmp = self.builder.ins().isub(dst, src);
+            let b1 = self.builder.ins().icmp(IntCC::UnsignedLessThan, dst, src);
+            let result = self.builder.ins().isub(tmp, cf);
+            let b2 = self.builder.ins().icmp(IntCC::UnsignedLessThan, tmp, cf);
+            (result, self.builder.ins().bor(b1, b2))
+        }
     }
 
     fn handle_lock_and(&mut self, instruction: &Instruction) -> crate::Result<()> {
