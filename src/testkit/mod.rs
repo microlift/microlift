@@ -258,6 +258,27 @@ impl<'a> LiftTest<'a> {
         self
     }
 
+    /// Whether the run relocates the region: the lifted code will form guest
+    /// addresses as `image_base + (va - lift_base)` with an `image_base` that is
+    /// not the lift base, so a lift-time VA and the address actually touched at
+    /// runtime are different addresses.
+    ///
+    /// This is what makes such a run non-diffable against Unicorn, which has no
+    /// relocation step and executes at the lift-time VAs; see
+    /// [`cross_check_unicorn`]. Under [`AddressMode::Direct`] the lifted code
+    /// ignores `image_base` entirely, so there is no relocation to speak of.
+    #[cfg(feature = "unicorn-oracle")]
+    fn image_is_relocated(&self) -> bool {
+        // Mirrors `compile`: an `image_base` seeded through `ctx`/`reg` wins,
+        // and only a zero there falls back to the builder's value.
+        let effective = if self.init.image_base == 0 {
+            self.image_base
+        } else {
+            self.init.image_base
+        };
+        self.config.address_mode == AddressMode::ImageBaseRelative && effective != self.ip
+    }
+
     /// Lift and compile, but do not run. Returns a ready-to-enter [`Harness`].
     pub fn compile(self) -> Result<Harness, TestError> {
         let code =
@@ -324,7 +345,8 @@ impl<'a> LiftTest<'a> {
         #[cfg(feature = "unicorn-oracle")]
         let xcheck = (self.unicorn_check
             && !self.config.analysis_mode
-            && self.config.execution_mode == ExecutionMode::Jit)
+            && self.config.execution_mode == ExecutionMode::Jit
+            && !self.image_is_relocated())
             .then(|| {
                 (
                     self.bytes.to_vec(),
@@ -359,6 +381,17 @@ impl<'a> LiftTest<'a> {
 /// Soundness guards, all derived from a static decode of the program so no test
 /// needs hand-annotation:
 ///
+/// - **Unrelocated image only.** Unicorn has no `image_base`: it executes at the
+///   lift-time VAs. A run whose lifted code forms addresses as
+///   `image_base + (va - lift_base)` with `image_base != lift_base` therefore
+///   touches different memory than Unicorn would for the same guest address, so
+///   the two are not comparable. This is checked by the caller
+///   ([`LiftTest::image_is_relocated`]) rather than here, because it is a
+///   property of the configuration, not of the program. It is a *hard* guard,
+///   not just an accuracy one: Unicorn's `MEM_UNMAPPED` hook identity-maps a
+///   guest page onto the same *host* address, so a read of an unrelocated
+///   lift-time VA (a jump table at `0x2000`, say) faults the host process
+///   instead of the emulator.
 /// - **Clean halt only.** Fires only when the Microlift run reached a clean halt
 ///   (`Return`/`None`); any VM exit is non-diffable and skipped. Likewise if
 ///   Unicorn itself faults (an instruction it lacks) the comparison is skipped.
