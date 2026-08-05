@@ -189,6 +189,10 @@ impl<'a> Lifter<'a> {
             Mnemonic::Divsd => self.handle_divsd(instruction),
             Mnemonic::Sqrtsd => self.handle_sqrtsd(instruction),
             Mnemonic::Sqrtpd => self.handle_sqrtpd(instruction),
+            Mnemonic::Roundsd => self.handle_roundsd(instruction),
+            Mnemonic::Roundss => self.handle_roundss(instruction),
+            Mnemonic::Roundpd => self.handle_roundpd(instruction),
+            Mnemonic::Roundps => self.handle_roundps(instruction),
             Mnemonic::Minsd => self.handle_minmaxsd(instruction, true),
             Mnemonic::Maxsd => self.handle_minmaxsd(instruction, false),
             Mnemonic::Minpd => self.handle_minmaxpd(instruction, true),
@@ -603,6 +607,8 @@ impl<'a> Lifter<'a> {
             Mnemonic::Btc => self.handle_btc(instruction),
             Mnemonic::Bsf => self.handle_bsf(instruction),
             Mnemonic::Bsr => self.handle_bsr(instruction),
+            Mnemonic::Tzcnt => self.handle_tzcnt(instruction),
+            Mnemonic::Lzcnt => self.handle_lzcnt(instruction),
             Mnemonic::Bswap => self.handle_bswap(instruction),
 
             // Unconditional Control Flow

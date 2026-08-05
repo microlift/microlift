@@ -377,6 +377,72 @@ fn test_bit_scans() {
     assert_eq!(ctx.zf, 1);
 }
 
+/// TZCNT and LZCNT, whose whole reason to exist is that they are **defined** for
+/// a zero source where BSF and BSR are not.
+#[test]
+fn test_count_leading_and_trailing_zeros() {
+    // TZCNT rax, rcx (rcx = 0x10) -> 4, CF = 0
+    let bytes = [
+        0x48, 0xC7, 0xC1, 0x10, 0x00, 0x00, 0x00, // mov rcx, 16
+        0xF3, 0x48, 0x0F, 0xBC, 0xC1, // tzcnt rax, rcx
+        0xC3, // ret
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rax, 4);
+    assert_eq!((ctx.cf, ctx.zf), (0, 0));
+
+    // TZCNT of zero -> the operand width, with CF set and ZF clear.
+    let bytes = [
+        0x48, 0x31, 0xC9, // xor rcx, rcx
+        0xF3, 0x48, 0x0F, 0xBC, 0xC1, // tzcnt rax, rcx
+        0xC3, // ret
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rax, 64, "TZCNT(0) is the operand width, not undefined");
+    assert_eq!((ctx.cf, ctx.zf), (1, 0));
+
+    // 32-bit TZCNT of zero -> 32, and the upper half of the register zeroed.
+    let bytes = [
+        0x48, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF, // mov rax, -1
+        0x31, 0xC9, // xor ecx, ecx
+        0xF3, 0x0F, 0xBC, 0xC1, // tzcnt eax, ecx
+        0xC3, // ret
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rax, 32);
+
+    // LZCNT counts the zeros *above* the highest set bit, which is not BSR's
+    // index: for 0x11 the highest set bit is 4, so LZCNT is 64 - 1 - 4 = 59.
+    let bytes = [
+        0x48, 0xC7, 0xC1, 0x11, 0x00, 0x00, 0x00, // mov rcx, 17
+        0xF3, 0x48, 0x0F, 0xBD, 0xC1, // lzcnt rax, rcx
+        0xC3, // ret
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rax, 59);
+    assert_eq!(ctx.cf, 0);
+
+    // LZCNT of zero -> the operand width, CF set, and ZF *clear* because the
+    // flag follows the result rather than the source.
+    let bytes = [
+        0x48, 0x31, 0xC9, // xor rcx, rcx
+        0xF3, 0x48, 0x0F, 0xBD, 0xC1, // lzcnt rax, rcx
+        0xC3, // ret
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rax, 64);
+    assert_eq!((ctx.cf, ctx.zf), (1, 0));
+
+    // A result of zero is the one case ZF is set: every bit already set.
+    let bytes = [
+        0x48, 0xC7, 0xC1, 0x01, 0x00, 0x00, 0x00, // mov rcx, 1
+        0xF3, 0x48, 0x0F, 0xBC, 0xC1, // tzcnt rax, rcx
+        0xC3, // ret
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!((ctx.rax, ctx.zf, ctx.cf), (0, 1, 0));
+}
+
 #[test]
 fn test_movsx() {
     // MOVSX rax, cl (cl = 0xFF) -> rax = 0xFFFFFFFFFFFFFFFF
@@ -396,6 +462,43 @@ fn test_movsx() {
     ];
     let ctx = run_test(&bytes, RegisterContext::default());
     assert_eq!(ctx.rax, 0xFFFFFFFF80000000);
+}
+
+/// MOVSXD's two narrow forms, which the encoding permits and the manual
+/// discourages. Neither extends: the destination is no wider than the source, so
+/// the instruction is an ordinary `mov` of that width. Mono's JIT emits the
+/// 32-bit form, which is how the unconditional extension to 64 bits was found.
+#[test]
+fn test_movsxd_narrow_forms_do_not_extend() {
+    // MOVSXD ecx, eax without REX.W: a 32-bit move, which zeroes RCX's top half.
+    let bytes = [
+        0x48, 0xB8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // mov rax, ...
+        0x48, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF, // mov rcx, -1
+        0x63, 0xC8, // movsxd ecx, eax
+        0xC3, // ret
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rcx, 0x5566_7788);
+
+    // MOVSXD from memory, the form Mono generates.
+    let mem = [0x8899AABB_u32, 0];
+    let mut ctx = RegisterContext::default();
+    ctx.rdi = mem.as_ptr() as u64 + 0x30;
+    ctx.rcx = 0xFFFF_FFFF_FFFF_FFFF;
+    // movsxd ecx, dword [rdi-0x30] ; ret
+    let bytes = [0x63, 0x4F, 0xD0, 0xC3];
+    let ctx = run_test(&bytes, ctx);
+    assert_eq!(ctx.rcx, 0x8899AABB, "no sign extension, and the top half zeroed");
+
+    // MOVSXD cx, ax under a 0x66 prefix: a 16-bit move, upper bits preserved.
+    let bytes = [
+        0x48, 0xB8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // mov rax, ...
+        0x48, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF, // mov rcx, -1
+        0x66, 0x63, 0xC8, // movsxd cx, ax
+        0xC3, // ret
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rcx, 0xFFFF_FFFF_FFFF_7788);
 }
 
 #[test]

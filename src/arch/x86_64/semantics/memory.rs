@@ -73,13 +73,31 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// MOVSXD - sign-extend a 32-bit register/memory value to 64 bits.
+    /// MOVSXD - sign-extend to the destination register's width.
+    ///
+    /// The familiar form is `movsxd r64, r/m32` under `REX.W`, and extending to
+    /// `I64` unconditionally is right for it and wrong for the other two the
+    /// encoding permits. Without `REX.W` the destination is a 32-bit register
+    /// and the instruction is a plain `mov`; with a `0x66` prefix it is 16-bit.
+    /// Both are discouraged by the manual and neither is unreachable: a JIT
+    /// emitting `movsxd ecx, [rdi-0x30]` is what found this, in Mono's generated
+    /// code under rosetta3. Extending to `I64` there produced a value one type
+    /// wider than the register write expected, and the whole region failed
+    /// Cranelift's verifier - an error about IR rather than about the guest.
     pub(super) fn handle_movsxd(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let dst_reg = instruction.op0_register();
         let src_size = self.operand_size(instruction, 1)?;
         let src_val = self.read_operand(instruction, 1, src_size)?;
-        let extended = self.builder.ins().sextend(types::I64, src_val);
-        self.set_reg_val(dst_reg, extended)?;
+        let dst_ty = size_to_type(dst_reg.size());
+        // `sextend`, `ireduce` and `uextend` all reject a conversion to the type
+        // a value already has, so the equal case has to be a no-op rather than
+        // an identity conversion.
+        let val = match dst_reg.size().cmp(&src_size) {
+            std::cmp::Ordering::Greater => self.builder.ins().sextend(dst_ty, src_val),
+            std::cmp::Ordering::Equal => src_val,
+            std::cmp::Ordering::Less => self.builder.ins().ireduce(dst_ty, src_val),
+        };
+        self.set_reg_val(dst_reg, val)?;
         Ok(())
     }
 

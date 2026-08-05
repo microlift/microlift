@@ -61,6 +61,55 @@ pub(super) fn fp_sqrt_x86(b: &mut FunctionBuilder, x: Value) -> Value {
     b.ins().select(negative, indefinite, r)
 }
 
+/// The rounding a `ROUND*` instruction's `imm8` selects.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub(super) enum RoundMode {
+    /// Ties to even - the IEEE default, and x86's reset MXCSR mode.
+    Nearest,
+    /// Toward negative infinity.
+    Floor,
+    /// Toward positive infinity.
+    Ceil,
+    /// Toward zero.
+    Trunc,
+}
+
+/// Decode `imm8[2:0]` of a `ROUND*` instruction.
+///
+/// Bit 2 means "ignore bits[1:0] and use MXCSR's current rounding mode". This
+/// recompiler does not model MXCSR and nothing it lifts writes one - `LDMXCSR`
+/// is not implemented - so the mode is MXCSR's reset value, round-to-nearest-even,
+/// and that is what bit 2 resolves to. A guest that changed its rounding mode and
+/// then rounded would differ; it is the same standing gap `setjmp`'s missing
+/// `MXCSR` save is, recorded in the same place rather than papered over.
+///
+/// Bit 3 suppresses the precision exception, which is unobservable here: no
+/// floating-point exception is raised in the first place.
+pub(super) fn round_mode(imm: u8) -> RoundMode {
+    if imm & 0b100 != 0 {
+        return RoundMode::Nearest;
+    }
+    match imm & 0b11 {
+        0b00 => RoundMode::Nearest,
+        0b01 => RoundMode::Floor,
+        0b10 => RoundMode::Ceil,
+        _ => RoundMode::Trunc,
+    }
+}
+
+/// Apply `mode` to one float value.
+///
+/// A free function for the reason [`fp_sqrt_x86`] is: the packed lane plumbing
+/// hands its `op` closure only the builder.
+pub(super) fn apply_round(b: &mut FunctionBuilder, mode: RoundMode, x: Value) -> Value {
+    match mode {
+        RoundMode::Nearest => b.ins().nearest(x),
+        RoundMode::Floor => b.ins().floor(x),
+        RoundMode::Ceil => b.ins().ceil(x),
+        RoundMode::Trunc => b.ins().trunc(x),
+    }
+}
+
 /// Lane width of a packed-integer SSE operation - the `b`/`w`/`d`/`q` suffix
 /// of mnemonics like `PADDB` / `PADDW` / `PADDD` / `PADDQ`.
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -2446,6 +2495,79 @@ impl<'a> Lifter<'a> {
         let sqrt = |b: &mut FunctionBuilder<'a>, x: Value, _y: Value| fp_sqrt_x86(b, x);
         let res_lo = self.f32_pair_arith(src_lo, src_lo, &sqrt);
         let res_hi = self.f32_pair_arith(src_hi, src_hi, &sqrt);
+        self.set_xmm_lo(dst_idx, res_lo);
+        self.set_xmm_hi(dst_idx, res_hi);
+        Ok(())
+    }
+
+    /// ROUNDSD / ROUNDSS / ROUNDPD / ROUNDPS - SSE4.1 rounding with the mode
+    /// chosen by `imm8` rather than by MXCSR.
+    ///
+    /// The scalar forms preserve the destination's upper bits, exactly as
+    /// `SQRTSD` and `SQRTSS` do, so they reuse the same two writers.
+    ///
+    /// Reached by every `Math.Floor`, `Math.Ceiling` and `Math.Round` a .NET
+    /// program performs: clang and the Mono JIT both emit `ROUNDSD` for
+    /// `floor`/`ceil`/`trunc` instead of calling libm, so a runtime without it
+    /// stops a managed program at its first rounded number.
+    pub(super) fn handle_roundsd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, "roundsd")?;
+        let mode = round_mode(instruction.immediate8());
+        let src_bits = self.read_scalar_f64_bits(instruction, 1)?;
+        let x = self
+            .builder
+            .ins()
+            .bitcast(types::F64, MemFlagsData::new(), src_bits);
+        let r = apply_round(&mut self.builder, mode, x);
+        let bits = self
+            .builder
+            .ins()
+            .bitcast(types::I64, MemFlagsData::new(), r);
+        self.set_xmm_lo(dst_idx, bits);
+        Ok(())
+    }
+
+    /// ROUNDSS - see [`Self::handle_roundsd`]; bits[127:32] are preserved.
+    pub(super) fn handle_roundss(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, "roundss")?;
+        let mode = round_mode(instruction.immediate8());
+        let src_bits = self.read_scalar_f32_bits(instruction, 1, "roundss")?;
+        let x = self
+            .builder
+            .ins()
+            .bitcast(types::F32, MemFlagsData::new(), src_bits);
+        let r = apply_round(&mut self.builder, mode, x);
+        let bits = self
+            .builder
+            .ins()
+            .bitcast(types::I32, MemFlagsData::new(), r);
+        self.merge_xmm_dword0(dst_idx, bits);
+        Ok(())
+    }
+
+    /// ROUNDPD - both 64-bit lanes, see [`Self::handle_roundsd`].
+    pub(super) fn handle_roundpd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, "roundpd")?;
+        let mode = round_mode(instruction.immediate8());
+        let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
+        // The unary op as a binary one that ignores its second argument, the
+        // shape `SQRTPD` already established for this plumbing.
+        let round = |b: &mut FunctionBuilder<'a>, x: Value, _y: Value| apply_round(b, mode, x);
+        let res_lo = self.f64_bits_arith(src_lo, src_lo, &round);
+        let res_hi = self.f64_bits_arith(src_hi, src_hi, &round);
+        self.set_xmm_lo(dst_idx, res_lo);
+        self.set_xmm_hi(dst_idx, res_hi);
+        Ok(())
+    }
+
+    /// ROUNDPS - all four 32-bit lanes, see [`Self::handle_roundsd`].
+    pub(super) fn handle_roundps(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, "roundps")?;
+        let mode = round_mode(instruction.immediate8());
+        let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
+        let round = |b: &mut FunctionBuilder<'a>, x: Value, _y: Value| apply_round(b, mode, x);
+        let res_lo = self.f32_pair_arith(src_lo, src_lo, &round);
+        let res_hi = self.f32_pair_arith(src_hi, src_hi, &round);
         self.set_xmm_lo(dst_idx, res_lo);
         self.set_xmm_hi(dst_idx, res_hi);
         Ok(())

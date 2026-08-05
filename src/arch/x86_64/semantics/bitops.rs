@@ -910,6 +910,60 @@ impl<'a> Lifter<'a> {
         self.write_bit_scan_result(instruction, ctz, zf)
     }
 
+    /// TZCNT - count trailing zeros, **defined** for a zero source.
+    ///
+    /// The BMI1 replacement for `BSF`, and the difference is the whole point of
+    /// it: `BSF` leaves the destination alone when the source is zero, while
+    /// `TZCNT` writes the operand's bit width. Cranelift's `ctz` already has
+    /// exactly that definition, so the result needs no fixing up - only the
+    /// flags do.
+    ///
+    /// `CF = (src == 0)` and `ZF = (result == 0)`; the rest are architecturally
+    /// undefined and left as they are. Note that `ZF` is set from the *result*,
+    /// not from the source as `BSF` sets it, so the two cannot share a helper
+    /// even though they compute the same number.
+    ///
+    /// On a CPU without BMI1 this encoding decodes as `REP BSF`, which is why a
+    /// compiler emits it freely: it is correct on old hardware for every input
+    /// but zero. Terraria's Mono reaches it.
+    pub(super) fn handle_tzcnt(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let size = self.operand_size(instruction, 1)?;
+        let src = self.read_operand(instruction, 1, size)?;
+        let result = self.builder.ins().ctz(src);
+        self.write_count_zeros_result(instruction, src, result)
+    }
+
+    /// LZCNT - count leading zeros, the mirror of [`Self::handle_tzcnt`].
+    ///
+    /// `BSR` returns the *index* of the highest set bit; `LZCNT` returns the
+    /// count of zeros above it, which is `width - 1 - index`. Cranelift's `clz`
+    /// is the second of those, so this is not `BSR` with different flags - it is
+    /// a different number.
+    pub(super) fn handle_lzcnt(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let size = self.operand_size(instruction, 1)?;
+        let src = self.read_operand(instruction, 1, size)?;
+        let result = self.builder.ins().clz(src);
+        self.write_count_zeros_result(instruction, src, result)
+    }
+
+    /// The shared tail of `TZCNT` and `LZCNT`: write the result and set the two
+    /// flags they define.
+    fn write_count_zeros_result(
+        &mut self,
+        instruction: &Instruction,
+        src: Value,
+        result: Value,
+    ) -> crate::Result<()> {
+        let cf = self.builder.ins().icmp_imm_s(IntCC::Equal, src, 0);
+        self.set_flag(X86Flag::Carry, cf)?;
+        let zf = self.builder.ins().icmp_imm_s(IntCC::Equal, result, 0);
+        self.set_flag(X86Flag::Zero, zf)?;
+        // The ordinary destination write: unlike `BSF`/`BSR` there is no
+        // "leave the register alone" case to preserve, so the x86-64 rule that a
+        // 32-bit write zeroes the upper half applies as it does everywhere else.
+        self.write_operand(instruction, 0, result)
+    }
+
     /// Write a BSF/BSR result (`result`, in the operand type) to the register
     /// destination, leaving the entire 64-bit register unchanged when
     /// `keep_old` (ZF, i.e. source was zero) is set.

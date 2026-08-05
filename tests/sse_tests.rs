@@ -3533,6 +3533,115 @@ fn test_horizontal_arithmetic_agrees_in_vector_mode() {
     }
 }
 
+//  ROUNDSD / ROUNDSS / ROUNDPD / ROUNDPS
+
+/// Every mode of the scalar double form, against the same input, with the upper
+/// quadword of the destination checked to be untouched.
+#[test]
+fn test_roundsd_modes() {
+    for (imm, expected) in [
+        (0x00u8, 2.0f64),  // nearest, ties to even: 2.5 -> 2
+        (0x01, 2.0),       // floor
+        (0x02, 3.0),       // ceil
+        (0x03, 2.0),       // truncate
+    ] {
+        // roundsd xmm0, xmm1, imm; ret
+        let bytes = [0x66, 0x0F, 0x3A, 0x0B, 0xC1, imm, 0xC3];
+        let mut ctx = RegisterContext::default();
+        ctx.xmm[0] = [0, 0xDEAD_BEEF_DEAD_BEEF];
+        ctx.xmm[1] = [2.5f64.to_bits(), 0];
+        let out = run_test(&bytes, ctx);
+        assert_eq!(
+            f64::from_bits(out.xmm[0][0]),
+            expected,
+            "imm {imm:#04x}"
+        );
+        assert_eq!(out.xmm[0][1], 0xDEAD_BEEF_DEAD_BEEF, "imm {imm:#04x}");
+    }
+}
+
+/// Negative inputs, where floor and truncate stop agreeing.
+#[test]
+fn test_roundsd_negative_floor_and_truncate_differ() {
+    for (imm, expected) in [(0x01u8, -3.0f64), (0x03, -2.0)] {
+        let bytes = [0x66, 0x0F, 0x3A, 0x0B, 0xC1, imm, 0xC3];
+        let mut ctx = RegisterContext::default();
+        ctx.xmm[1] = [(-2.5f64).to_bits(), 0];
+        let out = run_test(&bytes, ctx);
+        assert_eq!(f64::from_bits(out.xmm[0][0]), expected, "imm {imm:#04x}");
+    }
+}
+
+/// Bit 2 means "use MXCSR", whose reset mode is round-to-nearest-even; see
+/// `round_mode`.
+#[test]
+fn test_roundsd_mxcsr_bit_rounds_to_nearest_even() {
+    let bytes = [0x66, 0x0F, 0x3A, 0x0B, 0xC1, 0x04, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[1] = [3.5f64.to_bits(), 0];
+    let out = run_test(&bytes, ctx);
+    assert_eq!(f64::from_bits(out.xmm[0][0]), 4.0);
+}
+
+/// ROUNDSS preserves bits[127:32], which is the whole difference from ROUNDPS.
+#[test]
+fn test_roundss_preserves_the_upper_lanes() {
+    // roundss xmm0, xmm1, 1; ret
+    let bytes = [0x66, 0x0F, 0x3A, 0x0A, 0xC1, 0x01, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [0x1111_1111_0000_0000, 0x2222_2222_3333_3333];
+    ctx.xmm[1] = [u64::from(2.75f32.to_bits()), 0];
+    let out = run_test(&bytes, ctx);
+    assert_eq!(f32::from_bits(out.xmm[0][0] as u32), 2.0);
+    assert_eq!(out.xmm[0][0] >> 32, 0x1111_1111);
+    assert_eq!(out.xmm[0][1], 0x2222_2222_3333_3333);
+}
+
+/// Both lanes of the packed double form, one per rounding direction.
+#[test]
+fn test_roundpd_rounds_both_lanes() {
+    // roundpd xmm0, xmm1, 2 (ceil); ret
+    let bytes = [0x66, 0x0F, 0x3A, 0x09, 0xC1, 0x02, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[1] = [1.25f64.to_bits(), (-1.25f64).to_bits()];
+    let out = run_test(&bytes, ctx);
+    assert_eq!(f64::from_bits(out.xmm[0][0]), 2.0);
+    assert_eq!(f64::from_bits(out.xmm[0][1]), -1.0);
+}
+
+/// All four lanes of the packed single form.
+#[test]
+fn test_roundps_rounds_four_lanes() {
+    // roundps xmm0, xmm1, 1 (floor); ret
+    let bytes = [0x66, 0x0F, 0x3A, 0x08, 0xC1, 0x01, 0xC3];
+    let lanes = [1.5f32, -1.5, 9.75, -0.25];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[1] = [
+        u64::from(lanes[0].to_bits()) | (u64::from(lanes[1].to_bits()) << 32),
+        u64::from(lanes[2].to_bits()) | (u64::from(lanes[3].to_bits()) << 32),
+    ];
+    let out = run_test(&bytes, ctx);
+    let got = [
+        f32::from_bits(out.xmm[0][0] as u32),
+        f32::from_bits((out.xmm[0][0] >> 32) as u32),
+        f32::from_bits(out.xmm[0][1] as u32),
+        f32::from_bits((out.xmm[0][1] >> 32) as u32),
+    ];
+    assert_eq!(got, [1.0, -2.0, 9.0, -1.0]);
+}
+
+/// A memory source, which is the form a constant operand compiles to.
+#[test]
+fn test_roundsd_memory_source() {
+    // roundsd xmm0, [rax], 2 (ceil); ret
+    let bytes = [0x66, 0x0F, 0x3A, 0x0B, 0x00, 0x02, 0xC3];
+    let mem = [7.125f64];
+    let mut ctx = RegisterContext::default();
+    ctx.rax = mem.as_ptr() as u64;
+    let out = run_test(&bytes, ctx);
+    assert_eq!(f64::from_bits(out.xmm[0][0]), 8.0);
+}
+
 //  RCPPS / RSQRTPS / RCPSS / RSQRTSS - approximate, so compared with a
 //  tolerance well inside the architectural 1.5 * 2^-12 relative error bound.
 
