@@ -1184,3 +1184,242 @@ fn packed_memory_sources_agree() {
         assert!(diff.is_empty(), "{name} (mem) diverged: {diff:?}");
     }
 }
+
+/// EXTRACTPS against hardware: every lane selector (including the imm8 bits
+/// above `[1:0]` that hardware ignores), for both the 32-bit and the `REX.W`
+/// destination spelling.
+#[test]
+fn extractps_agrees() {
+    for imm in 0..8u8 {
+        let progs: &[(&str, &[u8])] = &[
+            // extractps eax, xmm1, imm8 ; ret
+            ("extractps r32", &[0x66, 0x0F, 0x3A, 0x17, 0xC8, imm, 0xC3]),
+            // extractps rax, xmm1, imm8 ; ret
+            (
+                "extractps r64",
+                &[0x66, 0x48, 0x0F, 0x3A, 0x17, 0xC8, imm, 0xC3],
+            ),
+        ];
+        for (name, code) in progs {
+            let mut init = CpuState::zeroed();
+            init.xmm[1] = [0x2222_2222_1111_1111, 0x4444_4444_3333_3333];
+            // A dirty destination catches a merge where hardware zero-extends.
+            init.gpr[gpr::RAX] = 0xDEAD_BEEF_DEAD_BEEF;
+            let diff =
+                differential_unicorn(code, CODE_VA, &init, &[], BUDGET, DiffOptions::default())
+                    .expect("clean halt");
+            assert!(diff.is_empty(), "{name} imm={imm} diverged: {diff:?}");
+        }
+    }
+}
+
+/// Dot-product destinations at *single* precision: signed zeros, infinities,
+/// denormals and near-overflow magnitudes, and no NaN in any dword.
+///
+/// [`FLOAT_OPERANDS`] cannot be reused here. It keeps the source NaN-free but
+/// lets the destination hold NaNs, which is safe for a lane-wise op - only one
+/// operand of each addition can then be a NaN. `DPPS` reduces *across* lanes,
+/// so two NaN destination lanes meet each other in the summation tree, and the
+/// two-QNaN case is a standing disagreement between the engines: x86 returns
+/// the first (destination) operand, which is what Microlift gets by deferring
+/// to the host, while Unicorn's older softfloat applies the x87 larger-
+/// significand rule. Plain `ADDPS` with a QNaN in both operands shows the same
+/// divergence, so it is not a property of these instructions.
+///
+/// Propagation of a *single* NaN is covered by
+/// [`dot_product_nan_propagation_agrees`]; the infinities and zeros below still
+/// exercise the *generated* NaNs (`inf - inf`, `0 * inf`), where Microlift
+/// substitutes x86's floating indefinite rather than the host's default NaN.
+const DPPS_OPERANDS: &[([u64; 2], [u64; 2])] = &[
+    // f32 lanes 1.5, 2.5, -3.0, 4.0 against 2.0, 2.0, 4.0, 8.0
+    (
+        [0x4020_0000_3FC0_0000, 0x4080_0000_C040_0000],
+        [0x4000_0000_4000_0000, 0x4100_0000_4080_0000],
+    ),
+    // signed zeros in the destination
+    (
+        [0x8000_0000_0000_0000, 0x0000_0000_0000_0000],
+        [0x3F80_0000_3F80_0000, 0x4049_0FDB_4049_0FDB],
+    ),
+    // +/-inf lanes: with two enabled multiplies of opposite sign the tree hits
+    // `inf + -inf`, an invalid operation that *generates* a NaN.
+    (
+        [0x7F80_0000_FF80_0000, 0xFF80_0000_7F80_0000],
+        [0x3F80_0000_3F80_0000, 0x4000_0000_4000_0000],
+    ),
+    // an infinity against a +0.0 source lane: `0 * inf`, the other invalid
+    // operation reachable here.
+    (
+        [0x0000_0000_7F80_0000, 0x7F80_0000_0000_0000],
+        [0x3F80_0000_0000_0000, 0x0000_0000_3F80_0000],
+    ),
+    // denormals and near-overflow magnitudes, so the sum can round to infinity
+    (
+        [0x0000_0001_8000_0001, 0x7F7F_FFFF_FF7F_FFFF],
+        [0x0080_0000_4000_0000, 0x4000_0000_3F80_0000],
+    ),
+];
+
+/// The double-precision companion of [`DPPS_OPERANDS`], NaN-free per quadword.
+const DPPD_OPERANDS: &[([u64; 2], [u64; 2])] = &[
+    (
+        [0x3FF0_0000_0000_0000, 0x4000_0000_0000_0000],
+        [0x4000_0000_0000_0000, 0x3FF0_0000_0000_0000],
+    ),
+    // signed zeros
+    (
+        [0x8000_0000_0000_0000, 0x0000_0000_0000_0000],
+        [0x3FF0_0000_0000_0000, 0x4009_21FB_5444_2D18],
+    ),
+    // +inf and -inf: `inf + -inf` when both multiplies are enabled
+    (
+        [0x7FF0_0000_0000_0000, 0xFFF0_0000_0000_0000],
+        [0x3FF0_0000_0000_0000, 0x3FF0_0000_0000_0000],
+    ),
+    // an infinity against a +0.0 source lane: `0 * inf`
+    (
+        [0x7FF0_0000_0000_0000, 0x3FF0_0000_0000_0000],
+        [0x0000_0000_0000_0000, 0x4000_0000_0000_0000],
+    ),
+    // denormal and near-overflow magnitudes
+    (
+        [0x0000_0000_0000_0001, 0x7FEF_FFFF_FFFF_FFFF],
+        [0x4000_0000_0000_0000, 0x3FF0_0000_0000_0000],
+    ),
+];
+
+/// DPPS / DPPD over every `imm8`, on operands whose summation is **exact**.
+///
+/// The exactness is a hard requirement, not a convenience. Unicorn 2.x carries
+/// a pre-fix QEMU `helper_dpps`/`helper_dppd` that folds the products into a
+/// running accumulator, where the SDM (and current QEMU) specify the pairwise
+/// tree `(t0 + t1) + (t2 + t3)`. The two agree only when no intermediate
+/// rounds, so every value in the tables above is a small power-of-two multiple,
+/// an infinity, or a magnitude that overflows or underflows identically either
+/// way. Adding an operand that rounds turns this test into an assertion about
+/// the oracle's bug; `test_dpps_sums_as_a_pairwise_tree_not_left_to_right` in
+/// `tests/sse_tests.rs` pins the order against the SDM instead.
+///
+/// What the oracle *does* prove here is everything else, and the full 256-value
+/// sweep is why: the two mask nibbles interact, a masked-off multiply
+/// substituting `+0.0` is the only thing keeping an infinity in a disabled lane
+/// out of the sum, and which `imm8` values reach an `inf + -inf` - so a
+/// *generated* NaN, whose sign is x86's floating indefinite and not the host
+/// FPU's default - depends on the mask too.
+#[test]
+fn dot_product_agrees() {
+    for (name, opcode, operands) in [
+        ("dpps", 0x40u8, DPPS_OPERANDS),
+        ("dppd", 0x41u8, DPPD_OPERANDS),
+    ] {
+        for imm in 0..=255u8 {
+            // dpps/dppd xmm0, xmm1, imm8 ; ret
+            let code = [0x66, 0x0F, 0x3A, opcode, 0xC1, imm, 0xC3];
+            for &(dst, src) in operands {
+                let mut init = CpuState::zeroed();
+                init.xmm[0] = dst;
+                init.xmm[1] = src;
+                let diff = differential_unicorn(
+                    &code,
+                    CODE_VA,
+                    &init,
+                    &[],
+                    BUDGET,
+                    DiffOptions::default(),
+                )
+                .expect("clean halt");
+                assert!(
+                    diff.is_empty(),
+                    "{name} imm={imm:#04x} {dst:#018x?},{src:#018x?} diverged: {diff:?}"
+                );
+            }
+        }
+    }
+}
+
+/// Dot-product NaN *propagation*, with exactly one NaN in play.
+///
+/// One multiply is enabled and its destination lane holds a QNaN, so every
+/// addition in the tree sees at most one NaN operand and the result must be
+/// that NaN, bits intact. This is the coverage
+/// [`DPPS_OPERANDS`] / [`DPPD_OPERANDS`] deliberately give up to stay clear of
+/// the two-QNaN disagreement.
+#[test]
+fn dot_product_nan_propagation_agrees() {
+    // Sign, payload and signalling-ness all have to survive.
+    const NANS: [u64; 3] = [0x7FC0_0000, 0xFFC0_1234, 0x7F80_0001];
+
+    for lane in 0..4u32 {
+        for nan in NANS {
+            // Enable only `lane`'s multiply; broadcast to all four lanes.
+            let imm = ((1u8 << lane) << 4) | 0x0F;
+            let code = [0x66, 0x0F, 0x3A, 0x40, 0xC1, imm, 0xC3];
+            let mut init = CpuState::zeroed();
+            init.xmm[0] = [0x4000_0000_3F80_0000, 0x4080_0000_4040_0000];
+            init.xmm[0][(lane / 2) as usize] &= !(0xFFFF_FFFFu64 << ((lane % 2) * 32));
+            init.xmm[0][(lane / 2) as usize] |= nan << ((lane % 2) * 32);
+            init.xmm[1] = [0x4000_0000_4000_0000, 0x4000_0000_4000_0000];
+            let diff =
+                differential_unicorn(&code, CODE_VA, &init, &[], BUDGET, DiffOptions::default())
+                    .expect("clean halt");
+            assert!(
+                diff.is_empty(),
+                "dpps nan={nan:#010x} lane={lane} diverged: {diff:?}"
+            );
+        }
+    }
+
+    for lane in 0..2u32 {
+        for nan in [
+            0x7FF8_0000_0000_0000u64,
+            0xFFF8_0000_0000_1234,
+            0x7FF0_0000_0000_0001,
+        ] {
+            let imm = ((1u8 << lane) << 4) | 0x03;
+            let code = [0x66, 0x0F, 0x3A, 0x41, 0xC1, imm, 0xC3];
+            let mut init = CpuState::zeroed();
+            init.xmm[0] = [0x3FF0_0000_0000_0000, 0x4000_0000_0000_0000];
+            init.xmm[0][lane as usize] = nan;
+            init.xmm[1] = [0x4000_0000_0000_0000, 0x4000_0000_0000_0000];
+            let diff =
+                differential_unicorn(&code, CODE_VA, &init, &[], BUDGET, DiffOptions::default())
+                    .expect("clean halt");
+            assert!(
+                diff.is_empty(),
+                "dppd nan={nan:#018x} lane={lane} diverged: {diff:?}"
+            );
+        }
+    }
+}
+
+/// PHMINPOSUW against hardware. The unsigned comparison and the lowest-index
+/// tie rule are both invisible in the common case, so this leans on
+/// [`PACKED_OPERANDS`], which contains all-equal vectors and words whose high
+/// bit is set.
+#[test]
+fn phminposuw_agrees() {
+    // phminposuw xmm0, xmm1 ; ret
+    agree_packed("phminposuw", &[0x66, 0x0F, 0x38, 0x41, 0xC1, 0xC3]);
+}
+
+/// MPSADBW over every block/window selector `imm8` encodes, plus the bits above
+/// `[2:0]` that hardware ignores.
+#[test]
+fn mpsadbw_agrees() {
+    for imm in 0..16u8 {
+        // mpsadbw xmm0, xmm1, imm8 ; ret
+        let code = [0x66, 0x0F, 0x3A, 0x42, 0xC1, imm, 0xC3];
+        for &(dst, src) in PACKED_OPERANDS {
+            let mut init = CpuState::zeroed();
+            init.xmm[0] = dst;
+            init.xmm[1] = src;
+            let diff =
+                differential_unicorn(&code, CODE_VA, &init, &[], BUDGET, DiffOptions::default())
+                    .expect("clean halt");
+            assert!(
+                diff.is_empty(),
+                "mpsadbw imm={imm:#04x} {dst:#018x?},{src:#018x?} diverged: {diff:?}"
+            );
+        }
+    }
+}

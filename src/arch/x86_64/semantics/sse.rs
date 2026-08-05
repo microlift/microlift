@@ -1622,6 +1622,94 @@ impl<'a> Lifter<'a> {
         self.builder.ins().bor(lo64, hi_shifted)
     }
 
+    /// DPPS - single-precision dot product of the two operands, broadcast into
+    /// the destination lanes `imm8[3:0]` selects.
+    ///
+    /// `imm8[7:4]` is the *multiply* mask: a lane it clears contributes `+0.0`
+    /// rather than a product, so a NaN or an infinity sitting in a masked-off
+    /// lane cannot reach the sum. `imm8[3:0]` is the *broadcast* mask: a lane it
+    /// clears is written `+0.0` rather than the sum.
+    ///
+    /// The summation order is architectural, not an implementation choice - the
+    /// SDM specifies the pairwise tree `(t0 + t1) + (t2 + t3)`, each step
+    /// rounded to single precision. Summing left to right would be a different
+    /// (and wrong) result for most inputs, so the tree is written out literally
+    /// here. Every step goes through [`fadd_x86`] / [`fmul_x86`] so a *generated*
+    /// NaN is x86's floating indefinite rather than the host FPU's default.
+    pub(super) fn handle_dpps(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, "dpps")?;
+        let dst_lo = self.get_xmm_lo(dst_idx);
+        let dst_hi = self.get_xmm_hi(dst_idx);
+        let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
+        let imm = instruction.immediate8();
+
+        let (d0, d1) = self.split_dwords(dst_lo);
+        let (d2, d3) = self.split_dwords(dst_hi);
+        let (s0, s1) = self.split_dwords(src_lo);
+        let (s2, s3) = self.split_dwords(src_hi);
+        let d = [d0, d1, d2, d3];
+        let s = [s0, s1, s2, s3];
+
+        let pos_zero = self.builder.ins().iconst(types::I32, 0);
+        let mut terms = [pos_zero; 4];
+        for (lane, term) in terms.iter_mut().enumerate() {
+            if imm & (1 << (4 + lane)) != 0 {
+                *term = self.f32_bits_arith(d[lane], s[lane], &fmul_x86);
+            }
+        }
+
+        let left = self.f32_bits_arith(terms[0], terms[1], &fadd_x86);
+        let right = self.f32_bits_arith(terms[2], terms[3], &fadd_x86);
+        let sum = self.f32_bits_arith(left, right, &fadd_x86);
+
+        let pick = |lane: u8| {
+            if imm & (1 << lane) != 0 {
+                sum
+            } else {
+                pos_zero
+            }
+        };
+        let res_lo = self.join_dwords(pick(0), pick(1));
+        let res_hi = self.join_dwords(pick(2), pick(3));
+        self.set_xmm_lo(dst_idx, res_lo);
+        self.set_xmm_hi(dst_idx, res_hi);
+        Ok(())
+    }
+
+    /// DPPD - double-precision dot product, the two-lane companion of
+    /// [`handle_dpps`](Self::handle_dpps).
+    ///
+    /// `imm8[5:4]` masks the multiplies and `imm8[1:0]` the broadcast; bits
+    /// `[7:6]` and `[3:2]` are ignored, there being only two lanes. With one
+    /// addition there is no summation order to get wrong.
+    pub(super) fn handle_dppd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, "dppd")?;
+        let dst_lo = self.get_xmm_lo(dst_idx);
+        let dst_hi = self.get_xmm_hi(dst_idx);
+        let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
+        let imm = instruction.immediate8();
+
+        let pos_zero = self.builder.ins().iconst(types::I64, 0);
+        let mut terms = [pos_zero; 2];
+        for (lane, term) in terms.iter_mut().enumerate() {
+            if imm & (1 << (4 + lane)) != 0 {
+                let (a, b) = if lane == 0 {
+                    (dst_lo, src_lo)
+                } else {
+                    (dst_hi, src_hi)
+                };
+                *term = self.f64_bits_arith(a, b, &fmul_x86);
+            }
+        }
+        let sum = self.f64_bits_arith(terms[0], terms[1], &fadd_x86);
+
+        let res_lo = if imm & 0b01 != 0 { sum } else { pos_zero };
+        let res_hi = if imm & 0b10 != 0 { sum } else { pos_zero };
+        self.set_xmm_lo(dst_idx, res_lo);
+        self.set_xmm_hi(dst_idx, res_hi);
+        Ok(())
+    }
+
     /// HADDPD - horizontal add of the two double-precision lanes of each operand.
     pub(super) fn handle_haddpd(&mut self, instruction: &Instruction) -> crate::Result<()> {
         self.horizontal_double_arith(instruction, "haddpd", fadd_x86)

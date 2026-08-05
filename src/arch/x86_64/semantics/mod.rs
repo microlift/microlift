@@ -513,6 +513,13 @@ impl<'a> Lifter<'a> {
             Mnemonic::Pextrw => self.handle_pextr(instruction, PackedWidth::Word),
             Mnemonic::Pextrd => self.handle_pextr(instruction, PackedWidth::Dword),
             Mnemonic::Pextrq => self.handle_pextr(instruction, PackedWidth::Qword),
+            Mnemonic::Extractps => self.handle_extractps(instruction),
+
+            // SSE4.1 - dot products and the two cross-lane reductions.
+            Mnemonic::Dpps => self.handle_dpps(instruction),
+            Mnemonic::Dppd => self.handle_dppd(instruction),
+            Mnemonic::Phminposuw => self.handle_phminposuw(instruction),
+            Mnemonic::Mpsadbw => self.handle_mpsadbw(instruction),
 
             // SSE4.1 - blends and the 128-bit bitwise test.
             Mnemonic::Pblendw => self.handle_blend_imm(instruction, PackedWidth::Word),

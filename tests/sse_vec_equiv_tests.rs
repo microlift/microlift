@@ -296,6 +296,15 @@ fn vector_fast_paths_lower_on_every_target() {
         ("cvtpd2ps", &[0x66, 0x0F, 0x5A, 0xC1]),
         ("cvtps2pd", &[0x0F, 0x5A, 0xC1]),
         ("cvtdq2pd", &[0xF3, 0x0F, 0xE6, 0xC1]),
+        // These five have no vector fast path - their cross-lane reductions
+        // have no Cranelift primitive behind them - but under `use_vector_xmm`
+        // they still reach the XMM file through `extractlane`/`insertlane`, so
+        // they emit vector IR and have to lower like everything else here.
+        ("extractps", &[0x66, 0x0F, 0x3A, 0x17, 0xC8, 0x02]),
+        ("dpps", &[0x66, 0x0F, 0x3A, 0x40, 0xC1, 0xFF]),
+        ("dppd", &[0x66, 0x0F, 0x3A, 0x41, 0xC1, 0x33]),
+        ("phminposuw", &[0x66, 0x0F, 0x38, 0x41, 0xC1]),
+        ("mpsadbw", &[0x66, 0x0F, 0x3A, 0x42, 0xC1, 0x05]),
     ];
 
     // The `NLT` / `NLE` compare predicates are the ones without an aarch64

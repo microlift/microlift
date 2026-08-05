@@ -892,7 +892,35 @@ impl<'a> Lifter<'a> {
         instruction: &Instruction,
         width: PackedWidth,
     ) -> crate::Result<()> {
-        let src_idx = self.xmm_operand_index(instruction, 1, "pextr")?;
+        self.lane_extract_to_rm(instruction, width, "pextr")
+    }
+
+    /// EXTRACTPS - extract one single-precision lane of an XMM register into a
+    /// GPR or a 32-bit memory location, selected by `imm8[1:0]`.
+    ///
+    /// Despite the floating-point name this is a pure bit copy: no conversion,
+    /// no NaN quieting, no MXCSR effect. It is therefore exactly `PEXTRD`, and
+    /// shares its implementation.
+    ///
+    /// `EXTRACTPS` additionally accepts `REX.W`, which the SDM writes as an
+    /// `r64/m32` destination that still zeroes `DEST[63:32]`. iced normalizes
+    /// that back to the 32-bit register, and a 32-bit GPR write already
+    /// zero-extends, so the prefix needs no handling of its own - both spellings
+    /// land on the same IR.
+    pub(super) fn handle_extractps(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.lane_extract_to_rm(instruction, PackedWidth::Dword, "extractps")
+    }
+
+    /// Shared body of the lane-extract-to-`r/m` forms (`PEXTR*`, `EXTRACTPS`):
+    /// operand 1 is the XMM source, operand 0 the GPR or memory destination,
+    /// and `imm8`'s low `log2(lane count)` bits pick the lane.
+    fn lane_extract_to_rm(
+        &mut self,
+        instruction: &Instruction,
+        width: PackedWidth,
+        who: &str,
+    ) -> crate::Result<()> {
+        let src_idx = self.xmm_operand_index(instruction, 1, who)?;
         let bits = width.bits();
 
         let lanes = 128 / bits;
@@ -925,9 +953,99 @@ impl<'a> Lifter<'a> {
                 Ok(())
             }
             other => Err(MicroliftError::UnsupportedInstruction {
-                mnemonic: format!("pextr-dst-{:?}", other),
+                mnemonic: format!("{}-dst-{:?}", who, other),
             }),
         }
+    }
+
+    /// PHMINPOSUW - find the smallest *unsigned* word of the source, and report
+    /// both it and where it was.
+    ///
+    /// `DEST[15:0]` is the minimum, `DEST[18:16]` its lane index, and every
+    /// remaining bit is zeroed. Ties keep the *lowest* index, which is why the
+    /// running comparison below is a strict `<`: an equal lane never displaces
+    /// the one already held.
+    ///
+    /// There is no vector fast path. Cranelift has no horizontal minimum, so a
+    /// native expansion would be the same seven-step select chain over
+    /// `extractlane`s - i.e. the scalar one with extra bitcasts.
+    pub(super) fn handle_phminposuw(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, "phminposuw")?;
+        let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
+        let words = self.xmm_lanes(src_lo, src_hi, 16, false);
+
+        // Owning the iterator keeps `words` out of the loop body, which would
+        // otherwise be borrowed across the `&mut self` calls inside it.
+        let mut lanes = words.into_iter().enumerate();
+        let mut min = lanes.next().expect("eight word lanes").1;
+        let mut pos = self.builder.ins().iconst(types::I64, 0);
+        for (i, word) in lanes {
+            let better = self.builder.ins().icmp(IntCC::UnsignedLessThan, word, min);
+            min = self.builder.ins().select(better, word, min);
+            let this = self.builder.ins().iconst(types::I64, i as i64);
+            pos = self.builder.ins().select(better, this, pos);
+        }
+
+        let placed = self.builder.ins().ishl_imm_u(pos, 16);
+        let res_lo = self.builder.ins().bor(min, placed);
+        let zero = self.builder.ins().iconst(types::I64, 0);
+        self.set_xmm_lo(dst_idx, res_lo);
+        self.set_xmm_hi(dst_idx, zero);
+        Ok(())
+    }
+
+    /// MPSADBW - eight overlapping sums of absolute byte differences.
+    ///
+    /// `imm8[1:0]` picks which dword of the source is the 4-byte reference
+    /// block; `imm8[2]` picks whether the destination's 11-byte window starts at
+    /// byte 0 or byte 4. Result word `i` is the sum of the absolute differences
+    /// between the reference block and the destination bytes at `window + i`, so
+    /// consecutive results overlap by three bytes - that sliding window is the
+    /// whole point of the instruction and the reason it has no lane-wise form.
+    ///
+    /// Each byte is zero-extended into an `I64` first, so `|x - y|` is
+    /// `umax - umin` with nothing to overflow, and the maximum sum (`4 * 255`)
+    /// cannot saturate the word it is written to.
+    ///
+    /// No vector fast path: the sliding window crosses lanes at byte
+    /// granularity with no Cranelift primitive behind it.
+    pub(super) fn handle_mpsadbw(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, "mpsadbw")?;
+        let dst_lo = self.get_xmm_lo(dst_idx);
+        let dst_hi = self.get_xmm_hi(dst_idx);
+        let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
+        let imm = u32::from(instruction.immediate8());
+        // Byte (not bit) offsets: imm8[2] scales by 4 dwords -> 4 bytes, and
+        // imm8[1:0] selects one of the source's four dwords.
+        let window = (((imm >> 2) & 1) * 4) as usize;
+        let block = ((imm & 3) * 4) as usize;
+
+        let a = self.xmm_lanes(dst_lo, dst_hi, 8, false);
+        let b = self.xmm_lanes(src_lo, src_hi, 8, false);
+
+        let mut out = Vec::with_capacity(8);
+        for i in 0..8usize {
+            let mut sum = None;
+            for j in 0..4usize {
+                // window + i + j <= 4 + 7 + 3 = 14, so the window never leaves
+                // the register.
+                let x = a[window + i + j];
+                let y = b[block + j];
+                let high = self.builder.ins().umax(x, y);
+                let low = self.builder.ins().umin(x, y);
+                let diff = self.builder.ins().isub(high, low);
+                sum = Some(match sum {
+                    None => diff,
+                    Some(acc) => self.builder.ins().iadd(acc, diff),
+                });
+            }
+            out.push(sum.expect("four differences accumulated"));
+        }
+
+        let (res_lo, res_hi) = self.pack_xmm_lanes(&out, 16);
+        self.set_xmm_lo(dst_idx, res_lo);
+        self.set_xmm_hi(dst_idx, res_hi);
+        Ok(())
     }
 
     //  Blends and PTEST.

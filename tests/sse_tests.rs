@@ -4024,3 +4024,363 @@ fn test_mmx_encodings_exit_to_host() {
         .expect("mmx forms must lift, not error");
     assert_eq!(out.exit, ExitReason::UnimplementedInstruction);
 }
+
+//  EXTRACTPS - SSE4.1 single-precision lane extract into a GPR or m32. Despite
+//  the floating-point name it is a bit copy, so every case below checks raw
+//  bits rather than float values.
+
+/// The four lanes of the fixture XMM used by the EXTRACTPS tests, as a
+/// `(lo, hi)` pair: lane `i` is `0x1111_1111 * (i + 1)`.
+const EXTRACTPS_SRC: [u64; 2] = [0x2222_2222_1111_1111, 0x4444_4444_3333_3333];
+
+#[test]
+fn test_extractps_all_lanes_to_gpr() {
+    for lane in 0..4u8 {
+        // extractps eax, xmm1, imm8; ret  ->  66 0F 3A 17 C8 ib  C3
+        let bytes = [0x66, 0x0F, 0x3A, 0x17, 0xC8, lane, 0xC3];
+        let mut ctx = RegisterContext::default();
+        ctx.xmm[1] = EXTRACTPS_SRC;
+        // A dirty destination proves the write zero-extends rather than merges.
+        ctx.rax = 0xDEAD_BEEF_DEAD_BEEF;
+        let out = run_test(&bytes, ctx);
+        let want = 0x1111_1111u64 * u64::from(lane + 1);
+        assert_eq!(out.rax, want, "extractps lane {lane}");
+        assert_eq!(out.xmm[1], EXTRACTPS_SRC, "source must not be written");
+    }
+}
+
+#[test]
+fn test_extractps_rex_w_still_zero_extends() {
+    // The REX.W spelling is `r64/m32` in the SDM but still zeroes DEST[63:32].
+    // extractps rax, xmm1, 2; ret  ->  66 48 0F 3A 17 C8 02  C3
+    let bytes = [0x66, 0x48, 0x0F, 0x3A, 0x17, 0xC8, 0x02, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[1] = EXTRACTPS_SRC;
+    ctx.rax = 0xDEAD_BEEF_DEAD_BEEF;
+    let out = run_test(&bytes, ctx);
+    assert_eq!(out.rax, 0x3333_3333);
+}
+
+#[test]
+fn test_extractps_imm_selector_masks_to_two_bits() {
+    // imm8 bits above [1:0] are ignored, so 0x06 selects lane 2.
+    let bytes = [0x66, 0x0F, 0x3A, 0x17, 0xC8, 0x06, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[1] = EXTRACTPS_SRC;
+    let out = run_test(&bytes, ctx);
+    assert_eq!(out.rax, 0x3333_3333);
+}
+
+#[test]
+fn test_extractps_to_memory_writes_one_dword() {
+    // extractps dword ptr [rax], xmm1, 3; ret  ->  66 0F 3A 17 08 03  C3
+    let bytes = [0x66, 0x0F, 0x3A, 0x17, 0x08, 0x03, 0xC3];
+    let mem = [0xAAAA_AAAAu32, 0xBBBB_BBBB];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[1] = EXTRACTPS_SRC;
+    ctx.rax = mem.as_ptr() as u64;
+    run_test(&bytes, ctx);
+    assert_eq!(mem[0], 0x4444_4444, "lane 3 stored");
+    assert_eq!(mem[1], 0xBBBB_BBBB, "only four bytes written");
+}
+
+#[test]
+fn test_extractps_vector_mode_agrees() {
+    let bytes = [0x66, 0x0F, 0x3A, 0x17, 0xC8, 0x01, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[1] = EXTRACTPS_SRC;
+    ctx.rax = 0xDEAD_BEEF_DEAD_BEEF;
+    assert_eq!(run_test(&bytes, ctx).rax, run_test_vec(&bytes, ctx).rax);
+    assert_eq!(run_test_vec(&bytes, ctx).rax, 0x2222_2222);
+}
+
+//  DPPS / DPPD - SSE4.1 dot products. `imm8`'s high nibble masks the
+//  multiplies and its low nibble the broadcast; both masks substitute +0.0.
+
+/// f32 bit patterns for 1.0 .. 8.0, used to build the DPPS fixtures.
+const F32_1: u64 = 0x3F80_0000;
+const F32_2: u64 = 0x4000_0000;
+const F32_3: u64 = 0x4040_0000;
+const F32_4: u64 = 0x4080_0000;
+const F32_5: u64 = 0x40A0_0000;
+const F32_6: u64 = 0x40C0_0000;
+const F32_7: u64 = 0x40E0_0000;
+const F32_8: u64 = 0x4100_0000;
+/// 70.0f32 = 1*5 + 2*6 + 3*7 + 4*8.
+const F32_70: u64 = 0x428C_0000;
+/// 38.0f32 = 1*5 + 2*6 + 3*7 (lane 3 masked out).
+const F32_38: u64 = 0x4218_0000;
+
+/// `dpps xmm0, xmm1, imm8; ret` with xmm0 = [1,2,3,4] and xmm1 = [5,6,7,8].
+fn run_dpps(imm: u8) -> RegisterContext {
+    let bytes = [0x66, 0x0F, 0x3A, 0x40, 0xC1, imm, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [(F32_2 << 32) | F32_1, (F32_4 << 32) | F32_3];
+    ctx.xmm[1] = [(F32_6 << 32) | F32_5, (F32_8 << 32) | F32_7];
+    let scalar = run_test(&bytes, ctx);
+    let vector = run_test_vec(&bytes, ctx);
+    assert_eq!(
+        scalar.xmm, vector.xmm,
+        "dpps {imm:#04x} differs across modes"
+    );
+    scalar
+}
+
+#[test]
+fn test_dpps_full_mask_broadcasts_the_sum() {
+    let out = run_dpps(0xFF);
+    assert_eq!(
+        out.xmm[0],
+        [(F32_70 << 32) | F32_70, (F32_70 << 32) | F32_70]
+    );
+}
+
+#[test]
+fn test_dpps_multiply_mask_substitutes_zero() {
+    // Lanes 0..2 multiplied, lane 3 contributes +0.0; broadcast to lane 0 only.
+    let out = run_dpps(0x71);
+    assert_eq!(out.xmm[0], [F32_38, 0]);
+}
+
+#[test]
+fn test_dpps_broadcast_mask_selects_destination_lanes() {
+    // All four products, written to lanes 1 and 3 only.
+    let out = run_dpps(0xFA);
+    assert_eq!(out.xmm[0], [F32_70 << 32, F32_70 << 32]);
+}
+
+#[test]
+fn test_dpps_masked_off_lane_cannot_propagate_nan() {
+    // A masked-off lane is replaced by +0.0 *before* the multiply, so a NaN
+    // parked there must not reach the sum.
+    let bytes = [0x66, 0x0F, 0x3A, 0x40, 0xC1, 0x71, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [(F32_2 << 32) | F32_1, (0x7FC0_0000 << 32) | F32_3];
+    ctx.xmm[1] = [(F32_6 << 32) | F32_5, (0x7FF0_0000 << 32) | F32_7];
+    let out = run_test(&bytes, ctx);
+    assert_eq!(out.xmm[0], [F32_38, 0], "masked lane 3 must be inert");
+}
+
+#[test]
+fn test_dpps_sums_as_a_pairwise_tree_not_left_to_right() {
+    // Products are [1.0, 2^-24, 2^-24, 2^-24]. The SDM's tree
+    // ((t0+t1) + (t2+t3)) gives 1.0 + 2^-23 = 0x3F800001, while a left-to-right
+    // fold gives 1.0 - each 2^-24 vanishing into the running sum on its own.
+    //
+    // `no_unicorn` because this is the one case where the oracle is behind the
+    // architecture: unicorn 2.x carries a pre-fix QEMU `helper_dpps` that folds
+    // into a running accumulator, so it answers 0x3F800000 here. Upstream QEMU
+    // has since been corrected to the tree, and the SDM's `DP_primitive`
+    // pseudocode has always specified it. See `dot_product_agrees` in
+    // `tests/unicorn_oracle_tests.rs` for what the oracle can still prove.
+    const F32_EPS: u64 = 0x3380_0000; // 2^-24
+    let bytes = [0x66, 0x0F, 0x3A, 0x40, 0xC1, 0xF1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [(F32_EPS << 32) | F32_1, (F32_EPS << 32) | F32_EPS];
+    ctx.xmm[1] = [(F32_1 << 32) | F32_1, (F32_1 << 32) | F32_1];
+    let out = LiftTest::new(&bytes).ctx(ctx).no_unicorn().run().ctx;
+    assert_eq!(out.xmm[0], [0x3F80_0001, 0]);
+}
+
+/// `dppd xmm0, xmm1, imm8; ret` with xmm0 = [2.0, 3.0] and xmm1 = [5.0, 7.0].
+fn run_dppd(imm: u8) -> RegisterContext {
+    let bytes = [0x66, 0x0F, 0x3A, 0x41, 0xC1, imm, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [0x4000_0000_0000_0000, 0x4008_0000_0000_0000];
+    ctx.xmm[1] = [0x4014_0000_0000_0000, 0x401C_0000_0000_0000];
+    let scalar = run_test(&bytes, ctx);
+    let vector = run_test_vec(&bytes, ctx);
+    assert_eq!(
+        scalar.xmm, vector.xmm,
+        "dppd {imm:#04x} differs across modes"
+    );
+    scalar
+}
+
+#[test]
+fn test_dppd_full_mask_broadcasts_the_sum() {
+    // 2*5 + 3*7 = 31.0
+    let out = run_dppd(0x33);
+    assert_eq!(out.xmm[0], [0x403F_0000_0000_0000, 0x403F_0000_0000_0000]);
+}
+
+#[test]
+fn test_dppd_lane_masks() {
+    // Multiply lane 0 only, broadcast to lane 0 only: 2*5 = 10.0.
+    let out = run_dppd(0x11);
+    assert_eq!(out.xmm[0], [0x4024_0000_0000_0000, 0]);
+
+    // Multiply lane 1 only, broadcast to lane 1 only: 3*7 = 21.0.
+    let out = run_dppd(0x22);
+    assert_eq!(out.xmm[0], [0, 0x4035_0000_0000_0000]);
+}
+
+#[test]
+fn test_dppd_ignores_imm_bits_without_a_lane() {
+    // Only imm8[5:4] and imm8[1:0] are defined; 0xCC adds bits [7:6] and [3:2],
+    // which must change nothing relative to a bare 0x00.
+    assert_eq!(run_dppd(0xCC).xmm[0], [0, 0]);
+}
+
+#[test]
+fn test_dppd_masked_off_lane_cannot_propagate_nan() {
+    let bytes = [0x66, 0x0F, 0x3A, 0x41, 0xC1, 0x11, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [0x4000_0000_0000_0000, 0x7FF8_0000_0000_0000];
+    ctx.xmm[1] = [0x4014_0000_0000_0000, 0x7FF0_0000_0000_0000];
+    let out = run_test(&bytes, ctx);
+    assert_eq!(out.xmm[0], [0x4024_0000_0000_0000, 0]);
+}
+
+//  PHMINPOSUW - horizontal unsigned-word minimum plus its position.
+
+/// `phminposuw xmm0, xmm1; ret` over the eight words of `src`, lowest first.
+fn run_phminposuw(src: [u16; 8]) -> RegisterContext {
+    let bytes = [0x66, 0x0F, 0x38, 0x41, 0xC1, 0xC3];
+    let pack = |w: &[u16]| {
+        w.iter()
+            .enumerate()
+            .fold(0u64, |acc, (i, &v)| acc | (u64::from(v) << (i * 16)))
+    };
+    let mut ctx = RegisterContext::default();
+    // Garbage in the destination proves both halves are fully overwritten.
+    ctx.xmm[0] = [0xDEAD_BEEF_DEAD_BEEF, 0xCAFE_BABE_CAFE_BABE];
+    ctx.xmm[1] = [pack(&src[..4]), pack(&src[4..])];
+    let scalar = run_test(&bytes, ctx);
+    let vector = run_test_vec(&bytes, ctx);
+    assert_eq!(scalar.xmm, vector.xmm, "phminposuw differs across modes");
+    scalar
+}
+
+#[test]
+fn test_phminposuw_reports_minimum_and_index() {
+    // 0x8000 is present and is *not* the minimum: the comparison is unsigned.
+    let out = run_phminposuw([
+        0x0007, 0x0003, 0xFFFF, 0x0003, 0x8000, 0x0100, 0x0002, 0x0009,
+    ]);
+    assert_eq!(out.xmm[0], [(6 << 16) | 0x0002, 0]);
+}
+
+#[test]
+fn test_phminposuw_ties_keep_the_lowest_index() {
+    let out = run_phminposuw([
+        0x0005, 0x0001, 0x0001, 0x0009, 0x0001, 0xFFFF, 0xAAAA, 0x0002,
+    ]);
+    assert_eq!(out.xmm[0], [(1 << 16) | 0x0001, 0]);
+}
+
+#[test]
+fn test_phminposuw_minimum_in_lane_zero_and_in_lane_seven() {
+    let out = run_phminposuw([
+        0x0000, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
+    ]);
+    assert_eq!(out.xmm[0], [0, 0]);
+
+    let out = run_phminposuw([0xFFFF; 8]);
+    assert_eq!(out.xmm[0], [0xFFFF, 0], "an all-equal vector picks index 0");
+
+    let out = run_phminposuw([
+        0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFE,
+    ]);
+    assert_eq!(out.xmm[0], [(7 << 16) | 0xFFFE, 0]);
+}
+
+#[test]
+fn test_phminposuw_from_memory() {
+    // phminposuw xmm0, [rax]; ret  ->  66 0F 38 41 00  C3
+    let bytes = [0x66, 0x0F, 0x38, 0x41, 0x00, 0xC3];
+    let mem: [u16; 8] = [
+        0x0040, 0x0030, 0x0020, 0x0010, 0x0011, 0x0012, 0x0013, 0x0014,
+    ];
+    let mut ctx = RegisterContext::default();
+    ctx.rax = mem.as_ptr() as u64;
+    let out = run_test(&bytes, ctx);
+    assert_eq!(out.xmm[0], [(3 << 16) | 0x0010, 0]);
+}
+
+//  MPSADBW - eight overlapping 4-byte sums of absolute differences.
+
+/// `mpsadbw xmm0, xmm1, imm8; ret` with xmm0 bytes 0x00..0x0F and xmm1 bytes
+/// 0x10..0x1F, so every byte in the problem is distinct and the arithmetic
+/// stays easy to state.
+fn run_mpsadbw(imm: u8) -> RegisterContext {
+    let bytes = [0x66, 0x0F, 0x3A, 0x42, 0xC1, imm, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [0x0706_0504_0302_0100, 0x0F0E_0D0C_0B0A_0908];
+    ctx.xmm[1] = [0x1716_1514_1312_1110, 0x1F1E_1D1C_1B1A_1918];
+    let scalar = run_test(&bytes, ctx);
+    let vector = run_test_vec(&bytes, ctx);
+    assert_eq!(
+        scalar.xmm, vector.xmm,
+        "mpsadbw {imm:#04x} differs across modes"
+    );
+    scalar
+}
+
+/// Pack eight result words into the `(lo, hi)` pair they occupy.
+fn words(w: [u16; 8]) -> [u64; 2] {
+    let pack = |s: &[u16]| {
+        s.iter()
+            .enumerate()
+            .fold(0u64, |acc, (i, &v)| acc | (u64::from(v) << (i * 16)))
+    };
+    [pack(&w[..4]), pack(&w[4..])]
+}
+
+#[test]
+fn test_mpsadbw_default_blocks() {
+    // imm8 = 0: reference is src bytes 0..3 (16..19), window is dst bytes 0..10.
+    // Result word i = sum_j |(i+j) - (16+j)| = 4 * (16 - i).
+    let out = run_mpsadbw(0x00);
+    assert_eq!(out.xmm[0], words([64, 60, 56, 52, 48, 44, 40, 36]));
+}
+
+#[test]
+fn test_mpsadbw_source_block_selector() {
+    // imm8[1:0] = 1: reference is src bytes 4..7 (20..23), window unchanged.
+    // Result word i = 4 * (20 - i).
+    let out = run_mpsadbw(0x01);
+    assert_eq!(out.xmm[0], words([80, 76, 72, 68, 64, 60, 56, 52]));
+}
+
+#[test]
+fn test_mpsadbw_destination_window_selector() {
+    // imm8[2] = 1: window is dst bytes 4..14, reference back to src bytes 0..3.
+    // Result word i = 4 * |(4 + i) - 16| = 4 * (12 - i).
+    let out = run_mpsadbw(0x04);
+    assert_eq!(out.xmm[0], words([48, 44, 40, 36, 32, 28, 24, 20]));
+}
+
+#[test]
+fn test_mpsadbw_ignores_imm_bits_above_two() {
+    // 0xF9 has bits[1:0] = 1 and bit 2 = 0, so it must match 0x01 exactly.
+    assert_eq!(run_mpsadbw(0xF9).xmm[0], run_mpsadbw(0x01).xmm[0]);
+}
+
+#[test]
+fn test_mpsadbw_differences_are_unsigned_absolute_and_do_not_saturate() {
+    let bytes = [0x66, 0x0F, 0x3A, 0x42, 0xC1, 0x00, 0xC3];
+    // Largest possible sum in both directions: 4 * 255 = 1020, which needs the
+    // full word and must not be taken modulo 256 or clamped.
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [u64::MAX, u64::MAX];
+    ctx.xmm[1] = [0, 0];
+    assert_eq!(run_test(&bytes, ctx).xmm[0], words([1020; 8]));
+
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [0, 0];
+    ctx.xmm[1] = [u64::MAX, u64::MAX];
+    assert_eq!(run_test(&bytes, ctx).xmm[0], words([1020; 8]));
+}
+
+#[test]
+fn test_mpsadbw_from_memory() {
+    // mpsadbw xmm0, [rax], 0; ret  ->  66 0F 3A 42 00 00  C3
+    let bytes = [0x66, 0x0F, 0x3A, 0x42, 0x00, 0x00, 0xC3];
+    let mem: [u64; 2] = [0x1716_1514_1312_1110, 0x1F1E_1D1C_1B1A_1918];
+    let mut ctx = RegisterContext::default();
+    ctx.rax = mem.as_ptr() as u64;
+    ctx.xmm[0] = [0x0706_0504_0302_0100, 0x0F0E_0D0C_0B0A_0908];
+    let out = run_test(&bytes, ctx);
+    assert_eq!(out.xmm[0], words([64, 60, 56, 52, 48, 44, 40, 36]));
+}
