@@ -61,6 +61,58 @@ pub(super) fn fp_sqrt_x86(b: &mut FunctionBuilder, x: Value) -> Value {
     b.ins().select(negative, indefinite, r)
 }
 
+/// One `F32`/`F64` arithmetic lane with x86's *generated*-NaN bits.
+///
+/// The companion of [`fp_sqrt_x86`] for the binary operations: `inf + -inf`,
+/// `inf - inf`, `0 * inf`, `0 / 0` and `inf / inf` are *invalid operations*,
+/// and the NaN they produce is one the instruction generates rather than
+/// propagates - so it must be x86's sign-set floating indefinite, not whatever
+/// default NaN the host FPU picks (AArch64's is positive).
+///
+/// The condition is stated once for all four operations rather than enumerated
+/// per operation: a NaN result that neither operand supplied *is* the invalid
+/// case, and it is exactly the set above. When an operand is already a NaN the
+/// host propagates it correctly - quieted, sign and payload intact, as x86
+/// does - so `Ordered(x, y)` leaves that path untouched.
+pub(super) fn fp_arith_x86(
+    b: &mut FunctionBuilder,
+    x: Value,
+    y: Value,
+    op: impl FnOnce(&mut FunctionBuilder, Value, Value) -> Value,
+) -> Value {
+    let r = op(b, x, y);
+    let indefinite = if b.func.dfg.value_type(r) == types::F32 {
+        b.ins().f32const(F32_INDEFINITE)
+    } else {
+        b.ins().f64const(F64_INDEFINITE)
+    };
+    let generated = b.ins().fcmp(FloatCC::Unordered, r, r);
+    let operands_ok = b.ins().fcmp(FloatCC::Ordered, x, y);
+    let invalid = b.ins().band(generated, operands_ok);
+    b.ins().select(invalid, indefinite, r)
+}
+
+/// [`fp_arith_x86`] over `FADD` - the lane closure the packed/scalar plumbing
+/// expects.
+pub(super) fn fadd_x86(b: &mut FunctionBuilder, x: Value, y: Value) -> Value {
+    fp_arith_x86(b, x, y, |b, x, y| b.ins().fadd(x, y))
+}
+
+/// [`fp_arith_x86`] over `FSUB`.
+pub(super) fn fsub_x86(b: &mut FunctionBuilder, x: Value, y: Value) -> Value {
+    fp_arith_x86(b, x, y, |b, x, y| b.ins().fsub(x, y))
+}
+
+/// [`fp_arith_x86`] over `FMUL`.
+pub(super) fn fmul_x86(b: &mut FunctionBuilder, x: Value, y: Value) -> Value {
+    fp_arith_x86(b, x, y, |b, x, y| b.ins().fmul(x, y))
+}
+
+/// [`fp_arith_x86`] over `FDIV`.
+pub(super) fn fdiv_x86(b: &mut FunctionBuilder, x: Value, y: Value) -> Value {
+    fp_arith_x86(b, x, y, |b, x, y| b.ins().fdiv(x, y))
+}
+
 /// The rounding a `ROUND*` instruction's `imm8` selects.
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub(super) enum RoundMode {
@@ -1572,22 +1624,22 @@ impl<'a> Lifter<'a> {
 
     /// HADDPD - horizontal add of the two double-precision lanes of each operand.
     pub(super) fn handle_haddpd(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        self.horizontal_double_arith(instruction, "haddpd", |b, x, y| b.ins().fadd(x, y))
+        self.horizontal_double_arith(instruction, "haddpd", fadd_x86)
     }
 
     /// HSUBPD - horizontal subtract: `dst[0] - dst[1]`, then `src[0] - src[1]`.
     pub(super) fn handle_hsubpd(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        self.horizontal_double_arith(instruction, "hsubpd", |b, x, y| b.ins().fsub(x, y))
+        self.horizontal_double_arith(instruction, "hsubpd", fsub_x86)
     }
 
     /// HADDPS - horizontal add of adjacent single-precision lane pairs.
     pub(super) fn handle_haddps(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        self.horizontal_single_arith(instruction, "haddps", |b, x, y| b.ins().fadd(x, y))
+        self.horizontal_single_arith(instruction, "haddps", fadd_x86)
     }
 
     /// HSUBPS - horizontal subtract of adjacent single-precision lane pairs.
     pub(super) fn handle_hsubps(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        self.horizontal_single_arith(instruction, "hsubps", |b, x, y| b.ins().fsub(x, y))
+        self.horizontal_single_arith(instruction, "hsubps", fsub_x86)
     }
 
     /// Shared implementation for the packed double-precision arithmetic
@@ -1658,19 +1710,19 @@ impl<'a> Lifter<'a> {
     /// ADDSD - scalar double-precision add of the low 64 bits; the high 64 bits
     /// of the destination are preserved.
     pub(super) fn handle_addsd(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        self.scalar_double_arith(instruction, "addsd", |b, x, y| b.ins().fadd(x, y))
+        self.scalar_double_arith(instruction, "addsd", fadd_x86)
     }
 
     /// MULSD - scalar double-precision multiply of the low 64 bits; the high 64
     /// bits of the destination are preserved.
     pub(super) fn handle_mulsd(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        self.scalar_double_arith(instruction, "mulsd", |b, x, y| b.ins().fmul(x, y))
+        self.scalar_double_arith(instruction, "mulsd", fmul_x86)
     }
 
     /// DIVSD - scalar double-precision divide of the low 64 bits (`dst / src`);
     /// the high 64 bits of the destination are preserved.
     pub(super) fn handle_divsd(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        self.scalar_double_arith(instruction, "divsd", |b, x, y| b.ins().fdiv(x, y))
+        self.scalar_double_arith(instruction, "divsd", fdiv_x86)
     }
 
     /// ADDPD - packed double-precision add of both 64-bit lanes.
@@ -1678,7 +1730,7 @@ impl<'a> Lifter<'a> {
         if self.try_packed_fp_vec(instruction, "addpd", false, PackedFpOp::Add)? {
             return Ok(());
         }
-        self.packed_double_arith(instruction, "addpd", |b, x, y| b.ins().fadd(x, y))
+        self.packed_double_arith(instruction, "addpd", fadd_x86)
     }
 
     /// SUBPD - packed double-precision subtract of both 64-bit lanes.
@@ -1686,31 +1738,31 @@ impl<'a> Lifter<'a> {
         if self.try_packed_fp_vec(instruction, "subpd", false, PackedFpOp::Sub)? {
             return Ok(());
         }
-        self.packed_double_arith(instruction, "subpd", |b, x, y| b.ins().fsub(x, y))
+        self.packed_double_arith(instruction, "subpd", fsub_x86)
     }
 
     /// ADDSS - scalar single-precision add of the low 32 bits; bits[127:32] of
     /// the destination are preserved.
     pub(super) fn handle_addss(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        self.scalar_single_arith(instruction, "addss", |b, x, y| b.ins().fadd(x, y))
+        self.scalar_single_arith(instruction, "addss", fadd_x86)
     }
 
     /// SUBSS - scalar single-precision subtract of the low 32 bits (`dst - src`);
     /// bits[127:32] of the destination are preserved.
     pub(super) fn handle_subss(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        self.scalar_single_arith(instruction, "subss", |b, x, y| b.ins().fsub(x, y))
+        self.scalar_single_arith(instruction, "subss", fsub_x86)
     }
 
     /// MULSS - scalar single-precision multiply of the low 32 bits; bits[127:32]
     /// of the destination are preserved.
     pub(super) fn handle_mulss(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        self.scalar_single_arith(instruction, "mulss", |b, x, y| b.ins().fmul(x, y))
+        self.scalar_single_arith(instruction, "mulss", fmul_x86)
     }
 
     /// DIVSS - scalar single-precision divide of the low 32 bits (`dst / src`);
     /// bits[127:32] of the destination are preserved.
     pub(super) fn handle_divss(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        self.scalar_single_arith(instruction, "divss", |b, x, y| b.ins().fdiv(x, y))
+        self.scalar_single_arith(instruction, "divss", fdiv_x86)
     }
 
     /// MULPS - packed single-precision multiply of all four 32-bit lanes.
@@ -1718,7 +1770,7 @@ impl<'a> Lifter<'a> {
         if self.try_packed_fp_vec(instruction, "mulps", true, PackedFpOp::Mul)? {
             return Ok(());
         }
-        self.packed_single_arith(instruction, "mulps", |b, x, y| b.ins().fmul(x, y))
+        self.packed_single_arith(instruction, "mulps", fmul_x86)
     }
 
     /// CVTSI2SS - convert a signed integer to a scalar single-precision float.
@@ -2316,7 +2368,7 @@ impl<'a> Lifter<'a> {
     /// SUBSD - scalar double-precision subtract of the low 64 bits (`dst - src`);
     /// the high 64 bits of the destination are preserved.
     pub(super) fn handle_subsd(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        self.scalar_double_arith(instruction, "subsd", |b, x, y| b.ins().fsub(x, y))
+        self.scalar_double_arith(instruction, "subsd", fsub_x86)
     }
 
     /// MULPD - packed double-precision multiply of both 64-bit lanes.
@@ -2324,7 +2376,7 @@ impl<'a> Lifter<'a> {
         if self.try_packed_fp_vec(instruction, "mulpd", false, PackedFpOp::Mul)? {
             return Ok(());
         }
-        self.packed_double_arith(instruction, "mulpd", |b, x, y| b.ins().fmul(x, y))
+        self.packed_double_arith(instruction, "mulpd", fmul_x86)
     }
 
     /// DIVPD - packed double-precision divide of both 64-bit lanes.
@@ -2332,7 +2384,7 @@ impl<'a> Lifter<'a> {
         if self.try_packed_fp_vec(instruction, "divpd", false, PackedFpOp::Div)? {
             return Ok(());
         }
-        self.packed_double_arith(instruction, "divpd", |b, x, y| b.ins().fdiv(x, y))
+        self.packed_double_arith(instruction, "divpd", fdiv_x86)
     }
 
     /// ADDPS - packed single-precision add of all four 32-bit lanes.
@@ -2340,7 +2392,7 @@ impl<'a> Lifter<'a> {
         if self.try_packed_fp_vec(instruction, "addps", true, PackedFpOp::Add)? {
             return Ok(());
         }
-        self.packed_single_arith(instruction, "addps", |b, x, y| b.ins().fadd(x, y))
+        self.packed_single_arith(instruction, "addps", fadd_x86)
     }
 
     /// SUBPS - packed single-precision subtract of all four 32-bit lanes.
@@ -2348,7 +2400,7 @@ impl<'a> Lifter<'a> {
         if self.try_packed_fp_vec(instruction, "subps", true, PackedFpOp::Sub)? {
             return Ok(());
         }
-        self.packed_single_arith(instruction, "subps", |b, x, y| b.ins().fsub(x, y))
+        self.packed_single_arith(instruction, "subps", fsub_x86)
     }
 
     /// DIVPS - packed single-precision divide of all four 32-bit lanes.
@@ -2356,7 +2408,7 @@ impl<'a> Lifter<'a> {
         if self.try_packed_fp_vec(instruction, "divps", true, PackedFpOp::Div)? {
             return Ok(());
         }
-        self.packed_single_arith(instruction, "divps", |b, x, y| b.ins().fdiv(x, y))
+        self.packed_single_arith(instruction, "divps", fdiv_x86)
     }
 
     /// MINSS / MINSD / MINPS / MINPD, MAXSS / MAXSD / MAXPS / MAXPD.
@@ -3312,9 +3364,14 @@ impl<'a> Lifter<'a> {
     /// `1.5 * 2^-12`; the exact quotient emitted here is within that bound but
     /// will not be bit-identical to a real CPU. Compilers only emit these under
     /// fast-math, where that difference is already licensed.
+    ///
+    /// The square root goes through [`fp_sqrt_x86`] rather than a bare
+    /// Cranelift `sqrt`: a negative lane makes `RSQRT*` *generate* a NaN, and
+    /// that NaN must be x86's sign-set floating indefinite rather than the
+    /// host's default NaN. The following `fdiv` merely propagates it.
     fn fp_reciprocal(sqrt: bool) -> impl Fn(&mut FunctionBuilder<'a>, Value, Value) -> Value {
         move |b, _x, y| {
-            let y = if sqrt { b.ins().sqrt(y) } else { y };
+            let y = if sqrt { fp_sqrt_x86(b, y) } else { y };
             let one = b.ins().f32const(1.0);
             b.ins().fdiv(one, y)
         }

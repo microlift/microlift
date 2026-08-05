@@ -256,6 +256,37 @@ impl<'a> Lifter<'a> {
         self.builder.ins().bitselect(negative, indefinite, r)
     }
 
+    /// Lane-wise arithmetic with x86's generated-NaN bits.
+    ///
+    /// The vector twin of [`fp_arith_x86`](super::sse::fp_arith_x86): a lane
+    /// whose result is a NaN neither operand supplied performed an invalid
+    /// operation (`inf + -inf`, `inf - inf`, `0 * inf`, `0 / 0`, `inf / inf`)
+    /// and must yield x86's sign-set floating indefinite rather than the host's
+    /// default NaN. Lanes with a NaN operand fall through to the host's
+    /// propagation, which already matches x86.
+    fn vec_fp_arith_x86(
+        &mut self,
+        a: Value,
+        b: Value,
+        op: impl FnOnce(&mut Self, Value, Value) -> Value,
+    ) -> Value {
+        let fty = self.builder.func.dfg.value_type(a);
+        let r = op(self, a, b);
+
+        let indefinite = if fty.lane_type() == types::F32 {
+            self.builder.ins().f32const(F32_INDEFINITE)
+        } else {
+            self.builder.ins().f64const(F64_INDEFINITE)
+        };
+        let indefinite = self.builder.ins().splat(fty, indefinite);
+
+        let generated = self.vec_fcmp(FloatCC::Unordered, r, r);
+        let operands_ok = self.vec_fcmp(FloatCC::Ordered, a, b);
+        let invalid = self.builder.ins().band(generated, operands_ok);
+        let invalid = self.vec_bitcast(invalid, fty);
+        self.builder.ins().bitselect(invalid, indefinite, r)
+    }
+
     /// Emit a packed floating-point op over whole 128-bit vectors, when XMM
     /// registers are vector-backed.
     ///
@@ -284,10 +315,10 @@ impl<'a> Lifter<'a> {
         let b = self.vec_bitcast(src, fty);
 
         let r = match op {
-            PackedFpOp::Add => self.builder.ins().fadd(a, b),
-            PackedFpOp::Sub => self.builder.ins().fsub(a, b),
-            PackedFpOp::Mul => self.builder.ins().fmul(a, b),
-            PackedFpOp::Div => self.builder.ins().fdiv(a, b),
+            PackedFpOp::Add => self.vec_fp_arith_x86(a, b, |s, a, b| s.builder.ins().fadd(a, b)),
+            PackedFpOp::Sub => self.vec_fp_arith_x86(a, b, |s, a, b| s.builder.ins().fsub(a, b)),
+            PackedFpOp::Mul => self.vec_fp_arith_x86(a, b, |s, a, b| s.builder.ins().fmul(a, b)),
+            PackedFpOp::Div => self.vec_fp_arith_x86(a, b, |s, a, b| s.builder.ins().fdiv(a, b)),
             PackedFpOp::Sqrt => self.vec_fp_sqrt_x86(b),
             PackedFpOp::Min | PackedFpOp::Max => {
                 let cc = if matches!(op, PackedFpOp::Min) {
@@ -309,7 +340,9 @@ impl<'a> Lifter<'a> {
                 return Ok(true);
             }
             PackedFpOp::Rcp { sqrt } => {
-                let y = if sqrt { self.builder.ins().sqrt(b) } else { b };
+                // Through `vec_fp_sqrt_x86`, not a bare `sqrt`: a negative lane
+                // generates a NaN, which must be x86's sign-set indefinite.
+                let y = if sqrt { self.vec_fp_sqrt_x86(b) } else { b };
                 let one = self.builder.ins().f32const(1.0);
                 let one = self.builder.ins().splat(fty, one);
                 self.builder.ins().fdiv(one, y)
