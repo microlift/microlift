@@ -17,6 +17,7 @@
 //! representations.
 
 use crate::MicroliftError;
+use crate::arch::x86_64::context::{MXCSR_MASK, RegisterContext};
 use crate::arch::x86_64::semantics::helpers::xmm_register_index;
 use crate::arch::x86_64::semantics::sse_vec::{B, PackedFpOp};
 use crate::lifter::{Lifter, X86Flag};
@@ -128,12 +129,12 @@ pub(super) enum RoundMode {
 
 /// Decode `imm8[2:0]` of a `ROUND*` instruction.
 ///
-/// Bit 2 means "ignore bits[1:0] and use MXCSR's current rounding mode". This
-/// recompiler does not model MXCSR and nothing it lifts writes one - `LDMXCSR`
-/// is not implemented - so the mode is MXCSR's reset value, round-to-nearest-even,
-/// and that is what bit 2 resolves to. A guest that changed its rounding mode and
-/// then rounded would differ; it is the same standing gap `setjmp`'s missing
-/// `MXCSR` save is, recorded in the same place rather than papered over.
+/// Bit 2 means "ignore bits[1:0] and use MXCSR's current rounding mode". The
+/// register itself exists ([`crate::context::RegisterContext::mxcsr`], written
+/// by `LDMXCSR`), but no arithmetic consults it: every SSE operation here
+/// rounds nearest-even, so that is what bit 2 resolves to. A guest that changed
+/// `MXCSR.RC` and then rounded would differ - the standing gap recorded on the
+/// `mxcsr` field, not papered over here.
 ///
 /// Bit 3 suppresses the precision exception, which is unobservable here: no
 /// floating-point exception is raised in the first place.
@@ -3521,5 +3522,61 @@ impl<'a> Lifter<'a> {
         self.set_xmm_lo(dst_idx, halves[0]);
         self.set_xmm_hi(dst_idx, halves[1]);
         Ok(())
+    }
+
+    // --- MXCSR ----------------------------------------------------------
+
+    /// STMXCSR m32 (and its AVX alias `VSTMXCSR`) - store `MXCSR` to memory.
+    ///
+    /// A plain 32-bit copy out of the context. The register form of the opcode
+    /// (`0F AE /3` with `mod = 11`) is `#UD` on hardware and iced never decodes
+    /// one, so a non-memory operand is rejected rather than guessed at.
+    pub(super) fn handle_stmxcsr(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let ctx = self.builder.use_var(self.state.context_ptr);
+        let off = std::mem::offset_of!(RegisterContext, mxcsr) as i32;
+        let mxcsr = self
+            .builder
+            .ins()
+            .load(types::I32, MemFlagsData::trusted(), ctx, off);
+        let ptr = self.mxcsr_mem_ptr(instruction, "stmxcsr")?;
+        self.builder.ins().store(MemFlagsData::new(), mxcsr, ptr, 0);
+        Ok(())
+    }
+
+    /// LDMXCSR m32 (and its AVX alias `VLDMXCSR`) - load `MXCSR` from memory.
+    ///
+    /// Hardware raises `#GP(0)` if any reserved bit (31:16) of the source is
+    /// set. Microlift models no faults of that class (the same choice
+    /// [`Lifter::handle_movaps`]'s alignment behaviour documents), so the
+    /// reserved bits are dropped instead: bits 31:16 of the context field stay
+    /// zero, which is the state a subsequent `STMXCSR` would see on a machine
+    /// where the `LDMXCSR` had been legal. Every defined bit - the six
+    /// exception flags, DAZ, the six masks, RC and FZ - is stored verbatim.
+    ///
+    /// Storing them is all that happens: see [`RegisterContext::mxcsr`] for
+    /// which of those bits the lifted SSE arithmetic actually honours.
+    pub(super) fn handle_ldmxcsr(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let ptr = self.mxcsr_mem_ptr(instruction, "ldmxcsr")?;
+        let val = self
+            .builder
+            .ins()
+            .load(types::I32, MemFlagsData::new(), ptr, 0);
+        let val = self.builder.ins().band_imm_u(val, MXCSR_MASK as i64);
+        let ctx = self.builder.use_var(self.state.context_ptr);
+        let off = std::mem::offset_of!(RegisterContext, mxcsr) as i32;
+        self.builder
+            .ins()
+            .store(MemFlagsData::trusted(), val, ctx, off);
+        Ok(())
+    }
+
+    /// The single `m32` operand shared by `LDMXCSR`/`STMXCSR`.
+    fn mxcsr_mem_ptr(&mut self, instruction: &Instruction, who: &str) -> crate::Result<Value> {
+        match self.operand_kind(instruction, 0) {
+            OpKind::Memory => self.get_mem_ptr(instruction, 0),
+            other => Err(MicroliftError::UnsupportedInstruction {
+                mnemonic: format!("{}-{:?}", who, other),
+            }),
+        }
     }
 }

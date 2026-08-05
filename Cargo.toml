@@ -108,6 +108,10 @@ name = "fpu_tests"
 required-features = ["testkit"]
 
 [[test]]
+name = "mxcsr_tests"
+required-features = ["testkit"]
+
+[[test]]
 name = "trap_tests"
 required-features = ["testkit"]
 

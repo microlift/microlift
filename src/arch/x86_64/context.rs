@@ -6,8 +6,25 @@
 //! `imported_function_va`, `image_base`) mirror [`crate::core::exit::ControlHeader`]
 //! conceptually but stay inline to preserve the established layout.
 
+/// The value `MXCSR` holds after a processor reset / `FXRSTOR` of a fresh
+/// state: all six exception flags clear, all six exception masks set, round to
+/// nearest-even, FZ and DAZ off. Used as the [`Default`] for
+/// [`RegisterContext::mxcsr`] so that a freshly constructed context is one the
+/// hardware could actually be in - a zeroed `MXCSR` is not, since it unmasks
+/// every SSE exception.
+pub const MXCSR_RESET: u32 = 0x0000_1F80;
+
+/// The `MXCSR` bits that are defined; bits 31:16 are reserved and writing a
+/// non-zero value to any of them raises `#GP(0)`. See
+/// [`crate::arch::x86_64::Lifter::handle_ldmxcsr`] for how that is handled.
+pub const MXCSR_MASK: u32 = 0x0000_FFFF;
+
+/// The x87 control word after `FNINIT` / a processor reset: all six exception
+/// masks set, extended (64-bit) precision, round to nearest-even.
+pub const X87_CW_RESET: u16 = 0x037F;
+
 #[repr(C)]
-#[derive(Default, Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct RegisterContext {
     pub rax: u64,
     pub rcx: u64,
@@ -80,9 +97,76 @@ pub struct RegisterContext {
     pub fpu_sw: u16,
     /// x87 control word (used by `FLDCW`/`FNSTCW`).
     pub fpu_cw: u16,
-    /// x87 tag word (2 bits per physical register). Maintained loosely; kept for
-    /// `FNSTSW`/debugging completeness.
+    /// x87 tag word, in the *abridged* (`FXSAVE`) encoding: bit `i` is set when
+    /// physical register `i` holds a value and clear when it is empty. The full
+    /// two-bits-per-register architectural tag word that `FNSTENV`/`FLDENV`
+    /// exchange with memory is expanded from / collapsed into this on the fly.
     pub fpu_tag: u16,
+
+    /// SSE control and status register, read by `STMXCSR` and written by
+    /// `LDMXCSR`.
+    ///
+    /// The field is architecturally faithful *as storage* - whatever `LDMXCSR`
+    /// writes, `STMXCSR` reads back - but the lifter does not currently let it
+    /// influence SSE arithmetic: rounding is always round-to-nearest-even
+    /// (`RC = 00`), FZ/DAZ are not applied to denormals, and the six exception
+    /// flags (bits 5:0) are never set by a lifted SSE instruction. Code that
+    /// saves, modifies and restores `MXCSR` therefore behaves correctly; code
+    /// that changes the rounding mode and expects arithmetic to follow it, or
+    /// that polls the sticky exception flags, does not.
+    pub mxcsr: u32,
+}
+
+impl Default for RegisterContext {
+    /// A context in the processor's post-reset state: everything zero except
+    /// `mxcsr` and `fpu_cw`, whose reset values ([`MXCSR_RESET`],
+    /// [`X87_CW_RESET`]) are not zero. Zero in those two fields would mean
+    /// "every floating-point exception unmasked", which no real thread starts
+    /// out in and which would make `STMXCSR`/`FNSTCW` report an impossible
+    /// state.
+    fn default() -> Self {
+        Self {
+            rax: 0,
+            rcx: 0,
+            rdx: 0,
+            rbx: 0,
+            rsp: 0,
+            rbp: 0,
+            rsi: 0,
+            rdi: 0,
+            r8: 0,
+            r9: 0,
+            r10: 0,
+            r11: 0,
+            r12: 0,
+            r13: 0,
+            r14: 0,
+            r15: 0,
+            rip: 0,
+            image_base: 0,
+            syscall_handler: None,
+            resume_function: None,
+            cf: 0,
+            pf: 0,
+            af: 0,
+            zf: 0,
+            sf: 0,
+            of: 0,
+            df: 0,
+            exit_reason: 0,
+            exit_code: 0,
+            imported_function_va: 0,
+            xmm: [[0; 2]; 16],
+            fs_base: 0,
+            gs_base: 0,
+            fpr: [[0; 2]; 8],
+            fpu_top: 0,
+            fpu_sw: 0,
+            fpu_cw: X87_CW_RESET,
+            fpu_tag: 0,
+            mxcsr: MXCSR_RESET,
+        }
+    }
 }
 
 impl RegisterContext {

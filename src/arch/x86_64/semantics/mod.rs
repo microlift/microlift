@@ -764,7 +764,19 @@ impl<'a> Lifter<'a> {
             Mnemonic::Fincstp => self.handle_fincstp(instruction),
             Mnemonic::Fdecstp => self.handle_fdecstp(instruction),
             Mnemonic::Ffree => self.handle_ffree(instruction),
-            Mnemonic::Fnop => self.handle_fpu_nop(instruction),
+            // `FNOP` does nothing; `WAIT`/`FWAIT` has nothing to wait for (see
+            // `handle_fpu_nop`) and is also the `9B` prefix byte iced splits
+            // off the `FSTENV`/`FCLEX`/`FINIT` spellings.
+            Mnemonic::Fnop | Mnemonic::Wait => self.handle_fpu_nop(instruction),
+            Mnemonic::Fnstenv => self.handle_fnstenv(instruction),
+            Mnemonic::Fldenv => self.handle_fldenv(instruction),
+            Mnemonic::Fnclex => self.handle_fnclex(instruction),
+            Mnemonic::Fninit => self.handle_fninit(instruction),
+
+            // SSE control/status register. The AVX spellings are the same
+            // instruction with a VEX prefix and identical semantics.
+            Mnemonic::Stmxcsr | Mnemonic::Vstmxcsr => self.handle_stmxcsr(instruction),
+            Mnemonic::Ldmxcsr | Mnemonic::Vldmxcsr => self.handle_ldmxcsr(instruction),
 
             Mnemonic::Stc => self.handle_stc(instruction),
             Mnemonic::Clc => self.handle_clc(instruction),

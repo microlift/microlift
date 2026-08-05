@@ -23,7 +23,7 @@
 //! narrowing/widening in `FLD`/`FST`, where it is the correct storage width.
 
 use crate::MicroliftError;
-use crate::arch::x86_64::context::RegisterContext;
+use crate::arch::x86_64::context::{RegisterContext, X87_CW_RESET};
 use crate::arch::x86_64::semantics::softfloat::{self, F80Kernel};
 use crate::lifter::{Lifter, X86Flag};
 use cranelift::prelude::*;
@@ -1053,20 +1053,7 @@ impl<'a> Lifter<'a> {
     /// FNSTSW - store the status word (with the live `TOP` field) to `AX` or a
     /// 16-bit memory operand.
     pub(super) fn handle_fnstsw(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let ctx = self.fpu_ctx_ptr();
-        let sw_off = std::mem::offset_of!(RegisterContext, fpu_sw) as i32;
-        let sw = self
-            .builder
-            .ins()
-            .load(types::I16, MemFlagsData::trusted(), ctx, sw_off);
-        let sw = self.builder.ins().uextend(types::I32, sw);
-        // Insert TOP into bits 11-13.
-        let sw = self.builder.ins().band_imm_u(sw, !0x3800);
-        let top = self.fpu_load_top();
-        let top = self.builder.ins().band_imm_u(top, 7);
-        let top_field = self.builder.ins().ishl_imm_u(top, 11);
-        let sw = self.builder.ins().bor(sw, top_field);
-        let sw16 = self.builder.ins().ireduce(types::I16, sw);
+        let sw16 = self.fpu_status_word();
 
         match self.operand_kind(instruction, 0) {
             OpKind::Register => {
@@ -1144,7 +1131,302 @@ impl<'a> Lifter<'a> {
     }
 
     /// FNOP / FWAIT - no observable effect in this FPU model.
+    ///
+    /// `FWAIT`/`WAIT` waits for pending *unmasked* x87 exceptions to be
+    /// delivered. This model never raises one - the softfloat kernels compute
+    /// the masked (default) result and no exception flag is ever set in the
+    /// status word - so there is never anything to wait for. It is also what
+    /// makes the `9B`-prefixed `FSTENV`/`FCLEX`/`FINIT` spellings work, since
+    /// iced decodes those as a `WAIT` followed by the `FN…` form.
     pub(super) fn handle_fpu_nop(&mut self, _instruction: &Instruction) -> crate::Result<()> {
+        Ok(())
+    }
+
+    /// The 16-bit status word as software sees it: the stored condition-code
+    /// bits with the live `TOP` (bits 13-11) merged in.
+    fn fpu_status_word(&mut self) -> Value {
+        let ctx = self.fpu_ctx_ptr();
+        let sw_off = std::mem::offset_of!(RegisterContext, fpu_sw) as i32;
+        let sw = self
+            .builder
+            .ins()
+            .load(types::I16, MemFlagsData::trusted(), ctx, sw_off);
+        let sw = self.builder.ins().uextend(types::I32, sw);
+        // Insert TOP into bits 11-13.
+        let sw = self.builder.ins().band_imm_u(sw, !0x3800);
+        let top = self.fpu_load_top();
+        let top = self.builder.ins().band_imm_u(top, 7);
+        let top_field = self.builder.ins().ishl_imm_u(top, 11);
+        let sw = self.builder.ins().bor(sw, top_field);
+        self.builder.ins().ireduce(types::I16, sw)
+    }
+
+    /// Expand the abridged tag word ([`RegisterContext::fpu_tag`], one bit per
+    /// physical register) into the architectural 16-bit tag word that
+    /// `FNSTENV`/`FNSAVE` write to memory: two bits per physical register,
+    /// `00` valid, `01` zero, `10` special, `11` empty.
+    ///
+    /// The three non-empty encodings are not tracked - they are a pure function
+    /// of the register's contents - so they are recomputed here from the stored
+    /// 80-bit value, exactly as the hardware derives them:
+    ///
+    /// - exponent `0` and significand `0`     -> zero (`01`);
+    /// - exponent `0x7FFF` (inf/NaN), exponent `0` with a non-zero significand
+    ///   (denormal), or a clear explicit integer bit (unnormal) -> special
+    ///   (`10`);
+    /// - anything else -> valid (`00`).
+    fn fpu_expand_tag_word(&mut self) -> Value {
+        let abridged = self.fpu_load_tag();
+        let ctx = self.fpu_ctx_ptr();
+        let fpr_off = std::mem::offset_of!(RegisterContext, fpr) as i32;
+
+        let mut word = self.builder.ins().iconst(types::I32, 0);
+        for i in 0..8i32 {
+            let slot = fpr_off + i * 16;
+            let mant = self
+                .builder
+                .ins()
+                .load(types::I64, MemFlagsData::trusted(), ctx, slot);
+            let se = self
+                .builder
+                .ins()
+                .load(types::I16, MemFlagsData::trusted(), ctx, slot + 8);
+            let se = self.builder.ins().uextend(types::I32, se);
+            let exp = self.builder.ins().band_imm_u(se, 0x7FFF);
+
+            let exp_zero = self.builder.ins().icmp_imm_s(IntCC::Equal, exp, 0);
+            let exp_nonzero = self.builder.ins().icmp_imm_s(IntCC::NotEqual, exp, 0);
+            let exp_finite = self.builder.ins().icmp_imm_s(IntCC::NotEqual, exp, 0x7FFF);
+            let mant_zero = self.builder.ins().icmp_imm_s(IntCC::Equal, mant, 0);
+            let integer_bit = self.builder.ins().ushr_imm_u(mant, 63);
+            let integer_bit_set = self.builder.ins().icmp_imm_s(IntCC::Equal, integer_bit, 1);
+
+            // zero: exponent 0 and significand 0.
+            let is_zero = self.builder.ins().band(exp_zero, mant_zero);
+            // valid: a finite normal - exponent in range with the explicit
+            // integer bit set.
+            let exp_normal = self.builder.ins().band(exp_finite, exp_nonzero);
+            let is_valid = self.builder.ins().band(exp_normal, integer_bit_set);
+
+            // 11 empty, else 01 zero, else 00 valid, else 10 special.
+            let special = self.builder.ins().iconst(types::I32, 0b10);
+            let valid = self.builder.ins().iconst(types::I32, 0b00);
+            let zero = self.builder.ins().iconst(types::I32, 0b01);
+            let empty = self.builder.ins().iconst(types::I32, 0b11);
+            let tag = self.builder.ins().select(is_valid, valid, special);
+            let tag = self.builder.ins().select(is_zero, zero, tag);
+
+            let live = self.builder.ins().ushr_imm_u(abridged, i as i64);
+            let live = self.builder.ins().band_imm_u(live, 1);
+            let live = self.builder.ins().icmp_imm_s(IntCC::Equal, live, 1);
+            let tag = self.builder.ins().select(live, tag, empty);
+
+            let placed = self.builder.ins().ishl_imm_u(tag, (i * 2) as i64);
+            word = self.builder.ins().bor(word, placed);
+        }
+        word
+    }
+
+    /// Collapse an architectural 16-bit tag word (`I32`-carried) back into the
+    /// abridged form: a register is live iff its two-bit field is not `11`.
+    ///
+    /// This direction is lossy in the same way the hardware's `FXSAVE` is, and
+    /// harmlessly so: the zero/special/valid distinction is recoverable from
+    /// the register contents at any time (see [`Self::fpu_expand_tag_word`]).
+    fn fpu_collapse_tag_word(&mut self, full: Value) -> Value {
+        let mut abridged = self.builder.ins().iconst(types::I32, 0);
+        for i in 0..8i64 {
+            let field = self.builder.ins().ushr_imm_u(full, i * 2);
+            let field = self.builder.ins().band_imm_u(field, 3);
+            let live = self.builder.ins().icmp_imm_s(IntCC::NotEqual, field, 0b11);
+            let live = self.builder.ins().uextend(types::I32, live);
+            let placed = self.builder.ins().ishl_imm_u(live, i);
+            abridged = self.builder.ins().bor(abridged, placed);
+        }
+        abridged
+    }
+
+    /// The width of an x87 environment operand: `m14byte` (16-bit operand size)
+    /// or `m28byte` (32-bit, the default in 64-bit mode). The two layouts hold
+    /// the same fields with 16-bit vs 32-bit pointer/selector slots.
+    fn fpu_env_is_32bit(instruction: &Instruction, who: &str) -> crate::Result<bool> {
+        match instruction.memory_size() {
+            MemorySize::FpuEnv28 => Ok(true),
+            MemorySize::FpuEnv14 => Ok(false),
+            other => Err(MicroliftError::UnsupportedInstruction {
+                mnemonic: format!("{}-{:?}", who, other),
+            }),
+        }
+    }
+
+    /// FNSTENV m14/m28byte - store the x87 *environment* (control word, status
+    /// word, tag word and the instruction/data pointers) to memory, then mask
+    /// every floating-point exception.
+    ///
+    /// The masking side effect is not incidental - it is why `feholdexcept` and
+    /// friends use this instruction - so it is modelled: `FCW[5:0]` are set
+    /// after the store, and the *stored* copy is the pre-masking control word.
+    ///
+    /// The instruction/data pointer fields (`FIP`, `FCS`, the opcode, `FDP`,
+    /// `FDS`) are stored as zero: Microlift does not track the address of the
+    /// last x87 instruction or of its memory operand, so there is nothing
+    /// faithful to put there. They are observable only to a debugger or to an
+    /// unmasked-exception handler reconstructing the faulting operation, and
+    /// this model raises no x87 exceptions. Everything a `fenv.h`
+    /// implementation reads back - the control word, the status word (with the
+    /// live `TOP`) and the tag word - is exact.
+    pub(super) fn handle_fnstenv(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let wide = Self::fpu_env_is_32bit(instruction, "fnstenv")?;
+        let ptr = self.get_mem_ptr(instruction, 0)?;
+
+        let ctx = self.fpu_ctx_ptr();
+        let cw_off = std::mem::offset_of!(RegisterContext, fpu_cw) as i32;
+        let cw = self
+            .builder
+            .ins()
+            .load(types::I16, MemFlagsData::trusted(), ctx, cw_off);
+        let sw = self.fpu_status_word();
+        let tw = self.fpu_expand_tag_word();
+        let tw = self.builder.ins().ireduce(types::I16, tw);
+
+        let stride = if wide { 4 } else { 2 };
+        // Zero the whole area first, so the reserved halves of the 32-bit
+        // layout and the unmodelled pointer fields are all defined.
+        let zero64 = self.builder.ins().iconst(types::I64, 0);
+        let zero32 = self.builder.ins().iconst(types::I32, 0);
+        let zero16 = self.builder.ins().iconst(types::I16, 0);
+        if wide {
+            for off in [0, 8, 16] {
+                self.builder
+                    .ins()
+                    .store(MemFlagsData::new(), zero64, ptr, off);
+            }
+            self.builder
+                .ins()
+                .store(MemFlagsData::new(), zero32, ptr, 24);
+        } else {
+            self.builder
+                .ins()
+                .store(MemFlagsData::new(), zero64, ptr, 0);
+            self.builder
+                .ins()
+                .store(MemFlagsData::new(), zero32, ptr, 8);
+            self.builder
+                .ins()
+                .store(MemFlagsData::new(), zero16, ptr, 12);
+        }
+        self.builder.ins().store(MemFlagsData::new(), cw, ptr, 0);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), sw, ptr, stride);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), tw, ptr, stride * 2);
+
+        // FNSTENV masks all six floating-point exceptions.
+        let masked = self.builder.ins().bor_imm_u(cw, 0x3F);
+        self.builder
+            .ins()
+            .store(MemFlagsData::trusted(), masked, ctx, cw_off);
+        Ok(())
+    }
+
+    /// FLDENV m14/m28byte - reload the x87 environment saved by `FNSTENV`.
+    ///
+    /// The control word is taken verbatim, the tag word is collapsed into the
+    /// abridged form, and `TOP` is restored from bits 13-11 of the loaded
+    /// status word (which is where the *stack pointer* lives - reloading the
+    /// condition codes without it would leave `ST(i)` naming the wrong
+    /// registers). The pointer/opcode fields are ignored, mirroring the zeros
+    /// [`Self::handle_fnstenv`] wrote.
+    ///
+    /// Data registers are untouched, as on hardware: `FLDENV` restores the
+    /// environment, `FRSTOR` restores the environment *and* the stack.
+    pub(super) fn handle_fldenv(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let wide = Self::fpu_env_is_32bit(instruction, "fldenv")?;
+        let ptr = self.get_mem_ptr(instruction, 0)?;
+        let stride = if wide { 4 } else { 2 };
+
+        let cw = self
+            .builder
+            .ins()
+            .load(types::I16, MemFlagsData::new(), ptr, 0);
+        let sw = self
+            .builder
+            .ins()
+            .load(types::I16, MemFlagsData::new(), ptr, stride);
+        let tw = self
+            .builder
+            .ins()
+            .load(types::I16, MemFlagsData::new(), ptr, stride * 2);
+
+        let ctx = self.fpu_ctx_ptr();
+        let cw_off = std::mem::offset_of!(RegisterContext, fpu_cw) as i32;
+        let sw_off = std::mem::offset_of!(RegisterContext, fpu_sw) as i32;
+        self.builder
+            .ins()
+            .store(MemFlagsData::trusted(), cw, ctx, cw_off);
+        self.builder
+            .ins()
+            .store(MemFlagsData::trusted(), sw, ctx, sw_off);
+
+        let sw32 = self.builder.ins().uextend(types::I32, sw);
+        let top = self.builder.ins().ushr_imm_u(sw32, 11);
+        let top = self.builder.ins().band_imm_u(top, 7);
+        self.fpu_store_top(top);
+
+        let tw32 = self.builder.ins().uextend(types::I32, tw);
+        let abridged = self.fpu_collapse_tag_word(tw32);
+        self.fpu_store_tag(abridged);
+        Ok(())
+    }
+
+    /// FNCLEX - clear the exception flags (bits 7-0) and the busy bit (15) of
+    /// the status word.
+    ///
+    /// The condition codes C0-C3 and `TOP` survive, which is the whole
+    /// architectural content of the instruction. Microlift never sets an
+    /// exception flag in the first place, so in practice this clears the bits a
+    /// host runtime may have set in the context itself.
+    pub(super) fn handle_fnclex(&mut self, _instruction: &Instruction) -> crate::Result<()> {
+        let ctx = self.fpu_ctx_ptr();
+        let sw_off = std::mem::offset_of!(RegisterContext, fpu_sw) as i32;
+        let sw = self
+            .builder
+            .ins()
+            .load(types::I16, MemFlagsData::trusted(), ctx, sw_off);
+        let cleared = self.builder.ins().band_imm_u(sw, !0x80FF);
+        self.builder
+            .ins()
+            .store(MemFlagsData::trusted(), cleared, ctx, sw_off);
+        Ok(())
+    }
+
+    /// FNINIT - reset the FPU: control word to [`X87_CW_RESET`], status word
+    /// (and `TOP`) to zero, every register tagged empty.
+    ///
+    /// The data registers themselves keep their contents, exactly as on
+    /// hardware - `FNINIT` only marks them empty in the tag word.
+    pub(super) fn handle_fninit(&mut self, _instruction: &Instruction) -> crate::Result<()> {
+        let ctx = self.fpu_ctx_ptr();
+        let cw = self.builder.ins().iconst(types::I16, X87_CW_RESET as i64);
+        let zero = self.builder.ins().iconst(types::I16, 0);
+        let cw_off = std::mem::offset_of!(RegisterContext, fpu_cw) as i32;
+        let sw_off = std::mem::offset_of!(RegisterContext, fpu_sw) as i32;
+        let top_off = std::mem::offset_of!(RegisterContext, fpu_top) as i32;
+        let tag_off = std::mem::offset_of!(RegisterContext, fpu_tag) as i32;
+        self.builder
+            .ins()
+            .store(MemFlagsData::trusted(), cw, ctx, cw_off);
+        self.builder
+            .ins()
+            .store(MemFlagsData::trusted(), zero, ctx, sw_off);
+        self.builder
+            .ins()
+            .store(MemFlagsData::trusted(), zero, ctx, top_off);
+        self.builder
+            .ins()
+            .store(MemFlagsData::trusted(), zero, ctx, tag_off);
         Ok(())
     }
 }

@@ -559,6 +559,19 @@ pub mod unicorn {
             // host-backed TLS buffer Microlift addresses.
             uc.reg_write(RegisterX86::FS_BASE, st.fs_base)?;
             uc.reg_write(RegisterX86::GS_BASE, st.gs_base)?;
+            // `MXCSR` is not part of `CpuState`, so both engines have to be put
+            // in the same *implicit* starting state. Microlift's is the
+            // architectural reset value (`RegisterContext::default`); Unicorn
+            // starts it at zero, which unmasks every SSE exception and is not a
+            // state hardware powers up in. Seed it so an `STMXCSR` reads the
+            // same value on both sides.
+            uc.reg_write(RegisterX86::MXCSR, crate::context::MXCSR_RESET as u64)?;
+            // Same story for the x87 environment, which `CpuState` also does
+            // not carry: Microlift starts with the `FNINIT` control word and
+            // every register tagged empty, Unicorn with a zero control word and
+            // every register tagged valid.
+            uc.reg_write(RegisterX86::FPCW, crate::context::X87_CW_RESET as u64)?;
+            uc.reg_write(RegisterX86::FPTAG, 0xFFFF)?;
             for (i, &reg) in XMM_REG.iter().enumerate() {
                 let mut bytes = [0u8; 16];
                 bytes[0..8].copy_from_slice(&st.xmm[i][0].to_le_bytes());
