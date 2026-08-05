@@ -406,7 +406,7 @@ fn test_compile_runtime_assisted_two_fast_imports_have_relocations() {
     );
 }
 
-/// `lock cmpxchg16b [rdi]` — the region used by the `Atomic128Mode` AOT tests.
+/// `lock cmpxchg16b [rdi]` - the region used by the `Atomic128Mode` AOT tests.
 const CMPXCHG16B_SNIPPET: [u8; 6] = [0xF0, 0x48, 0x0F, 0xC7, 0x0F, 0xC3];
 
 fn lift_cmpxchg16b(mode: Atomic128Mode) -> Function {

@@ -146,7 +146,7 @@ fn test_mul() {
 
 /// The narrower `mul` forms, which every 64-bit test above misses: the
 /// accumulator and the operand are read at the operand's own width, so
-/// narrowing them again is an `ireduce` from a type to itself — malformed IR
+/// narrowing them again is an `ireduce` from a type to itself - malformed IR
 /// that the verifier rejects for the whole function. libpng's `png_zalloc`
 /// does `mul esi` on its way to every allocation, which is how this was found.
 #[test]

@@ -18,6 +18,17 @@ const RFLAGS_FLAG_BITS: [(X86Flag, u8); 7] = [
     (X86Flag::Overflow, 11),
 ];
 
+/// The five status flags `LAHF` and `SAHF` carry, and their bit positions
+/// within the low byte of RFLAGS. Overflow and Direction are deliberately
+/// absent: they sit at bits 11 and 10, outside the byte.
+const LOW_BYTE_FLAG_BITS: [(X86Flag, u8); 5] = [
+    (X86Flag::Carry, 0),
+    (X86Flag::Parity, 2),
+    (X86Flag::Auxiliary, 4),
+    (X86Flag::Zero, 6),
+    (X86Flag::Sign, 7),
+];
+
 impl<'a> Lifter<'a> {
     pub(super) fn handle_nop(&mut self, _instruction: &Instruction) -> crate::Result<()> {
         Ok(())
@@ -532,6 +543,40 @@ impl<'a> Lifter<'a> {
             let one_bit = self.builder.ins().band_imm_u(shifted, 1);
             let val = self.builder.ins().ireduce(types::I8, one_bit);
             self.set_flag(flag, val)?;
+        }
+        Ok(())
+    }
+
+    /// LAHF - load the low byte of RFLAGS into AH.
+    ///
+    /// `AH = SF:ZF:0:AF:0:PF:1:CF`. The two zero bits and the one bit are
+    /// architectural: bits 1, 3 and 5 of RFLAGS are reserved and read as 1, 0
+    /// and 0. Overflow is *not* among them - it lives at bit 11, outside the
+    /// byte - which is the difference from `PUSHFQ` and the reason this is a
+    /// list of five flags rather than a loop over [`RFLAGS_FLAG_BITS`].
+    pub(super) fn handle_lahf(&mut self, _instruction: &Instruction) -> crate::Result<()> {
+        let mut ah = self.builder.ins().iconst(types::I8, 0x2);
+        for (flag, bit) in LOW_BYTE_FLAG_BITS {
+            let raw = self.builder.use_var(self.state.flags[&flag]);
+            // Flags are logically 1-bit; mask defensively before positioning.
+            let one_bit = self.builder.ins().band_imm_u(raw, 1);
+            let positioned = self.builder.ins().ishl_imm_u(one_bit, bit as i64);
+            ah = self.builder.ins().bor(ah, positioned);
+        }
+        self.set_reg_val(Register::AH, ah)
+    }
+
+    /// SAHF - store AH into the low byte of RFLAGS.
+    ///
+    /// The inverse of [`handle_lahf`](Self::handle_lahf), over the same five
+    /// flags. Overflow is untouched, and so is Direction: neither is in the
+    /// byte.
+    pub(super) fn handle_sahf(&mut self, _instruction: &Instruction) -> crate::Result<()> {
+        let ah = self.get_reg_val(Register::AH)?;
+        for (flag, bit) in LOW_BYTE_FLAG_BITS {
+            let shifted = self.builder.ins().ushr_imm_u(ah, bit as i64);
+            let one_bit = self.builder.ins().band_imm_u(shifted, 1);
+            self.set_flag(flag, one_bit)?;
         }
         Ok(())
     }

@@ -3437,6 +3437,102 @@ fn test_insertps_memory_source_reads_one_dword() {
     assert_eq!(out.xmm[0], [0xAABB_CCDD_2222_2222, 0x5555_5555_4444_4444]);
 }
 
+//  HADDPD / HSUBPD / HADDPS / HSUBPS - SSE3 horizontal arithmetic. The lanes
+//  combined are *adjacent within one operand*, which is the whole difference
+//  from ADDPD, and reading them the vertical way is a result that is plausible
+//  rather than wrong-looking - so every case below uses four distinct values.
+
+#[test]
+fn test_haddpd_adds_adjacent_lanes_of_each_operand() {
+    // haddpd xmm0, xmm1; ret
+    let bytes = [0x66, 0x0F, 0x7C, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    // xmm0 = [1.5, 2.25], xmm1 = [3.0, 4.0]
+    ctx.xmm[0] = [0x3FF8_0000_0000_0000, 0x4002_0000_0000_0000];
+    ctx.xmm[1] = [0x4008_0000_0000_0000, 0x4010_0000_0000_0000];
+    let out = run_test(&bytes, ctx);
+    // [1.5 + 2.25, 3.0 + 4.0] = [3.75, 7.0]
+    assert_eq!(out.xmm[0], [0x400E_0000_0000_0000, 0x401C_0000_0000_0000]);
+}
+
+#[test]
+fn test_haddpd_with_the_destination_as_its_own_source() {
+    // haddpd xmm0, xmm0; ret - the shape a compiler emits to sum a pair, and
+    // the one that goes wrong if a result lane is written before both operands
+    // have been read.
+    let bytes = [0x66, 0x0F, 0x7C, 0xC0, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [0x3FF8_0000_0000_0000, 0x4002_0000_0000_0000];
+    let out = run_test(&bytes, ctx);
+    assert_eq!(out.xmm[0], [0x400E_0000_0000_0000, 0x400E_0000_0000_0000]);
+}
+
+#[test]
+fn test_hsubpd_subtracts_the_high_lane_from_the_low_one() {
+    // hsubpd xmm0, xmm1; ret
+    let bytes = [0x66, 0x0F, 0x7D, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [0x3FF8_0000_0000_0000, 0x4002_0000_0000_0000];
+    ctx.xmm[1] = [0x4008_0000_0000_0000, 0x4010_0000_0000_0000];
+    let out = run_test(&bytes, ctx);
+    // [1.5 - 2.25, 3.0 - 4.0] = [-0.75, -1.0]
+    assert_eq!(out.xmm[0], [0xBFE8_0000_0000_0000, 0xBFF0_0000_0000_0000]);
+}
+
+#[test]
+fn test_haddpd_memory_source() {
+    // haddpd xmm0, [rax]; ret
+    let bytes = [0x66, 0x0F, 0x7C, 0x00, 0xC3];
+    let mem = [3.0_f64, 4.0];
+    let mut ctx = RegisterContext::default();
+    ctx.rax = mem.as_ptr() as u64;
+    ctx.xmm[0] = [0x3FF8_0000_0000_0000, 0x4002_0000_0000_0000];
+    let out = run_test(&bytes, ctx);
+    assert_eq!(out.xmm[0], [0x400E_0000_0000_0000, 0x401C_0000_0000_0000]);
+}
+
+#[test]
+fn test_haddps_pairs_all_four_lanes_of_both_operands() {
+    // haddps xmm0, xmm1; ret
+    let bytes = [0xF2, 0x0F, 0x7C, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    // xmm0 = [1.5, 2.5, 3.0, 4.0], xmm1 = [1.0, 2.0, 5.0, 6.0]
+    ctx.xmm[0] = [0x4020_0000_3FC0_0000, 0x4080_0000_4040_0000];
+    ctx.xmm[1] = [0x4000_0000_3F80_0000, 0x40C0_0000_40A0_0000];
+    let out = run_test(&bytes, ctx);
+    // [1.5+2.5, 3.0+4.0, 1.0+2.0, 5.0+6.0] = [4.0, 7.0, 3.0, 11.0]
+    assert_eq!(out.xmm[0], [0x40E0_0000_4080_0000, 0x4130_0000_4040_0000]);
+}
+
+#[test]
+fn test_hsubps_subtracts_within_each_adjacent_pair() {
+    // hsubps xmm0, xmm1; ret
+    let bytes = [0xF2, 0x0F, 0x7D, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [0x4020_0000_3FC0_0000, 0x4080_0000_4040_0000];
+    ctx.xmm[1] = [0x4000_0000_3F80_0000, 0x40C0_0000_40A0_0000];
+    let out = run_test(&bytes, ctx);
+    // [1.5-2.5, 3.0-4.0, 1.0-2.0, 5.0-6.0] = [-1.0, -1.0, -1.0, -1.0]
+    assert_eq!(out.xmm[0], [0xBF80_0000_BF80_0000, 0xBF80_0000_BF80_0000]);
+}
+
+#[test]
+fn test_horizontal_arithmetic_agrees_in_vector_mode() {
+    // The vector-XMM lift is a different path through the same semantics, so it
+    // has to produce the same registers.
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [0x3FF8_0000_0000_0000, 0x4002_0000_0000_0000];
+    ctx.xmm[1] = [0x4008_0000_0000_0000, 0x4010_0000_0000_0000];
+    for bytes in [
+        [0x66, 0x0F, 0x7C, 0xC1, 0xC3],
+        [0x66, 0x0F, 0x7D, 0xC1, 0xC3],
+        [0xF2, 0x0F, 0x7C, 0xC1, 0xC3],
+        [0xF2, 0x0F, 0x7D, 0xC1, 0xC3],
+    ] {
+        assert_eq!(run_test(&bytes, ctx).xmm, run_test_vec(&bytes, ctx).xmm);
+    }
+}
+
 //  RCPPS / RSQRTPS / RCPSS / RSQRTSS - approximate, so compared with a
 //  tolerance well inside the architectural 1.5 * 2^-12 relative error bound.
 

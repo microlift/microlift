@@ -172,6 +172,93 @@ fn test_popfq() {
 }
 
 #[test]
+fn test_lahf() {
+    // STC then LAHF: AH = reserved bit 1 | CF -> 0x03, and nothing else in RAX
+    // moves.
+    let bytes = [
+        0x48, 0xC7, 0xC0, 0x00, 0x00, 0x00, 0x00, // mov rax, 0
+        0xF9, // stc
+        0x9F, // lahf
+        0xC3, // ret
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rax, 0x0300, "AH should hold CF and the reserved bit");
+
+    // A subtraction that yields zero sets ZF (bit 6) and PF (bit 2) and clears
+    // CF -> AH = 0x40 | 0x04 | 0x02 = 0x46.
+    let bytes = [
+        0x48, 0xC7, 0xC0, 0x05, 0x00, 0x00, 0x00, // mov rax, 5
+        0x48, 0x2B, 0xC0, // sub rax, rax
+        0x9F, // lahf
+        0xC3, // ret
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rax & 0xFF00, 0x4600, "ZF, PF and the reserved bit");
+    assert_eq!(ctx.rax & 0xFF, 0, "AL is not part of AH");
+
+    // Overflow lives at bit 11 of RFLAGS, outside the byte LAHF carries.
+    // 0x7fff_ffff + 1 overflows positive-to-negative: OF=1 and SF=1, with PF
+    // set because the result's low byte is zero and AF set because bit 3 of
+    // 0xf carried. AH is therefore SF | AF | PF | reserved = 0x96, with no
+    // trace of OF anywhere in it.
+    let bytes = [
+        0x48, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0x7F, // mov rax, 0x7fffffff
+        0x83, 0xC0, 0x01, // add eax, 1  (-> 0x80000000, OF=1, SF=1)
+        0x9F, // lahf
+        0xC3, // ret
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.of, 1, "the fixture must actually set OF");
+    assert_eq!(
+        ctx.rax & 0xFF00,
+        0x9600,
+        "SF, AF, PF and the reserved bit only"
+    );
+}
+
+#[test]
+fn test_sahf() {
+    // AH = CF | reserved | ZF: SAHF must set both flags it names and clear the
+    // ones it does not, over whatever the context arrived with. AH is loaded
+    // with `mov`, which touches no flag - a `shl` would set OF itself and the
+    // second half of this test would be measuring the fixture.
+    let bytes = [
+        0xB4, 0x43, // mov ah, 0x43
+        0x9E, // sahf
+        0xC3, // ret
+    ];
+    let mut ctx_in = RegisterContext::default();
+    ctx_in.sf = 1;
+    ctx_in.pf = 1;
+    let ctx = run_test(&bytes, ctx_in);
+    assert_eq!(ctx.cf, 1);
+    assert_eq!(ctx.zf, 1);
+    assert_eq!(ctx.sf, 0, "SAHF clears a flag whose bit is 0");
+    assert_eq!(ctx.pf, 0, "SAHF clears a flag whose bit is 0");
+
+    // Overflow is not in the byte, so SAHF leaves it exactly as it found it -
+    // the property that makes this the inverse of LAHF rather than of POPFQ.
+    let mut ctx_in = RegisterContext::default();
+    ctx_in.of = 1;
+    let ctx = run_test(&bytes, ctx_in);
+    assert_eq!(ctx.of, 1, "SAHF must not touch OF");
+}
+
+#[test]
+fn test_lahf_sahf_round_trip() {
+    // LAHF then SAHF is the identity on the five flags it carries.
+    let bytes = [
+        0xF9, // stc
+        0x9F, // lahf
+        0xF8, // clc
+        0x9E, // sahf
+        0xC3, // ret
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.cf, 1, "the CF LAHF saved should come back");
+}
+
+#[test]
 fn test_loopne() {
     // LOOPNE runs the body while RCX != 0 AND ZF == 0. Here the body keeps ZF=0
     // (INC RAX always yields a nonzero result), so it runs the full count.

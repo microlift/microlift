@@ -55,6 +55,8 @@ impl<'a> Lifter<'a> {
             Mnemonic::Pop => self.handle_pop(instruction),
             Mnemonic::Pushfq => self.handle_pushfq(instruction),
             Mnemonic::Popfq => self.handle_popfq(instruction),
+            Mnemonic::Lahf => self.handle_lahf(instruction),
+            Mnemonic::Sahf => self.handle_sahf(instruction),
             Mnemonic::Leave => self.handle_leave(instruction),
             Mnemonic::Xchg => self.handle_xchg(instruction),
             Mnemonic::Nop | Mnemonic::Reservednop => self.handle_nop(instruction),
@@ -169,6 +171,12 @@ impl<'a> Lifter<'a> {
             Mnemonic::Punpckhqdq | Mnemonic::Unpckhpd => {
                 self.handle_punpck(instruction, "punpckhqdq", PackedWidth::Qword, true)
             }
+
+            // SSE3 - horizontal arithmetic
+            Mnemonic::Haddpd => self.handle_haddpd(instruction),
+            Mnemonic::Hsubpd => self.handle_hsubpd(instruction),
+            Mnemonic::Haddps => self.handle_haddps(instruction),
+            Mnemonic::Hsubps => self.handle_hsubps(instruction),
 
             // SSE2 - scalar / packed double-precision arithmetic
             Mnemonic::Addpd => self.handle_addpd(instruction),

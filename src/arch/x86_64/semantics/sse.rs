@@ -1444,6 +1444,103 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
+    /// Shared implementation for the SSE3 horizontal double-precision
+    /// instructions (`HADDPD` / `HSUBPD`): the destination's two lanes are
+    /// combined into the result's low lane and the source's two into its high
+    /// one.
+    ///
+    /// Both operands are read before either result is written, because the
+    /// source is very often the destination - `haddpd xmm0, xmm0` is how a
+    /// compiler sums a pair - and a lane written early would then be an input to
+    /// the other half.
+    fn horizontal_double_arith(
+        &mut self,
+        instruction: &Instruction,
+        who: &str,
+        op: impl Fn(&mut FunctionBuilder<'a>, Value, Value) -> Value,
+    ) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, who)?;
+        let dst_lo = self.get_xmm_lo(dst_idx);
+        let dst_hi = self.get_xmm_hi(dst_idx);
+        let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
+
+        let res_lo = self.f64_bits_arith(dst_lo, dst_hi, &op);
+        let res_hi = self.f64_bits_arith(src_lo, src_hi, &op);
+
+        self.set_xmm_lo(dst_idx, res_lo);
+        self.set_xmm_hi(dst_idx, res_hi);
+        Ok(())
+    }
+
+    /// Shared implementation for the SSE3 horizontal single-precision
+    /// instructions (`HADDPS` / `HSUBPS`): each 64-bit half contributes one
+    /// 32-bit result lane, the destination's two halves filling the low half of
+    /// the result and the source's two the high half.
+    fn horizontal_single_arith(
+        &mut self,
+        instruction: &Instruction,
+        who: &str,
+        op: impl Fn(&mut FunctionBuilder<'a>, Value, Value) -> Value,
+    ) -> crate::Result<()> {
+        let dst_idx = self.xmm_operand_index(instruction, 0, who)?;
+        let dst_lo = self.get_xmm_lo(dst_idx);
+        let dst_hi = self.get_xmm_hi(dst_idx);
+        let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
+
+        let r0 = self.f32_pair_horizontal(dst_lo, &op);
+        let r1 = self.f32_pair_horizontal(dst_hi, &op);
+        let r2 = self.f32_pair_horizontal(src_lo, &op);
+        let r3 = self.f32_pair_horizontal(src_hi, &op);
+
+        let res_lo = self.join_dwords(r0, r1);
+        let res_hi = self.join_dwords(r2, r3);
+
+        self.set_xmm_lo(dst_idx, res_lo);
+        self.set_xmm_hi(dst_idx, res_hi);
+        Ok(())
+    }
+
+    /// Apply `op` to the two packed `f32` lanes held in one 64-bit half of an
+    /// XMM register, returning the single 32-bit result's bits.
+    fn f32_pair_horizontal(
+        &mut self,
+        bits: Value,
+        op: &impl Fn(&mut FunctionBuilder<'a>, Value, Value) -> Value,
+    ) -> Value {
+        let lane0 = self.builder.ins().ireduce(types::I32, bits);
+        let lane1_64 = self.builder.ins().ushr_imm_u(bits, 32);
+        let lane1 = self.builder.ins().ireduce(types::I32, lane1_64);
+        self.f32_bits_arith(lane0, lane1, op)
+    }
+
+    /// Two 32-bit values as one 64-bit half, `lo` in bits [31:0].
+    fn join_dwords(&mut self, lo: Value, hi: Value) -> Value {
+        let lo64 = self.builder.ins().uextend(types::I64, lo);
+        let hi64 = self.builder.ins().uextend(types::I64, hi);
+        let hi_shifted = self.builder.ins().ishl_imm_u(hi64, 32);
+        self.builder.ins().bor(lo64, hi_shifted)
+    }
+
+    /// HADDPD - horizontal add of the two double-precision lanes of each operand.
+    pub(super) fn handle_haddpd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.horizontal_double_arith(instruction, "haddpd", |b, x, y| b.ins().fadd(x, y))
+    }
+
+    /// HSUBPD - horizontal subtract: `dst[0] - dst[1]`, then `src[0] - src[1]`.
+    pub(super) fn handle_hsubpd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.horizontal_double_arith(instruction, "hsubpd", |b, x, y| b.ins().fsub(x, y))
+    }
+
+    /// HADDPS - horizontal add of adjacent single-precision lane pairs.
+    pub(super) fn handle_haddps(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.horizontal_single_arith(instruction, "haddps", |b, x, y| b.ins().fadd(x, y))
+    }
+
+    /// HSUBPS - horizontal subtract of adjacent single-precision lane pairs.
+    pub(super) fn handle_hsubps(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        self.horizontal_single_arith(instruction, "hsubps", |b, x, y| b.ins().fsub(x, y))
+    }
+
     /// Shared implementation for the packed double-precision arithmetic
     /// instructions (`ADDPD` / `SUBPD` / ...): apply `op` to both 64-bit lanes.
     fn packed_double_arith(
