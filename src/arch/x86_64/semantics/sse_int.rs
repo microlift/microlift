@@ -195,7 +195,10 @@ impl<'a> Lifter<'a> {
 
             // Bit 3 of the index picks the half; bit 7 forces a zero byte.
             let pick_hi_bit = self.builder.ins().band_imm_u(index, 8);
-            let pick_hi = self.builder.ins().icmp_imm_s(IntCC::NotEqual, pick_hi_bit, 0);
+            let pick_hi = self
+                .builder
+                .ins()
+                .icmp_imm_s(IntCC::NotEqual, pick_hi_bit, 0);
             let byte = self.builder.ins().select(pick_hi, from_hi, from_lo);
             let clear_bit = self.builder.ins().band_imm_u(index, 0x80);
             let clear = self.builder.ins().icmp_imm_s(IntCC::NotEqual, clear_bit, 0);
@@ -591,7 +594,10 @@ impl<'a> Lifter<'a> {
                 let y = self.extract_lane(b, shift, 8, false);
                 let diff = self.builder.ins().isub(x, y);
                 let neg = self.builder.ins().ineg(diff);
-                let is_neg = self.builder.ins().icmp_imm_s(IntCC::SignedLessThan, diff, 0);
+                let is_neg = self
+                    .builder
+                    .ins()
+                    .icmp_imm_s(IntCC::SignedLessThan, diff, 0);
                 let abs = self.builder.ins().select(is_neg, neg, diff);
                 acc = self.builder.ins().iadd(acc, abs);
             }
@@ -1027,7 +1033,10 @@ impl<'a> Lifter<'a> {
             .zip(s)
             .zip(m)
             .map(|((x, y), mask)| {
-                let take_src = self.builder.ins().icmp_imm_s(IntCC::SignedLessThan, mask, 0);
+                let take_src = self
+                    .builder
+                    .ins()
+                    .icmp_imm_s(IntCC::SignedLessThan, mask, 0);
                 self.builder.ins().select(take_src, y, x)
             })
             .collect();

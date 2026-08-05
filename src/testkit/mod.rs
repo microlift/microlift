@@ -18,6 +18,7 @@
 use crate::arch::x86_64::X86_64;
 use crate::backend::CraneliftBackend;
 use crate::context::{ExitReason, MemorySegment, RegisterContext};
+use crate::core::srcloc::GuestCodeMap;
 use crate::core::{AddressMode, Atomic128Mode, ExecutionMode, LifterConfig, lift_to_code};
 use cranelift_codegen::settings::{self, Configurable};
 
@@ -191,7 +192,7 @@ impl<'a> LiftTest<'a> {
 
     /// Configure the lift for resumable VM exits: `RuntimeAssisted` execution
     /// with resume blocks and interpreter fallback. Use with
-    /// [`RunOutcome::resume_with`] to drive exit → mutate → resume cycles.
+    /// [`RunOutcome::resume_with`] to drive exit -> mutate -> resume cycles.
     pub fn resumable(mut self) -> Self {
         self.config.execution_mode = ExecutionMode::RuntimeAssisted;
         self.config.emit_resume_blocks = true;
@@ -264,7 +265,9 @@ impl<'a> LiftTest<'a> {
 
         let mut backend =
             CraneliftBackend::with_flags(self.opt.flags(), &[]).map_err(TestError::Compile)?;
-        let code_ptr = backend.compile_lifted(code).map_err(TestError::Compile)?;
+        let (code_ptr, code_map) = backend
+            .compile_lifted_with_map(code)
+            .map_err(TestError::Compile)?;
 
         // The guest stack is a heap `Vec`; its backing allocation address is
         // stable across moves (only the handle moves), so `rsp` remains valid
@@ -296,6 +299,8 @@ impl<'a> LiftTest<'a> {
         Ok(Harness {
             ctx,
             initial_rsp,
+            code_ptr,
+            code_map,
             _stack: stack,
             _backend: backend,
             entry,
@@ -517,6 +522,13 @@ pub struct Harness {
     /// The value of `rsp` at the point the lifted function is first entered
     /// (useful for stack-balance / alignment assertions).
     pub initial_rsp: u64,
+    /// Host address the lifted function was compiled to. Base for
+    /// [`GuestCodeMap::lookup_host_addr`].
+    pub code_ptr: *const u8,
+    /// Which guest instruction each byte of the compiled region came from; see
+    /// [`crate::core::srcloc`]. Empty if the test disabled
+    /// [`LifterConfig::emit_source_locs`].
+    pub code_map: GuestCodeMap,
     // Keeps the guest stack allocation alive for the duration of execution.
     _stack: Vec<u64>,
     // Keeps the JIT module (and its executable pages) mapped.
@@ -578,6 +590,18 @@ impl RunOutcome {
     /// Re-enter without mutating the context.
     pub fn resume(self) -> RunOutcome {
         self.resume_with(|_| {})
+    }
+
+    /// Which guest instruction each byte of the compiled region came from - the
+    /// map built from the IR's source locations. See [`crate::core::srcloc`].
+    pub fn code_map(&self) -> &GuestCodeMap {
+        &self.harness.code_map
+    }
+
+    /// Host address the compiled region starts at, for
+    /// [`GuestCodeMap::lookup_host_addr`].
+    pub fn code_ptr(&self) -> *const u8 {
+        self.harness.code_ptr
     }
 }
 

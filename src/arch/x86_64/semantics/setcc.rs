@@ -8,7 +8,7 @@ impl<'a> Lifter<'a> {
         self.write_operand(instruction, 0, cond)
     }
 
-    /// Invert a boolean I8 flag (0→1, 1→0) using an equality compare.
+    /// Invert a boolean I8 flag (0->1, 1->0) using an equality compare.
     fn bool_not(&mut self, val: Value) -> Value {
         self.builder.ins().icmp_imm_s(IntCC::Equal, val, 0)
     }

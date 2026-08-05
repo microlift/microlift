@@ -265,7 +265,7 @@ impl CpuOracle for MicroliftOracle {
 /// A field-by-field difference between two [`CpuState`]s. Empty means equal.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StateDiff {
-    /// GPR index → (a, b) for each differing register (rsp is skipped by
+    /// GPR index -> (a, b) for each differing register (rsp is skipped by
     /// [`differential`] unless a shared stack VA is used - see its docs).
     pub gpr: Vec<(usize, u64, u64)>,
     pub rflags: Option<(u64, u64)>,

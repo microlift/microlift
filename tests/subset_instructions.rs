@@ -488,7 +488,10 @@ fn test_movsxd_narrow_forms_do_not_extend() {
     // movsxd ecx, dword [rdi-0x30] ; ret
     let bytes = [0x63, 0x4F, 0xD0, 0xC3];
     let ctx = run_test(&bytes, ctx);
-    assert_eq!(ctx.rcx, 0x8899AABB, "no sign extension, and the top half zeroed");
+    assert_eq!(
+        ctx.rcx, 0x8899AABB,
+        "no sign extension, and the top half zeroed"
+    );
 
     // MOVSXD cx, ax under a 0x66 prefix: a 16-bit move, upper bits preserved.
     let bytes = [

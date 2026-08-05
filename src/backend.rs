@@ -1,4 +1,5 @@
 use crate::Result;
+use crate::core::srcloc::{GuestCodeMap, SourceLocMap};
 use crate::core::{HelperFunction, LiftedCode};
 use cranelift::prelude::*;
 use cranelift_codegen::ir::Function;
@@ -61,6 +62,19 @@ fn declare_externals<M: Module>(
             Ok((id, helper.func))
         })
         .collect()
+}
+
+/// Extract the guest-instruction map for a function that was just compiled into
+/// `ctx`, decoding the surviving `SourceLoc`s with the lift's `source_map`.
+///
+/// Empty when the function was lifted with
+/// [`LifterConfig::emit_source_locs`](crate::core::LifterConfig::emit_source_locs)
+/// off (nothing to decode), and - defensively - when the module reported no
+/// compiled code at all.
+fn guest_code_map(ctx: &cranelift_codegen::Context, source_map: SourceLocMap) -> GuestCodeMap {
+    ctx.compiled_code()
+        .map(|compiled| GuestCodeMap::from_compiled(compiled, source_map))
+        .unwrap_or_default()
 }
 
 /// Compile the helper bodies [`declare_externals`] set aside.
@@ -137,11 +151,28 @@ impl CraneliftBackend {
     /// backend's module already was - use
     /// [`compile_lifted_with_fast_imports`](Self::compile_lifted_with_fast_imports).
     pub fn compile_lifted(&mut self, code: LiftedCode) -> Result<*const u8> {
+        Ok(self.compile_lifted_with_map(code)?.0)
+    }
+
+    /// [`compile_lifted`](Self::compile_lifted), additionally returning the
+    /// host-code -> guest-instruction map for the compiled region.
+    ///
+    /// The map's offsets are relative to the returned function pointer, so
+    /// [`GuestCodeMap::lookup_host_addr`] turns a host `RIP` sampled inside this
+    /// region - from a signal handler, a profiler, a debugger - into the guest
+    /// address it is executing. It is empty unless the lift ran with
+    /// [`LifterConfig::emit_source_locs`](crate::core::LifterConfig::emit_source_locs)
+    /// on (the default).
+    pub fn compile_lifted_with_map(
+        &mut self,
+        code: LiftedCode,
+    ) -> Result<(*const u8, GuestCodeMap)> {
         if !code.imports.is_empty() {
             return Err(crate::MicroliftError::CraneliftError(
                 "lifted code has relocatable imports; use compile_lifted_with_fast_imports".into(),
             ));
         }
+        let source_map = code.source_map;
         let pending = declare_externals(&mut self.module, &[], code.helpers)?;
 
         let mut ctx = self.module.make_context();
@@ -155,6 +186,9 @@ impl CraneliftBackend {
         self.module
             .define_function(id, &mut ctx)
             .map_err(|e| crate::MicroliftError::CraneliftError(format!("{e:?}")))?;
+        // Read the compiled buffer's source locations before the context - and
+        // with it the compiled code - is recycled.
+        let map = guest_code_map(&ctx, source_map);
         self.module.clear_context(&mut ctx);
 
         define_helpers(&mut self.module, pending)?;
@@ -162,7 +196,7 @@ impl CraneliftBackend {
             .finalize_definitions()
             .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
 
-        Ok(self.module.get_finalized_function(id))
+        Ok((self.module.get_finalized_function(id), map))
     }
 
     /// JIT-compile a single lifted `Function`.
@@ -175,6 +209,7 @@ impl CraneliftBackend {
             imports: Vec::new(),
             helpers: Vec::new(),
             analysis_call_targets: Vec::new(),
+            source_map: SourceLocMap::default(),
         })
     }
 
@@ -200,6 +235,7 @@ impl CraneliftBackend {
                 imports: imports.to_vec(),
                 helpers: Vec::new(),
                 analysis_call_targets: Vec::new(),
+                source_map: SourceLocMap::default(),
             },
             flags,
             isa_settings,
@@ -214,6 +250,18 @@ impl CraneliftBackend {
         flags: settings::Flags,
         isa_settings: &[(&str, &str)],
     ) -> Result<*const u8> {
+        Ok(Self::compile_lifted_with_fast_imports_and_map(code, flags, isa_settings)?.0)
+    }
+
+    /// [`compile_lifted_with_fast_imports`](Self::compile_lifted_with_fast_imports),
+    /// additionally returning the host-code -> guest-instruction map. See
+    /// [`compile_lifted_with_map`](Self::compile_lifted_with_map).
+    pub fn compile_lifted_with_fast_imports_and_map(
+        code: LiftedCode,
+        flags: settings::Flags,
+        isa_settings: &[(&str, &str)],
+    ) -> Result<(*const u8, GuestCodeMap)> {
+        let source_map = code.source_map;
         let isa = Self::native_isa(flags, isa_settings)?;
 
         let mut jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
@@ -232,13 +280,14 @@ impl CraneliftBackend {
         module
             .define_function(id, &mut ctx)
             .map_err(|e| crate::MicroliftError::CraneliftError(format!("{e:?}")))?;
+        let map = guest_code_map(&ctx, source_map);
 
         define_helpers(&mut module, pending)?;
         module
             .finalize_definitions()
             .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
 
-        Ok(module.get_finalized_function(id))
+        Ok((module.get_finalized_function(id), map))
     }
 }
 
@@ -309,6 +358,7 @@ impl ArtifactBackend {
                 imports: imports.to_vec(),
                 helpers: Vec::new(),
                 analysis_call_targets: Vec::new(),
+                source_map: SourceLocMap::default(),
             },
             triple,
             flags,
@@ -325,6 +375,24 @@ impl ArtifactBackend {
         flags: Option<settings::Flags>,
         isa_settings: &[(&str, &str)],
     ) -> Result<Vec<u8>> {
+        Ok(Self::compile_lifted_to_object_with_map(code, triple, flags, isa_settings)?.0)
+    }
+
+    /// [`compile_lifted_to_object`](Self::compile_lifted_to_object), additionally
+    /// returning the host-code -> guest-instruction map for `lifted_func`.
+    ///
+    /// Offsets are relative to the start of `lifted_func`, not to the start of
+    /// the object's `.text` - look the symbol's address up in the object (or
+    /// note that `lifted_func` is defined first, so it sits at offset 0 of the
+    /// `.text` that [`compile_lifted_to_raw`](Self::compile_lifted_to_raw)
+    /// extracts).
+    pub fn compile_lifted_to_object_with_map(
+        code: LiftedCode,
+        triple: Option<&str>,
+        flags: Option<settings::Flags>,
+        isa_settings: &[(&str, &str)],
+    ) -> Result<(Vec<u8>, GuestCodeMap)> {
+        let source_map = code.source_map;
         let isa = Self::get_isa(triple, flags, isa_settings)?;
         let obj_builder =
             ObjectBuilder::new(isa, "lifted", cranelift_module::default_libcall_names())
@@ -340,13 +408,15 @@ impl ArtifactBackend {
         module
             .define_function(id, &mut ctx)
             .map_err(|e| crate::MicroliftError::CraneliftError(format!("{e:?}")))?;
+        let map = guest_code_map(&ctx, source_map);
 
         define_helpers(&mut module, pending)?;
 
         let product = module.finish();
-        product
+        let bytes = product
             .emit()
-            .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))
+            .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
+        Ok((bytes, map))
     }
 
     pub fn compile_to_object(
@@ -360,6 +430,7 @@ impl ArtifactBackend {
                 imports: Vec::new(),
                 helpers: Vec::new(),
                 analysis_call_targets: Vec::new(),
+                source_map: SourceLocMap::default(),
             },
             triple,
             flags,
@@ -378,6 +449,7 @@ impl ArtifactBackend {
                 imports: Vec::new(),
                 helpers: Vec::new(),
                 analysis_call_targets: Vec::new(),
+                source_map: SourceLocMap::default(),
             },
             triple,
             flags,
@@ -396,7 +468,22 @@ impl ArtifactBackend {
         triple: Option<&str>,
         flags: Option<settings::Flags>,
     ) -> Result<Vec<u8>> {
-        let obj_bytes = Self::compile_lifted_to_object(code, triple, flags, &[])?;
+        Ok(Self::compile_lifted_to_raw_with_map(code, triple, flags)?.0)
+    }
+
+    /// [`compile_lifted_to_raw`](Self::compile_lifted_to_raw), additionally
+    /// returning the host-code -> guest-instruction map.
+    ///
+    /// `lifted_func` is defined before the helpers, so its code starts at offset
+    /// 0 of the extracted `.text` and the map's offsets index the returned bytes
+    /// directly - which is what makes an annotated disassembly possible; see
+    /// [`disassemble_annotated`](Self::disassemble_annotated).
+    pub fn compile_lifted_to_raw_with_map(
+        code: LiftedCode,
+        triple: Option<&str>,
+        flags: Option<settings::Flags>,
+    ) -> Result<(Vec<u8>, GuestCodeMap)> {
+        let (obj_bytes, map) = Self::compile_lifted_to_object_with_map(code, triple, flags, &[])?;
         let obj = object::File::parse(&*obj_bytes)
             .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
 
@@ -411,11 +498,12 @@ impl ArtifactBackend {
             .data()
             .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
 
-        Ok(bytes.to_vec())
+        Ok((bytes.to_vec(), map))
     }
 
+    /// Build a Capstone engine for `triple` (host triple when `None`).
     #[cfg(feature = "disasm")]
-    pub fn disassemble(bytes: &[u8], triple: Option<&str>) -> Result<String> {
+    fn capstone_for(triple: Option<&str>) -> Result<Capstone> {
         use target_lexicon::Architecture;
 
         let triple_obj = if let Some(t) = triple {
@@ -424,18 +512,6 @@ impl ArtifactBackend {
             })?
         } else {
             Triple::host()
-        };
-
-        let (arch, mode) = match triple_obj.architecture {
-            Architecture::X86_64 => (capstone::Arch::X86, capstone::Mode::Mode64),
-            Architecture::Riscv64(_) => (capstone::Arch::RISCV, capstone::Mode::Mode64),
-            Architecture::Aarch64(_) => (capstone::Arch::ARM64, capstone::Mode::Arm),
-            _ => {
-                return Err(crate::MicroliftError::CraneliftError(format!(
-                    "unsupported architecture for disassembly: {:?}",
-                    triple_obj.architecture
-                )));
-            }
         };
 
         let cs = match triple_obj.architecture {
@@ -462,12 +538,64 @@ impl ArtifactBackend {
             }
         };
 
+        Ok(cs)
+    }
+
+    #[cfg(feature = "disasm")]
+    pub fn disassemble(bytes: &[u8], triple: Option<&str>) -> Result<String> {
+        let cs = Self::capstone_for(triple)?;
         let insns = cs
             .disasm_all(bytes, 0x0)
             .map_err(|e: capstone::Error| crate::MicroliftError::CraneliftError(e.to_string()))?;
 
         let mut output = String::new();
         for i in insns.as_ref() {
+            output.push_str(&format!("{}\n", i));
+        }
+
+        Ok(output)
+    }
+
+    /// Disassemble compiled code, interleaving a header line each time the guest
+    /// instruction responsible for it changes.
+    ///
+    /// This is the payoff of source locations for a human reading output: the
+    /// lifted code for one guest instruction is not contiguous, not in guest
+    /// order, and heavily interleaved by scheduling, so a bare disassembly of a
+    /// lifted region is very hard to relate back to the guest program. Host
+    /// instructions with no guest origin (prologue, dispatch switch) are grouped
+    /// under a `[no source]` header.
+    ///
+    /// `bytes` must start at the beginning of the function the map came from -
+    /// i.e. the output of
+    /// [`compile_lifted_to_raw_with_map`](Self::compile_lifted_to_raw_with_map),
+    /// whose `lifted_func` sits at offset 0.
+    #[cfg(feature = "disasm")]
+    pub fn disassemble_annotated(
+        bytes: &[u8],
+        triple: Option<&str>,
+        map: &GuestCodeMap,
+    ) -> Result<String> {
+        let cs = Self::capstone_for(triple)?;
+        let insns = cs
+            .disasm_all(bytes, 0x0)
+            .map_err(|e: capstone::Error| crate::MicroliftError::CraneliftError(e.to_string()))?;
+
+        let mut output = String::new();
+        // `None` is a real state here ("no guest origin"), so the "have we
+        // printed a header yet" flag cannot be folded into the value itself.
+        let mut current: Option<u64> = None;
+        let mut started = false;
+        for i in insns.as_ref() {
+            let guest = u32::try_from(i.address()).ok().and_then(|o| map.lookup(o));
+            if !started || guest != current {
+                match guest {
+                    Some(va) => output.push_str(&format!("; guest {va:#x}\n")),
+                    None => output.push_str("; [no source]\n"),
+                }
+                current = guest;
+                started = true;
+            }
             output.push_str(&format!("{}\n", i));
         }
 

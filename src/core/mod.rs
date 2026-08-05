@@ -11,17 +11,19 @@
 pub mod abi;
 pub mod bridge;
 pub mod exit;
+pub mod srcloc;
 
 use crate::arch::{ControlFlow, ControlFlowKind, InstructionEffects};
 use crate::core::abi::CallAbi;
 use crate::core::bridge::{BridgeImport, ImportKind, ImportRegistry};
 use crate::core::exit::{ExitReason, MemorySegment, TransferKind};
+use crate::core::srcloc::SourceLocMap;
 use crate::function_traits::{DynamicSymbol, FunctionArgumentType};
 use crate::os::get_host_calling_conv;
 use cranelift::prelude::*;
 use cranelift_codegen::ir::{
-    ExtFuncData, ExternalName, FuncRef, Function, SigRef, UserExternalName, UserExternalNameRef,
-    UserFuncName,
+    ExtFuncData, ExternalName, FuncRef, Function, SigRef, SourceLoc, UserExternalName,
+    UserExternalNameRef, UserFuncName,
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch, Variable};
@@ -164,6 +166,16 @@ pub struct LiftedCode {
     /// Analysis-mode call-target map; see
     /// [`lift_to_function_with_call_targets`].
     pub analysis_call_targets: Vec<u64>,
+    /// Decodes the [`SourceLoc`](cranelift_codegen::ir::SourceLoc)s carried by
+    /// [`func`](Self::func) back to guest instruction addresses.
+    ///
+    /// Meaningful only when the lift ran with
+    /// [`LifterConfig::emit_source_locs`] on; with it off the IR carries no
+    /// locations and this map has nothing to decode. Pass it to
+    /// [`GuestCodeMap::from_compiled`](crate::core::srcloc::GuestCodeMap::from_compiled)
+    /// to turn a compiled function's surviving locations into a host-offset ->
+    /// guest-VA map.
+    pub source_map: SourceLocMap,
 }
 
 /// Lift a region of guest code to a Cranelift [`Function`] plus the external
@@ -193,6 +205,7 @@ pub fn lift_to_code<A: GuestArch>(
     engine.lift(bytes, ip)?;
     let analysis_call_targets = std::mem::take(&mut engine.analysis_call_targets);
     let imports = std::mem::take(&mut engine.aot_imports);
+    let source_map = engine.source_map;
     let helpers = engine.take_helpers();
 
     // Release the mutable borrow of `func` held by the builder/engine.
@@ -203,6 +216,7 @@ pub fn lift_to_code<A: GuestArch>(
         imports,
         helpers,
         analysis_call_targets,
+        source_map,
     })
 }
 
@@ -502,7 +516,7 @@ pub struct LifterConfig {
     /// The layout of immutable segments in memory at lift time.
     /// This helps with value-set analysis based optimizations,
     /// as we can promote memory values into constants at lift time.
-    /// 
+    ///
     /// NOTE: Do NOT use this on writable data! This is assumed to be *immutable*
     /// memory. There is a `writable` property incase future optimizations permit
     /// mutable memory to be valid for hints.
@@ -599,6 +613,26 @@ pub struct LifterConfig {
     /// Ignored under [`analysis_mode`](Self::analysis_mode), which always
     /// inlines so the inspection IR stays self-contained.
     pub outline_helpers: bool,
+    /// Tag every emitted IR instruction with the guest instruction it was lifted
+    /// from, encoded as a Cranelift `SourceLoc` (see [`crate::core::srcloc`]).
+    ///
+    /// This is debug information and nothing else: Cranelift treats a
+    /// `SourceLoc` as opaque metadata, so it changes neither what is emitted nor
+    /// how it is optimized. What it buys is the ability to answer "which guest
+    /// instruction is this?" of a line of printed IR, of a byte of compiled
+    /// machine code, or of a host `RIP` captured in a crash - the last of which
+    /// is otherwise near-impossible in a region whose blocks have been merged,
+    /// duplicated and scheduled out of guest order.
+    ///
+    /// On by default, since the cost is a `u32` per IR instruction at lift time
+    /// and a sorted range list per compiled function, neither of which the
+    /// generated code pays for. Turn it off for the smallest possible in-memory
+    /// footprint when nothing will ever inspect the mapping.
+    ///
+    /// The lift-time half of the mapping comes back as
+    /// [`LiftedCode::source_map`]; the compiled half is
+    /// [`GuestCodeMap`](crate::core::srcloc::GuestCodeMap).
+    pub emit_source_locs: bool,
 }
 
 impl Default for LifterConfig {
@@ -618,6 +652,7 @@ impl Default for LifterConfig {
             atomic128: Atomic128Mode::default(),
             analysis_mode: false,
             outline_helpers: true,
+            emit_source_locs: true,
         }
     }
 }
@@ -747,6 +782,11 @@ pub struct LiftEngine<'a, A: GuestArch = crate::arch::x86_64::X86_64> {
     /// One `FuncRef` per helper symbol, so repeated sites share one call
     /// target (and one entry in [`Self::helpers`]).
     helper_refs: HashMap<&'static str, FuncRef>,
+    /// Encoding of guest addresses into the `SourceLoc`s tagged onto emitted IR.
+    /// Set from `ip` at the top of [`Self::lift`]; the default
+    /// (`lift_base == 0`) is only ever observed before then. See
+    /// [`Self::set_source_loc`] and [`crate::core::srcloc`].
+    pub source_map: SourceLocMap,
     /// Successors recovered from jump tables during phase 1, keyed by the
     /// address of the indirect branch they dispatch. Empty unless
     /// [`LifterConfig::analyze_jump_tables`] is set. Recorded for inspection -
@@ -840,8 +880,38 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             analysis_call_sig: None,
             helpers: Vec::new(),
             helper_refs: HashMap::new(),
+            source_map: SourceLocMap::default(),
             jump_tables: HashMap::new(),
         }
+    }
+
+    /// Attribute the IR emitted from here on to guest instruction `va`.
+    ///
+    /// The builder holds one current `SourceLoc` and stamps it onto every
+    /// instruction it creates, so this is a mode switch, not a per-instruction
+    /// call: the emission loop sets it once before handing an instruction to
+    /// [`GuestArch::lift_instruction`], and everything that handler emits -
+    /// however many IR instructions, across however many blocks, including
+    /// anything Cranelift's SSA construction inserts on its behalf - inherits it.
+    ///
+    /// A no-op when [`LifterConfig::emit_source_locs`] is off, and a
+    /// [`clear_source_loc`](Self::clear_source_loc) when `va` is too far from the
+    /// region to encode.
+    pub fn set_source_loc(&mut self, va: u64) {
+        if !self.config.emit_source_locs {
+            return;
+        }
+        let loc = self.source_map.encode(va);
+        self.builder.set_srcloc(loc);
+    }
+
+    /// Stop attributing emitted IR to any guest instruction.
+    ///
+    /// Used for the region's own scaffolding - the entry prologue, the PC
+    /// dispatch switch - which implements no guest instruction, and where a
+    /// stale location would be actively misleading.
+    pub fn clear_source_loc(&mut self) {
+        self.builder.set_srcloc(SourceLoc::default());
     }
 
     /// Declare (or reuse) an outlined helper function named `name`, returning a
@@ -1204,6 +1274,9 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
     pub fn lift(&mut self, bytes: &[u8], ip: u64) -> crate::Result<()> {
         self.lift_base = ip;
         self.lift_end = ip + bytes.len() as u64;
+        // Guest addresses are encoded relative to the region base, so the map
+        // has to be established before any IR is emitted.
+        self.source_map = SourceLocMap::new(ip);
 
         // Phase 1: decode + block-leader discovery.
         //
@@ -1405,6 +1478,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                 // Fell through past the end of the region.
                 if cur < self.lift_base || cur >= self.lift_end {
                     self.current_ip = cur;
+                    self.set_source_loc(cur);
                     A::sync_to_context(self, None, ExitReason::None)?;
                     self.builder.ins().return_(&[]);
                     self.block_terminated = true;
@@ -1421,6 +1495,10 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                 if !first {
                     if let Some(&next_block) = self.blocks.get(&cur) {
                         if self.builder.current_block() != Some(next_block) {
+                            // A synthetic terminator, belonging to the block
+                            // boundary at `cur` rather than to the instruction
+                            // just lifted - whose location is still current.
+                            self.set_source_loc(cur);
                             self.builder.ins().jump(next_block, &[]);
                             self.block_terminated = true;
                             break;
@@ -1438,6 +1516,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                         }
                         None => {
                             self.current_ip = cur;
+                            self.set_source_loc(cur);
                             A::sync_to_context(self, None, ExitReason::None)?;
                             self.builder.ins().return_(&[]);
                             self.block_terminated = true;
@@ -1450,6 +1529,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                 if A::is_invalid(inst) {
                     // Sync PC to point AT the invalid instruction.
                     self.current_ip = A::instr_ip(inst);
+                    self.set_source_loc(self.current_ip);
                     A::sync_to_context(self, None, ExitReason::InvalidInstruction)?;
                     self.builder.ins().return_(&[]);
                     self.block_terminated = true;
@@ -1457,8 +1537,11 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                 }
 
                 // Advance current_ip before dispatch so a PC read inside the
-                // handler sees the post-instruction value.
+                // handler sees the post-instruction value. The source location,
+                // by contrast, names the instruction *being* lifted, so it is
+                // the pre-advance address.
                 let next_ip = A::instr_next_ip(inst);
+                self.set_source_loc(A::instr_ip(inst));
                 self.current_ip = next_ip;
                 A::lift_instruction(self, inst)?;
                 if self.block_terminated {
@@ -1481,6 +1564,11 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             let block = self.blocks[&offset];
             if !self.visited_blocks.contains(&block) && !processed_blocks.contains(&block) {
                 self.builder.switch_to_block(block);
+                // The stub implements the transfer *to* `offset`, which is the
+                // only guest address it can honestly be attributed to (the
+                // instruction it belongs to may be any of several branches
+                // targeting it).
+                self.set_source_loc(offset);
                 if self.config.analysis_mode {
                     // Inspection IR: out-of-region targets are bare returns; no
                     // context sync or exit code.
@@ -1500,6 +1588,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             }
         }
 
+        self.clear_source_loc();
         self.builder.seal_all_blocks();
         self.finalize_helper_indices();
         Ok(())

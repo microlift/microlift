@@ -589,7 +589,11 @@ fn test_cmpxchg16b_exit_mode() {
         DEFAULT_LIFT_BASE + 6,
         "PC is past the CMPXCHG16B (nop + 5-byte instruction)"
     );
-    assert_eq!((mem.lo, mem.hi), (1, 2), "memory untouched - the host runs it");
+    assert_eq!(
+        (mem.lo, mem.hi),
+        (1, 2),
+        "memory untouched - the host runs it"
+    );
 }
 
 /// The shape a compiler emits for a 128-bit compare-exchange loop: save RBX,

@@ -23,7 +23,10 @@ impl<'a> Lifter<'a> {
                     handler_offset,
                 );
 
-                let has_handler = self.builder.ins().icmp_imm_s(IntCC::NotEqual, handler_ptr, 0);
+                let has_handler = self
+                    .builder
+                    .ins()
+                    .icmp_imm_s(IntCC::NotEqual, handler_ptr, 0);
                 let assist_block = self.builder.create_block();
                 let exit_block = self.builder.create_block();
                 let resume_block = self.builder.create_block();

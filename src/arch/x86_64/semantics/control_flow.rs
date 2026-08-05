@@ -833,7 +833,10 @@ impl<'a> Lifter<'a> {
             .iconst(size_to_type(counter_reg.size()), 1);
         let decremented = self.builder.ins().isub(counter, one);
         self.set_reg_val(counter_reg, decremented)?;
-        Ok(self.builder.ins().icmp_imm_s(IntCC::NotEqual, decremented, 0))
+        Ok(self
+            .builder
+            .ins()
+            .icmp_imm_s(IntCC::NotEqual, decremented, 0))
     }
 
     /// LOOP - decrement the counter; branch while it is nonzero.

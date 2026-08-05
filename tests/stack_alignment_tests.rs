@@ -87,7 +87,7 @@ fn compile_and_run_with_stack(bytes: &[u8], ctx: RegisterContext) -> (RegisterCo
 /// leaving RSP 8 bytes too high.
 ///
 /// Byte sequence at `0x1000`:
-///   `E8 FB 0F 00 00`  →  `call 0x2000`
+///   `E8 FB 0F 00 00`  ->  `call 0x2000`
 ///   (rel32 = 0x2000 − next_ip(0x1005) = 0xFFB)
 ///
 /// image_base = 0x1000, so rebased return address = 0x1000 + (0x1005 − 0x1000) = 0x1005.
@@ -203,11 +203,11 @@ fn test_out_of_region_call_exit_metadata_is_correct() {
 ///
 /// `handle_push` calls `immediate32to64()` for `Immediate8to64` operands.
 /// The VSA pass uses the dedicated `immediate8to64()` accessor.  If the
-/// iced-x86 `immediate32to64()` method does not correctly sign-extend 8→64
+/// iced-x86 `immediate32to64()` method does not correctly sign-extend 8->64
 /// for this operand kind, negative byte values will be wrong on the stack.
 #[test]
 fn test_push_neg1_imm8_sign_extends() {
-    // 6A FF  push -1   (Immediate8to64: 0xFF as i8 = −1 → 0xFFFF_FFFF_FFFF_FFFF)
+    // 6A FF  push -1   (Immediate8to64: 0xFF as i8 = −1 -> 0xFFFF_FFFF_FFFF_FFFF)
     // 58     pop rax
     // C3     ret
     let bytes = [0x6Au8, 0xFF, 0x58, 0xC3];
@@ -225,7 +225,7 @@ fn test_push_neg1_imm8_sign_extends() {
 /// Sign-extended to 64 bits: `0xFFFF_FFFF_FFFF_FF80`.
 #[test]
 fn test_push_neg128_imm8_sign_extends() {
-    // 6A 80  push -128  (0x80 as i8 = −128 → 0xFFFF_FFFF_FFFF_FF80)
+    // 6A 80  push -128  (0x80 as i8 = −128 -> 0xFFFF_FFFF_FFFF_FF80)
     // 58     pop rax
     // C3     ret
     let bytes = [0x6Au8, 0x80, 0x58, 0xC3];
@@ -242,7 +242,7 @@ fn test_push_neg128_imm8_sign_extends() {
 /// Sign-extended: `0xFFFF_FFFF_FFFF_FF9C`.
 #[test]
 fn test_push_neg100_imm8_sign_extends() {
-    // 6A 9C  push -100  (0x9C as i8 = −100 → 0xFFFF_FFFF_FFFF_FF9C)
+    // 6A 9C  push -100  (0x9C as i8 = −100 -> 0xFFFF_FFFF_FFFF_FF9C)
     // 58     pop rax
     // C3     ret
     let bytes = [0x6Au8, 0x9C, 0x58, 0xC3];
@@ -261,7 +261,7 @@ fn test_push_neg100_imm8_sign_extends() {
 /// Expected to pass regardless of whether Bug 2 is fixed.
 #[test]
 fn test_push_neg1_imm32_sign_extends_sanity() {
-    // 68 FF FF FF FF  push 0xFFFF_FFFF  (Immediate32to64 → 0xFFFF_FFFF_FFFF_FFFF)
+    // 68 FF FF FF FF  push 0xFFFF_FFFF  (Immediate32to64 -> 0xFFFF_FFFF_FFFF_FFFF)
     // 58              pop rax
     // C3              ret
     let bytes = [0x68u8, 0xFF, 0xFF, 0xFF, 0xFF, 0x58, 0xC3];
@@ -300,8 +300,8 @@ fn test_push_positive_imm8_unaffected() {
 /// code (host must push `ctx.rip` onto `ctx.rsp` before re-entering).
 ///
 /// Byte sequence at `0x1000`:
-///   `48 C7 C0 00 20 00 00`  →  `mov rax, 0x2000`  (7 bytes)
-///   `FF D0`                 →  `call rax`          (2 bytes, next_ip = 0x1009)
+///   `48 C7 C0 00 20 00 00`  ->  `mov rax, 0x2000`  (7 bytes)
+///   `FF D0`                 ->  `call rax`          (2 bytes, next_ip = 0x1009)
 #[test]
 fn test_indirect_call_via_reg_exits_with_indirect_call_reason() {
     #[rustfmt::skip]

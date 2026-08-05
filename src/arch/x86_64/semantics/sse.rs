@@ -1977,7 +1977,9 @@ impl<'a> Lifter<'a> {
             } else {
                 self.builder.ins().ishl_imm_u(v, left)
             };
-            self.builder.ins().sshr_imm_u(aligned, 64 - lane_bits as i64)
+            self.builder
+                .ins()
+                .sshr_imm_u(aligned, 64 - lane_bits as i64)
         } else {
             let shifted = if shift == 0 {
                 v
@@ -2254,7 +2256,11 @@ impl<'a> Lifter<'a> {
             // register. A count above 15 leaves every byte pointing at zero.
             let mut mask = [B; 16];
             for (i, m) in mask.iter_mut().enumerate() {
-                let from = if left { i as i32 - count } else { i as i32 + count };
+                let from = if left {
+                    i as i32 - count
+                } else {
+                    i as i32 + count
+                };
                 if (0..16).contains(&from) {
                     *m = from as u8;
                 }
@@ -2393,7 +2399,11 @@ impl<'a> Lifter<'a> {
         min: bool,
     ) -> crate::Result<()> {
         let who = if min { "minpd" } else { "maxpd" };
-        let op = if min { PackedFpOp::Min } else { PackedFpOp::Max };
+        let op = if min {
+            PackedFpOp::Min
+        } else {
+            PackedFpOp::Max
+        };
         if self.try_packed_fp_vec(instruction, who, false, op)? {
             return Ok(());
         }
@@ -2418,7 +2428,11 @@ impl<'a> Lifter<'a> {
         min: bool,
     ) -> crate::Result<()> {
         let who = if min { "minps" } else { "maxps" };
-        let op = if min { PackedFpOp::Min } else { PackedFpOp::Max };
+        let op = if min {
+            PackedFpOp::Min
+        } else {
+            PackedFpOp::Max
+        };
         if self.try_packed_fp_vec(instruction, who, true, op)? {
             return Ok(());
         }

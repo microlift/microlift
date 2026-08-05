@@ -2,16 +2,16 @@ use cranelift::prelude::*;
 use cranelift_codegen::ir::{Function, UserFuncName};
 use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::settings;
+use microlift::arch::x86_64::X86_64;
 use microlift::backend::ArtifactBackend;
 use microlift::backend::CraneliftBackend;
 use microlift::context::{ExitReason, RegisterContext};
 use microlift::core::abi::CallAbi;
+use microlift::core::lift_to_function;
 use microlift::function_traits::{DynamicSymbol, trampoline_func};
+use microlift::lifter::Atomic128Mode;
 use microlift::lifter::{ExecutionMode, Lifter, LifterConfig};
 use microlift::os::get_host_calling_conv;
-use microlift::arch::x86_64::X86_64;
-use microlift::core::lift_to_function;
-use microlift::lifter::Atomic128Mode;
 use object::{Object, ObjectSection, ObjectSymbol};
 
 #[test]
@@ -432,8 +432,12 @@ fn test_cmpxchg16b_emulated_lowers_everywhere() {
         "aarch64-unknown-linux-gnu",
         "riscv64gc-unknown-linux-gnu",
     ] {
-        ArtifactBackend::compile_to_raw(lift_cmpxchg16b(Atomic128Mode::Emulated), Some(triple), None)
-            .unwrap_or_else(|e| panic!("emulated cmpxchg16b failed to lower for {triple}: {e:?}"));
+        ArtifactBackend::compile_to_raw(
+            lift_cmpxchg16b(Atomic128Mode::Emulated),
+            Some(triple),
+            None,
+        )
+        .unwrap_or_else(|e| panic!("emulated cmpxchg16b failed to lower for {triple}: {e:?}"));
     }
 }
 
@@ -448,6 +452,7 @@ fn test_cmpxchg16b_native_emits_the_instruction() {
             imports: Vec::new(),
             helpers: Vec::new(),
             analysis_call_targets: Default::default(),
+            source_map: Default::default(),
         },
         Some("x86_64-unknown-linux-gnu"),
         None,

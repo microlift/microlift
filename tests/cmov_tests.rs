@@ -6,10 +6,10 @@
 use microlift::testkit::prelude::*;
 
 /// `cmovCC rax, rcx` with rax=0, rcx=42.
-/// All tests follow: if condition true → rax=42; if false → rax=0.
+/// All tests follow: if condition true -> rax=42; if false -> rax=0.
 ///
 /// Encoding: REX.W (48) + 0F + opcode + ModRM(C1)
-///   ModRM C1 = mod=11, reg=rax(000), rm=rcx(001) → 0b11_000_001
+///   ModRM C1 = mod=11, reg=rax(000), rm=rcx(001) -> 0b11_000_001
 
 // ---------------------------------------------------------------------------
 // CMOVE / CMOVZ  (ZF=1)
@@ -17,7 +17,7 @@ use microlift::testkit::prelude::*;
 
 #[test]
 fn test_cmove_true() {
-    // ZF=1 → condition true → rax = 42
+    // ZF=1 -> condition true -> rax = 42
     let mut ctx = RegisterContext::default();
     ctx.rcx = 42;
     ctx.zf = 1;
@@ -32,7 +32,7 @@ fn test_cmove_true() {
 
 #[test]
 fn test_cmove_false() {
-    // ZF=0 → condition false → rax stays 0
+    // ZF=0 -> condition false -> rax stays 0
     let mut ctx = RegisterContext::default();
     ctx.rcx = 42;
     // zf=0 by default
@@ -51,7 +51,7 @@ fn test_cmove_false() {
 
 #[test]
 fn test_cmovne_true() {
-    // ZF=0 → condition true → rax = 42
+    // ZF=0 -> condition true -> rax = 42
     let mut ctx = RegisterContext::default();
     ctx.rcx = 42;
     // zf=0 by default
@@ -66,7 +66,7 @@ fn test_cmovne_true() {
 
 #[test]
 fn test_cmovne_false() {
-    // ZF=1 → condition false → rax stays 0
+    // ZF=1 -> condition false -> rax stays 0
     let mut ctx = RegisterContext::default();
     ctx.rcx = 42;
     ctx.zf = 1;
@@ -243,7 +243,7 @@ fn test_cmova_false_via_zf() {
 fn test_cmovl_true() {
     let mut ctx = RegisterContext::default();
     ctx.rcx = 42;
-    ctx.sf = 1; // SF=1, OF=0 → SF != OF
+    ctx.sf = 1; // SF=1, OF=0 -> SF != OF
     #[rustfmt::skip]
     let bytes = [
         0x48, 0x0F, 0x4C, 0xC1, // cmovl rax, rcx
@@ -257,7 +257,7 @@ fn test_cmovl_true() {
 fn test_cmovl_false() {
     let mut ctx = RegisterContext::default();
     ctx.rcx = 42;
-    // sf=0, of=0 → SF == OF → not less
+    // sf=0, of=0 -> SF == OF -> not less
     #[rustfmt::skip]
     let bytes = [
         0x48, 0x0F, 0x4C, 0xC1, // cmovl rax, rcx
@@ -275,7 +275,7 @@ fn test_cmovl_false() {
 fn test_cmovge_true() {
     let mut ctx = RegisterContext::default();
     ctx.rcx = 42;
-    // sf=0, of=0 → SF == OF
+    // sf=0, of=0 -> SF == OF
     #[rustfmt::skip]
     let bytes = [
         0x48, 0x0F, 0x4D, 0xC1, // cmovge rax, rcx
@@ -335,7 +335,7 @@ fn test_cmovle_true_via_sf_ne_of() {
 fn test_cmovle_false() {
     let mut ctx = RegisterContext::default();
     ctx.rcx = 42;
-    // zf=0, sf=0, of=0 → ZF=0 and SF==OF
+    // zf=0, sf=0, of=0 -> ZF=0 and SF==OF
     #[rustfmt::skip]
     let bytes = [
         0x48, 0x0F, 0x4E, 0xC1, // cmovle rax, rcx
@@ -589,13 +589,13 @@ fn test_cmovnp_false() {
 
 #[test]
 fn test_cmove_via_cmp_equal() {
-    // cmp rax, rax (rax=0=0 → ZF=1) then cmove rax, rcx (rcx=42)
-    // cmp rax, rax: 48 39 C0  (CMP r/m64, r64; reg=rax, rm=rax → ModRM 0xC0)
+    // cmp rax, rax (rax=0=0 -> ZF=1) then cmove rax, rcx (rcx=42)
+    // cmp rax, rax: 48 39 C0  (CMP r/m64, r64; reg=rax, rm=rax -> ModRM 0xC0)
     let mut ctx = RegisterContext::default();
     ctx.rcx = 42;
     #[rustfmt::skip]
     let bytes = [
-        0x48, 0x39, 0xC0,       // cmp rax, rax  → ZF=1
+        0x48, 0x39, 0xC0,       // cmp rax, rax  -> ZF=1
         0x48, 0x0F, 0x44, 0xC1, // cmove rax, rcx
         0xC3,
     ];
@@ -605,12 +605,12 @@ fn test_cmove_via_cmp_equal() {
 
 #[test]
 fn test_cmovne_via_cmp_unequal() {
-    // mov rax, 1; mov rcx, 42; cmp rax, 0 (ZF=0) → cmovne moves
+    // mov rax, 1; mov rcx, 42; cmp rax, 0 (ZF=0) -> cmovne moves
     #[rustfmt::skip]
     let bytes = [
         0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00, // mov rax, 1
         0x48, 0xC7, 0xC1, 0x2A, 0x00, 0x00, 0x00, // mov rcx, 42
-        0x48, 0x83, 0xF8, 0x00,                   // cmp rax, 0 → ZF=0
+        0x48, 0x83, 0xF8, 0x00,                   // cmp rax, 0 -> ZF=0
         0x48, 0x0F, 0x45, 0xC1,                   // cmovne rax, rcx
         0xC3,
     ];

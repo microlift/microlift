@@ -3421,7 +3421,10 @@ fn test_insertps_zero_mask_overrides_insert_and_vector_mode_agrees() {
     ctx.xmm[1] = [0xBBBB_BBBB_AAAA_AAAA, 0xDDDD_DDDD_CCCC_CCCC];
     let scalar = run_test(&bytes, ctx);
     let vector = run_test_vec(&bytes, ctx);
-    assert_eq!(scalar.xmm[0], [0x3333_3333_2222_2222, 0x5555_5555_0000_0000]);
+    assert_eq!(
+        scalar.xmm[0],
+        [0x3333_3333_2222_2222, 0x5555_5555_0000_0000]
+    );
     assert_eq!(scalar.xmm, vector.xmm);
 }
 
@@ -3540,10 +3543,10 @@ fn test_horizontal_arithmetic_agrees_in_vector_mode() {
 #[test]
 fn test_roundsd_modes() {
     for (imm, expected) in [
-        (0x00u8, 2.0f64),  // nearest, ties to even: 2.5 -> 2
-        (0x01, 2.0),       // floor
-        (0x02, 3.0),       // ceil
-        (0x03, 2.0),       // truncate
+        (0x00u8, 2.0f64), // nearest, ties to even: 2.5 -> 2
+        (0x01, 2.0),      // floor
+        (0x02, 3.0),      // ceil
+        (0x03, 2.0),      // truncate
     ] {
         // roundsd xmm0, xmm1, imm; ret
         let bytes = [0x66, 0x0F, 0x3A, 0x0B, 0xC1, imm, 0xC3];
@@ -3551,11 +3554,7 @@ fn test_roundsd_modes() {
         ctx.xmm[0] = [0, 0xDEAD_BEEF_DEAD_BEEF];
         ctx.xmm[1] = [2.5f64.to_bits(), 0];
         let out = run_test(&bytes, ctx);
-        assert_eq!(
-            f64::from_bits(out.xmm[0][0]),
-            expected,
-            "imm {imm:#04x}"
-        );
+        assert_eq!(f64::from_bits(out.xmm[0][0]), expected, "imm {imm:#04x}");
         assert_eq!(out.xmm[0][1], 0xDEAD_BEEF_DEAD_BEEF, "imm {imm:#04x}");
     }
 }

@@ -198,10 +198,10 @@ impl<'a> Lifter<'a> {
                 // `atomic_cas` straight to `lock cmpxchg16b`.
                 let expected = self.builder.ins().iconcat(rax, rdx);
                 let replacement = self.builder.ins().iconcat(rbx, rcx);
-                let old = self
-                    .builder
-                    .ins()
-                    .atomic_cas(MemFlagsData::new(), ptr, expected, replacement);
+                let old =
+                    self.builder
+                        .ins()
+                        .atomic_cas(MemFlagsData::new(), ptr, expected, replacement);
                 let succeeded = self.builder.ins().icmp(IntCC::Equal, old, expected);
                 let (lo, hi) = self.builder.ins().isplit(old);
                 (lo, hi, succeeded)
@@ -369,7 +369,10 @@ impl<'a> Lifter<'a> {
             let tmp = self.builder.ins().iadd(dst, src);
             let c1 = self.builder.ins().icmp(IntCC::UnsignedLessThan, tmp, dst);
             let result = self.builder.ins().iadd(tmp, cf);
-            let c2 = self.builder.ins().icmp(IntCC::UnsignedLessThan, result, tmp);
+            let c2 = self
+                .builder
+                .ins()
+                .icmp(IntCC::UnsignedLessThan, result, tmp);
             (result, self.builder.ins().bor(c1, c2))
         } else {
             let tmp = self.builder.ins().isub(dst, src);

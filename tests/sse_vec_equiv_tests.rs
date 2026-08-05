@@ -305,7 +305,10 @@ fn vector_fast_paths_lower_on_every_target() {
         .map(|(n, b)| ((*n).to_string(), snippet(b, None)))
         .collect();
     for imm in 0..8u8 {
-        cases.push((format!("cmpps-{imm}"), snippet(&[0x0F, 0xC2, 0xC1], Some(imm))));
+        cases.push((
+            format!("cmpps-{imm}"),
+            snippet(&[0x0F, 0xC2, 0xC1], Some(imm)),
+        ));
         cases.push((
             format!("cmppd-{imm}"),
             snippet(&[0x66, 0x0F, 0xC2, 0xC1], Some(imm)),

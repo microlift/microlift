@@ -214,7 +214,10 @@ impl<'a> Lifter<'a> {
         // Biased f64 exponent of the integer bit: exp80 - 16383 + 1023.
         let e = self.builder.ins().iadd_imm_s(exp80_64, -15360);
 
-        let is_special = self.builder.ins().icmp_imm_s(IntCC::Equal, exp80_64, 0x7FFF);
+        let is_special = self
+            .builder
+            .ins()
+            .icmp_imm_s(IntCC::Equal, exp80_64, 0x7FFF);
         let is_zero_mant = self.builder.ins().icmp_imm_s(IntCC::Equal, mant, 0);
         let overflow = self
             .builder
@@ -443,7 +446,10 @@ impl<'a> Lifter<'a> {
             let round_up = self.builder.ins().bor(gt, tie_up);
             let inc = self.builder.ins().uextend(types::I64, round_up);
             // No shift (shift==0) -> already integral, don't round.
-            let no_frac = self.builder.ins().icmp_imm_s(IntCC::Equal, shift_clamped, 0);
+            let no_frac = self
+                .builder
+                .ins()
+                .icmp_imm_s(IntCC::Equal, shift_clamped, 0);
             let inc = {
                 let zero = self.builder.ins().iconst(types::I64, 0);
                 self.builder.ins().select(no_frac, zero, inc)
@@ -458,11 +464,14 @@ impl<'a> Lifter<'a> {
 
         // Out-of-range: value < 1 (shift >= 64) -> 0; magnitude too large
         // (shift < 0, i.e. exponent >= 63) -> integer indefinite.
-        let value_lt_one = self
+        let value_lt_one =
+            self.builder
+                .ins()
+                .icmp_imm_s(IntCC::SignedGreaterThanOrEqual, shift, 64);
+        let too_large = self
             .builder
             .ins()
-            .icmp_imm_s(IntCC::SignedGreaterThanOrEqual, shift, 64);
-        let too_large = self.builder.ins().icmp_imm_s(IntCC::SignedLessThan, shift, 0);
+            .icmp_imm_s(IntCC::SignedLessThan, shift, 0);
         let zero = self.builder.ins().iconst(types::I64, 0);
         let indef = self.builder.ins().iconst(types::I64, i64::MIN);
         let r = self.builder.ins().select(value_lt_one, zero, signed);
