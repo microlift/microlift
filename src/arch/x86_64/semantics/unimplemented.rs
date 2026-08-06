@@ -52,6 +52,7 @@ impl<'a> Lifter<'a> {
     pub(super) fn handle_ud2(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let rip_at = self.rip_at(instruction);
         self.sync_to_context(Some(rip_at), ExitReason::Ud2)?;
+        self.resumes_at(instruction.next_ip());
         self.builder.ins().return_(&[]);
         self.block_terminated = true;
         Ok(())
