@@ -168,3 +168,7 @@ required-features = ["testkit"]
 [[test]]
 name = "srcloc_tests"
 required-features = ["testkit"]
+
+[[test]]
+name = "region_bounds_tests"
+required-features = ["testkit"]

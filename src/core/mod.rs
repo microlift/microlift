@@ -13,6 +13,8 @@ pub mod bridge;
 pub mod exit;
 pub mod srcloc;
 
+use std::collections::BTreeSet;
+
 use crate::arch::{ControlFlow, ControlFlowKind, InstructionEffects};
 use crate::core::abi::CallAbi;
 use crate::core::bridge::{BridgeImport, ImportKind, ImportRegistry};
@@ -38,6 +40,15 @@ use std::sync::Arc;
 /// semantics themselves are implemented as inherent methods on the concrete
 /// `LiftEngine<'a, Self>` monomorphization and reached via `lift_instruction`.
 pub trait GuestArch: Sized {
+    /// The longest encoding this guest has, in bytes.
+    ///
+    /// What it is for: an instruction that begins inside a lifted region can
+    /// still *end* outside it, and only for a variable-length ISA is that
+    /// possible at all. Everything within `MAX_INSTRUCTION_LEN - 1` bytes of the
+    /// end of a region is therefore suspect, and this is the width of that
+    /// suspicion. See [`LifterConfig::region_tail_exit`].
+    const MAX_INSTRUCTION_LEN: u64;
+
     /// A single decoded guest instruction.
     type Instr;
     /// SSA-variable register file (guest registers, flags, dirty tracking, plus
@@ -176,6 +187,19 @@ pub struct LiftedCode {
     /// to turn a compiled function's surviving locations into a host-offset ->
     /// guest-VA map.
     pub source_map: SourceLocMap,
+    /// Every guest address this code can be **entered at**, ascending.
+    ///
+    /// The arms of the entry dispatch, which is a narrower set than "the
+    /// addresses the region covers" and a wider one than "its first
+    /// instruction". A host cache keyed by address has to know it exactly:
+    /// entering at anything else either runs the region from the top (silently
+    /// wrong) or exits with
+    /// [`TransferKind::NoResumePoint`](crate::core::exit::TransferKind::NoResumePoint)
+    /// under [`LifterConfig::strict_resume`], and neither is something to
+    /// discover at run time when the answer was known at lift time.
+    ///
+    /// Empty under [`LifterConfig::analysis_mode`], which emits no dispatch.
+    pub resume_points: Vec<u64>,
 }
 
 /// Lift a region of guest code to a Cranelift [`Function`] plus the external
@@ -206,6 +230,7 @@ pub fn lift_to_code<A: GuestArch>(
     let analysis_call_targets = std::mem::take(&mut engine.analysis_call_targets);
     let imports = std::mem::take(&mut engine.aot_imports);
     let source_map = engine.source_map;
+    let resume_points = std::mem::take(&mut engine.emitted_resume_points);
     let helpers = engine.take_helpers();
 
     // Release the mutable borrow of `func` held by the builder/engine.
@@ -217,6 +242,7 @@ pub fn lift_to_code<A: GuestArch>(
         helpers,
         analysis_call_targets,
         source_map,
+        resume_points,
     })
 }
 
@@ -633,6 +659,116 @@ pub struct LifterConfig {
     /// [`LiftedCode::source_map`]; the compiled half is
     /// [`GuestCodeMap`](crate::core::srcloc::GuestCodeMap).
     pub emit_source_locs: bool,
+    /// Exit rather than decode when an instruction's bytes run past the end of
+    /// the region.
+    ///
+    /// ## The problem this exists for
+    ///
+    /// A region's extent is normally chosen so that it ends where an
+    /// instruction ends - by walking the guest's control flow, or by trusting a
+    /// function record. A host that instead cuts regions on a **fixed grid** (a
+    /// page, a cache line, a fixed byte count) has no such guarantee: an x86-64
+    /// instruction is one to fifteen bytes, so the last one before the cut
+    /// straddles it about as often as not.
+    ///
+    /// What the decoder does with the truncated bytes is the whole problem.
+    /// Given fewer bytes than the encoding needs it reports an *invalid*
+    /// instruction - so a perfectly ordinary `mov` at the end of a page becomes
+    /// [`ExitReason::InvalidInstruction`], which is a fault the host reports and
+    /// the program dies on. The bytes are fine; the region was cut through them.
+    ///
+    /// ## What it does instead
+    ///
+    /// With this on, an instruction that begins inside the region and ends
+    /// outside it - either because its decoded length says so, or because it
+    /// came back invalid from within
+    /// [`MAX_INSTRUCTION_LEN`](GuestArch::MAX_INSTRUCTION_LEN) of the end, which
+    /// is exactly the window in which truncation is possible - is not lifted at
+    /// all. It becomes an [`ExitReason::UnknownJump`] with
+    /// [`TransferKind::RegionTail`]: the PC is the address of that instruction
+    /// and nothing about it has executed, so the host lifts a fresh region
+    /// starting there and re-enters.
+    ///
+    /// **Progress is guaranteed** because the first instruction of a region is
+    /// exempt. A region always holds at least its own entry instruction, so the
+    /// re-lift the exit asks for cannot produce the same exit at the same
+    /// address; a genuinely undecodable byte at a region's entry still reports
+    /// itself as invalid.
+    ///
+    /// Off by default: a host that chooses extents on instruction boundaries
+    /// never reaches the case, and for a fixed-width guest it cannot arise at
+    /// all.
+    ///
+    /// [`ExitReason::InvalidInstruction`]: crate::core::exit::ExitReason::InvalidInstruction
+    /// [`ExitReason::UnknownJump`]: crate::core::exit::ExitReason::UnknownJump
+    /// [`TransferKind::RegionTail`]: crate::core::exit::TransferKind::RegionTail
+    pub region_tail_exit: bool,
+    /// The guest page size [`page_bounded_extent`](Self::page_bounded_extent)
+    /// cuts regions on.
+    ///
+    /// A knob rather than a constant because the answer is a property of the
+    /// *host* a translation runs on as much as of the guest that was compiled:
+    /// an x86-64 program assumes 4 KiB, Apple Silicon gives it 16 KiB, and the
+    /// larger page is strictly better here - the same code is covered by a
+    /// quarter as many regions, with a quarter as many boundaries for an
+    /// instruction to straddle.
+    ///
+    /// Only [`page_bounded_extent`](Self::page_bounded_extent) reads it;
+    /// lifting itself is told an extent and does not ask where it came from.
+    pub page_size: u64,
+    /// Which addresses the region's entry dispatch offers, if not all of them.
+    ///
+    /// ## What a resume point costs
+    ///
+    /// The entry dispatch is a `Switch` on the incoming PC, and by default every
+    /// block leader in the region gets an arm. That is what makes JIT re-entry
+    /// work - but it also means **every block is reachable from the function
+    /// entry**, so every guest register and flag is live into every block. A
+    /// region's live-range count therefore scales with its block count rather
+    /// than with its real control flow, and Cranelift's register allocator is
+    /// superlinear in live ranges. The measured effect is not subtle: over the
+    /// same 128 KiB of a real program's `__text`, lifting in 4 KiB pieces costs
+    /// 1.45s of compile time when only the natural leaders are resume points and
+    /// 19.42s when every instruction boundary is one.
+    ///
+    /// So the number of resume points, not the number of guest instructions, is
+    /// what decides whether a large region is affordable - and a host usually
+    /// knows that its own set is small: the addresses control can arrive at from
+    /// outside are the entry, the function starts, and the resume point after
+    /// each call.
+    ///
+    /// ## What this does
+    ///
+    /// `Some(addresses)` restricts the dispatch to those (plus the region's own
+    /// entry, and plus every call resume point, which the engine adds itself
+    /// because a call that leaves the region has to be able to come back). Each
+    /// becomes a block leader whether or not control flow discovered it, so a
+    /// function reached only through a pointer is still enterable. `None`, the
+    /// default, keeps the historical behaviour of offering every block.
+    ///
+    /// Pair it with [`strict_resume`](Self::strict_resume), which decides what
+    /// happens to an address that was left out.
+    pub resume_points: Option<Vec<u64>>,
+    /// Exit rather than guess when the entry PC matches no resume point.
+    ///
+    /// The dispatch `Switch` needs a default arm, and historically that arm is
+    /// the region's **first block** - so a host that resumes at an address the
+    /// region cannot actually start at silently executes from the top of the
+    /// region instead. There is no fault and no diagnostic; the guest simply
+    /// runs the wrong code.
+    ///
+    /// With this on the default arm is an [`ExitReason::UnknownJump`] carrying
+    /// [`TransferKind::NoResumePoint`], leaving the PC exactly as the host set
+    /// it. No guest state has been touched - the arm is reached before any
+    /// instruction is lifted - so the host is free to translate a region
+    /// starting at that address and enter that instead.
+    ///
+    /// Off by default only because it changes what an existing embedder sees;
+    /// any host that can resume at a computed address wants it on.
+    ///
+    /// [`ExitReason::UnknownJump`]: crate::core::exit::ExitReason::UnknownJump
+    /// [`TransferKind::NoResumePoint`]: crate::core::exit::TransferKind::NoResumePoint
+    pub strict_resume: bool,
 }
 
 impl Default for LifterConfig {
@@ -653,6 +789,10 @@ impl Default for LifterConfig {
             analysis_mode: false,
             outline_helpers: true,
             emit_source_locs: true,
+            region_tail_exit: false,
+            page_size: 4096,
+            resume_points: None,
+            strict_resume: false,
         }
     }
 }
@@ -713,6 +853,51 @@ impl LifterConfig {
     /// [`indirect_call_bridge`](Self::indirect_call_bridge).
     pub fn set_indirect_call_bridge(&mut self, bridge: BridgeImport) {
         self.indirect_call_bridge = Some(bridge);
+    }
+
+    /// The extent to lift so that `pc` can execute, cut on page boundaries.
+    ///
+    /// The alternative to walking the guest's control flow to find out where a
+    /// region should end. Walking predicts which bytes will be executed; this
+    /// declines to predict, and answers with the bytes control could reach
+    /// *before it has to ask again* - everything from `pc` to the end of the
+    /// page it is in.
+    ///
+    /// Two things make that a usable answer rather than an arbitrary one:
+    ///
+    /// - **It is monotone in what the guest has actually written.** A prediction
+    ///   made ahead of execution can be wrong about generated code, because
+    ///   nobody knows what a byte holds until it is about to run. A page
+    ///   boundary is not a claim about the bytes at all.
+    /// - **It terminates.** The result always spans `pc` plus at least one
+    ///   maximal instruction, so entering at `pc` always makes progress even
+    ///   when `pc` sits in the last few bytes of a page: the extent then runs to
+    ///   the end of the *next* page instead. Without that, a region could
+    ///   contain no complete instruction and the host would re-lift the same
+    ///   address forever.
+    ///
+    /// `available` bounds the answer to memory the host can actually read -
+    /// typically one mapped image or one arena. The result is clamped into it,
+    /// and is empty when `pc` is not inside it.
+    ///
+    /// Pair this with [`region_tail_exit`](Self::region_tail_exit), which is
+    /// what makes the instruction straddling the far end a resumable exit
+    /// instead of a fault.
+    pub fn page_bounded_extent<A: GuestArch>(
+        &self,
+        pc: u64,
+        available: core::ops::Range<u64>,
+    ) -> core::ops::Range<u64> {
+        if !available.contains(&pc) {
+            return pc..pc;
+        }
+        let page = self.page_size.max(A::MAX_INSTRUCTION_LEN.next_power_of_two());
+        // Round *up* from the last byte the entry instruction could possibly
+        // occupy, so a `pc` near the end of a page takes the following page with
+        // it rather than getting an extent too short to hold one instruction.
+        let last = pc.saturating_add(A::MAX_INSTRUCTION_LEN - 1);
+        let end = (last / page).saturating_add(1).saturating_mul(page);
+        pc..end.min(available.end)
     }
 }
 
@@ -792,6 +977,15 @@ pub struct LiftEngine<'a, A: GuestArch = crate::arch::x86_64::X86_64> {
     /// [`LifterConfig::analyze_jump_tables`] is set. Recorded for inspection -
     /// leader discovery has already consumed it by the time the lift returns.
     pub jump_tables: HashMap<u64, Vec<u64>>,
+    /// The guest addresses the entry dispatch was given an arm for, ascending.
+    ///
+    /// Filled while the dispatch is emitted, and handed out as
+    /// [`LiftedCode::resume_points`] - the authoritative answer to "can this
+    /// translation be entered there", which only the lift knows.
+    pub emitted_resume_points: Vec<u64>,
+    /// In-region addresses a *resumable VM exit* continues at, collected while
+    /// lifting rather than declared up front. See [`Self::resumes_at`].
+    pub exit_resumes: HashSet<u64>,
 }
 
 /// A helper under construction: its body plus the `UserExternalName` slot whose
@@ -882,6 +1076,8 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             helper_refs: HashMap::new(),
             source_map: SourceLocMap::default(),
             jump_tables: HashMap::new(),
+            emitted_resume_points: Vec::new(),
+            exit_resumes: HashSet::new(),
         }
     }
 
@@ -1180,6 +1376,76 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             .store(MemFlagsData::trusted(), val, ctx_ptr, A::exit_code_offset());
     }
 
+    /// Declare that the VM exit just emitted **resumes at `va`**.
+    ///
+    /// Semantics call this for every exit the host is expected to service and
+    /// then re-enter after — `CPUID`, `RDTSC`, `XGETBV`, `SYSCALL`, `INT`,
+    /// `INT3`, the port-I/O string instructions, and an unimplemented
+    /// instruction the host emulates. It does two things, and both are needed:
+    ///
+    /// - **Makes `va` a block leader**, so the code after the exit is lifted at
+    ///   all. An exit terminates its block, so without this the phase-2 walk
+    ///   simply stops and the rest of the region is never emitted unless some
+    ///   other leader happens to reach it.
+    /// - **Makes `va` a resume point**, so the entry dispatch has an arm for it
+    ///   and the host can come back to exactly where it left.
+    ///
+    /// Neither used to happen. `CPUID` in the middle of a region left everything
+    /// after it unlifted and unenterable, and the only thing that covered it was
+    /// [`LifterConfig::emit_resume_blocks`] making *every* instruction a resume
+    /// point — which is why that flag looked mandatory and cost what it cost.
+    ///
+    /// Out-of-region addresses are ignored: the resume point is then the host's
+    /// problem in the ordinary way, and it will translate a region there.
+    pub fn resumes_at(&mut self, va: u64) {
+        if va >= self.lift_base && va < self.lift_end {
+            self.exit_resumes.insert(va);
+            self.get_block(va);
+        }
+    }
+
+    /// Emit a store of `reason` into the `exit_reason` control field.
+    ///
+    /// The reason on its own, with no PC write and no register sync - for the
+    /// one exit that happens before any guest instruction has been lifted, where
+    /// the context already holds exactly what the host put there.
+    pub fn write_exit_reason(&mut self, reason: ExitReason) {
+        let ctx_ptr = self.builder.use_var(A::context_ptr_var(&self.state));
+        let val = self.builder.ins().iconst(types::I32, reason as i64);
+        self.builder.ins().store(
+            MemFlagsData::trusted(),
+            val,
+            ctx_ptr,
+            A::exit_reason_offset(),
+        );
+    }
+
+    /// Whether the instruction at `addr` runs off the end of the lifted bytes.
+    ///
+    /// Two ways it can, and the second is the one that is easy to miss:
+    ///
+    /// - The decode says so outright - `next_ip` is past `lift_end`. That
+    ///   happens when the bytes past the cut *were* readable to the decoder,
+    ///   which is the case whenever the region was clipped out of a longer
+    ///   buffer.
+    /// - The decode came back **invalid** from within one maximal instruction
+    ///   of the end. A decoder given fewer bytes than an encoding needs cannot
+    ///   say "truncated" - it says "invalid", identically to a byte that really
+    ///   is not an instruction. Inside that window the two are indistinguishable
+    ///   and the resumable answer is the safe one: a re-lift starting at `addr`
+    ///   sees the whole encoding and reports the genuine invalid if that is what
+    ///   it is.
+    ///
+    /// Never true at `lift_base`, which is what makes the exit terminate rather
+    /// than repeat; see [`LifterConfig::region_tail_exit`].
+    fn runs_off_region(&self, addr: u64, inst: &A::Instr) -> bool {
+        self.config.region_tail_exit
+            && addr != self.lift_base
+            && addr < self.lift_end
+            && (A::instr_next_ip(inst) > self.lift_end
+                || (A::is_invalid(inst) && self.lift_end - addr < A::MAX_INSTRUCTION_LEN))
+    }
+
     /// The value the `image_base` variable is defined to at region entry.
     ///
     /// Under [`AddressMode::ImageBaseRelative`] that is the relocation base the
@@ -1314,6 +1580,23 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         let mut leaders: HashSet<u64> = HashSet::from([ip]);
         let mut work: Vec<u64> = decoded.keys().copied().collect();
         work.push(ip);
+        // Host-declared resume points are leaders before discovery rather than
+        // after it, so that the code reachable *from* one is discovered too. An
+        // address the guest only ever reaches through a pointer has no static
+        // predecessor and would otherwise be a block with nothing behind it.
+        if let Some(points) = &self.config.resume_points {
+            for &p in points {
+                if p >= self.lift_base && p < self.lift_end {
+                    leaders.insert(p);
+                    work.push(p);
+                }
+            }
+        }
+        // Where a call that leaves the region comes back to. Collected because
+        // these have to stay in the dispatch whatever the host declared: the
+        // host cannot name them without decoding the region itself, and a
+        // region whose calls cannot return is a region that runs once.
+        let mut call_resumes: HashSet<u64> = HashSet::new();
         let mut processed: HashSet<u64> = HashSet::new();
 
         while let Some(addr) = work.pop() {
@@ -1335,6 +1618,14 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                 }
             }
             let inst = &decoded[&addr];
+            // Its bytes are not all here, so neither are its control-flow facts:
+            // a `next_ip` or a branch target read out of a truncated encoding is
+            // a guess. Phase 2 turns this address into a resumable exit, and
+            // discovery stops rather than following the guess.
+            if self.runs_off_region(addr, inst) {
+                leaders.insert(addr);
+                continue;
+            }
             let cf = A::control_flow(inst);
             let next = A::instr_next_ip(inst);
             match cf.kind {
@@ -1377,6 +1668,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                     // path; for an in-region callee it is the `RET` dispatch,
                     // which can only reach addresses that have a block.
                     leaders.insert(next);
+                    call_resumes.insert(next);
                     work.push(next);
                 }
                 ControlFlowKind::Ret => {}
@@ -1422,27 +1714,25 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
 
         let start_block = self.get_block(ip);
 
-        if self.config.analysis_mode {
-            // Analysis mode: skip the resumable PC dispatch entirely and just
-            // enter at the region's first instruction.
-            self.builder.ins().jump(start_block, &[]);
-        } else {
-            // Resumable dispatch: jump to the block matching the context PC.
-            let pc_val = self.builder.ins().load(
-                types::I64,
-                MemFlagsData::trusted(),
-                ctx_ptr_val,
-                A::pc_offset(),
-            );
-            let entry_va = self.to_lift_va(pc_val);
-
-            let mut switch = Switch::new();
-            for (&offset, &block) in &self.blocks {
-                switch.set_entry(offset.into(), block);
-            }
-
-            switch.emit(&mut self.builder, entry_va, start_block);
-        }
+        // The dispatch is emitted **after** phase 2 rather than here, because
+        // phase 2 is where some of the addresses it has to offer come from: an
+        // instruction that lifts to a *resumable* VM exit registers its own
+        // resume point (see [`Self::resumes_at`]), and nobody knows that address
+        // exists until the instruction has been lifted. Fixing the arms before
+        // then is what used to make [`LifterConfig::emit_resume_blocks`] the
+        // only way to be re-enterable after a `CPUID` — the switch was built
+        // before the `CPUID` was seen.
+        //
+        // Cranelift will not let the builder leave a block unfilled, so the
+        // entry block is terminated with a jump to one that stays empty until
+        // the lift is done. The jump folds away.
+        let dispatch_block = (!self.config.analysis_mode).then(|| self.builder.create_block());
+        match dispatch_block {
+            // Analysis mode has no dispatch at all: enter at the region's first
+            // instruction and nowhere else.
+            None => self.builder.ins().jump(start_block, &[]),
+            Some(dispatch) => self.builder.ins().jump(dispatch, &[]),
+        };
 
         // Phase 2: emit each block by walking instructions from its leader,
         // following `instr_next_ip` rather than linear list order. Overlapping
@@ -1526,6 +1816,20 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                 }
                 let inst = &decoded[&cur];
 
+                // The instruction begins here and ends past the bytes we were
+                // given. Nothing about it has executed, so this is a transfer
+                // *to* `cur` and the host resumes there with a region that holds
+                // all of it. See [`LifterConfig::region_tail_exit`].
+                if self.runs_off_region(cur, inst) {
+                    self.current_ip = cur;
+                    self.set_source_loc(cur);
+                    A::sync_to_context(self, None, ExitReason::UnknownJump)?;
+                    self.write_exit_code(TransferKind::RegionTail as u32);
+                    self.builder.ins().return_(&[]);
+                    self.block_terminated = true;
+                    break;
+                }
+
                 if A::is_invalid(inst) {
                     // Sync PC to point AT the invalid instruction.
                     self.current_ip = A::instr_ip(inst);
@@ -1548,6 +1852,87 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                     break;
                 }
                 cur = next_ip;
+            }
+        }
+
+        // Phase 3: the entry dispatch, now that every block that will exist
+        // does. See where `dispatch_block` was created for why it waits.
+        if let Some(dispatch) = dispatch_block {
+            self.builder.switch_to_block(dispatch);
+            self.visited_blocks.insert(dispatch);
+
+            let ctx_ptr = self.builder.use_var(A::context_ptr_var(&self.state));
+            let pc_val =
+                self.builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::trusted(), ctx_ptr, A::pc_offset());
+            let entry_va = self.to_lift_va(pc_val);
+
+            // Which addresses get an arm. Every block by default; when the host
+            // has declared its own set, that set plus the three the engine knows
+            // are mandatory and the host cannot name — the region's own entry,
+            // the return point of every call that leaves it, and the resume
+            // point of every VM exit that resumes. See
+            // [`LifterConfig::resume_points`] for why a smaller set is worth
+            // having at all.
+            let arms: BTreeSet<u64> = match &self.config.resume_points {
+                None => self.blocks.keys().copied().collect(),
+                Some(points) => points
+                    .iter()
+                    .copied()
+                    .chain(call_resumes.iter().copied())
+                    .chain(self.exit_resumes.iter().copied())
+                    .chain(std::iter::once(ip))
+                    .collect(),
+            };
+            let mut switch = Switch::new();
+            for offset in arms {
+                if let Some(&block) = self.blocks.get(&offset) {
+                    switch.set_entry(offset.into(), block);
+                    // Reported only for addresses control can enter here and
+                    // then *make progress from*. Two kinds cannot, and both
+                    // leave the PC exactly as the host set it — so a host that
+                    // took one for a resume point would enter, exit unchanged,
+                    // look the same translation up again, and spin forever.
+                    //
+                    // - **Out-of-region targets.** The block map holds the
+                    //   branch and call targets that leave the region too, and
+                    //   `finish` turns their blocks into exit stubs.
+                    // - **The instruction the region was cut through**, under
+                    //   [`LifterConfig::region_tail_exit`]. Its block is the
+                    //   tail exit, and the host's answer to that exit is a
+                    //   region beginning at the address — which this is not.
+                    let in_region = offset >= self.lift_base && offset < self.lift_end;
+                    let tail = decoded
+                        .get(&offset)
+                        .is_some_and(|inst| self.runs_off_region(offset, inst));
+                    if in_region && !tail {
+                        self.emitted_resume_points.push(offset);
+                    }
+                }
+            }
+
+            // The default arm, which is where a PC that matched nothing lands.
+            // Falling into the region's first block is a *guess*, and a silent
+            // one; see [`LifterConfig::strict_resume`].
+            let refuse = self
+                .config
+                .strict_resume
+                .then(|| self.builder.create_block());
+            switch.emit(&mut self.builder, entry_va, refuse.unwrap_or(start_block));
+
+            // Filled only now: `switch.emit` terminates whichever block it was
+            // called from, and Cranelift refuses to leave one unfilled.
+            if let Some(refuse) = refuse {
+                self.builder.switch_to_block(refuse);
+                // No sync. The arm runs before any instruction is lifted, so the
+                // context still holds exactly what the host wrote — including
+                // the PC, which has to be left alone for the host to translate a
+                // region at.
+                self.write_exit_reason(ExitReason::UnknownJump);
+                self.write_exit_code(TransferKind::NoResumePoint as u32);
+                self.builder.ins().return_(&[]);
+                self.visited_blocks.insert(refuse);
             }
         }
 

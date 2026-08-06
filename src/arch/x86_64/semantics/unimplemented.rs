@@ -14,6 +14,7 @@ impl<'a> Lifter<'a> {
     ) -> crate::Result<()> {
         // Sync full state to RegisterContext - we're exiting to the host
         self.sync_to_context(None, ExitReason::UnimplementedInstruction)?;
+        self.resumes_at(instruction.next_ip());
 
         // Store the instruction code for the host to identify what failed
         let ctx_ptr = self.builder.use_var(self.state.context_ptr);
@@ -60,6 +61,7 @@ impl<'a> Lifter<'a> {
     pub(super) fn handle_int3(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let rip_at = self.rip_at(instruction);
         self.sync_to_context(Some(rip_at), ExitReason::Breakpoint)?;
+        self.resumes_at(instruction.next_ip());
         self.builder.ins().return_(&[]);
         self.block_terminated = true;
         Ok(())
@@ -84,6 +86,7 @@ impl<'a> Lifter<'a> {
     fn emit_interrupt_exit(&mut self, instruction: &Instruction, vector: u32) -> crate::Result<()> {
         let rip_after = self.rip_after(instruction);
         self.sync_to_context(Some(rip_after), ExitReason::Interrupt)?;
+        self.resumes_at(instruction.next_ip());
         self.write_exit_code(vector);
         self.builder.ins().return_(&[]);
         self.block_terminated = true;
@@ -110,6 +113,7 @@ impl<'a> Lifter<'a> {
     pub(super) fn handle_cpuid(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let rip_after = self.rip_after(instruction);
         self.sync_to_context(Some(rip_after), ExitReason::Cpuid)?;
+        self.resumes_at(instruction.next_ip());
         self.builder.ins().return_(&[]);
         self.block_terminated = true;
         Ok(())
@@ -118,6 +122,7 @@ impl<'a> Lifter<'a> {
     pub(super) fn handle_xgetbv(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let rip_after = self.rip_after(instruction);
         self.sync_to_context(Some(rip_after), ExitReason::Xgetbv)?;
+        self.resumes_at(instruction.next_ip());
         self.builder.ins().return_(&[]);
         self.block_terminated = true;
         Ok(())
@@ -130,6 +135,7 @@ impl<'a> Lifter<'a> {
     pub(super) fn handle_rdtsc(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let rip_after = self.rip_after(instruction);
         self.sync_to_context(Some(rip_after), ExitReason::Rdtsc)?;
+        self.resumes_at(instruction.next_ip());
         self.builder.ins().return_(&[]);
         self.block_terminated = true;
         Ok(())

@@ -237,6 +237,29 @@ pub enum TransferKind {
     /// registered as an import. A return address was pushed; the runtime must
     /// call the target and then resume at that address.
     DirectCall = 5,
+    /// Control reached an instruction whose **bytes** run past the end of the
+    /// lifted region, so the lifter never saw all of it and refused to guess.
+    ///
+    /// Only [`LifterConfig::region_tail_exit`] produces this, and only for a
+    /// variable-length guest. Nothing has happened yet: the PC is the address of
+    /// that instruction, no guest state past the previous instruction has
+    /// changed, and the stack is untouched. The host lifts a fresh region
+    /// **starting at the PC** - which is guaranteed to contain the whole
+    /// instruction, since a region always holds at least its own first one - and
+    /// re-enters.
+    ///
+    /// [`LifterConfig::region_tail_exit`]: crate::core::LifterConfig::region_tail_exit
+    RegionTail = 6,
+    /// The region was entered at a PC that is not one of its resume points, so
+    /// the entry dispatch declined to start anywhere.
+    ///
+    /// Only [`LifterConfig::strict_resume`] produces this, and it is reached
+    /// before any guest instruction is lifted: the PC is exactly what the host
+    /// set, and no register, flag or stack slot has changed. The host translates
+    /// a region beginning at that PC and enters that one instead.
+    ///
+    /// [`LifterConfig::strict_resume`]: crate::core::LifterConfig::strict_resume
+    NoResumePoint = 7,
 }
 
 impl TryFrom<u32> for TransferKind {
@@ -255,6 +278,10 @@ impl TryFrom<u32> for TransferKind {
             Ok(Self::Return)
         } else if value == Self::DirectCall as u32 {
             Ok(Self::DirectCall)
+        } else if value == Self::RegionTail as u32 {
+            Ok(Self::RegionTail)
+        } else if value == Self::NoResumePoint as u32 {
+            Ok(Self::NoResumePoint)
         } else {
             Err(())
         }
@@ -270,6 +297,8 @@ impl std::fmt::Display for TransferKind {
             TransferKind::ConditionalJump => "conditional-jump",
             TransferKind::Return => "return",
             TransferKind::DirectCall => "direct-call",
+            TransferKind::RegionTail => "region-tail",
+            TransferKind::NoResumePoint => "no-resume-point",
         })
     }
 }

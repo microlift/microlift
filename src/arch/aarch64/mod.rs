@@ -25,6 +25,11 @@ pub struct Aarch64;
 pub type Lifter64<'a> = LiftEngine<'a, Aarch64>;
 
 impl GuestArch for Aarch64 {
+    /// Fixed-width: every A64 instruction is one aligned word. A region cut on
+    /// any four-byte boundary therefore never splits one, which is why
+    /// [`LifterConfig::region_tail_exit`] can never fire for this guest.
+    const MAX_INSTRUCTION_LEN: u64 = 4;
+
     type Instr = A64Instr;
     type RegState = Aarch64RegState;
 

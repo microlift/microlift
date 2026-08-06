@@ -9,6 +9,7 @@ impl<'a> Lifter<'a> {
                 let rip_after = self.runtime_addr(instruction.next_ip());
 
                 self.sync_to_context(Some(rip_after), crate::context::ExitReason::Syscall)?;
+                self.resumes_at(instruction.next_ip());
                 self.builder.ins().return_(&[]);
                 self.block_terminated = true;
             }

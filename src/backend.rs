@@ -210,6 +210,7 @@ impl CraneliftBackend {
             helpers: Vec::new(),
             analysis_call_targets: Vec::new(),
             source_map: SourceLocMap::default(),
+            resume_points: Vec::new(),
         })
     }
 
@@ -236,6 +237,7 @@ impl CraneliftBackend {
                 helpers: Vec::new(),
                 analysis_call_targets: Vec::new(),
                 source_map: SourceLocMap::default(),
+                resume_points: Vec::new(),
             },
             flags,
             isa_settings,
@@ -359,6 +361,7 @@ impl ArtifactBackend {
                 helpers: Vec::new(),
                 analysis_call_targets: Vec::new(),
                 source_map: SourceLocMap::default(),
+                resume_points: Vec::new(),
             },
             triple,
             flags,
@@ -431,6 +434,7 @@ impl ArtifactBackend {
                 helpers: Vec::new(),
                 analysis_call_targets: Vec::new(),
                 source_map: SourceLocMap::default(),
+                resume_points: Vec::new(),
             },
             triple,
             flags,
@@ -450,6 +454,7 @@ impl ArtifactBackend {
                 helpers: Vec::new(),
                 analysis_call_targets: Vec::new(),
                 source_map: SourceLocMap::default(),
+                resume_points: Vec::new(),
             },
             triple,
             flags,

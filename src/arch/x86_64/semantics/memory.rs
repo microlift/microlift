@@ -511,6 +511,9 @@ impl<'a> Lifter<'a> {
         let rip_at = self.runtime_addr(instruction.ip());
 
         self.sync_to_context(Some(rip_at), reason)?;
+        // The exit reports the instruction's own address, and the host advances
+        // past it once the access is served — so that is where it comes back to.
+        self.resumes_at(instruction.next_ip());
         self.write_exit_code(size as u32);
         self.builder.ins().return_(&[]);
         self.block_terminated = true;

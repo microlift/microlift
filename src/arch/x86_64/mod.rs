@@ -27,6 +27,10 @@ pub struct X86_64;
 pub type Lifter<'a> = LiftEngine<'a, X86_64>;
 
 impl GuestArch for X86_64 {
+    /// The architectural limit: no legal x86-64 encoding exceeds fifteen bytes,
+    /// however many prefixes it carries, and a decoder rejects anything longer.
+    const MAX_INSTRUCTION_LEN: u64 = 15;
+
     type Instr = Instruction;
     type RegState = RegisterState;
 
