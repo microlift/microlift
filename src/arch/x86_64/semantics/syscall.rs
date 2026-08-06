@@ -14,6 +14,10 @@ impl<'a> Lifter<'a> {
                 self.block_terminated = true;
             }
             ExecutionMode::RuntimeAssisted => {
+                let next = instruction.next_ip();
+                self.resumes_at(next);
+                let in_region = next >= self.lift_base && next < self.lift_end;
+
                 let ctx_ptr = self.builder.use_var(self.state.context_ptr);
                 let handler_offset =
                     std::mem::offset_of!(crate::context::RegisterContext, syscall_handler) as i32;
@@ -30,7 +34,7 @@ impl<'a> Lifter<'a> {
                     .icmp_imm_s(IntCC::NotEqual, handler_ptr, 0);
                 let assist_block = self.builder.create_block();
                 let exit_block = self.builder.create_block();
-                let resume_block = self.builder.create_block();
+                let resume_block = self.get_block(next);
 
                 self.builder
                     .ins()
@@ -52,7 +56,13 @@ impl<'a> Lifter<'a> {
                 self.sync_to_context(Some(rip_after), crate::context::ExitReason::Syscall)?;
                 self.builder.ins().return_(&[]);
 
-                self.builder.switch_to_block(resume_block);
+                if in_region {
+                    self.continue_in_fallthrough(resume_block);
+                } else {
+                    // `finish` turns an out-of-region block into the VM-exit
+                    // stub that leaves at `next`; there is nothing to emit.
+                    self.block_terminated = true;
+                }
             }
         }
 

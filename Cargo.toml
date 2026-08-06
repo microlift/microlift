@@ -172,3 +172,7 @@ required-features = ["testkit"]
 [[test]]
 name = "region_bounds_tests"
 required-features = ["testkit"]
+
+[[test]]
+name = "exit_resume_tests"
+required-features = ["testkit"]
