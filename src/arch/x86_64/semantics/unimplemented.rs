@@ -1,4 +1,5 @@
 use crate::context::{ExitReason, RegisterContext};
+use crate::core::VmResumptionPoints;
 use crate::lifter::{ExecutionMode, Lifter};
 use cranelift::prelude::*;
 use iced_x86::Instruction;
@@ -30,12 +31,12 @@ impl<'a> Lifter<'a> {
             exit_code_offset,
         );
 
-        // In RuntimeAssisted mode or when emit_resume_blocks is enabled,
-        // we can set the resume_function pointer to point back to the entry
-        // point of this region (or a block). For now we leave it as 0
+        // In RuntimeAssisted mode, or whenever the region offers resume points
+        // at all, we can set the resume_function pointer to point back to the
+        // entry point of this region (or a block). For now we leave it as 0
         // and expect the host to handle resumption.
         if self.config.execution_mode == ExecutionMode::RuntimeAssisted
-            || self.config.emit_resume_blocks
+            || self.config.resumption != VmResumptionPoints::None
         {
             self.set_resume_placeholder()?;
         }

@@ -414,7 +414,7 @@ impl<'a> Lifter<'a> {
     /// `self.current_ip` already holds the instruction after the CALL (the
     /// resume point), so we sync and store that as RIP.
     fn emit_import_slow_exit(&mut self, import_va: u64) -> crate::Result<()> {
-        // Ensure the resume block exists even without emit_resume_blocks.
+        // Ensure the resume block exists even without VmResumptionPoints::All.
         self.get_block(self.current_ip);
 
         let ctx_ptr = self.builder.use_var(self.state.context_ptr);

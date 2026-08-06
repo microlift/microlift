@@ -133,7 +133,7 @@ fn direct_reentry_dispatches_on_lift_time_pc() {
         .address_mode(AddressMode::Direct)
         // Make every instruction boundary a block so there is a resume point
         // just past the INT3.
-        .with_config(|c| c.emit_resume_blocks = true)
+        .with_config(|c| c.resumption = VmResumptionPoints::All)
         .run();
 
     assert_eq!(out.exit, ExitReason::Breakpoint);

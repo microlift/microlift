@@ -198,7 +198,12 @@ pub struct LiftedCode {
     /// under [`LifterConfig::strict_resume`], and neither is something to
     /// discover at run time when the answer was known at lift time.
     ///
-    /// Empty under [`LifterConfig::analysis_mode`], which emits no dispatch.
+    /// How wide the set is follows [`LifterConfig::resumption`]: every
+    /// instruction boundary under [`VmResumptionPoints::All`], the exit and call
+    /// resume points plus the host's own declarations under
+    /// [`ExitOnly`](VmResumptionPoints::ExitOnly), and just the region's entry
+    /// under [`None`](VmResumptionPoints::None). Empty under
+    /// [`LifterConfig::analysis_mode`], whose IR is not runnable at all.
     pub resume_points: Vec<u64>,
 }
 
@@ -531,6 +536,63 @@ pub enum Atomic128Mode {
     Exit,
 }
 
+/// Which addresses a lifted region's entry dispatch offers for re-entry.
+///
+/// The dispatch is a `Switch` on the incoming PC, and it is the whole reason a
+/// host can jump *back into* the middle of a translation instead of only at its
+/// start. It is also the single biggest lever on what a large region costs to
+/// compile: every address with an arm is a block reachable from the function
+/// entry, so every guest register and flag is live into it, and Cranelift's
+/// register allocator is superlinear in the live ranges that produces. Over the
+/// same 128 KiB of a real program's `__text`, lifting in 4 KiB pieces costs
+/// 1.42s of compile time with an arm per block leader and 19.36s with one per
+/// instruction boundary (16 KiB pieces: 5.20s against 134.21s).
+///
+/// So this is a performance knob first and a capability knob second: pick the
+/// smallest mode that still lets the host come back to everywhere it can leave
+/// from. [`LiftedCode::resume_points`] reports the resulting set, and is the
+/// authoritative answer a host cache should key on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VmResumptionPoints {
+    /// No dispatch at all - the region is enterable only at its own entry.
+    ///
+    /// The entry block jumps straight to the first instruction, so the PC the
+    /// host wrote is never even read. That makes entering anywhere else
+    /// *silently wrong*: the region runs from the top with the guest state the
+    /// host set. Only for a host that never re-enters a translation except at
+    /// the address it was lifted for - and which handles every VM exit by
+    /// translating a fresh region at the exit PC.
+    ///
+    /// [`LiftedCode::resume_points`] reports exactly one address, the entry.
+    None,
+    /// **Default.** An arm for every address control can *leave* the region at
+    /// and come back to.
+    ///
+    /// That is the region's own entry, the return point of every call that
+    /// leaves the region, and the resume point of every VM exit that resumes
+    /// (`CPUID`, `RDTSC`, `XGETBV`, `SYSCALL`, `INT`, `INT3`, port I/O, an
+    /// emulated unimplemented instruction) - the three sets the engine knows and
+    /// a host cannot name without redoing the lift itself. Semantics register
+    /// the last of those through [`LiftEngine::resumes_at`].
+    ///
+    /// This is the right default for an emulator, because those *are* the
+    /// addresses execution can resume at: everywhere else, control got there
+    /// from inside the region and never left it. Anything the host does know
+    /// about - a function reached only through a pointer, say - goes in
+    /// [`LifterConfig::resume_points`] and is offered on top of these.
+    #[default]
+    ExitOnly,
+    /// Legacy. Every instruction boundary in the region is a resume point.
+    ///
+    /// Correct for any re-entry a host can think of, and the historical way to
+    /// be re-enterable after a mid-region `CPUID` - back when a resumable exit
+    /// did not register its own resume point, this flag was the only thing
+    /// covering it, which is why it looked mandatory. It is not, and it is
+    /// expensive: see the timings above. Kept for hosts that genuinely resume at
+    /// arbitrary addresses, and for tests that want to enter anywhere.
+    All,
+}
+
 #[derive(Debug, Clone)]
 pub struct LifterConfig {
     pub execution_mode: ExecutionMode,
@@ -548,7 +610,15 @@ pub struct LifterConfig {
     /// mutable memory to be valid for hints.
     pub segments: Vec<MemorySegment>,
     pub interpreter_fallback: bool,
-    pub emit_resume_blocks: bool,
+    /// Which guest addresses the region can be **re-entered** at. See
+    /// [`VmResumptionPoints`]; defaults to
+    /// [`ExitOnly`](VmResumptionPoints::ExitOnly).
+    ///
+    /// Pair it with [`resume_points`](Self::resume_points), which adds the
+    /// host's own addresses to whatever the mode produces, and with
+    /// [`strict_resume`](Self::strict_resume), which decides what happens to an
+    /// address that is not offered.
+    pub resumption: VmResumptionPoints,
     /// **Experimental.** Before emitting IR, try to recover the successors of
     /// each indirect branch from a compiler-emitted jump table, using
     /// [`segments`](Self::segments) as the backing store the table is read from
@@ -716,39 +786,22 @@ pub struct LifterConfig {
     /// Only [`page_bounded_extent`](Self::page_bounded_extent) reads it;
     /// lifting itself is told an extent and does not ask where it came from.
     pub page_size: u64,
-    /// Which addresses the region's entry dispatch offers, if not all of them.
+    /// Extra addresses the host wants the entry dispatch to offer, on top of
+    /// whatever [`resumption`](Self::resumption) produces.
     ///
-    /// ## What a resume point costs
+    /// Each becomes a block leader whether or not control flow discovered it, so
+    /// a function reached only through a pointer is still lifted and still
+    /// enterable. Addresses outside the region are ignored.
     ///
-    /// The entry dispatch is a `Switch` on the incoming PC, and by default every
-    /// block leader in the region gets an arm. That is what makes JIT re-entry
-    /// work - but it also means **every block is reachable from the function
-    /// entry**, so every guest register and flag is live into every block. A
-    /// region's live-range count therefore scales with its block count rather
-    /// than with its real control flow, and Cranelift's register allocator is
-    /// superlinear in live ranges. The measured effect is not subtle: over the
-    /// same 128 KiB of a real program's `__text`, lifting in 4 KiB pieces costs
-    /// 1.45s of compile time when only the natural leaders are resume points and
-    /// 19.42s when every instruction boundary is one.
-    ///
-    /// So the number of resume points, not the number of guest instructions, is
-    /// what decides whether a large region is affordable - and a host usually
-    /// knows that its own set is small: the addresses control can arrive at from
-    /// outside are the entry, the function starts, and the resume point after
-    /// each call.
-    ///
-    /// ## What this does
-    ///
-    /// `Some(addresses)` restricts the dispatch to those (plus the region's own
-    /// entry, and plus every call resume point, which the engine adds itself
-    /// because a call that leaves the region has to be able to come back). Each
-    /// becomes a block leader whether or not control flow discovered it, so a
-    /// function reached only through a pointer is still enterable. `None`, the
-    /// default, keeps the historical behaviour of offering every block.
+    /// This is where a host puts what it knows and the engine cannot: the
+    /// function starts in the region, a resume point recovered from its own
+    /// cache, an address a signal handler can land on. Under
+    /// [`VmResumptionPoints::None`] there is no dispatch, so nothing here is
+    /// offered.
     ///
     /// Pair it with [`strict_resume`](Self::strict_resume), which decides what
     /// happens to an address that was left out.
-    pub resume_points: Option<Vec<u64>>,
+    pub resume_points: Vec<u64>,
     /// Exit rather than guess when the entry PC matches no resume point.
     ///
     /// The dispatch `Switch` needs a default arm, and historically that arm is
@@ -764,7 +817,9 @@ pub struct LifterConfig {
     /// starting at that address and enter that instead.
     ///
     /// Off by default only because it changes what an existing embedder sees;
-    /// any host that can resume at a computed address wants it on.
+    /// any host that can resume at a computed address wants it on. Inert under
+    /// [`VmResumptionPoints::None`], which emits no dispatch and so has no
+    /// default arm to replace.
     ///
     /// [`ExitReason::UnknownJump`]: crate::core::exit::ExitReason::UnknownJump
     /// [`TransferKind::NoResumePoint`]: crate::core::exit::TransferKind::NoResumePoint
@@ -779,7 +834,7 @@ impl Default for LifterConfig {
             syscall_handler_call_conv: CallConv::SystemV,
             segments: Vec::new(),
             interpreter_fallback: false,
-            emit_resume_blocks: false,
+            resumption: VmResumptionPoints::default(),
             analyze_jump_tables: false,
             imports: HashMap::new(),
             import_registry: None,
@@ -791,7 +846,7 @@ impl Default for LifterConfig {
             emit_source_locs: true,
             region_tail_exit: false,
             page_size: 4096,
-            resume_points: None,
+            resume_points: Vec::new(),
             strict_resume: false,
         }
     }
@@ -1392,8 +1447,9 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
     ///
     /// Neither used to happen. `CPUID` in the middle of a region left everything
     /// after it unlifted and unenterable, and the only thing that covered it was
-    /// [`LifterConfig::emit_resume_blocks`] making *every* instruction a resume
-    /// point — which is why that flag looked mandatory and cost what it cost.
+    /// [`VmResumptionPoints::All`] making *every* instruction a resume point —
+    /// which is why that mode looked mandatory and cost what it cost. It is what
+    /// [`ExitOnly`](VmResumptionPoints::ExitOnly) is named after.
     ///
     /// Out-of-region addresses are ignored: the resume point is then the host's
     /// problem in the ordinary way, and it will translate a region there.
@@ -1584,8 +1640,8 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         // after it, so that the code reachable *from* one is discovered too. An
         // address the guest only ever reaches through a pointer has no static
         // predecessor and would otherwise be a block with nothing behind it.
-        if let Some(points) = &self.config.resume_points {
-            for &p in points {
+        if self.config.resumption != VmResumptionPoints::None {
+            for &p in &self.config.resume_points {
                 if p >= self.lift_base && p < self.lift_end {
                     leaders.insert(p);
                     work.push(p);
@@ -1701,7 +1757,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
 
         A::load_state_from_context(self)?;
 
-        if self.config.emit_resume_blocks {
+        if self.config.resumption == VmResumptionPoints::All {
             for instruction in decoded.values() {
                 leaders.insert(A::instr_ip(instruction));
                 leaders.insert(A::instr_next_ip(instruction));
@@ -1719,17 +1775,20 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         // instruction that lifts to a *resumable* VM exit registers its own
         // resume point (see [`Self::resumes_at`]), and nobody knows that address
         // exists until the instruction has been lifted. Fixing the arms before
-        // then is what used to make [`LifterConfig::emit_resume_blocks`] the
-        // only way to be re-enterable after a `CPUID` — the switch was built
-        // before the `CPUID` was seen.
+        // then is what used to make [`VmResumptionPoints::All`] the only way to
+        // be re-enterable after a `CPUID` — the switch was built before the
+        // `CPUID` was seen.
         //
         // Cranelift will not let the builder leave a block unfilled, so the
         // entry block is terminated with a jump to one that stays empty until
         // the lift is done. The jump folds away.
-        let dispatch_block = (!self.config.analysis_mode).then(|| self.builder.create_block());
+        let wants_dispatch =
+            !self.config.analysis_mode && self.config.resumption != VmResumptionPoints::None;
+        let dispatch_block = wants_dispatch.then(|| self.builder.create_block());
         match dispatch_block {
-            // Analysis mode has no dispatch at all: enter at the region's first
-            // instruction and nowhere else.
+            // No dispatch at all: enter at the region's first instruction and
+            // nowhere else. Analysis mode emits inspection IR that is never run,
+            // and [`VmResumptionPoints::None`] is a host that never re-enters.
             None => self.builder.ins().jump(start_block, &[]),
             Some(dispatch) => self.builder.ins().jump(dispatch, &[]),
         };
@@ -1868,16 +1927,19 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                     .load(types::I64, MemFlagsData::trusted(), ctx_ptr, A::pc_offset());
             let entry_va = self.to_lift_va(pc_val);
 
-            // Which addresses get an arm. Every block by default; when the host
-            // has declared its own set, that set plus the three the engine knows
+            // Which addresses get an arm. Under [`VmResumptionPoints::All`]
+            // every block, which after the leader expansion above is every
+            // instruction boundary; otherwise the three sets the engine knows
             // are mandatory and the host cannot name — the region's own entry,
             // the return point of every call that leaves it, and the resume
-            // point of every VM exit that resumes. See
-            // [`LifterConfig::resume_points`] for why a smaller set is worth
-            // having at all.
-            let arms: BTreeSet<u64> = match &self.config.resume_points {
-                None => self.blocks.keys().copied().collect(),
-                Some(points) => points
+            // point of every VM exit that resumes — plus whatever the host
+            // declared. See [`VmResumptionPoints`] for why the smaller set is
+            // worth having at all.
+            let host_declared = &self.config.resume_points;
+            let arms: BTreeSet<u64> = match self.config.resumption {
+                VmResumptionPoints::None => unreachable!("no dispatch block"),
+                VmResumptionPoints::All => self.blocks.keys().copied().collect(),
+                VmResumptionPoints::ExitOnly => host_declared
                     .iter()
                     .copied()
                     .chain(call_resumes.iter().copied())
@@ -1934,6 +1996,13 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                 self.builder.ins().return_(&[]);
                 self.visited_blocks.insert(refuse);
             }
+        } else if !self.config.analysis_mode {
+            // [`VmResumptionPoints::None`]: the entry jumps straight to the
+            // region's first instruction, so that address — and only it — is
+            // where this code can be entered. Reporting it keeps
+            // [`LiftedCode::resume_points`] the one thing a host cache has to
+            // consult, whatever the mode.
+            self.emitted_resume_points.push(ip);
         }
 
         self.finish()

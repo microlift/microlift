@@ -145,11 +145,11 @@ fn test_int3_resume_by_advancing_rip() {
     let mut ctx2 = ctx;
     ctx2.rip = 0x1001; // skip the int3
 
-    // Re-lift with emit_resume_blocks so every instruction boundary is a block
+    // Re-lift with VmResumptionPoints::All so every instruction boundary is a block
     // leader and the dispatch switch has a case for 0x1001. The preset rip
     // routes the entry dispatch straight to the `mov rax, 99` block.
     let out = LiftTest::new(&bytes)
-        .with_config(|c| c.emit_resume_blocks = true)
+        .with_config(|c| c.resumption = VmResumptionPoints::All)
         .ctx(ctx2)
         .run();
 

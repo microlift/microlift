@@ -19,7 +19,9 @@ use crate::arch::x86_64::X86_64;
 use crate::backend::CraneliftBackend;
 use crate::context::{ExitReason, MemorySegment, RegisterContext};
 use crate::core::srcloc::GuestCodeMap;
-use crate::core::{AddressMode, Atomic128Mode, ExecutionMode, LifterConfig, lift_to_code};
+use crate::core::{
+    AddressMode, Atomic128Mode, ExecutionMode, LifterConfig, VmResumptionPoints, lift_to_code,
+};
 use cranelift_codegen::settings::{self, Configurable};
 
 pub mod oracle;
@@ -191,12 +193,22 @@ impl<'a> LiftTest<'a> {
     }
 
     /// Configure the lift for resumable VM exits: `RuntimeAssisted` execution
-    /// with resume blocks and interpreter fallback. Use with
+    /// with a resume point at every instruction boundary
+    /// ([`VmResumptionPoints::All`]) and interpreter fallback. Use with
     /// [`RunOutcome::resume_with`] to drive exit -> mutate -> resume cycles.
+    ///
+    /// `All` rather than the default so a test can resume at any address it
+    /// likes without declaring it first.
     pub fn resumable(mut self) -> Self {
         self.config.execution_mode = ExecutionMode::RuntimeAssisted;
-        self.config.emit_resume_blocks = true;
+        self.config.resumption = VmResumptionPoints::All;
         self.config.interpreter_fallback = true;
+        self
+    }
+
+    /// Set the resumption mode ([`LifterConfig::resumption`]).
+    pub fn resumption(mut self, mode: VmResumptionPoints) -> Self {
+        self.config.resumption = mode;
         self
     }
 
@@ -680,5 +692,5 @@ pub fn run_test(bytes: &[u8], ctx: RegisterContext) -> RegisterContext {
 pub mod prelude {
     pub use super::{Harness, LiftTest, Opt, RetAddr, RunOutcome, TestError, run_test};
     pub use crate::context::{ExitReason, RegisterContext};
-    pub use crate::core::{AddressMode, Atomic128Mode};
+    pub use crate::core::{AddressMode, Atomic128Mode, VmResumptionPoints};
 }

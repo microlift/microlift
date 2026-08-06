@@ -10,9 +10,9 @@
 //! This file covers the three mechanisms that let a host give both up:
 //! [`LifterConfig::page_bounded_extent`] to choose an extent without predicting
 //! anything, [`LifterConfig::region_tail_exit`] for the instruction the cut
-//! lands inside, and [`LifterConfig::resume_points`] /
-//! [`LifterConfig::strict_resume`] for entering a region at an address that was
-//! not offered.
+//! lands inside, and [`LifterConfig::resumption`] /
+//! [`LifterConfig::resume_points`] / [`LifterConfig::strict_resume`] for
+//! entering a region at an address that was not offered.
 
 use microlift::arch::x86_64::X86_64;
 use microlift::core::exit::TransferKind;
@@ -92,7 +92,7 @@ fn a_cut_instruction_is_not_a_resume_point() {
         region_tail_exit: true,
         // Ask for it explicitly: the address is a plausible thing for a host to
         // declare, and declaring it must not be able to override the rule.
-        resume_points: Some(vec![BASE + 1]),
+        resume_points: vec![BASE + 1],
         ..Default::default()
     };
     let lifted = lift_to_code::<X86_64>(&TRUNCATED_MOV, BASE, config).unwrap();
@@ -183,32 +183,69 @@ fn an_extent_never_leaves_the_memory_it_was_given() {
 }
 
 /// `xor eax,eax ; jmp +0 ; inc eax ; ret` - the `jmp` makes `BASE + 4` a block
-/// leader, so it is a resume point by default and can be entered directly.
+/// leader, but control never *leaves* the region there, so the default
+/// [`VmResumptionPoints::ExitOnly`] does not offer it.
 const TWO_BLOCKS: [u8; 6] = [0x31, 0xC0, 0xEB, 0x00, 0xFF, 0xC0];
 
 #[test]
-fn every_block_is_a_resume_point_by_default() {
+fn declared_resume_points_are_the_whole_dispatch() {
     let lifted = lift_to_code::<X86_64>(&TWO_BLOCKS, BASE, LifterConfig::default()).unwrap();
-    assert!(lifted.resume_points.contains(&BASE));
-    assert!(
-        lifted.resume_points.contains(&(BASE + 4)),
-        "{:#x?} should offer the branch target",
-        lifted.resume_points
+    assert_eq!(
+        lifted.resume_points,
+        vec![BASE],
+        "declaring nothing still keeps the region's own entry"
     );
 }
 
+/// The legacy mode, and the reason it costs what it does: every instruction
+/// boundary in the region becomes an arm, branch target or not.
 #[test]
-fn declared_resume_points_are_the_whole_dispatch() {
+fn the_all_mode_offers_every_instruction_boundary() {
     let config = LifterConfig {
-        resume_points: Some(Vec::new()),
+        resumption: VmResumptionPoints::All,
         ..Default::default()
     };
     let lifted = lift_to_code::<X86_64>(&TWO_BLOCKS, BASE, config).unwrap();
     assert_eq!(
         lifted.resume_points,
-        vec![BASE],
-        "an empty declaration still keeps the region's own entry"
+        vec![BASE, BASE + 2, BASE + 4],
+        "every boundary, including the ones nothing branches to"
     );
+}
+
+/// With no dispatch there is exactly one way in, and the reported set says so
+/// rather than staying empty - a host cache consults it in every mode.
+#[test]
+fn the_none_mode_offers_only_the_entry() {
+    let config = LifterConfig {
+        resumption: VmResumptionPoints::None,
+        // Declared points have nowhere to go without a dispatch.
+        resume_points: vec![BASE + 4],
+        ..Default::default()
+    };
+    let lifted = lift_to_code::<X86_64>(&TWO_BLOCKS, BASE, config).unwrap();
+    assert_eq!(lifted.resume_points, vec![BASE]);
+}
+
+/// And it really is a jump straight into the region: a PC the host set is not
+/// read at all, so execution starts at the top whatever it says. That is the
+/// mode's whole bargain, and `strict_resume` cannot soften it - there is no
+/// default arm to replace.
+#[test]
+fn the_none_mode_ignores_the_entry_pc() {
+    let out = LiftTest::new(&TWO_BLOCKS)
+        .at(BASE)
+        .image_base(BASE)
+        .with_config(|c| {
+            c.resumption = VmResumptionPoints::None;
+            c.strict_resume = true;
+        })
+        .reg(|c| {
+            c.rip = BASE + 4;
+            c.rax = 7;
+        })
+        .run();
+    assert_eq!(out.ctx.rax, 1, "ran from the `xor` at the top, not the `inc`");
 }
 
 #[test]
@@ -217,7 +254,7 @@ fn a_declared_resume_point_can_be_entered_at() {
         .at(BASE)
         .image_base(BASE)
         .with_config(|c| {
-            c.resume_points = Some(vec![BASE + 4]);
+            c.resume_points = vec![BASE + 4];
             c.strict_resume = true;
         })
         .reg(|c| {
@@ -238,10 +275,7 @@ fn an_unoffered_pc_exits_rather_than_starting_from_the_top() {
     let out = LiftTest::new(&TWO_BLOCKS)
         .at(BASE)
         .image_base(BASE)
-        .with_config(|c| {
-            c.resume_points = Some(Vec::new());
-            c.strict_resume = true;
-        })
+        .with_config(|c| c.strict_resume = true)
         .reg(|c| {
             c.rip = BASE + 4;
             c.rax = 7;
@@ -273,16 +307,12 @@ const TWO_EXITS: [u8; 9] = [
 /// A `CPUID` exit says "resume at the next instruction", and until the engine
 /// registered that address itself, nothing made it a block leader: the exit
 /// terminated its block, phase 2 stopped there, and everything after the
-/// `CPUID` was neither lifted nor enterable. `emit_resume_blocks` covered it by
-/// making *every* instruction a resume point, which is why that flag looked
-/// mandatory — and is exactly the cost this file exists to avoid paying.
+/// `CPUID` was neither lifted nor enterable. [`VmResumptionPoints::All`] covered
+/// it by making *every* instruction a resume point, which is why that mode
+/// looked mandatory — and is exactly the cost this file exists to avoid paying.
 #[test]
 fn a_resumable_exit_offers_the_address_it_resumes_at() {
-    let config = LifterConfig {
-        resume_points: Some(Vec::new()),
-        ..Default::default()
-    };
-    let lifted = lift_to_code::<X86_64>(&TWO_EXITS, BASE, config).unwrap();
+    let lifted = lift_to_code::<X86_64>(&TWO_EXITS, BASE, LifterConfig::default()).unwrap();
     assert_eq!(
         lifted.resume_points,
         vec![BASE, BASE + 4, BASE + 8],
@@ -297,10 +327,7 @@ fn a_region_resumes_through_its_exits() {
     let out = LiftTest::new(&TWO_EXITS)
         .at(BASE)
         .image_base(BASE)
-        .with_config(|c| {
-            c.resume_points = Some(Vec::new());
-            c.strict_resume = true;
-        })
+        .with_config(|c| c.strict_resume = true)
         .reg(|c| c.rip = BASE)
         .run();
     assert_eq!(out.exit, ExitReason::Cpuid);
@@ -324,11 +351,7 @@ fn a_region_resumes_through_its_exits() {
 fn call_resume_points_survive_a_narrow_declaration() {
     // call rel32 (out of region) ; nop ; ret
     let code = [0xE8, 0x00, 0x10, 0x00, 0x00, 0x90, 0xC3];
-    let config = LifterConfig {
-        resume_points: Some(Vec::new()),
-        ..Default::default()
-    };
-    let lifted = lift_to_code::<X86_64>(&code, BASE, config).unwrap();
+    let lifted = lift_to_code::<X86_64>(&code, BASE, LifterConfig::default()).unwrap();
     assert!(
         lifted.resume_points.contains(&(BASE + 5)),
         "{:#x?} lost the address the call returns to",
@@ -344,7 +367,13 @@ fn call_resume_points_survive_a_narrow_declaration() {
 fn out_of_region_targets_are_not_reported_as_resume_points() {
     // jmp +0x40, well past the six bytes of the region.
     let code = [0xE9, 0x40, 0x00, 0x00, 0x00, 0xC3];
-    let lifted = lift_to_code::<X86_64>(&code, BASE, LifterConfig::default()).unwrap();
+    // `All`, so that the out-of-region target gets a switch arm at all - the
+    // filter this is about only has something to filter under that mode.
+    let config = LifterConfig {
+        resumption: VmResumptionPoints::All,
+        ..Default::default()
+    };
+    let lifted = lift_to_code::<X86_64>(&code, BASE, config).unwrap();
     let end = BASE + code.len() as u64;
     assert!(
         lifted.resume_points.iter().all(|&p| p >= BASE && p < end),
