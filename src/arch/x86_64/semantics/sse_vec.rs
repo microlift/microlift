@@ -354,6 +354,50 @@ impl<'a> Lifter<'a> {
         Ok(true)
     }
 
+    /// `ADDSUBPS` / `ADDSUBPD` - subtract in the even lanes, add in the odd
+    /// ones - over whole 128-bit vectors, when XMM registers are vector-backed.
+    ///
+    /// Returns `false` without emitting anything in scalar mode, leaving the
+    /// caller to fall through to its portable lane expansion.
+    ///
+    /// Both results are computed and then blended by a lift-time constant
+    /// shuffle. The cheaper-looking alternative - flip the sign of the even
+    /// source lanes and issue a single `fadd` - is *not* equivalent: an even
+    /// lane whose source is a NaN would propagate that NaN with its sign bit
+    /// flipped, where the real subtract propagates it unchanged.
+    pub(super) fn try_addsub_vec(
+        &mut self,
+        instruction: &Instruction,
+        who: &str,
+        single: bool,
+    ) -> crate::Result<bool> {
+        if !self.vec_mode() {
+            return Ok(false);
+        }
+        let dst_idx = self.xmm_operand_index(instruction, 0, who)?;
+        let fty = if single { types::F32X4 } else { types::F64X2 };
+
+        let dst = self.get_xmm_vec(dst_idx);
+        let src = self.read_xmm_src_vec(instruction, 1)?;
+        let a = self.vec_bitcast(dst, fty);
+        let b = self.vec_bitcast(src, fty);
+
+        let sub = self.vec_fp_arith_x86(a, b, |s, a, b| s.builder.ins().fsub(a, b));
+        let add = self.vec_fp_arith_x86(a, b, |s, a, b| s.builder.ins().fadd(a, b));
+        let sub = self.vec_bitcast(sub, types::I64X2);
+        let add = self.vec_bitcast(add, types::I64X2);
+
+        let bits = if single { 32 } else { 64 };
+        let lanes = 128 / bits;
+        // Operand 0 is the subtract result, operand 1 the add: a lane index at
+        // or past `lanes` addresses the second.
+        let mask = Self::lane_shuffle_mask(bits, |j| if j % 2 == 0 { j } else { lanes + j });
+        let r = self.vec_shuffle(sub, add, mask);
+
+        self.set_xmm_vec(dst_idx, r);
+        Ok(true)
+    }
+
     /// Build a 16-byte shuffle mask from a lane-level selector.
     ///
     /// `bits` is the lane width; `pick(j)` returns the source lane of result

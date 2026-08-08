@@ -409,6 +409,15 @@ fn sse_float_arith_agrees() {
         ("maxpd", &[0x66, 0x0F, 0x5F, 0xC1, 0xC3]),
         ("cvtss2sd", &[0xF3, 0x0F, 0x5A, 0xC1, 0xC3]),
         ("cvtsd2ss", &[0xF2, 0x0F, 0x5A, 0xC1, 0xC3]),
+        ("addsubps", &[0xF2, 0x0F, 0xD0, 0xC1, 0xC3]),
+        ("addsubpd", &[0x66, 0x0F, 0xD0, 0xC1, 0xC3]),
+        ("haddps", &[0xF2, 0x0F, 0x7C, 0xC1, 0xC3]),
+        ("hsubps", &[0xF2, 0x0F, 0x7D, 0xC1, 0xC3]),
+        ("haddpd", &[0x66, 0x0F, 0x7C, 0xC1, 0xC3]),
+        ("hsubpd", &[0x66, 0x0F, 0x7D, 0xC1, 0xC3]),
+        ("movsldup", &[0xF3, 0x0F, 0x12, 0xC1, 0xC3]),
+        ("movshdup", &[0xF3, 0x0F, 0x16, 0xC1, 0xC3]),
+        ("movddup", &[0xF2, 0x0F, 0x12, 0xC1, 0xC3]),
     ];
     for (name, code) in ops {
         for &(dst, src) in FLOAT_OPERANDS {
@@ -423,6 +432,143 @@ fn sse_float_arith_agrees() {
                 "{name} {dst:#018x?},{src:#018x?} diverged: {diff:?}"
             );
         }
+    }
+}
+
+/// Operands for the ADDSUB differential, chosen so the two lane kinds are
+/// forced apart.
+///
+/// The point of every entry is that an even lane and an odd lane must disagree
+/// on it: `inf - inf` invalidates where `inf + inf` does not, and the two swap
+/// over when the source sign flips. A handler running one operation across all
+/// four lanes passes every finite test and fails these. The signed zeros do the
+/// same job with no NaN involved at all - `-0.0 - +0.0` is `-0.0` while
+/// `-0.0 + +0.0` is `+0.0`.
+///
+/// NaNs appear on one side only, never both: with a NaN in each operand the
+/// oracle itself is unreliable, since Unicorn does not reproduce x86's
+/// "destination NaN wins" rule (`MULPS` shows the same divergence with no
+/// ADDSUB involved). See the caveat on [`FLOAT_OPERANDS`].
+const ADDSUB_OPERANDS: &[([u64; 2], [u64; 2])] = &[
+    // f64 +inf against +inf then -inf: lane 0 subtracts, lane 1 adds.
+    (
+        [0x7FF0_0000_0000_0000, 0x7FF0_0000_0000_0000],
+        [0x7FF0_0000_0000_0000, 0xFFF0_0000_0000_0000],
+    ),
+    // the mirror: the invalid operation lands in the other lane.
+    (
+        [0xFFF0_0000_0000_0000, 0x7FF0_0000_0000_0000],
+        [0xFFF0_0000_0000_0000, 0x7FF0_0000_0000_0000],
+    ),
+    // f32 lanes +inf,+inf,+inf,-inf against +inf,-inf,-inf,-inf.
+    (
+        [0x7F80_0000_7F80_0000, 0xFF80_0000_7F80_0000],
+        [0xFF80_0000_7F80_0000, 0xFF80_0000_FF80_0000],
+    ),
+    // signed zeros, both orders - no NaN, pure sign-of-zero.
+    (
+        [0x8000_0000_0000_0000, 0x0000_0000_0000_0000],
+        [0x0000_0000_0000_0000, 0x8000_0000_0000_0000],
+    ),
+    (
+        [0x8000_0000_8000_0000, 0x0000_0000_0000_0000],
+        [0x0000_0000_8000_0000, 0x8000_0000_0000_0000],
+    ),
+    // QNaN destination against finite sources: sign and payload propagate.
+    (
+        [0x7FF8_0000_DEAD_BEEF, 0xFFF8_0000_CAFE_BABE],
+        [0x4000_0000_4000_0000, 0x3F80_0000_3F80_0000],
+    ),
+    // QNaN source against a finite destination, the direction that would break
+    // under a "negate the source and add" implementation.
+    (
+        [0x3FF0_0000_0000_0000, 0x3F80_0000_3F80_0000],
+        [0xFFF8_0000_1234_5678, 0x7FF8_0000_9ABC_DEF0],
+    ),
+    // SNaNs, which the instruction quiets rather than replaces.
+    (
+        [0x3FF0_0000_0000_0000, 0x3F80_0000_3F80_0000],
+        [0x7FF4_0000_0000_0001, 0xFFA0_0000_FFA0_0000],
+    ),
+    (
+        [0x7FF4_0000_0000_0001, 0xFFA0_0000_FFA0_0000],
+        [0x3FF0_0000_0000_0000, 0x3F80_0000_3F80_0000],
+    ),
+    // ordinary finite lanes, so the common path is covered here too.
+    (
+        [0x4020_0000_3FC0_0000, 0x4080_0000_C040_0000],
+        [0xBF80_0000_3F00_0000, 0x4100_0000_4000_0000],
+    ),
+    (
+        [0x0000_0000_0000_0001, 0x7FEF_FFFF_FFFF_FFFF],
+        [0x4100_0000_4080_0000, 0x3FC0_0000_4020_0000],
+    ),
+];
+
+/// ADDSUBPS / ADDSUBPD against hardware over [`ADDSUB_OPERANDS`].
+#[test]
+fn sse3_addsub_agrees() {
+    let ops: &[(&str, &[u8])] = &[
+        ("addsubps", &[0xF2, 0x0F, 0xD0, 0xC1, 0xC3]),
+        ("addsubpd", &[0x66, 0x0F, 0xD0, 0xC1, 0xC3]),
+    ];
+    for (name, code) in ops {
+        for &(dst, src) in ADDSUB_OPERANDS {
+            let mut init = CpuState::zeroed();
+            init.xmm[0] = dst;
+            init.xmm[1] = src;
+            let diff =
+                differential_unicorn(code, CODE_VA, &init, &[], BUDGET, DiffOptions::default())
+                    .expect("clean halt");
+            assert!(
+                diff.is_empty(),
+                "{name} {dst:#018x?},{src:#018x?} diverged: {diff:?}"
+            );
+        }
+    }
+}
+
+/// The sequence a compiler emits around ADDSUBPS: a complex multiply built
+/// from MOVSLDUP / MOVSHDUP / SHUFPS / MULPS / ADDSUBPS, checked against
+/// hardware as a whole rather than one instruction at a time.
+///
+/// Operands are finite: the MULPS pair ahead of the ADDSUBPS can put a NaN
+/// into *both* of its operands, which is the one case the oracle cannot
+/// adjudicate (see the caveat on [`ADDSUB_OPERANDS`]). The NaN and infinity
+/// behaviour of ADDSUBPS itself is pinned down by
+/// [`sse3_addsub_agrees`] instead.
+#[test]
+fn complex_multiply_sequence_agrees() {
+    let code = [
+        0xF3, 0x0F, 0x12, 0xD1, // movsldup xmm2, xmm1
+        0xF3, 0x0F, 0x16, 0xD9, // movshdup xmm3, xmm1
+        0x0F, 0x59, 0xD0, // mulps xmm2, xmm0
+        0x0F, 0xC6, 0xC0, 0xB1, // shufps xmm0, xmm0, 0xB1
+        0x0F, 0x59, 0xD8, // mulps xmm3, xmm0
+        0xF2, 0x0F, 0xD0, 0xD3, // addsubps xmm2, xmm3
+        0xC3, // ret
+    ];
+    // (a + bi) * (c + di), four complex pairs per run: signed zeros, a
+    // denormal, and magnitudes whose product both underflows and overflows.
+    let pairs: &[[f32; 4]] = &[
+        [1.0, 2.0, 3.0, 4.0],
+        [-1.5, 0.25, 2.0, -8.0],
+        [0.0, -0.0, -0.0, 0.0],
+        [f32::MIN_POSITIVE, -f32::MIN_POSITIVE, 0.5, 0.5],
+        [f32::MAX, f32::MAX, 2.0, -2.0],
+        [1e-30, 1e30, 1e30, 1e-30],
+    ];
+    for lanes in pairs {
+        let pack = |a: f32, b: f32| u64::from(a.to_bits()) | (u64::from(b.to_bits()) << 32);
+        let mut init = CpuState::zeroed();
+        init.xmm[0] = [pack(lanes[0], lanes[1]), pack(lanes[1], lanes[0])];
+        init.xmm[1] = [pack(lanes[2], lanes[3]), pack(lanes[3], lanes[2])];
+        let diff = differential_unicorn(&code, CODE_VA, &init, &[], BUDGET, DiffOptions::default())
+            .expect("clean halt");
+        assert!(
+            diff.is_empty(),
+            "complex multiply {lanes:?} diverged: {diff:?}"
+        );
     }
 }
 

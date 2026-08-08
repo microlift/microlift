@@ -3519,6 +3519,231 @@ fn test_hsubps_subtracts_within_each_adjacent_pair() {
     assert_eq!(out.xmm[0], [0xBF80_0000_BF80_0000, 0xBF80_0000_BF80_0000]);
 }
 
+//  ADDSUBPS / ADDSUBPD
+
+/// Pack four `f32` lanes into the `[lo, hi]` XMM halves the context uses.
+fn xmm_f32(lanes: [f32; 4]) -> [u64; 2] {
+    let w = |i: usize| u64::from(lanes[i].to_bits());
+    [w(0) | (w(1) << 32), w(2) | (w(3) << 32)]
+}
+
+/// The raw-bits form of [`xmm_f32`], for the NaN cases where a literal would
+/// not survive the round trip.
+fn xmm_bits32(lanes: [u32; 4]) -> [u64; 2] {
+    let w = |i: usize| u64::from(lanes[i]);
+    [w(0) | (w(1) << 32), w(2) | (w(3) << 32)]
+}
+
+#[test]
+fn test_addsubps_subtracts_even_lanes_and_adds_odd_ones() {
+    // addsubps xmm0, xmm1; ret
+    let bytes = [0xF2, 0x0F, 0xD0, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = xmm_f32([1.5, 2.5, 3.0, 4.0]);
+    ctx.xmm[1] = xmm_f32([1.0, 2.0, 5.0, 6.0]);
+    let out = run_test(&bytes, ctx);
+    // [1.5-1.0, 2.5+2.0, 3.0-5.0, 4.0+6.0]
+    assert_eq!(out.xmm[0], xmm_f32([0.5, 4.5, -2.0, 10.0]));
+    // Only the destination is written.
+    assert_eq!(out.xmm[1], xmm_f32([1.0, 2.0, 5.0, 6.0]));
+}
+
+#[test]
+fn test_addsubps_memory_source() {
+    // addsubps xmm0, [rax]; ret
+    let bytes = [0xF2, 0x0F, 0xD0, 0x00, 0xC3];
+    let mem = [1.0_f32, 2.0, 5.0, 6.0];
+    let mut ctx = RegisterContext::default();
+    ctx.rax = mem.as_ptr() as u64;
+    ctx.xmm[0] = xmm_f32([1.5, 2.5, 3.0, 4.0]);
+    let out = run_test(&bytes, ctx);
+    assert_eq!(out.xmm[0], xmm_f32([0.5, 4.5, -2.0, 10.0]));
+}
+
+#[test]
+fn test_addsubpd_subtracts_low_lane_and_adds_high_lane() {
+    // addsubpd xmm0, xmm1; ret
+    let bytes = [0x66, 0x0F, 0xD0, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [1.5f64.to_bits(), 3.0f64.to_bits()];
+    ctx.xmm[1] = [2.25f64.to_bits(), 4.0f64.to_bits()];
+    let out = run_test(&bytes, ctx);
+    // [1.5 - 2.25, 3.0 + 4.0]
+    assert_eq!(out.xmm[0], [(-0.75f64).to_bits(), 7.0f64.to_bits()]);
+}
+
+#[test]
+fn test_addsubpd_memory_source() {
+    // addsubpd xmm0, [rax]; ret
+    let bytes = [0x66, 0x0F, 0xD0, 0x00, 0xC3];
+    let mem = [2.25_f64, 4.0];
+    let mut ctx = RegisterContext::default();
+    ctx.rax = mem.as_ptr() as u64;
+    ctx.xmm[0] = [1.5f64.to_bits(), 3.0f64.to_bits()];
+    let out = run_test(&bytes, ctx);
+    assert_eq!(out.xmm[0], [(-0.75f64).to_bits(), 7.0f64.to_bits()]);
+}
+
+/// An invalid operation in either kind of lane must produce x86's floating
+/// indefinite (`0xFFC0_0000`), not whatever default NaN the host FPU picks -
+/// and, crucially, the *even* lanes must trap `inf - inf` while the odd ones
+/// trap `inf + -inf`, which is what proves each lane runs its own operation.
+#[test]
+fn test_addsubps_invalid_operations_yield_the_floating_indefinite() {
+    const INF: u32 = 0x7F80_0000;
+    const NINF: u32 = 0xFF80_0000;
+    const INDEF: u32 = 0xFFC0_0000;
+
+    // addsubps xmm0, xmm1; ret
+    let bytes = [0xF2, 0x0F, 0xD0, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    //          lane0: inf-inf  lane1: inf+-inf  lane2: inf+inf  lane3: inf-inf
+    ctx.xmm[0] = xmm_bits32([INF, INF, INF, INF]);
+    ctx.xmm[1] = xmm_bits32([INF, NINF, NINF, INF]);
+    let out = run_test(&bytes, ctx);
+    // lane2 is an even (subtract) lane: inf - -inf = +inf.
+    // lane3 is an odd (add) lane: inf + inf = +inf.
+    assert_eq!(out.xmm[0], xmm_bits32([INDEF, INDEF, INF, INF]));
+}
+
+/// A NaN operand must reach the result with its own bits, which is why the
+/// even lanes cannot be implemented by negating the source and adding: a
+/// pre-negated NaN would arrive with its sign bit flipped.
+#[test]
+fn test_addsubps_propagates_source_nan_without_flipping_its_sign() {
+    // A quiet NaN with the sign bit set and a distinguishing payload.
+    const NEG_QNAN: u32 = 0xFFC0_1234;
+    const POS_QNAN: u32 = 0x7FC0_5678;
+
+    // addsubps xmm0, xmm1; ret
+    let bytes = [0xF2, 0x0F, 0xD0, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = xmm_f32([1.0, 1.0, 1.0, 1.0]);
+    ctx.xmm[1] = xmm_bits32([NEG_QNAN, NEG_QNAN, POS_QNAN, POS_QNAN]);
+    let out = run_test(&bytes, ctx);
+    // Every lane takes the source QNaN through unchanged - the subtract lanes
+    // (0 and 2) included.
+    assert_eq!(
+        out.xmm[0],
+        xmm_bits32([NEG_QNAN, NEG_QNAN, POS_QNAN, POS_QNAN])
+    );
+}
+
+/// The double-precision twin of
+/// `test_addsubps_propagates_source_nan_without_flipping_its_sign`.
+#[test]
+fn test_addsubpd_propagates_source_nan_without_flipping_its_sign() {
+    const NEG_QNAN: u64 = 0xFFF8_0000_0000_1234;
+
+    // addsubpd xmm0, xmm1; ret
+    let bytes = [0x66, 0x0F, 0xD0, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = [1.0f64.to_bits(), 1.0f64.to_bits()];
+    ctx.xmm[1] = [NEG_QNAN, NEG_QNAN];
+    let out = run_test(&bytes, ctx);
+    assert_eq!(out.xmm[0], [NEG_QNAN, NEG_QNAN]);
+}
+
+/// Signed zeros distinguish add from subtract where nothing else does:
+/// `+0.0 - +0.0` is `+0.0` but `-0.0 - +0.0` is `-0.0`, and `-0.0 + -0.0` is
+/// `-0.0` while `-0.0 + +0.0` is `+0.0`. A lane running the wrong operation
+/// shows up here as a sign bit.
+#[test]
+fn test_addsubps_signed_zero_lanes() {
+    // addsubps xmm0, xmm1; ret
+    let bytes = [0xF2, 0x0F, 0xD0, 0xC1, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.xmm[0] = xmm_f32([-0.0, -0.0, 0.0, 0.0]);
+    ctx.xmm[1] = xmm_f32([0.0, 0.0, 0.0, -0.0]);
+    let out = run_test(&bytes, ctx);
+    // lane0: -0.0 - 0.0 = -0.0   lane1: -0.0 + 0.0 = +0.0
+    // lane2: +0.0 - 0.0 = +0.0   lane3: +0.0 + -0.0 = +0.0
+    assert_eq!(out.xmm[0], xmm_f32([-0.0, 0.0, 0.0, 0.0]));
+}
+
+/// The shape a compiler actually emits: one complex multiply,
+/// `(a+bi)(c+di) = (ac-bd) + (ad+bc)i`, built from MOVSLDUP / MOVSHDUP /
+/// SHUFPS / MULPS / ADDSUBPS. This is the reason ADDSUBPS exists, and it
+/// exercises the instruction against neighbours rather than in isolation.
+#[test]
+fn test_complex_multiply_sequence() {
+    // xmm0 = [a, b, ...] (one complex number in the low pair)
+    // xmm1 = [c, d, ...]
+    //
+    //   movsldup xmm2, xmm1     ; xmm2 = [c, c, ...]
+    //   movshdup xmm3, xmm1     ; xmm3 = [d, d, ...]
+    //   mulps    xmm2, xmm0     ; xmm2 = [a*c, b*c, ...]
+    //   shufps   xmm0, xmm0, 0xB1 ; swap within each pair -> [b, a, ...]
+    //   mulps    xmm3, xmm0     ; xmm3 = [b*d, a*d, ...]
+    //   addsubps xmm2, xmm3     ; [a*c - b*d, b*c + a*d, ...]
+    //   ret
+    let bytes = [
+        0xF3, 0x0F, 0x12, 0xD1, // movsldup xmm2, xmm1
+        0xF3, 0x0F, 0x16, 0xD9, // movshdup xmm3, xmm1
+        0x0F, 0x59, 0xD0, // mulps xmm2, xmm0
+        0x0F, 0xC6, 0xC0, 0xB1, // shufps xmm0, xmm0, 0xB1
+        0x0F, 0x59, 0xD8, // mulps xmm3, xmm0
+        0xF2, 0x0F, 0xD0, 0xD3, // addsubps xmm2, xmm3
+        0xC3, // ret
+    ];
+
+    for (a, b, c, d) in [
+        (1.0f32, 2.0f32, 3.0f32, 4.0f32),
+        (-1.5, 0.25, 2.0, -8.0),
+        (0.0, 1.0, 0.0, 1.0),
+    ] {
+        let mut ctx = RegisterContext::default();
+        ctx.xmm[0] = xmm_f32([a, b, 0.0, 0.0]);
+        ctx.xmm[1] = xmm_f32([c, d, 0.0, 0.0]);
+        let out = run_test(&bytes, ctx);
+        let real = a * c - b * d;
+        let imag = b * c + a * d;
+        assert_eq!(
+            out.xmm[2][0],
+            xmm_f32([real, imag, 0.0, 0.0])[0],
+            "({a}+{b}i)*({c}+{d}i)"
+        );
+        // The vector representation must reach the same answer.
+        assert_eq!(run_test_vec(&bytes, ctx).xmm[2], out.xmm[2]);
+    }
+}
+
+#[test]
+fn test_addsub_agrees_in_vector_mode() {
+    // The vector-XMM lift is a different path through the same semantics, so it
+    // has to produce the same registers - NaN and infinity lanes included.
+    let states: &[([u64; 2], [u64; 2])] = &[
+        (xmm_f32([1.5, 2.5, 3.0, 4.0]), xmm_f32([1.0, 2.0, 5.0, 6.0])),
+        (
+            xmm_bits32([0x7F80_0000, 0x7F80_0000, 0xFF80_0000, 0x7FC0_1234]),
+            xmm_bits32([0x7F80_0000, 0xFF80_0000, 0xFF80_0000, 0xFFC0_5678]),
+        ),
+        (
+            xmm_f32([-0.0, -0.0, 0.0, 0.0]),
+            xmm_f32([0.0, 0.0, 0.0, -0.0]),
+        ),
+        (
+            [0xDEAD_BEEF_CAFE_BABE, 0x1234_5678_9ABC_DEF0],
+            [0x1122_3344_5566_7788, 0xFEDC_BA98_7654_3210],
+        ),
+    ];
+    for &(dst, src) in states {
+        let mut ctx = RegisterContext::default();
+        ctx.xmm[0] = dst;
+        ctx.xmm[1] = src;
+        for bytes in [
+            [0xF2, 0x0F, 0xD0, 0xC1, 0xC3], // addsubps
+            [0x66, 0x0F, 0xD0, 0xC1, 0xC3], // addsubpd
+        ] {
+            assert_eq!(
+                run_test(&bytes, ctx).xmm,
+                run_test_vec(&bytes, ctx).xmm,
+                "{bytes:02X?} on {dst:#018X?},{src:#018X?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn test_horizontal_arithmetic_agrees_in_vector_mode() {
     // The vector-XMM lift is a different path through the same semantics, so it

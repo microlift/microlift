@@ -1731,6 +1731,61 @@ impl<'a> Lifter<'a> {
         self.horizontal_single_arith(instruction, "hsubps", fsub_x86)
     }
 
+    /// ADDSUBPS - subtract in the even single-precision lanes, add in the odd
+    /// ones: `dst[2i] -= src[2i]`, `dst[2i+1] += src[2i+1]`.
+    ///
+    /// This is the instruction a compiler emits for the last step of a complex
+    /// multiply, where one component of the product is a difference of terms
+    /// and the other a sum. It is *not* expressible as "negate the even source
+    /// lanes, then add": a NaN source lane must propagate with the sign bit x86
+    /// gives it, and pre-negating would flip that bit. So both lanes really do
+    /// perform their own operation.
+    pub(super) fn handle_addsubps(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        if self.try_addsub_vec(instruction, "addsubps", true)? {
+            return Ok(());
+        }
+        let dst_idx = self.xmm_operand_index(instruction, 0, "addsubps")?;
+        let dst_lo = self.get_xmm_lo(dst_idx);
+        let dst_hi = self.get_xmm_hi(dst_idx);
+        let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
+
+        // Both 64-bit halves hold an even lane below an odd one, so the same
+        // sub-then-add pair covers lanes 0/1 and lanes 2/3.
+        let half = |s: &mut Self, d: Value, x: Value| {
+            let (d0, d1) = s.split_dwords(d);
+            let (x0, x1) = s.split_dwords(x);
+            let r0 = s.f32_bits_arith(d0, x0, &fsub_x86);
+            let r1 = s.f32_bits_arith(d1, x1, &fadd_x86);
+            s.join_dwords(r0, r1)
+        };
+        let res_lo = half(self, dst_lo, src_lo);
+        let res_hi = half(self, dst_hi, src_hi);
+
+        self.set_xmm_lo(dst_idx, res_lo);
+        self.set_xmm_hi(dst_idx, res_hi);
+        Ok(())
+    }
+
+    /// ADDSUBPD - the double-precision companion of
+    /// [`handle_addsubps`](Self::handle_addsubps): the low lane subtracts and
+    /// the high lane adds.
+    pub(super) fn handle_addsubpd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        if self.try_addsub_vec(instruction, "addsubpd", false)? {
+            return Ok(());
+        }
+        let dst_idx = self.xmm_operand_index(instruction, 0, "addsubpd")?;
+        let dst_lo = self.get_xmm_lo(dst_idx);
+        let dst_hi = self.get_xmm_hi(dst_idx);
+        let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
+
+        let res_lo = self.f64_bits_arith(dst_lo, src_lo, &fsub_x86);
+        let res_hi = self.f64_bits_arith(dst_hi, src_hi, &fadd_x86);
+
+        self.set_xmm_lo(dst_idx, res_lo);
+        self.set_xmm_hi(dst_idx, res_hi);
+        Ok(())
+    }
+
     /// Shared implementation for the packed double-precision arithmetic
     /// instructions (`ADDPD` / `SUBPD` / ...): apply `op` to both 64-bit lanes.
     fn packed_double_arith(

@@ -177,6 +177,8 @@ impl<'a> Lifter<'a> {
             Mnemonic::Hsubpd => self.handle_hsubpd(instruction),
             Mnemonic::Haddps => self.handle_haddps(instruction),
             Mnemonic::Hsubps => self.handle_hsubps(instruction),
+            Mnemonic::Addsubps => self.handle_addsubps(instruction),
+            Mnemonic::Addsubpd => self.handle_addsubpd(instruction),
 
             // SSE2 - scalar / packed double-precision arithmetic
             Mnemonic::Addpd => self.handle_addpd(instruction),
