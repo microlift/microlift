@@ -1274,7 +1274,7 @@ impl<'a> Lifter<'a> {
     /// the masked (default) result and no exception flag is ever set in the
     /// status word - so there is never anything to wait for. It is also what
     /// makes the `9B`-prefixed `FSTENV`/`FCLEX`/`FINIT` spellings work, since
-    /// iced decodes those as a `WAIT` followed by the `FN…` form.
+    /// iced decodes those as a `WAIT` followed by the `FN` form.
     pub(super) fn handle_fpu_nop(&mut self, _instruction: &Instruction) -> crate::Result<()> {
         Ok(())
     }

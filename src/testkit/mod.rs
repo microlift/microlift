@@ -239,6 +239,17 @@ impl<'a> LiftTest<'a> {
         self
     }
 
+    /// Skip the IR for condition-flag writes nothing reads
+    /// ([`LifterConfig::eliminate_dead_flags`]).
+    ///
+    /// A metamorphic switch: turning it on may not change a single bit of
+    /// architectural state, which is what `tests/dead_flag_tests.rs` and the
+    /// cross-config fuzz suite check.
+    pub fn eliminate_dead_flags(mut self) -> Self {
+        self.config.eliminate_dead_flags = true;
+        self
+    }
+
     /// Set the guest stack size in 64-bit words.
     pub fn stack_words(mut self, n: usize) -> Self {
         self.stack_words = n;
@@ -373,13 +384,13 @@ impl<'a> LiftTest<'a> {
             && !self.config.analysis_mode
             && self.config.execution_mode == ExecutionMode::Jit
             && !self.image_is_relocated())
-            .then(|| {
-                (
-                    self.bytes.to_vec(),
-                    self.ip,
-                    oracle::CpuState::from_ctx(&self.init),
-                )
-            });
+        .then(|| {
+            (
+                self.bytes.to_vec(),
+                self.ip,
+                oracle::CpuState::from_ctx(&self.init),
+            )
+        });
 
         let mut harness = self.compile()?;
         let exit = harness.enter();
@@ -430,7 +441,7 @@ impl<'a> LiftTest<'a> {
 ///   the shared identity-mapped memory; a program that writes to non-stack
 ///   memory (atomics, stores, `xchg [mem]`) would feed Unicorn already-mutated
 ///   inputs, so those are skipped. Stack writes (base `RSP`) are exempt.
-/// - **x86-undefined flags masked.** Instructions like `MUL`/`IMUL` (SF/ZF/…)
+/// - **x86-undefined flags masked.** Instructions like `MUL`/`IMUL` (SF/ZF/)
 ///   and variable-count shifts/rotates/`BT*` (OF) leave flags *architecturally
 ///   undefined*; the two engines may pick different bits without either being
 ///   wrong. Those flags (last-writer-wins across the program) are masked out of

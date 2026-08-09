@@ -11,6 +11,7 @@
 pub mod abi;
 pub mod bridge;
 pub mod exit;
+pub mod flags;
 pub mod specialize;
 pub mod srcloc;
 
@@ -20,6 +21,7 @@ use crate::arch::{ControlFlow, ControlFlowKind, InstructionEffects};
 use crate::core::abi::CallAbi;
 use crate::core::bridge::{BridgeImport, ImportKind, ImportRegistry};
 use crate::core::exit::{ExitReason, MemorySegment, TransferKind};
+use crate::core::flags::{FlagEffects, FlagLiveness, FlagSet};
 use crate::core::specialize::Specialization;
 use crate::core::srcloc::SourceLocMap;
 use crate::function_traits::{DynamicSymbol, FunctionArgumentType};
@@ -99,6 +101,25 @@ pub trait GuestArch: Sized {
     /// Defaults to `None`; guest frontends override it where instruction-info is
     /// available (x86-64 does, via iced's instruction-info).
     fn instruction_effects(_i: &Self::Instr) -> Option<InstructionEffects> {
+        None
+    }
+
+    /// What lifting `i` does to the guest's condition flags, in this guest's own
+    /// flag numbering, or `None` when this frontend cannot say.
+    ///
+    /// Drives [`LifterConfig::eliminate_dead_flags`]. `None` - the default, and
+    /// the right answer for any instruction nobody has audited - is treated as
+    /// [`FlagEffects::CONSERVATIVE`], so a frontend that never implements this
+    /// simply never gets the optimisation.
+    ///
+    /// **This describes the lift, not the architecture.** Read
+    /// [`FlagEffects`] before adding an entry: the two directions are
+    /// asymmetric, and the failure mode of getting one wrong is a guest that
+    /// computes the wrong answer with nothing to report.
+    ///
+    /// The bit indices are the frontend's own and must be the same ones it
+    /// passes to [`LiftEngine::flag_live`].
+    fn flag_effects(_i: &Self::Instr) -> Option<FlagEffects> {
         None
     }
 
@@ -827,6 +848,35 @@ pub struct LifterConfig {
     /// Pair it with [`strict_resume`](Self::strict_resume), which decides what
     /// happens to an address that was left out.
     pub resume_points: Vec<u64>,
+    /// Do not emit the IR for a condition-flag write nothing goes on to read.
+    ///
+    /// **Off by default, and opt-in on purpose** - see the caveat at the end.
+    ///
+    /// Guest flags are eager: an `ADD` emits CF, PF, AF, ZF, SF and OF whether
+    /// or not the next instruction is a `JE` that wants one of them, and PF
+    /// alone is a `popcnt`/`ireduce`/`band`/`bxor`. Being SSA the dead ones are
+    /// deleted at compile time, so this changes nothing about the *machine
+    /// code* - what it changes is how much IR the compiler is handed to reach
+    /// it, which is where a recompiler's time actually goes.
+    ///
+    /// With this on, [`crate::core::flags`] runs a backwards liveness pass over
+    /// the decoded region between phase 1 and phase 2, and each semantic handler
+    /// asks [`LiftEngine::flag_live`] before emitting a flag's computation. The
+    /// analysis is conservative wherever it cannot see: any call, return,
+    /// indirect branch or edge out of the region marks every flag live, which is
+    /// what keeps the flags a host reads at a VM exit correct, and an
+    /// instruction whose frontend has not classified it does too.
+    ///
+    /// **The caveat.** Soundness rests on the per-instruction classifications in
+    /// [`GuestArch::flag_effects`] matching what the handlers do, and a wrong
+    /// entry there is a wrong answer rather than an error. The analysis and its
+    /// conservative defaults are structural; the table is an audit. Until that
+    /// table has been through more guest code than it has, this stays a knob.
+    ///
+    /// Inert on a frontend that does not implement
+    /// [`GuestArch::flag_effects`] - every instruction classifies conservatively
+    /// and nothing is elided.
+    pub eliminate_dead_flags: bool,
     /// Exit rather than guess when the entry PC matches no resume point.
     ///
     /// The dispatch `Switch` needs a default arm, and historically that arm is
@@ -874,6 +924,7 @@ impl Default for LifterConfig {
             page_size: 4096,
             resume_points: Vec::new(),
             strict_resume: false,
+            eliminate_dead_flags: false,
         }
     }
 }
@@ -972,7 +1023,9 @@ impl LifterConfig {
         if !available.contains(&pc) {
             return pc..pc;
         }
-        let page = self.page_size.max(A::MAX_INSTRUCTION_LEN.next_power_of_two());
+        let page = self
+            .page_size
+            .max(A::MAX_INSTRUCTION_LEN.next_power_of_two());
         // Round *up* from the last byte the entry instruction could possibly
         // occupy, so a `pc` near the end of a page takes the following page with
         // it rather than getting an extent too short to hold one instruction.
@@ -999,6 +1052,19 @@ pub struct LiftEngine<'a, A: GuestArch = crate::arch::x86_64::X86_64> {
     pub visited_blocks: HashSet<Block>,
     /// Whether the current block has been terminated (jmp, ret, etc.).
     pub block_terminated: bool,
+    /// Per-address condition-flag liveness, when
+    /// [`LifterConfig::eliminate_dead_flags`] asked for it.
+    ///
+    /// Computed once between phase 1 and phase 2; `None` means the optimisation
+    /// is off, which [`Self::flag_live`] reads as "every flag is live".
+    flag_liveness: Option<FlagLiveness>,
+    /// The flags live after the instruction currently being lifted.
+    ///
+    /// Latched from [`Self::flag_liveness`] just before each handler runs,
+    /// because `current_ip` has by then been advanced to the *next*
+    /// instruction and a handler asking about "this" instruction would look up
+    /// the wrong address.
+    live_flags: FlagSet,
     /// Designated address for controlled VM exit via RET.
     pub exit_trampoline_address: u64,
     pub syscall_handler_sig: Option<SigRef>,
@@ -1143,6 +1209,10 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             current_ip: 0,
             visited_blocks: HashSet::new(),
             block_terminated: false,
+            flag_liveness: None,
+            // Nothing has been analysed yet, and the IR the engine emits before
+            // phase 2 - the entry block's state load - must not be elided.
+            live_flags: FlagSet::ALL,
             exit_trampoline_address: 0xFFFF_FFFF_FFFF_FFFF,
             syscall_handler_sig,
             fast_calls,
@@ -1460,7 +1530,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
     /// Declare that the VM exit just emitted **resumes at `va`**.
     ///
     /// Semantics call this for every exit the host is expected to service and
-    /// then re-enter after — `CPUID`, `RDTSC`, `XGETBV`, `SYSCALL`, `INT`,
+    /// then re-enter after - `CPUID`, `RDTSC`, `XGETBV`, `SYSCALL`, `INT`,
     /// `INT3`, the port-I/O string instructions, and an unimplemented
     /// instruction the host emulates. It does two things, and both are needed:
     ///
@@ -1473,7 +1543,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
     ///
     /// Neither used to happen. `CPUID` in the middle of a region left everything
     /// after it unlifted and unenterable, and the only thing that covered it was
-    /// [`VmResumptionPoints::All`] making *every* instruction a resume point —
+    /// [`VmResumptionPoints::All`] making *every* instruction a resume point -
     /// which is why that mode looked mandatory and cost what it cost. It is what
     /// [`ExitOnly`](VmResumptionPoints::ExitOnly) is named after.
     ///
@@ -1526,6 +1596,29 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             && addr < self.lift_end
             && (A::instr_next_ip(inst) > self.lift_end
                 || (A::is_invalid(inst) && self.lift_end - addr < A::MAX_INSTRUCTION_LEN))
+    }
+
+    /// Whether the instruction being lifted has to compute flag `bit`.
+    ///
+    /// `bit` is the frontend's own flag index - the same numbering it uses in
+    /// [`GuestArch::flag_effects`]. A semantic handler guards each flag's
+    /// computation with this:
+    ///
+    /// ```ignore
+    /// if self.flag_live(X86Flag::Parity as u8) {
+    ///     // emit the popcount
+    /// }
+    /// ```
+    ///
+    /// **Always true unless [`LifterConfig::eliminate_dead_flags`] is on**, so a
+    /// handler that forgets to ask is merely as fast as it was before, and a
+    /// handler that asks costs one bit test per flag when the optimisation is
+    /// off. Skipping a write leaves the flag's SSA variable holding its previous
+    /// value rather than an undefined one, which is what makes a conservative
+    /// point downstream - a sync to the context - publish something well-formed
+    /// even if the analysis were wrong about it.
+    pub fn flag_live(&self, bit: u8) -> bool {
+        self.live_flags.contains(bit)
     }
 
     /// The value the `image_base` variable is defined to at region entry.
@@ -1771,6 +1864,27 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             }
         }
 
+        // Between the phases, and only here: the decode map is complete enough
+        // to follow control flow, and no IR exists yet for the answer to be too
+        // late for. See [`crate::core::flags`].
+        if self.config.eliminate_dead_flags {
+            // Asked of the engine up front rather than from inside the
+            // analysis, so that the one definition of "this encoding is only
+            // partly here" - `runs_off_region`, which phase 2 also uses to
+            // decide the exit - is the one the analysis sees.
+            let truncated: HashSet<u64> = decoded
+                .iter()
+                .filter(|(addr, inst)| self.runs_off_region(**addr, inst))
+                .map(|(addr, _)| *addr)
+                .collect();
+            self.flag_liveness = Some(flags::analyze::<A>(
+                &decoded,
+                self.lift_base,
+                self.lift_end,
+                |addr, _| truncated.contains(&addr),
+            ));
+        }
+
         // Entry block receives the context pointer as its first parameter.
         let entry_block = self.builder.create_block();
         self.builder
@@ -1802,7 +1916,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         // resume point (see [`Self::resumes_at`]), and nobody knows that address
         // exists until the instruction has been lifted. Fixing the arms before
         // then is what used to make [`VmResumptionPoints::All`] the only way to
-        // be re-enterable after a `CPUID` — the switch was built before the
+        // be re-enterable after a `CPUID` - the switch was built before the
         // `CPUID` was seen.
         //
         // Cranelift will not let the builder leave a block unfilled, so the
@@ -1931,6 +2045,13 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                 // the pre-advance address.
                 let next_ip = A::instr_next_ip(inst);
                 self.set_source_loc(A::instr_ip(inst));
+                // Latched against the address of the instruction about to be
+                // lifted, which is why it happens here and not inside a handler:
+                // `current_ip` is the *next* address by the time one runs.
+                self.live_flags = match &self.flag_liveness {
+                    Some(liveness) => liveness.live_out(A::instr_ip(inst)),
+                    None => FlagSet::ALL,
+                };
                 self.current_ip = next_ip;
                 A::lift_instruction(self, inst)?;
                 if self.block_terminated {
@@ -1947,18 +2068,20 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             self.visited_blocks.insert(dispatch);
 
             let ctx_ptr = self.builder.use_var(A::context_ptr_var(&self.state));
-            let pc_val =
-                self.builder
-                    .ins()
-                    .load(types::I64, MemFlagsData::trusted(), ctx_ptr, A::pc_offset());
+            let pc_val = self.builder.ins().load(
+                types::I64,
+                MemFlagsData::trusted(),
+                ctx_ptr,
+                A::pc_offset(),
+            );
             let entry_va = self.to_lift_va(pc_val);
 
             // Which addresses get an arm. Under [`VmResumptionPoints::All`]
             // every block, which after the leader expansion above is every
             // instruction boundary; otherwise the three sets the engine knows
-            // are mandatory and the host cannot name — the region's own entry,
+            // are mandatory and the host cannot name - the region's own entry,
             // the return point of every call that leaves it, and the resume
-            // point of every VM exit that resumes — plus whatever the host
+            // point of every VM exit that resumes - plus whatever the host
             // declared. See [`VmResumptionPoints`] for why the smaller set is
             // worth having at all.
             let host_declared = &self.config.resume_points;
@@ -1979,7 +2102,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                     switch.set_entry(offset.into(), block);
                     // Reported only for addresses control can enter here and
                     // then *make progress from*. Two kinds cannot, and both
-                    // leave the PC exactly as the host set it — so a host that
+                    // leave the PC exactly as the host set it - so a host that
                     // took one for a resume point would enter, exit unchanged,
                     // look the same translation up again, and spin forever.
                     //
@@ -1989,7 +2112,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                     // - **The instruction the region was cut through**, under
                     //   [`LifterConfig::region_tail_exit`]. Its block is the
                     //   tail exit, and the host's answer to that exit is a
-                    //   region beginning at the address — which this is not.
+                    //   region beginning at the address - which this is not.
                     let in_region = offset >= self.lift_base && offset < self.lift_end;
                     let tail = decoded
                         .get(&offset)
@@ -2014,7 +2137,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             if let Some(refuse) = refuse {
                 self.builder.switch_to_block(refuse);
                 // No sync. The arm runs before any instruction is lifted, so the
-                // context still holds exactly what the host wrote — including
+                // context still holds exactly what the host wrote - including
                 // the PC, which has to be left alone for the host to translate a
                 // region at.
                 self.write_exit_reason(ExitReason::UnknownJump);
@@ -2024,7 +2147,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             }
         } else if !self.config.analysis_mode {
             // [`VmResumptionPoints::None`]: the entry jumps straight to the
-            // region's first instruction, so that address — and only it — is
+            // region's first instruction, so that address - and only it - is
             // where this code can be entered. Reporting it keeps
             // [`LiftedCode::resume_points`] the one thing a host cache has to
             // consult, whatever the mode.

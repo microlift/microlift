@@ -512,7 +512,7 @@ impl<'a> Lifter<'a> {
 
         self.sync_to_context(Some(rip_at), reason)?;
         // The exit reports the instruction's own address, and the host advances
-        // past it once the access is served — so that is where it comes back to.
+        // past it once the access is served - so that is where it comes back to.
         self.resumes_at(instruction.next_ip());
         self.write_exit_code(size as u32);
         self.builder.ins().return_(&[]);

@@ -245,7 +245,10 @@ fn the_none_mode_ignores_the_entry_pc() {
             c.rax = 7;
         })
         .run();
-    assert_eq!(out.ctx.rax, 1, "ran from the `xor` at the top, not the `inc`");
+    assert_eq!(
+        out.ctx.rax, 1,
+        "ran from the `xor` at the top, not the `inc`"
+    );
 }
 
 #[test]
@@ -287,7 +290,11 @@ fn an_unoffered_pc_exits_rather_than_starting_from_the_top() {
         TransferKind::try_from(out.ctx.exit_code),
         Ok(TransferKind::NoResumePoint)
     );
-    assert_eq!(out.ctx.rip, BASE + 4, "the PC the host asked for, untouched");
+    assert_eq!(
+        out.ctx.rip,
+        BASE + 4,
+        "the PC the host asked for, untouched"
+    );
     assert_eq!(out.ctx.rax, 7, "and no guest state touched either");
 }
 
@@ -335,8 +342,12 @@ fn a_region_resumes_through_its_exits() {
 
     // The host answers the `CPUID` and re-enters where the exit said to.
     let out = out.resume_with(|c| c.rax = 0);
-    assert_eq!(out.exit, ExitReason::Rdtsc, "the `inc` and `rdtsc` after the \
-         `cpuid` have to be in this translation at all");
+    assert_eq!(
+        out.exit,
+        ExitReason::Rdtsc,
+        "the `inc` and `rdtsc` after the \
+         `cpuid` have to be in this translation at all"
+    );
     assert_eq!(out.ctx.rip, BASE + 8);
     assert_eq!(out.ctx.rax, 1, "the `inc eax` between the two exits ran");
 

@@ -165,7 +165,34 @@ impl<'a> Lifter<'a> {
         }
     }
 
+    /// Whether the instruction being lifted has to compute `flag`.
+    ///
+    /// The x86-64 spelling of [`LiftEngine::flag_live`], and the only place the
+    /// `X86Flag` discriminant is used as a flag *index* - the same numbering
+    /// [`crate::arch::x86_64::flag_effects`] classifies in. Always true unless
+    /// [`LifterConfig::eliminate_dead_flags`] is on.
+    ///
+    /// [`LiftEngine::flag_live`]: crate::core::LiftEngine::flag_live
+    /// [`LifterConfig::eliminate_dead_flags`]: crate::core::LifterConfig::eliminate_dead_flags
+    pub fn flag_needed(&self, flag: X86Flag) -> bool {
+        self.flag_live(flag as u8)
+    }
+
+    /// Assign `flag`, unless nothing goes on to read it.
+    ///
+    /// The backstop for the guards in `semantics/flags.rs`: those skip the
+    /// *computation*, which is where the cost is, and this skips the assignment
+    /// whether or not a handler remembered to guard. A handler that computes a
+    /// dead flag anyway is therefore still correct and merely wasteful - the
+    /// value it built has no use and the compiler drops it, which is exactly the
+    /// state the whole lifter was in before this existed.
     pub fn set_flag(&mut self, flag: X86Flag, val: Value) -> crate::Result<()> {
+        if !self.flag_needed(flag) {
+            // Deliberately not an error even for a flag this guest has no
+            // variable for: the check below is what reports that, and it still
+            // runs on every path a live flag takes.
+            return Ok(());
+        }
         if let Some(&var) = self.state.flags.get(&flag) {
             // Ensure flag is I8
             let val_i8 = if self.builder.func.dfg.value_type(val) == types::I8 {

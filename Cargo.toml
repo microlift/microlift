@@ -36,6 +36,10 @@ unicorn-engine = { version = "2", optional = true }
 rustc_apfloat = "0.2"
 
 [[test]]
+name = "dead_flag_tests"
+required-features = ["testkit"]
+
+[[test]]
 name = "bridge_tests"
 required-features = ["testkit"]
 

@@ -5,6 +5,7 @@
 pub mod abi;
 pub mod context;
 pub mod decode;
+pub mod flag_effects;
 pub mod jumptable;
 pub mod regs;
 pub mod semantics;
@@ -88,6 +89,10 @@ impl GuestArch for X86_64 {
 
     fn instruction_effects(i: &Self::Instr) -> Option<crate::arch::InstructionEffects> {
         Some(decode::instruction_effects(i))
+    }
+
+    fn flag_effects(i: &Self::Instr) -> Option<crate::core::flags::FlagEffects> {
+        flag_effects::flag_effects(i)
     }
 
     fn resolved_indirect_targets(

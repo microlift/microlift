@@ -228,7 +228,11 @@ fn a_call_out_of_region_resumes_at_its_return_address() {
             c.r15 = 0;
         })
         .run();
-    assert_eq!(out.exit, ExitReason::UnknownJump, "the call leaves the region");
+    assert_eq!(
+        out.exit,
+        ExitReason::UnknownJump,
+        "the call leaves the region"
+    );
 
     // The host runs the callee, whose own `RET` pops the return address the
     // `CALL` pushed, and re-enters at that address.
@@ -274,7 +278,11 @@ fn a_region_resumes_through_every_exit_in_turn() {
     assert_eq!(out.ctx.rip, BASE + 2);
 
     let out = out.resume();
-    assert_eq!(out.exit, ExitReason::Cpuid, "the code between the exits is in this translation");
+    assert_eq!(
+        out.exit,
+        ExitReason::Cpuid,
+        "the code between the exits is in this translation"
+    );
     assert_eq!(out.ctx.r15, 1);
     assert_eq!(out.ctx.rip, BASE + 7);
 

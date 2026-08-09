@@ -39,7 +39,7 @@ const EXP_MAX: i64 = 0x7FFF;
 const BIAS: i64 = 16383;
 const INT_BIT: i64 = 0x8000_0000_0000_0000u64 as i64;
 const FRAC_MASK: i64 = 0x7FFF_FFFF_FFFF_FFFF;
-/// x87 QNaN floating-point indefinite: sign 1, exp all-ones, mantissa `1.1000…`.
+/// x87 QNaN floating-point indefinite: sign 1, exp all-ones, mantissa `1.1000`.
 const QNAN_MANT: i64 = 0xC000_0000_0000_0000u64 as i64;
 const QNAN_SE: i64 = 0xFFFF;
 
@@ -109,7 +109,7 @@ fn signed_zero(b: &mut FunctionBuilder, sign: Value) -> (Value, Value) {
 }
 
 /// Round a 64-bit significand `sig` up by `inc` (0/1) with carry handling: if it
-/// overflows to `2^64`, reset to `0x8000…0` and report a `+1` exponent step.
+/// overflows to `2^64`, reset to `0x80000` and report a `+1` exponent step.
 /// Returns `(sig_rounded, exp_carry_i32)`.
 fn round_significand(b: &mut FunctionBuilder, sig: Value, inc: Value) -> (Value, Value) {
     let sig_r = b.ins().iadd(sig, inc);

@@ -6,8 +6,8 @@
 //! or is host-specific (rdtsc/rdrand) is **not** diffable and surfaces as
 //! [`OracleOutcome::Exit`] rather than a comparable [`CpuOracle`] halt.
 
-use crate::core::specialize::Specialization;
 use crate::context::{ExitReason, RegisterContext};
+use crate::core::specialize::Specialization;
 use crate::testkit::{LiftTest, RetAddr};
 
 /// x86 general-purpose register indices, in hardware encoding order, for

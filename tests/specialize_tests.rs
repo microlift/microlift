@@ -74,8 +74,18 @@ fn cases() -> Vec<Case> {
     // which resolves to nearest. Sweep all eight so every mode is covered.
     for imm in 0..8u8 {
         let m = Spec::PackedFpRound;
-        push(&format!("roundps-{imm}"), &[0x66, 0x0F, 0x3A, 0x08, 0xC1, imm], m, BOTH);
-        push(&format!("roundpd-{imm}"), &[0x66, 0x0F, 0x3A, 0x09, 0xC1, imm], m, BOTH);
+        push(
+            &format!("roundps-{imm}"),
+            &[0x66, 0x0F, 0x3A, 0x08, 0xC1, imm],
+            m,
+            BOTH,
+        );
+        push(
+            &format!("roundpd-{imm}"),
+            &[0x66, 0x0F, 0x3A, 0x09, 0xC1, imm],
+            m,
+            BOTH,
+        );
     }
 
     // Horizontal floating-point. The even/odd gather is `shufps`-shaped at
@@ -99,7 +109,12 @@ fn cases() -> Vec<Case> {
     push("phsubsw", &[0x66, 0x0F, 0x38, 0x07, 0xC1], p, ARM);
 
     // Pairwise and widening multiplies.
-    push("pmaddwd", &[0x66, 0x0F, 0xF5, 0xC1], Spec::PairwiseMultiplyAdd, BOTH);
+    push(
+        "pmaddwd",
+        &[0x66, 0x0F, 0xF5, 0xC1],
+        Spec::PairwiseMultiplyAdd,
+        BOTH,
+    );
     push(
         "pmaddubsw",
         &[0x66, 0x0F, 0x38, 0x04, 0xC1],
@@ -114,7 +129,12 @@ fn cases() -> Vec<Case> {
     );
     // The portable `I64X2` imul is fine on a machine that has `pmuludq`, so
     // these two are aarch64-only in the support table.
-    push("pmuludq", &[0x66, 0x0F, 0xF4, 0xC1], Spec::WideningEvenMultiply, ARM);
+    push(
+        "pmuludq",
+        &[0x66, 0x0F, 0xF4, 0xC1],
+        Spec::WideningEvenMultiply,
+        ARM,
+    );
     push(
         "pmuldq",
         &[0x66, 0x0F, 0x38, 0x28, 0xC1],

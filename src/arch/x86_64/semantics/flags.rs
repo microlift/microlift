@@ -1,8 +1,50 @@
+//! The eager flag updates, and the guards that stop them being eager.
+//!
+//! Every `update_flags_*` here assigns a fixed set of flags, and the set is
+//! what [`crate::arch::x86_64::flag_effects`] classifies each mnemonic as
+//! writing - the two must agree, and the table is written against *this file*.
+//!
+//! Each flag's computation is wrapped in [`Lifter::flag_needed`]. With
+//! [`LifterConfig::eliminate_dead_flags`] off that is a constant `true` and the
+//! IR is exactly what it always was; with it on, a flag nothing reads costs
+//! nothing to not compute. The parity flag is the one that motivated this - a
+//! `popcnt`, an `ireduce`, a `band` and a `bxor` on every arithmetic
+//! instruction in the program, for a flag almost nothing looks at.
+//!
+//! [`LifterConfig::eliminate_dead_flags`]: crate::core::LifterConfig::eliminate_dead_flags
+
 use crate::lifter::{Lifter, X86Flag};
 use cranelift::prelude::*;
 use iced_x86::Instruction;
 
 impl<'a> Lifter<'a> {
+    /// PF: set when the low byte of `res` has an even population count.
+    ///
+    /// Four IR instructions, emitted once per arithmetic instruction by five
+    /// different callers, which is why it is worth both factoring out and
+    /// skipping.
+    fn parity_of(&mut self, res: Value) -> Value {
+        let res_lo = if self.builder.func.dfg.value_type(res) == types::I8 {
+            res
+        } else {
+            self.builder.ins().ireduce(types::I8, res)
+        };
+        let pop = self.builder.ins().popcnt(res_lo);
+        let pop_lsb = self.builder.ins().band_imm_u(pop, 1);
+        self.builder.ins().bxor_imm_u(pop_lsb, 1)
+    }
+
+    /// AF: the carry out of bit 3, which is `((lhs ^ rhs ^ res) >> 4) & 1` for
+    /// every add- and subtract-shaped operation, carry-in included - the carry
+    /// only reaches bit 0, and the three-way xor still captures bit 3's carry
+    /// into bit 4.
+    fn auxiliary_of(&mut self, lhs: Value, rhs: Value, res: Value) -> Value {
+        let lhs_xor_rhs = self.builder.ins().bxor(lhs, rhs);
+        let af_xor = self.builder.ins().bxor(lhs_xor_rhs, res);
+        let af_shifted = self.builder.ins().ushr_imm_u(af_xor, 4);
+        self.builder.ins().band_imm_u(af_shifted, 1)
+    }
+
     /// STC - set carry flag.
     pub(super) fn handle_stc(&mut self, _instruction: &Instruction) -> crate::Result<()> {
         let one = self.builder.ins().iconst(types::I8, 1);
@@ -45,41 +87,43 @@ impl<'a> Lifter<'a> {
         let bit_width = (size * 8) as i64;
 
         // Zero Flag (ZF)
-        let zf = self.builder.ins().icmp_imm_s(IntCC::Equal, res, 0);
-        self.set_flag(X86Flag::Zero, zf)?;
+        if self.flag_needed(X86Flag::Zero) {
+            let zf = self.builder.ins().icmp_imm_s(IntCC::Equal, res, 0);
+            self.set_flag(X86Flag::Zero, zf)?;
+        }
 
         // Sign Flag (SF): MSB of result
-        let sf = self.builder.ins().ushr_imm_u(res, bit_width - 1);
-        self.set_flag(X86Flag::Sign, sf)?;
+        if self.flag_needed(X86Flag::Sign) {
+            let sf = self.builder.ins().ushr_imm_u(res, bit_width - 1);
+            self.set_flag(X86Flag::Sign, sf)?;
+        }
 
         // Carry Flag (CF): unsigned overflow - result < lhs
-        let cf = self.builder.ins().icmp(IntCC::UnsignedLessThan, res, lhs);
-        self.set_flag(X86Flag::Carry, cf)?;
+        if self.flag_needed(X86Flag::Carry) {
+            let cf = self.builder.ins().icmp(IntCC::UnsignedLessThan, res, lhs);
+            self.set_flag(X86Flag::Carry, cf)?;
+        }
 
         // Overflow Flag (OF): (lhs ^ res) & (rhs ^ res), then check MSB
-        let xor1 = self.builder.ins().bxor(lhs, res);
-        let xor2 = self.builder.ins().bxor(rhs, res);
-        let and = self.builder.ins().band(xor1, xor2);
-        let of = self.builder.ins().ushr_imm_u(and, bit_width - 1);
-        self.set_flag(X86Flag::Overflow, of)?;
+        if self.flag_needed(X86Flag::Overflow) {
+            let xor1 = self.builder.ins().bxor(lhs, res);
+            let xor2 = self.builder.ins().bxor(rhs, res);
+            let and = self.builder.ins().band(xor1, xor2);
+            let of = self.builder.ins().ushr_imm_u(and, bit_width - 1);
+            self.set_flag(X86Flag::Overflow, of)?;
+        }
 
         // Auxiliary Carry (AF): carry from bit 3 -> ((lhs ^ rhs ^ res) >> 4) & 1
-        let lhs_xor_rhs = self.builder.ins().bxor(lhs, rhs);
-        let af_xor = self.builder.ins().bxor(lhs_xor_rhs, res);
-        let af_shifted = self.builder.ins().ushr_imm_u(af_xor, 4);
-        let af = self.builder.ins().band_imm_u(af_shifted, 1);
-        self.set_flag(X86Flag::Auxiliary, af)?;
+        if self.flag_needed(X86Flag::Auxiliary) {
+            let af = self.auxiliary_of(lhs, rhs, res);
+            self.set_flag(X86Flag::Auxiliary, af)?;
+        }
 
         // Parity Flag (PF): 1 if low 8 bits of result have even popcount
-        let res_lo = if self.builder.func.dfg.value_type(res) == types::I8 {
-            res
-        } else {
-            self.builder.ins().ireduce(types::I8, res)
-        };
-        let pop = self.builder.ins().popcnt(res_lo);
-        let pop_lsb = self.builder.ins().band_imm_u(pop, 1);
-        let pf = self.builder.ins().bxor_imm_u(pop_lsb, 1);
-        self.set_flag(X86Flag::Parity, pf)?;
+        if self.flag_needed(X86Flag::Parity) {
+            let pf = self.parity_of(res);
+            self.set_flag(X86Flag::Parity, pf)?;
+        }
 
         Ok(())
     }
@@ -94,40 +138,43 @@ impl<'a> Lifter<'a> {
         let bit_width = (size * 8) as i64;
 
         // Zero Flag (ZF)
-        let zf = self.builder.ins().icmp_imm_s(IntCC::Equal, res, 0);
-        self.set_flag(X86Flag::Zero, zf)?;
+        if self.flag_needed(X86Flag::Zero) {
+            let zf = self.builder.ins().icmp_imm_s(IntCC::Equal, res, 0);
+            self.set_flag(X86Flag::Zero, zf)?;
+        }
 
         // Sign Flag (SF)
-        let sf = self.builder.ins().ushr_imm_u(res, bit_width - 1);
-        self.set_flag(X86Flag::Sign, sf)?;
+        if self.flag_needed(X86Flag::Sign) {
+            let sf = self.builder.ins().ushr_imm_u(res, bit_width - 1);
+            self.set_flag(X86Flag::Sign, sf)?;
+        }
 
         // Carry Flag (CF) - borrow: lhs < rhs (unsigned)
-        let cf = self.builder.ins().icmp(IntCC::UnsignedLessThan, lhs, rhs);
-        self.set_flag(X86Flag::Carry, cf)?;
+        if self.flag_needed(X86Flag::Carry) {
+            let cf = self.builder.ins().icmp(IntCC::UnsignedLessThan, lhs, rhs);
+            self.set_flag(X86Flag::Carry, cf)?;
+        }
 
         // Overflow Flag (OF): (lhs ^ rhs) & (lhs ^ res), then MSB
-        let xor1 = self.builder.ins().bxor(lhs, rhs);
-        let xor2 = self.builder.ins().bxor(lhs, res);
-        let and = self.builder.ins().band(xor1, xor2);
-        let of = self.builder.ins().ushr_imm_u(and, bit_width - 1);
-        self.set_flag(X86Flag::Overflow, of)?;
+        if self.flag_needed(X86Flag::Overflow) {
+            let xor1 = self.builder.ins().bxor(lhs, rhs);
+            let xor2 = self.builder.ins().bxor(lhs, res);
+            let and = self.builder.ins().band(xor1, xor2);
+            let of = self.builder.ins().ushr_imm_u(and, bit_width - 1);
+            self.set_flag(X86Flag::Overflow, of)?;
+        }
 
         // Auxiliary Carry (AF): borrow from bit 3 -> ((lhs ^ rhs ^ res) >> 4) & 1
-        let af_xor = self.builder.ins().bxor(xor1, res);
-        let af_shifted = self.builder.ins().ushr_imm_u(af_xor, 4);
-        let af = self.builder.ins().band_imm_u(af_shifted, 1);
-        self.set_flag(X86Flag::Auxiliary, af)?;
+        if self.flag_needed(X86Flag::Auxiliary) {
+            let af = self.auxiliary_of(lhs, rhs, res);
+            self.set_flag(X86Flag::Auxiliary, af)?;
+        }
 
         // Parity Flag (PF): 1 if low 8 bits of result have even popcount
-        let res_lo = if self.builder.func.dfg.value_type(res) == types::I8 {
-            res
-        } else {
-            self.builder.ins().ireduce(types::I8, res)
-        };
-        let pop = self.builder.ins().popcnt(res_lo);
-        let pop_lsb = self.builder.ins().band_imm_u(pop, 1);
-        let pf = self.builder.ins().bxor_imm_u(pop_lsb, 1);
-        self.set_flag(X86Flag::Parity, pf)?;
+        if self.flag_needed(X86Flag::Parity) {
+            let pf = self.parity_of(res);
+            self.set_flag(X86Flag::Parity, pf)?;
+        }
 
         Ok(())
     }
@@ -136,30 +183,34 @@ impl<'a> Lifter<'a> {
         let bit_width = (size * 8) as i64;
 
         // Zero Flag (ZF)
-        let zf = self.builder.ins().icmp_imm_s(IntCC::Equal, res, 0);
-        self.set_flag(X86Flag::Zero, zf)?;
+        if self.flag_needed(X86Flag::Zero) {
+            let zf = self.builder.ins().icmp_imm_s(IntCC::Equal, res, 0);
+            self.set_flag(X86Flag::Zero, zf)?;
+        }
 
         // Sign Flag (SF)
-        let sf = self.builder.ins().ushr_imm_u(res, bit_width - 1);
-        self.set_flag(X86Flag::Sign, sf)?;
+        if self.flag_needed(X86Flag::Sign) {
+            let sf = self.builder.ins().ushr_imm_u(res, bit_width - 1);
+            self.set_flag(X86Flag::Sign, sf)?;
+        }
 
         // Carry and Overflow are always cleared for logical ops
-        let zero = self.builder.ins().iconst(types::I8, 0);
-        self.set_flag(X86Flag::Carry, zero)?;
-        self.set_flag(X86Flag::Overflow, zero)?;
+        if self.flag_needed(X86Flag::Carry) || self.flag_needed(X86Flag::Overflow) {
+            let zero = self.builder.ins().iconst(types::I8, 0);
+            self.set_flag(X86Flag::Carry, zero)?;
+            self.set_flag(X86Flag::Overflow, zero)?;
+        }
 
         // Parity Flag (PF): 1 if low 8 bits of result have even popcount
-        let res_lo = if self.builder.func.dfg.value_type(res) == types::I8 {
-            res
-        } else {
-            self.builder.ins().ireduce(types::I8, res)
-        };
-        let pop = self.builder.ins().popcnt(res_lo);
-        let pop_lsb = self.builder.ins().band_imm_u(pop, 1);
-        let pf = self.builder.ins().bxor_imm_u(pop_lsb, 1);
-        self.set_flag(X86Flag::Parity, pf)?;
+        if self.flag_needed(X86Flag::Parity) {
+            let pf = self.parity_of(res);
+            self.set_flag(X86Flag::Parity, pf)?;
+        }
 
-        // AF is undefined for logical ops per Intel SDM; leave unchanged.
+        // AF is undefined for logical ops per Intel SDM; leave unchanged. Which
+        // is why `flag_effects` does not list AF among this op's writes: a
+        // reader downstream sees whatever set it last, so that write has to stay
+        // live across an `AND`.
 
         Ok(())
     }
@@ -175,41 +226,41 @@ impl<'a> Lifter<'a> {
     ) -> crate::Result<()> {
         let bit_width = (size * 8) as i64;
 
-        let zf = self.builder.ins().icmp_imm_s(IntCC::Equal, res, 0);
-        self.set_flag(X86Flag::Zero, zf)?;
+        if self.flag_needed(X86Flag::Zero) {
+            let zf = self.builder.ins().icmp_imm_s(IntCC::Equal, res, 0);
+            self.set_flag(X86Flag::Zero, zf)?;
+        }
 
-        let sf = self.builder.ins().ushr_imm_u(res, bit_width - 1);
-        self.set_flag(X86Flag::Sign, sf)?;
+        if self.flag_needed(X86Flag::Sign) {
+            let sf = self.builder.ins().ushr_imm_u(res, bit_width - 1);
+            self.set_flag(X86Flag::Sign, sf)?;
+        }
 
         self.set_flag(X86Flag::Carry, cf_out)?;
 
         // OF: signed overflow in lhs + rhs + cf_in
         // Formula: ((lhs ^ res) & (rhs ^ res)) >> (bit_width - 1)
-        let xor1 = self.builder.ins().bxor(lhs, res);
-        let xor2 = self.builder.ins().bxor(rhs, res);
-        let and = self.builder.ins().band(xor1, xor2);
-        let of = self.builder.ins().ushr_imm_u(and, bit_width - 1);
-        self.set_flag(X86Flag::Overflow, of)?;
+        if self.flag_needed(X86Flag::Overflow) {
+            let xor1 = self.builder.ins().bxor(lhs, res);
+            let xor2 = self.builder.ins().bxor(rhs, res);
+            let and = self.builder.ins().band(xor1, xor2);
+            let of = self.builder.ins().ushr_imm_u(and, bit_width - 1);
+            self.set_flag(X86Flag::Overflow, of)?;
+        }
 
         // AF: bit-3 carry/borrow chain - ((lhs ^ rhs ^ res) >> 4) & 1.
         // For ADC/SBB this matches hardware because the cf_in only affects bit 0,
         // and bit-3 carry into bit 4 is captured by the xor of the three operands.
-        let lhs_xor_rhs = self.builder.ins().bxor(lhs, rhs);
-        let af_xor = self.builder.ins().bxor(lhs_xor_rhs, res);
-        let af_shifted = self.builder.ins().ushr_imm_u(af_xor, 4);
-        let af = self.builder.ins().band_imm_u(af_shifted, 1);
-        self.set_flag(X86Flag::Auxiliary, af)?;
+        if self.flag_needed(X86Flag::Auxiliary) {
+            let af = self.auxiliary_of(lhs, rhs, res);
+            self.set_flag(X86Flag::Auxiliary, af)?;
+        }
 
         // PF: even popcount of low 8 bits of result.
-        let res_lo = if self.builder.func.dfg.value_type(res) == types::I8 {
-            res
-        } else {
-            self.builder.ins().ireduce(types::I8, res)
-        };
-        let pop = self.builder.ins().popcnt(res_lo);
-        let pop_lsb = self.builder.ins().band_imm_u(pop, 1);
-        let pf = self.builder.ins().bxor_imm_u(pop_lsb, 1);
-        self.set_flag(X86Flag::Parity, pf)?;
+        if self.flag_needed(X86Flag::Parity) {
+            let pf = self.parity_of(res);
+            self.set_flag(X86Flag::Parity, pf)?;
+        }
 
         Ok(())
     }
@@ -225,38 +276,39 @@ impl<'a> Lifter<'a> {
     ) -> crate::Result<()> {
         let bit_width = (size * 8) as i64;
 
-        let zf = self.builder.ins().icmp_imm_s(IntCC::Equal, res, 0);
-        self.set_flag(X86Flag::Zero, zf)?;
+        if self.flag_needed(X86Flag::Zero) {
+            let zf = self.builder.ins().icmp_imm_s(IntCC::Equal, res, 0);
+            self.set_flag(X86Flag::Zero, zf)?;
+        }
 
-        let sf = self.builder.ins().ushr_imm_u(res, bit_width - 1);
-        self.set_flag(X86Flag::Sign, sf)?;
+        if self.flag_needed(X86Flag::Sign) {
+            let sf = self.builder.ins().ushr_imm_u(res, bit_width - 1);
+            self.set_flag(X86Flag::Sign, sf)?;
+        }
 
         self.set_flag(X86Flag::Carry, cf_out)?;
 
         // OF: signed overflow in lhs - rhs - cf_in
         // Formula: ((lhs ^ rhs) & (lhs ^ res)) >> (bit_width - 1)
-        let xor1 = self.builder.ins().bxor(lhs, rhs);
-        let xor2 = self.builder.ins().bxor(lhs, res);
-        let and = self.builder.ins().band(xor1, xor2);
-        let of = self.builder.ins().ushr_imm_u(and, bit_width - 1);
-        self.set_flag(X86Flag::Overflow, of)?;
+        if self.flag_needed(X86Flag::Overflow) {
+            let xor1 = self.builder.ins().bxor(lhs, rhs);
+            let xor2 = self.builder.ins().bxor(lhs, res);
+            let and = self.builder.ins().band(xor1, xor2);
+            let of = self.builder.ins().ushr_imm_u(and, bit_width - 1);
+            self.set_flag(X86Flag::Overflow, of)?;
+        }
 
-        // AF: ((lhs ^ rhs ^ res) >> 4) & 1 - reuses xor1 = lhs ^ rhs.
-        let af_xor = self.builder.ins().bxor(xor1, res);
-        let af_shifted = self.builder.ins().ushr_imm_u(af_xor, 4);
-        let af = self.builder.ins().band_imm_u(af_shifted, 1);
-        self.set_flag(X86Flag::Auxiliary, af)?;
+        // AF: ((lhs ^ rhs ^ res) >> 4) & 1.
+        if self.flag_needed(X86Flag::Auxiliary) {
+            let af = self.auxiliary_of(lhs, rhs, res);
+            self.set_flag(X86Flag::Auxiliary, af)?;
+        }
 
         // PF: even popcount of low 8 bits of result.
-        let res_lo = if self.builder.func.dfg.value_type(res) == types::I8 {
-            res
-        } else {
-            self.builder.ins().ireduce(types::I8, res)
-        };
-        let pop = self.builder.ins().popcnt(res_lo);
-        let pop_lsb = self.builder.ins().band_imm_u(pop, 1);
-        let pf = self.builder.ins().bxor_imm_u(pop_lsb, 1);
-        self.set_flag(X86Flag::Parity, pf)?;
+        if self.flag_needed(X86Flag::Parity) {
+            let pf = self.parity_of(res);
+            self.set_flag(X86Flag::Parity, pf)?;
+        }
 
         Ok(())
     }
@@ -272,46 +324,46 @@ impl<'a> Lifter<'a> {
         let bit_width = (size * 8) as i64;
 
         // Zero Flag (ZF)
-        let zf = self.builder.ins().icmp_imm_s(IntCC::Equal, res, 0);
-        self.set_flag(X86Flag::Zero, zf)?;
+        if self.flag_needed(X86Flag::Zero) {
+            let zf = self.builder.ins().icmp_imm_s(IntCC::Equal, res, 0);
+            self.set_flag(X86Flag::Zero, zf)?;
+        }
 
         // Sign Flag (SF)
-        let sf = self.builder.ins().ushr_imm_u(res, bit_width - 1);
-        self.set_flag(X86Flag::Sign, sf)?;
+        if self.flag_needed(X86Flag::Sign) {
+            let sf = self.builder.ins().ushr_imm_u(res, bit_width - 1);
+            self.set_flag(X86Flag::Sign, sf)?;
+        }
 
         // Overflow Flag (OF)
-        let of = if is_add {
-            // INC: (lhs ^ res) & (rhs ^ res) then MSB
-            let xor1 = self.builder.ins().bxor(lhs, res);
-            let xor2 = self.builder.ins().bxor(rhs, res);
-            let and = self.builder.ins().band(xor1, xor2);
-            self.builder.ins().ushr_imm_u(and, bit_width - 1)
-        } else {
-            // DEC: (lhs ^ rhs) & (lhs ^ res) then MSB
-            let xor1 = self.builder.ins().bxor(lhs, rhs);
-            let xor2 = self.builder.ins().bxor(lhs, res);
-            let and = self.builder.ins().band(xor1, xor2);
-            self.builder.ins().ushr_imm_u(and, bit_width - 1)
-        };
-        self.set_flag(X86Flag::Overflow, of)?;
+        if self.flag_needed(X86Flag::Overflow) {
+            let of = if is_add {
+                // INC: (lhs ^ res) & (rhs ^ res) then MSB
+                let xor1 = self.builder.ins().bxor(lhs, res);
+                let xor2 = self.builder.ins().bxor(rhs, res);
+                let and = self.builder.ins().band(xor1, xor2);
+                self.builder.ins().ushr_imm_u(and, bit_width - 1)
+            } else {
+                // DEC: (lhs ^ rhs) & (lhs ^ res) then MSB
+                let xor1 = self.builder.ins().bxor(lhs, rhs);
+                let xor2 = self.builder.ins().bxor(lhs, res);
+                let and = self.builder.ins().band(xor1, xor2);
+                self.builder.ins().ushr_imm_u(and, bit_width - 1)
+            };
+            self.set_flag(X86Flag::Overflow, of)?;
+        }
 
         // AF: ((lhs ^ rhs ^ res) >> 4) & 1
-        let lhs_xor_rhs = self.builder.ins().bxor(lhs, rhs);
-        let af_xor = self.builder.ins().bxor(lhs_xor_rhs, res);
-        let af_shifted = self.builder.ins().ushr_imm_u(af_xor, 4);
-        let af = self.builder.ins().band_imm_u(af_shifted, 1);
-        self.set_flag(X86Flag::Auxiliary, af)?;
+        if self.flag_needed(X86Flag::Auxiliary) {
+            let af = self.auxiliary_of(lhs, rhs, res);
+            self.set_flag(X86Flag::Auxiliary, af)?;
+        }
 
         // PF: even popcount of low 8 bits of result.
-        let res_lo = if self.builder.func.dfg.value_type(res) == types::I8 {
-            res
-        } else {
-            self.builder.ins().ireduce(types::I8, res)
-        };
-        let pop = self.builder.ins().popcnt(res_lo);
-        let pop_lsb = self.builder.ins().band_imm_u(pop, 1);
-        let pf = self.builder.ins().bxor_imm_u(pop_lsb, 1);
-        self.set_flag(X86Flag::Parity, pf)?;
+        if self.flag_needed(X86Flag::Parity) {
+            let pf = self.parity_of(res);
+            self.set_flag(X86Flag::Parity, pf)?;
+        }
 
         // Carry Flag (CF) is NOT affected by INC/DEC
         Ok(())
@@ -342,63 +394,82 @@ impl<'a> Lifter<'a> {
     ) -> crate::Result<()> {
         let bit_width = (size * 8) as i64;
 
-        // Load prior values of each flag so we can keep them when count == 0.
-        let old_zf = self.builder.use_var(self.state.flags[&X86Flag::Zero]);
-        let old_sf = self.builder.use_var(self.state.flags[&X86Flag::Sign]);
-        let old_cf = self.builder.use_var(self.state.flags[&X86Flag::Carry]);
-        let old_of = self.builder.use_var(self.state.flags[&X86Flag::Overflow]);
-        let old_pf = self.builder.use_var(self.state.flags[&X86Flag::Parity]);
-
-        // Newly-computed flag values (in operand width), reduced to I8 to
-        // match the flag SSA variable type that `select` requires.
-        let new_zf = self.builder.ins().icmp_imm_s(IntCC::Equal, res, 0);
-        let new_sf_w = self.builder.ins().ushr_imm_u(res, bit_width - 1);
-        let new_sf = if size == 1 {
-            new_sf_w
-        } else {
-            self.builder.ins().ireduce(types::I8, new_sf_w)
-        };
-        let new_cf = if self.builder.func.dfg.value_type(cf_bit) == types::I8 {
-            cf_bit
-        } else {
-            self.builder.ins().ireduce(types::I8, cf_bit)
-        };
-
-        // OF for count == 1: sign change between operand and result.
-        let sign_xor = self.builder.ins().bxor(orig, res);
-        let sign_change_w = self.builder.ins().ushr_imm_u(sign_xor, bit_width - 1);
-        let sign_change = if self.builder.func.dfg.value_type(sign_change_w) == types::I8 {
-            sign_change_w
-        } else {
-            self.builder.ins().ireduce(types::I8, sign_change_w)
-        };
-        let zero_i8 = self.builder.ins().iconst(types::I8, 0);
-        let is_one = self.builder.ins().icmp_imm_s(IntCC::Equal, count, 1);
-        let new_of = self.builder.ins().select(is_one, sign_change, zero_i8);
-
-        // PF: even popcount of the low 8 bits of the result.
-        let res_lo = if self.builder.func.dfg.value_type(res) == types::I8 {
-            res
-        } else {
-            self.builder.ins().ireduce(types::I8, res)
-        };
-        let pop = self.builder.ins().popcnt(res_lo);
-        let pop_lsb = self.builder.ins().band_imm_u(pop, 1);
-        let new_pf = self.builder.ins().bxor_imm_u(pop_lsb, 1);
+        // Every flag here is a read-modify-write, so a dead one skips its old
+        // value, its new value *and* the select between them - three savings
+        // per flag rather than one, which is why this handler is where the
+        // guards pay best. `flag_effects` classifies a shift as reading exactly
+        // this set, so the `use_var`s below are covered: a value one of them
+        // reads cannot have been elided at its definition.
+        let (zf, sf, cf, of, pf) = (
+            self.flag_needed(X86Flag::Zero),
+            self.flag_needed(X86Flag::Sign),
+            self.flag_needed(X86Flag::Carry),
+            self.flag_needed(X86Flag::Overflow),
+            self.flag_needed(X86Flag::Parity),
+        );
+        if !(zf || sf || cf || of || pf) {
+            return Ok(());
+        }
 
         // is_zero is I8 (icmp_imm_s result); select uses any nonzero as true.
         let is_zero = self.builder.ins().icmp_imm_s(IntCC::Equal, count, 0);
-        let final_zf = self.builder.ins().select(is_zero, old_zf, new_zf);
-        let final_sf = self.builder.ins().select(is_zero, old_sf, new_sf);
-        let final_cf = self.builder.ins().select(is_zero, old_cf, new_cf);
-        let final_of = self.builder.ins().select(is_zero, old_of, new_of);
-        let final_pf = self.builder.ins().select(is_zero, old_pf, new_pf);
 
-        self.set_flag(X86Flag::Zero, final_zf)?;
-        self.set_flag(X86Flag::Sign, final_sf)?;
-        self.set_flag(X86Flag::Carry, final_cf)?;
-        self.set_flag(X86Flag::Overflow, final_of)?;
-        self.set_flag(X86Flag::Parity, final_pf)?;
+        if zf {
+            let old_zf = self.builder.use_var(self.state.flags[&X86Flag::Zero]);
+            let new_zf = self.builder.ins().icmp_imm_s(IntCC::Equal, res, 0);
+            let final_zf = self.builder.ins().select(is_zero, old_zf, new_zf);
+            self.set_flag(X86Flag::Zero, final_zf)?;
+        }
+
+        if sf {
+            let old_sf = self.builder.use_var(self.state.flags[&X86Flag::Sign]);
+            // Newly-computed flag values (in operand width), reduced to I8 to
+            // match the flag SSA variable type that `select` requires.
+            let new_sf_w = self.builder.ins().ushr_imm_u(res, bit_width - 1);
+            let new_sf = if size == 1 {
+                new_sf_w
+            } else {
+                self.builder.ins().ireduce(types::I8, new_sf_w)
+            };
+            let final_sf = self.builder.ins().select(is_zero, old_sf, new_sf);
+            self.set_flag(X86Flag::Sign, final_sf)?;
+        }
+
+        if cf {
+            let old_cf = self.builder.use_var(self.state.flags[&X86Flag::Carry]);
+            let new_cf = if self.builder.func.dfg.value_type(cf_bit) == types::I8 {
+                cf_bit
+            } else {
+                self.builder.ins().ireduce(types::I8, cf_bit)
+            };
+            let final_cf = self.builder.ins().select(is_zero, old_cf, new_cf);
+            self.set_flag(X86Flag::Carry, final_cf)?;
+        }
+
+        if of {
+            // OF for count == 1: sign change between operand and result.
+            let old_of = self.builder.use_var(self.state.flags[&X86Flag::Overflow]);
+            let sign_xor = self.builder.ins().bxor(orig, res);
+            let sign_change_w = self.builder.ins().ushr_imm_u(sign_xor, bit_width - 1);
+            let sign_change = if self.builder.func.dfg.value_type(sign_change_w) == types::I8 {
+                sign_change_w
+            } else {
+                self.builder.ins().ireduce(types::I8, sign_change_w)
+            };
+            let zero_i8 = self.builder.ins().iconst(types::I8, 0);
+            let is_one = self.builder.ins().icmp_imm_s(IntCC::Equal, count, 1);
+            let new_of = self.builder.ins().select(is_one, sign_change, zero_i8);
+            let final_of = self.builder.ins().select(is_zero, old_of, new_of);
+            self.set_flag(X86Flag::Overflow, final_of)?;
+        }
+
+        if pf {
+            // PF: even popcount of the low 8 bits of the result.
+            let old_pf = self.builder.use_var(self.state.flags[&X86Flag::Parity]);
+            let new_pf = self.parity_of(res);
+            let final_pf = self.builder.ins().select(is_zero, old_pf, new_pf);
+            self.set_flag(X86Flag::Parity, final_pf)?;
+        }
 
         Ok(())
     }

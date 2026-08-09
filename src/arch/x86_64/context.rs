@@ -1,7 +1,7 @@
 //! x86-64 guest register context (the FFI struct passed to lifted code).
 //!
 //! Kept as a flat `#[repr(C)]` struct so existing host/test code that reads
-//! fields by name (`ctx.rax`, `ctx.rip`, `ctx.exit_reason`, …) is unaffected.
+//! fields by name (`ctx.rax`, `ctx.rip`, `ctx.exit_reason`, ) is unaffected.
 //! The architecture-neutral control fields (`exit_reason`, `exit_code`,
 //! `imported_function_va`, `image_base`) mirror [`crate::core::exit::ControlHeader`]
 //! conceptually but stay inline to preserve the established layout.

@@ -140,7 +140,7 @@ pub fn instruction_effects(i: &Instruction) -> InstructionEffects {
     }
 
     // Status flags are tracked separately from registers by iced; fold them in
-    // as pseudo-registers (`cf`, `zf`, …) for def-use analysis.
+    // as pseudo-registers (`cf`, `zf`, ) for def-use analysis.
     for (bit, name) in RFLAG_NAMES {
         if i.rflags_read() & bit != 0 {
             push_unique(&mut reads, name);

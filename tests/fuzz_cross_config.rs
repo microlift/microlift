@@ -50,6 +50,31 @@ proptest! {
         }
     }
 
+    /// Skipping the flag writes nothing reads may not change a single bit of
+    /// state - flags very much included, since a mistake in the classification
+    /// shows up there and nowhere else.
+    ///
+    /// The dedicated suite (`dead_flag_tests`) covers the seams by hand; this
+    /// is the half that tries operands nobody thought of.
+    #[test]
+    fn dead_flag_elimination_changes_nothing(
+        op in any_alu_op(),
+        a in any::<u64>(),
+        b in any::<u64>(),
+    ) {
+        let bytes = alu_snippet(op, a, b);
+        let run = |lean: bool| {
+            let test = LiftTest::new(&bytes).opt(Opt::Speed);
+            let test = if lean { test.eliminate_dead_flags() } else { test };
+            fingerprint(&test.run().ctx)
+        };
+        prop_assert_eq!(
+            run(true), run(false),
+            "dead-flag divergence for {:?} {:#x},{:#x}",
+            op, a, b
+        );
+    }
+
     /// `AddressMode::Direct` bakes lift-time VAs in as constants instead of
     /// rebasing them onto `image_base`. When the image is loaded exactly where
     /// it was lifted - which `LiftTest` does by default - the two must be

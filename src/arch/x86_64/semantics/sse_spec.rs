@@ -23,10 +23,7 @@ impl<'a> Lifter<'a> {
     fn horizontal_pair(&mut self, a: Value, b: Value, bits: u32) -> (Value, Value) {
         let even = Self::lane_shuffle_mask(bits, |j| 2 * j);
         let odd = Self::lane_shuffle_mask(bits, |j| 2 * j + 1);
-        (
-            self.vec_shuffle(a, b, even),
-            self.vec_shuffle(a, b, odd),
-        )
+        (self.vec_shuffle(a, b, even), self.vec_shuffle(a, b, odd))
     }
 
     /// `ROUNDPS` / `ROUNDPD` as one packed rounding instruction.
@@ -125,10 +122,7 @@ impl<'a> Lifter<'a> {
         let bits = width.bits();
 
         let gathers = op != HorizOp::Add;
-        if gathers
-            && bits < 32
-            && self.config.specialization.target() == SpecTarget::X86_64
-        {
+        if gathers && bits < 32 && self.config.specialization.target() == SpecTarget::X86_64 {
             return Ok(false);
         }
 

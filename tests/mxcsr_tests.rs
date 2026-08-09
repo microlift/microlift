@@ -417,7 +417,7 @@ fn test_fninit_resets_control_state() {
     assert_eq!(out.fpr[1], [0x1234_5678_9ABC_DEF0, 0x4000]);
 }
 
-/// A `9B`-prefixed `FSTENV`/`FCLEX` decodes as `WAIT` + the `FN…` form; the
+/// A `9B`-prefixed `FSTENV`/`FCLEX` decodes as `WAIT` + the `FN` form; the
 /// `WAIT` must lift as a no-op rather than an unsupported instruction.
 #[test]
 fn test_wait_prefixed_forms() {
