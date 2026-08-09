@@ -90,6 +90,60 @@ fn outlined_kernels_match_inline_emission() {
     assert_eq!(run_f80(&FDIVP, F80_SIX, F80_THREE, true), F80_TWO);
 }
 
+#[test]
+fn outlined_cos_matches_inline_emission() {
+    // The transcendental kernel is unary, so it takes its own program shape:
+    // `fld tbyte [rdi]; fcos; fstp tbyte [rdx]; ret`.
+    let bytes = [0xDB, 0x2F, 0xD9, 0xFF, 0xDB, 0x3A, 0xC3];
+    let run = |arg: [u64; 2], outline: bool| {
+        let mut input = arg;
+        let mut out = [0u64; 2];
+        LiftTest::new(&bytes)
+            .with_config(|c| c.outline_helpers = outline)
+            .reg(|c| {
+                c.rdi = input.as_mut_ptr() as u64;
+                c.rdx = out.as_mut_ptr() as u64;
+            })
+            .no_unicorn()
+            .run();
+        out
+    };
+
+    for arg in [F80_ONE, F80_TWO, F80_THREE, F80_SIX] {
+        assert_eq!(
+            run(arg, true),
+            run(arg, false),
+            "outlined and inlined fcos disagree for {arg:#x?}"
+        );
+    }
+    // cos(0) == 1 exactly, in both strategies.
+    let zero = [0u64, 0];
+    assert_eq!(run(zero, true), F80_ONE);
+    assert_eq!(run(zero, false), F80_ONE);
+}
+
+#[test]
+fn cos_kernel_cross_compiles() {
+    // The kernel is written out of Cranelift ops that lower everywhere; the
+    // 128-bit fixed-point sequences in particular must not need a host x86-64.
+    let bytes = [0xDB, 0x2F, 0xD9, 0xFF, 0xDB, 0x3A, 0xC3];
+    // aarch64 is the interesting target: it is the one that would reject an op
+    // that only lowers on the x64 backend. (Cross-compiling *any* x87 region to
+    // a non-host x86-64 triple panics inside Cranelift's x64 ABI code, which
+    // predates this kernel and is not specific to it.)
+    let triple = "aarch64-unknown-linux-gnu";
+    let code =
+        lift_to_code::<X86_64>(&bytes, DEFAULT_LIFT_BASE, LifterConfig::default()).expect("lift");
+    assert!(
+        code.helpers
+            .iter()
+            .any(|h| h.name == F80Kernel::Cos.symbol()),
+        "FCOS should outline the cos kernel"
+    );
+    ArtifactBackend::compile_lifted_to_object(code, Some(triple), None, &[])
+        .unwrap_or_else(|e| panic!("compile for {triple}: {e}"));
+}
+
 /// Compile a region both ways and return `(outlined_bytes, inlined_bytes)` of
 /// emitted machine code.
 fn text_sizes(bytes: &[u8]) -> (usize, usize) {

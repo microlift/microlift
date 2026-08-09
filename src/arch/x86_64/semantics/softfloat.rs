@@ -28,6 +28,8 @@
 //!    support is a later refinement.
 //!  - NaN results use the canonical x87 QNaN indefinite rather than propagating
 //!    input payloads bit-for-bit.
+//!  - The transcendental kernel ([`emit_f80_cos`]) is correctly *reduced* but
+//!    not correctly *rounded*: see its own accuracy note.
 
 use cranelift::prelude::*;
 use cranelift_codegen::isa::CallConv;
@@ -845,6 +847,462 @@ pub fn emit_f80_cmp(
     (unord, eq, lt)
 }
 
+/// `floor((2/pi) * 2^256)`, least-significant limb first.
+///
+/// Argument reduction is Payne-Hanek: the quadrant and the reduced argument
+/// both come out of the bits of `|x| * 2/pi`, which needs `2/pi` to far more
+/// precision than 80 bits. 256 bits is sized for the whole `FCOS` domain -
+/// `|x| < 2^63` puts the worst-case cancellation (an argument sitting almost
+/// exactly on a multiple of `pi/2`) around 2^-70, leaving well over 64 good
+/// bits in the remainder.
+const TWO_OVER_PI_Q256: [u64; 4] = [
+    0xFE51_63AB_DEBB_C561,
+    0xDB62_9599_3C43_9041,
+    0xFC27_57D1_F534_DDC0,
+    0xA2F9_836E_4E44_1529,
+];
+
+/// `floor((pi/2) * 2^127)`, as `(high, low)` 64-bit halves.
+const PI_OVER_2_Q127: (u64, u64) = (0xC90F_DAA2_2168_C234, 0xC4C6_628B_80DC_1CD1);
+
+/// Taylor coefficients of `cos` in `u = r^2`: `(-1)^k / (2k)!`, as Q126
+/// two's-complement `(high, low)` halves.
+///
+/// Twelve terms take the truncation error below 2^-87 over the whole reduced
+/// range `|r| <= pi/4` (`u <= 0.618`), which is far under the Q126 accumulator's
+/// own rounding noise.
+const COS_COEFFS_Q126: [(u64, u64); TRIG_POLY_TERMS] = [
+    (0x4000_0000_0000_0000, 0x0000_0000_0000_0000),
+    (0xE000_0000_0000_0000, 0x0000_0000_0000_0000),
+    (0x02AA_AAAA_AAAA_AAAA, 0xAAAA_AAAA_AAAA_AAAB),
+    (0xFFE9_3E93_E93E_93E9, 0x3E93_E93E_93E9_3E94),
+    (0x0000_6806_8068_0680, 0x6806_8068_0680_6807),
+    (0xFFFF_FED8_1B04_8876, 0x0A38_D10F_E92C_159A),
+    (0x0000_0002_3DDB_1DFF, 0x1B12_F6A8_9B53_0F5A),
+    (0xFFFF_FFFF_FCD8_D16A, 0xE7F0_6C5B_E8A4_1D74),
+    (0x0000_0000_0003_5CFE, 0x7CE6_7703_E23B_0CAD),
+    (0xFFFF_FFFF_FFFF_FD2F, 0xB0F3_88D0_4D10_89FF),
+    (0x0000_0000_0000_0001, 0xE542_BA40_2022_507B),
+    (0xFFFF_FFFF_FFFF_FFFF, 0xFEF3_1C69_2480_7AD7),
+];
+
+/// Taylor coefficients of `sin(r)/r` in `u = r^2`: `(-1)^k / (2k+1)!`, Q126.
+const SIN_COEFFS_Q126: [(u64, u64); TRIG_POLY_TERMS] = [
+    (0x4000_0000_0000_0000, 0x0000_0000_0000_0000),
+    (0xF555_5555_5555_5555, 0x5555_5555_5555_5555),
+    (0x0088_8888_8888_8888, 0x8888_8888_8888_8889),
+    (0xFFFC_BFCB_FCBF_CBFC, 0xBFCB_FCBF_CBFC_BFCC),
+    (0x0000_0B8E_F1D2_AB63, 0x99C7_D560_E447_2801),
+    (0xFFFF_FFE5_19BA_980A, 0xBB1C_7018_B81B_47C8),
+    (0x0000_0000_2C24_8C27, 0x50DA_12F9_4706_63A4),
+    (0xFFFF_FFFF_FFCA_3018, 0x3198_8FC1_DC4F_352A),
+    (0x0000_0000_0000_32A5, 0x8EE0_615A_94D6_4C0A),
+    (0xFFFF_FFFF_FFFF_FFDA, 0x16C9_72FD_7D51_B66C),
+    (0x0000_0000_0000_0000, 0x171B_8EF6_DCF5_718C),
+    (0xFFFF_FFFF_FFFF_FFFF, 0xFFF4_4F25_F674_E3F3),
+];
+
+const TRIG_POLY_TERMS: usize = 12;
+
+/// Biased exponent of `0.5` - at or above it an argument can exceed `pi/4` and
+/// needs reducing; below it, it *is* its own reduced argument.
+const REDUCE_MIN_EXP: i64 = 16382;
+
+/// Materialise a 128-bit constant from its two 64-bit halves (Cranelift's
+/// `iconst` tops out at `I64`).
+fn const_i128(b: &mut FunctionBuilder, hi: u64, lo: u64) -> Value {
+    let h = b.ins().iconst(types::I64, hi as i64);
+    let l = b.ins().iconst(types::I64, lo as i64);
+    join128(b, h, l)
+}
+
+/// Join two `I64` halves into an `I128`.
+fn join128(b: &mut FunctionBuilder, hi: Value, lo: Value) -> Value {
+    let h = b.ins().uextend(types::I128, hi);
+    let h = b.ins().ishl_imm_u(h, 64);
+    let l = b.ins().uextend(types::I128, lo);
+    b.ins().bor(h, l)
+}
+
+fn lo64(b: &mut FunctionBuilder, v: Value) -> Value {
+    b.ins().ireduce(types::I64, v)
+}
+
+fn hi64(b: &mut FunctionBuilder, v: Value) -> Value {
+    let s = b.ins().ushr_imm_u(v, 64);
+    b.ins().ireduce(types::I64, s)
+}
+
+fn zero128(b: &mut FunctionBuilder) -> Value {
+    let z = b.ins().iconst(types::I64, 0);
+    b.ins().uextend(types::I128, z)
+}
+
+/// Widen an `I32`/`I64` shift amount to `I128`, the width the value being
+/// shifted has.
+fn shift_amt(b: &mut FunctionBuilder, v: Value) -> Value {
+    b.ins().uextend(types::I128, v)
+}
+
+/// High 128 bits of the unsigned 256-bit product `x * y`.
+///
+/// Cranelift's `imul` on `I128` keeps only the low half and there is no
+/// `umulhi.i128`, so this is schoolbook over the four 64-bit limbs - each
+/// partial product is an exact `I128` multiply of two zero-extended limbs.
+fn umulhi128(b: &mut FunctionBuilder, x: Value, y: Value) -> Value {
+    let x0 = lo64(b, x);
+    let x1 = hi64(b, x);
+    let y0 = lo64(b, y);
+    let y1 = hi64(b, y);
+    let mul = |b: &mut FunctionBuilder, a: Value, c: Value| {
+        let a = b.ins().uextend(types::I128, a);
+        let c = b.ins().uextend(types::I128, c);
+        b.ins().imul(a, c)
+    };
+    let p00 = mul(b, x0, y0);
+    let p01 = mul(b, x0, y1);
+    let p10 = mul(b, x1, y0);
+    let p11 = mul(b, x1, y1);
+
+    let mask = const_i128(b, 0, u64::MAX);
+    let mid = {
+        let c00 = b.ins().ushr_imm_u(p00, 64);
+        let l01 = b.ins().band(p01, mask);
+        let l10 = b.ins().band(p10, mask);
+        let s = b.ins().iadd(c00, l01);
+        b.ins().iadd(s, l10)
+    };
+    let h01 = b.ins().ushr_imm_u(p01, 64);
+    let h10 = b.ins().ushr_imm_u(p10, 64);
+    let hmid = b.ins().ushr_imm_u(mid, 64);
+    let s = b.ins().iadd(p11, h01);
+    let s = b.ins().iadd(s, h10);
+    b.ins().iadd(s, hmid)
+}
+
+/// High 128 bits of `a * y` where `a` is **signed** and `y` unsigned - the
+/// usual correction on top of the unsigned product.
+fn mulhi_su(b: &mut FunctionBuilder, a: Value, y: Value) -> Value {
+    let hi = umulhi128(b, a, y);
+    let z = zero128(b);
+    let neg = b.ins().icmp(IntCC::SignedLessThan, a, z);
+    let corr = b.ins().select(neg, y, z);
+    b.ins().isub(hi, corr)
+}
+
+/// Reduce `|x|` (given as its raw significand and biased exponent) modulo
+/// `pi/2`.
+///
+/// Returns `(n, r_sig, r_exp, r_sign)`: the nearest quadrant index `n =
+/// round(|x| / (pi/2))` as an `I64`, and the remainder `r = |x| - n*(pi/2)`,
+/// `|r| <= pi/4`, as a normalised significand + biased exponent + sign bit.
+///
+/// The caller must have established `|x| < 2^63` and that `x` is finite; that
+/// bound is exactly what makes the fixed 256-bit `2/pi` window enough.
+fn emit_trig_reduce(b: &mut FunctionBuilder, m: Value, e: Value) -> (Value, Value, Value, Value) {
+    let i128 = types::I128;
+    let i32t = types::I32;
+
+    // `|x| < 1/2` is already its own remainder, in quadrant 0. Both paths are
+    // computed and selected between; the shifts below are clamped so the
+    // discarded one cannot produce an out-of-range shift amount.
+    let need = b
+        .ins()
+        .icmp_imm_s(IntCC::SignedGreaterThanOrEqual, e, REDUCE_MIN_EXP);
+
+    // `x = m * 2^E` with `E = e - 16446`; the reduction path has `E` in
+    // [-64, -1], so `t = -E` lies in [1, 64].
+    let t = {
+        let base = b.ins().iconst(i32t, 16446);
+        let t = b.ins().isub(base, e);
+        let one = b.ins().iconst(i32t, 1);
+        let too_small = b.ins().icmp_imm_s(IntCC::SignedLessThan, t, 1);
+        let t = b.ins().select(too_small, one, t);
+        let c64 = b.ins().iconst(i32t, 64);
+        let too_big = b.ins().icmp_imm_s(IntCC::SignedGreaterThan, t, 64);
+        b.ins().select(too_big, c64, t)
+    };
+
+    // D = floor((2/pi) * 2^(256+E)) = TWO_OVER_PI_Q256 >> t, as four limbs.
+    let a_lo = const_i128(b, TWO_OVER_PI_Q256[1], TWO_OVER_PI_Q256[0]);
+    let a_hi = const_i128(b, TWO_OVER_PI_Q256[3], TWO_OVER_PI_Q256[2]);
+    let t128 = shift_amt(b, t);
+    let inv_t = {
+        let c128 = b.ins().iconst(i32t, 128);
+        let d = b.ins().isub(c128, t);
+        shift_amt(b, d)
+    };
+    let d_lo = {
+        let down = b.ins().ushr(a_lo, t128);
+        let up = b.ins().ishl(a_hi, inv_t);
+        b.ins().bor(down, up)
+    };
+    let d_hi = b.ins().ushr(a_hi, t128);
+    let d_limbs = [lo64(b, d_lo), hi64(b, d_lo), lo64(b, d_hi), hi64(b, d_hi)];
+
+    // U = m * D: a 320-bit product whose limbs 0..3 are the fractional part of
+    // `|x| / (pi/2)` (in units of 2^-256) and whose limb 4 is its integer part.
+    let m128 = b.ins().uextend(i128, m);
+    let mut carry = b.ins().iconst(types::I64, 0);
+    let mut frac = [carry; 4];
+    for (i, &d) in d_limbs.iter().enumerate() {
+        let d128 = b.ins().uextend(i128, d);
+        let p = b.ins().imul(m128, d128);
+        let c128 = b.ins().uextend(i128, carry);
+        let p = b.ins().iadd(p, c128);
+        frac[i] = lo64(b, p);
+        carry = hi64(b, p);
+    }
+    let int_part = carry;
+
+    let frac_lo = join128(b, frac[1], frac[0]);
+    let frac_hi = join128(b, frac[3], frac[2]);
+
+    // Round the quotient to nearest: a fraction at or above 1/2 belongs to the
+    // next quadrant, with a negative remainder.
+    let half = {
+        let s = b.ins().ushr_imm_u(frac_hi, 127);
+        b.ins().ireduce(types::I64, s)
+    };
+    let half_b = b.ins().icmp_imm_s(IntCC::NotEqual, half, 0);
+    let n = b.ins().iadd(int_part, half);
+
+    // |frac - n| as a 256-bit fraction: either `frac` or its two's complement.
+    let z = zero128(b);
+    let neg_lo = b.ins().isub(z, frac_lo);
+    let neg_hi = {
+        let borrow = {
+            let nz = b.ins().icmp(IntCC::NotEqual, frac_lo, z);
+            b.ins().uextend(i128, nz)
+        };
+        let h = b.ins().isub(z, frac_hi);
+        b.ins().isub(h, borrow)
+    };
+    let mag_lo = b.ins().select(half_b, neg_lo, frac_lo);
+    let mag_hi = b.ins().select(half_b, neg_hi, frac_hi);
+
+    // Normalise the magnitude to its top 128 bits, `M`, with `c` leading zeros
+    // over the full 256: `|frac - n| = (M / 2^128) * 2^-c`.
+    let hi_nz = b.ins().icmp(IntCC::NotEqual, mag_hi, z);
+    let c = {
+        let ch = clz128(b, mag_hi);
+        let cl = {
+            let c = clz128(b, mag_lo);
+            b.ins().iadd_imm_s(c, 128)
+        };
+        b.ins().select(hi_nz, ch, cl)
+    };
+    let c32 = b.ins().ireduce(i32t, c);
+    let c128 = shift_amt(b, c);
+    let m_from_hi = {
+        let up = b.ins().ishl(mag_hi, c128);
+        let rest = {
+            let c128v = b.ins().iconst(i32t, 128);
+            let d = b.ins().isub(c128v, c32);
+            let d = shift_amt(b, d);
+            let r = b.ins().ushr(mag_lo, d);
+            // `c == 0` would make that a 128-bit shift, which Cranelift masks
+            // back to zero; there is nothing to carry in then anyway.
+            let c_zero = b.ins().icmp_imm_s(IntCC::Equal, c, 0);
+            b.ins().select(c_zero, z, r)
+        };
+        b.ins().bor(up, rest)
+    };
+    let m_from_lo = {
+        let d = b.ins().iadd_imm_s(c32, -128);
+        let d = shift_amt(b, d);
+        b.ins().ishl(mag_lo, d)
+    };
+    let mnorm = b.ins().select(hi_nz, m_from_hi, m_from_lo);
+
+    // |r| = (M / 2^128) * 2^-c * (pi/2); the product lands in [0.785, 1.571)
+    // as a Q127 value.
+    let pi2 = const_i128(b, PI_OVER_2_Q127.0, PI_OVER_2_Q127.1);
+    let w = umulhi128(b, mnorm, pi2);
+    let top_set = {
+        let s = b.ins().ushr_imm_u(w, 127);
+        let s = b.ins().ireduce(types::I64, s);
+        b.ins().icmp_imm_s(IntCC::NotEqual, s, 0)
+    };
+    let k = {
+        let k64 = b.ins().iconst(i32t, 64);
+        let k63 = b.ins().iconst(i32t, 63);
+        b.ins().select(top_set, k64, k63)
+    };
+    let sig = {
+        let sh = shift_amt(b, k);
+        let s = b.ins().ushr(w, sh);
+        b.ins().ireduce(types::I64, s)
+    };
+    let round_bit = {
+        let km1 = b.ins().iadd_imm_s(k, -1);
+        let sh = shift_amt(b, km1);
+        let s = b.ins().ushr(w, sh);
+        let s = b.ins().ireduce(types::I64, s);
+        b.ins().band_imm_u(s, 1)
+    };
+    let (sig_r, exp_carry) = round_significand(b, sig, round_bit);
+    // `|r| = sig * 2^(k - 127 - c)`, i.e. biased exponent 16383 + k - 64 - c.
+    let r_exp = {
+        let x = b.ins().iadd_imm_s(k, 16383 - 64);
+        let x = b.ins().isub(x, c32);
+        b.ins().iadd(x, exp_carry)
+    };
+
+    // An argument that is an exact multiple of pi/2 reduces to zero, which has
+    // no leading bit to normalise against.
+    let mag_zero = {
+        let l = b.ins().icmp(IntCC::Equal, mag_lo, z);
+        let h = b.ins().icmp(IntCC::Equal, mag_hi, z);
+        b.ins().band(l, h)
+    };
+    let zero64 = b.ins().iconst(types::I64, 0);
+    let zero32 = b.ins().iconst(i32t, 0);
+    let sig_r = b.ins().select(mag_zero, zero64, sig_r);
+    let r_exp = b.ins().select(mag_zero, zero32, r_exp);
+
+    let n = b.ins().select(need, n, zero64);
+    let r_sig = b.ins().select(need, sig_r, m);
+    let r_exp = b.ins().select(need, r_exp, e);
+    let r_sign = {
+        let no = b.ins().iconst(types::I8, 0);
+        b.ins().select(need, half_b, no)
+    };
+    (n, r_sig, r_exp, r_sign)
+}
+
+/// Emit `cos(a)` for a raw 80-bit value.
+///
+/// The caller is responsible for the x87 out-of-range protocol: this assumes
+/// `|a| < 2^63` (the domain on which `FCOS` computes at all) and returns the
+/// QNaN indefinite for a NaN or infinite input.
+///
+/// Shape: Payne-Hanek reduction against a 256-bit `2/pi` gives the quadrant and
+/// a remainder `|r| <= pi/4`; a twelve-term Horner evaluation in `u = r^2` gives
+/// `cos(r)` or `sin(r)/r`, selected per coefficient by the quadrant so the two
+/// series share one evaluation. The polynomial runs in 128-bit fixed point (Q126
+/// accumulator, Q127 argument) rather than through the 80-bit kernels: the
+/// series value is always near 1, so absolute precision there *is* relative
+/// precision, at a fraction of the IR. The `sin` case then multiplies by the
+/// *normalised* `r` rather than a fixed-point one, so an argument that lands
+/// almost exactly on a multiple of `pi/2` keeps its relative accuracy.
+///
+/// Accuracy: faithful to the 64-bit significand - every case in
+/// `fpu_tests::test_fcos_full_80_bit_precision`, checked against a 90-digit
+/// reference, comes out correctly rounded, including an argument on the 80-bit
+/// `pi/2` where the true result is ~3.4e-20 and survives only because of the
+/// reduction's spare bits. Correct rounding is *not* guaranteed in general
+/// (nothing here bounds the Q126 accumulator against a hard case), so the test
+/// allows a bit of slack. Real x87 hardware reduces against a 66-bit `pi` and is
+/// far *less* accurate than this for large arguments, so no bit-exact agreement
+/// with it is possible or attempted.
+pub fn emit_f80_cos(b: &mut FunctionBuilder, am: Value, ase: Value) -> (Value, Value) {
+    let i128 = types::I128;
+    let i32t = types::I32;
+
+    let e = exp_of(b, ase);
+    let a_nan = is_nan(b, am, ase);
+    let a_inf = is_inf(b, am, ase);
+
+    // cos is even, so the sign of the argument is dropped entirely.
+    let (n, r_sig, r_exp, r_sign) = emit_trig_reduce(b, am, e);
+
+    // cos(n*pi/2 + r) is cos(r), -sin(r), -cos(r), sin(r) for n mod 4 = 0..3.
+    let use_sin = {
+        let o = b.ins().band_imm_u(n, 1);
+        b.ins().icmp_imm_s(IntCC::NotEqual, o, 0)
+    };
+    let base_sign = {
+        let p = b.ins().iadd_imm_s(n, 1);
+        let s = b.ins().ushr_imm_u(p, 1);
+        let s = b.ins().band_imm_u(s, 1);
+        b.ins().ireduce(i32t, s)
+    };
+
+    // u = r^2 as Q127. `r = r_sig * 2^(r_exp - 16446)`, so the square needs a
+    // right shift of `32765 - 2*r_exp`, which is at least 1 for any |r| < 1 and
+    // saturates to "u is zero" for arguments too small to matter.
+    let rsq = {
+        let rs = b.ins().uextend(i128, r_sig);
+        b.ins().imul(rs, rs)
+    };
+    let u = {
+        let base = b.ins().iconst(i32t, 32765);
+        let twice = b.ins().imul_imm_s(r_exp, 2);
+        let sh = b.ins().isub(base, twice);
+        let vanishes = b.ins().icmp_imm_s(IntCC::SignedGreaterThanOrEqual, sh, 128);
+        let sh = shift_amt(b, sh);
+        let u = b.ins().ushr(rsq, sh);
+        let z = zero128(b);
+        b.ins().select(vanishes, z, u)
+    };
+
+    // Horner over the Taylor series. Both coefficient sets have the same shape,
+    // so selecting the coefficient per term costs twelve `select`s instead of a
+    // second full evaluation.
+    let coeff = |b: &mut FunctionBuilder, k: usize, use_sin: Value| {
+        let c = const_i128(b, COS_COEFFS_Q126[k].0, COS_COEFFS_Q126[k].1);
+        let s = const_i128(b, SIN_COEFFS_Q126[k].0, SIN_COEFFS_Q126[k].1);
+        b.ins().select(use_sin, s, c)
+    };
+    let mut p = coeff(b, TRIG_POLY_TERMS - 1, use_sin);
+    for k in (0..TRIG_POLY_TERMS - 1).rev() {
+        // Q126 * Q127 keeps Q125 in the high half; one shift restores Q126.
+        let t = mulhi_su(b, p, u);
+        let t = b.ins().ishl_imm_u(t, 1);
+        let c = coeff(b, k, use_sin);
+        p = b.ins().iadd(t, c);
+    }
+
+    // The series value is positive and in [0.7, 1] either way; normalise it into
+    // an 80-bit significand and exponent.
+    let pc = clz128(b, p);
+    let pn = {
+        let sh = shift_amt(b, pc);
+        b.ins().ishl(p, sh)
+    };
+    let p_sig = {
+        let s = b.ins().ushr_imm_u(pn, 64);
+        b.ins().ireduce(types::I64, s)
+    };
+    let p_round = {
+        let s = b.ins().ushr_imm_u(pn, 63);
+        let s = b.ins().ireduce(types::I64, s);
+        b.ins().band_imm_u(s, 1)
+    };
+    let (p_sig, p_carry) = round_significand(b, p_sig, p_round);
+    let p_exp = {
+        let pc32 = b.ins().ireduce(i32t, pc);
+        let base = b.ins().iconst(i32t, 16384);
+        let x = b.ins().isub(base, pc32);
+        b.ins().iadd(x, p_carry)
+    };
+
+    // sin(r) = r * (sin(r)/r); cos(r) is the series value itself.
+    let (sm, sse) = emit_f80_mul(b, r_sig, r_exp, p_sig, p_exp);
+    let vm = b.ins().select(use_sin, sm, p_sig);
+    let vse = b.ins().select(use_sin, sse, p_exp);
+
+    let sign = {
+        let zero32 = b.ins().iconst(i32t, 0);
+        let rs = b.ins().uextend(i32t, r_sign);
+        let s = b.ins().select(use_sin, rs, zero32);
+        b.ins().bxor(base_sign, s)
+    };
+    let se = {
+        let mag = b.ins().band_imm_u(vse, EXP_MAX);
+        compose_se(b, sign, mag)
+    };
+
+    // cos of an infinity is an invalid operation, and of a NaN a NaN; both
+    // deliver the QNaN indefinite.
+    let (qm, qse) = qnan(b);
+    let bad = b.ins().bor(a_nan, a_inf);
+    let m = b.ins().select(bad, qm, vm);
+    let se = b.ins().select(bad, qse, se);
+    (m, se)
+}
+
 // --- outlinable kernels --------------------------------------------------
 
 /// One 80-bit softfloat kernel, identified so it can be emitted **once** into a
@@ -867,17 +1325,20 @@ pub enum F80Kernel {
     Mul,
     Div,
     Sqrt,
+    /// Cosine, on the reduced domain `|x| < 2^63` (see [`emit_f80_cos`]).
+    Cos,
     /// Ordered compare, returning the `(unordered, equal, less_than)` triple.
     Cmp,
 }
 
 /// Every kernel, for callers that want to pre-emit or enumerate them.
-pub const F80_KERNELS: [F80Kernel; 6] = [
+pub const F80_KERNELS: [F80Kernel; 7] = [
     F80Kernel::Add,
     F80Kernel::Sub,
     F80Kernel::Mul,
     F80Kernel::Div,
     F80Kernel::Sqrt,
+    F80Kernel::Cos,
     F80Kernel::Cmp,
 ];
 
@@ -892,6 +1353,7 @@ impl F80Kernel {
             F80Kernel::Mul => "__microlift_f80_mul",
             F80Kernel::Div => "__microlift_f80_div",
             F80Kernel::Sqrt => "__microlift_f80_sqrt",
+            F80Kernel::Cos => "__microlift_f80_cos",
             F80Kernel::Cmp => "__microlift_f80_cmp",
         }
     }
@@ -900,7 +1362,7 @@ impl F80Kernel {
     /// parameter pair).
     fn operand_count(self) -> usize {
         match self {
-            F80Kernel::Sqrt => 1,
+            F80Kernel::Sqrt | F80Kernel::Cos => 1,
             _ => 2,
         }
     }
@@ -955,13 +1417,19 @@ impl F80Kernel {
                 let (m, se) = emit_f80_sqrt(b, p[0], p[1]);
                 b.ins().return_(&[m, se]);
             }
+            F80Kernel::Cos => {
+                let (m, se) = emit_f80_cos(b, p[0], p[1]);
+                b.ins().return_(&[m, se]);
+            }
             _ => {
                 let (m, se) = match self {
                     F80Kernel::Add => emit_f80_add(b, p[0], p[1], p[2], p[3]),
                     F80Kernel::Sub => emit_f80_sub(b, p[0], p[1], p[2], p[3]),
                     F80Kernel::Mul => emit_f80_mul(b, p[0], p[1], p[2], p[3]),
                     F80Kernel::Div => emit_f80_div(b, p[0], p[1], p[2], p[3]),
-                    F80Kernel::Sqrt | F80Kernel::Cmp => unreachable!("handled above"),
+                    F80Kernel::Sqrt | F80Kernel::Cos | F80Kernel::Cmp => {
+                        unreachable!("handled above")
+                    }
                 };
                 b.ins().return_(&[m, se]);
             }

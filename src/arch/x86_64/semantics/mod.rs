@@ -738,6 +738,7 @@ impl<'a> Lifter<'a> {
             Mnemonic::Fabs => self.handle_fabs(instruction),
             Mnemonic::Fchs => self.handle_fchs(instruction),
             Mnemonic::Fsqrt => self.handle_fsqrt(instruction),
+            Mnemonic::Fcos => self.handle_fcos(instruction),
 
             // x87 FPU - comparisons
             Mnemonic::Fcom => self.handle_fcom(instruction, false),

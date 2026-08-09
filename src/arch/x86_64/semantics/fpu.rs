@@ -758,6 +758,7 @@ impl<'a> Lifter<'a> {
                 F80Kernel::Mul => softfloat::emit_f80_mul(b, args[0], args[1], args[2], args[3]),
                 F80Kernel::Div => softfloat::emit_f80_div(b, args[0], args[1], args[2], args[3]),
                 F80Kernel::Sqrt => softfloat::emit_f80_sqrt(b, args[0], args[1]),
+                F80Kernel::Cos => softfloat::emit_f80_cos(b, args[0], args[1]),
                 F80Kernel::Cmp => {
                     let (unord, eq, lt) =
                         softfloat::emit_f80_cmp(b, args[0], args[1], args[2], args[3]);
@@ -833,6 +834,35 @@ impl<'a> Lifter<'a> {
         let (m, se) = self.fpu_read_st_raw(0);
         let (rm, rse) = self.f80_value_kernel(F80Kernel::Sqrt, &[m, se]);
         self.fpu_write_st_raw(0, rm, rse);
+        Ok(())
+    }
+
+    /// FCOS - `ST(0) = cos(ST(0))`, with the x87 out-of-range protocol.
+    ///
+    /// The hardware only reduces arguments with `|ST(0)| < 2^63`; outside that
+    /// it leaves `ST(0)` untouched and sets `C2`, which is the signal for the
+    /// caller's own `FPREM1` reduction loop. `C1` is cleared (nothing was
+    /// rounded up and no stack fault occurred); `C0`/`C3` are architecturally
+    /// undefined here, and come out cleared.
+    pub(super) fn handle_fcos(&mut self, _instruction: &Instruction) -> crate::Result<()> {
+        let (m, se) = self.fpu_read_st_raw(0);
+        let exp = self.builder.ins().band_imm_u(se, 0x7FFF);
+        let finite = self.builder.ins().icmp_imm_s(IntCC::NotEqual, exp, 0x7FFF);
+        // 2^63 has biased exponent 16383 + 63.
+        let too_big =
+            self.builder
+                .ins()
+                .icmp_imm_s(IntCC::SignedGreaterThanOrEqual, exp, 16383 + 63);
+        let out_of_range = self.builder.ins().band(finite, too_big);
+
+        let (rm, rse) = self.f80_value_kernel(F80Kernel::Cos, &[m, se]);
+        let nm = self.builder.ins().select(out_of_range, m, rm);
+        let nse = self.builder.ins().select(out_of_range, se, rse);
+        self.fpu_write_st_raw(0, nm, nse);
+
+        let c2 = self.builder.ins().uextend(types::I32, out_of_range);
+        let cc = self.builder.ins().ishl_imm_u(c2, 10);
+        self.fpu_store_cc(cc);
         Ok(())
     }
 
