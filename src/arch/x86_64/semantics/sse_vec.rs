@@ -264,7 +264,7 @@ impl<'a> Lifter<'a> {
     /// and must yield x86's sign-set floating indefinite rather than the host's
     /// default NaN. Lanes with a NaN operand fall through to the host's
     /// propagation, which already matches x86.
-    fn vec_fp_arith_x86(
+    pub(super) fn vec_fp_arith_x86(
         &mut self,
         a: Value,
         b: Value,

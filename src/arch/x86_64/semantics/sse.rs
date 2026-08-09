@@ -1713,21 +1713,33 @@ impl<'a> Lifter<'a> {
 
     /// HADDPD - horizontal add of the two double-precision lanes of each operand.
     pub(super) fn handle_haddpd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        if self.try_horizontal_fp_spec(instruction, "haddpd", false, false)? {
+            return Ok(());
+        }
         self.horizontal_double_arith(instruction, "haddpd", fadd_x86)
     }
 
     /// HSUBPD - horizontal subtract: `dst[0] - dst[1]`, then `src[0] - src[1]`.
     pub(super) fn handle_hsubpd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        if self.try_horizontal_fp_spec(instruction, "hsubpd", false, true)? {
+            return Ok(());
+        }
         self.horizontal_double_arith(instruction, "hsubpd", fsub_x86)
     }
 
     /// HADDPS - horizontal add of adjacent single-precision lane pairs.
     pub(super) fn handle_haddps(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        if self.try_horizontal_fp_spec(instruction, "haddps", true, false)? {
+            return Ok(());
+        }
         self.horizontal_single_arith(instruction, "haddps", fadd_x86)
     }
 
     /// HSUBPS - horizontal subtract of adjacent single-precision lane pairs.
     pub(super) fn handle_hsubps(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        if self.try_horizontal_fp_spec(instruction, "hsubps", true, true)? {
+            return Ok(());
+        }
         self.horizontal_single_arith(instruction, "hsubps", fsub_x86)
     }
 
@@ -2757,8 +2769,11 @@ impl<'a> Lifter<'a> {
 
     /// ROUNDPD - both 64-bit lanes, see [`Self::handle_roundsd`].
     pub(super) fn handle_roundpd(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let dst_idx = self.xmm_operand_index(instruction, 0, "roundpd")?;
         let mode = round_mode(instruction.immediate8());
+        if self.try_packed_round_spec(instruction, "roundpd", false, mode)? {
+            return Ok(());
+        }
+        let dst_idx = self.xmm_operand_index(instruction, 0, "roundpd")?;
         let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
         // The unary op as a binary one that ignores its second argument, the
         // shape `SQRTPD` already established for this plumbing.
@@ -2772,8 +2787,11 @@ impl<'a> Lifter<'a> {
 
     /// ROUNDPS - all four 32-bit lanes, see [`Self::handle_roundsd`].
     pub(super) fn handle_roundps(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let dst_idx = self.xmm_operand_index(instruction, 0, "roundps")?;
         let mode = round_mode(instruction.immediate8());
+        if self.try_packed_round_spec(instruction, "roundps", true, mode)? {
+            return Ok(());
+        }
+        let dst_idx = self.xmm_operand_index(instruction, 0, "roundps")?;
         let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
         let round = |b: &mut FunctionBuilder<'a>, x: Value, _y: Value| apply_round(b, mode, x);
         let res_lo = self.f32_pair_arith(src_lo, src_lo, &round);

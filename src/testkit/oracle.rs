@@ -6,6 +6,7 @@
 //! or is host-specific (rdtsc/rdrand) is **not** diffable and surfaces as
 //! [`OracleOutcome::Exit`] rather than a comparable [`CpuOracle`] halt.
 
+use crate::core::specialize::Specialization;
 use crate::context::{ExitReason, RegisterContext};
 use crate::testkit::{LiftTest, RetAddr};
 
@@ -215,11 +216,34 @@ pub trait CpuOracle {
 pub struct MicroliftOracle {
     /// Backend optimization level to compile with.
     pub opt: crate::testkit::Opt,
+    /// Whether to use native `I64X2` XMM variables and the vector fast paths.
+    ///
+    /// Defaults off, matching [`LifterConfig`](crate::core::LifterConfig).
+    pub vector_xmm: bool,
+    /// Target-directed instruction specializations to apply
+    /// (`config.specialization`).
+    ///
+    /// Defaults to [`Specialization::generic`]. Setting it points the oracle at
+    /// the specialized lowerings, which is how those get differential coverage
+    /// against real hardware semantics rather than only against microlift's own
+    /// portable path. Every specialization additionally needs
+    /// [`vector_xmm`](Self::vector_xmm).
+    pub specialization: Specialization,
 }
 
 impl MicroliftOracle {
     pub fn new(opt: crate::testkit::Opt) -> Self {
-        Self { opt }
+        Self {
+            opt,
+            ..Default::default()
+        }
+    }
+
+    /// Lift with vector-backed XMM registers and `spec` applied.
+    pub fn specialized(mut self, spec: Specialization) -> Self {
+        self.vector_xmm = true;
+        self.specialization = spec;
+        self
     }
 }
 
@@ -243,6 +267,8 @@ impl CpuOracle for MicroliftOracle {
             .at(code_va)
             .image_base(code_va)
             .opt(self.opt)
+            .vector_xmm(self.vector_xmm)
+            .specialize(self.specialization)
             .ctx(ctx)
             .ret_addr(RetAddr::Trampoline)
             .run();
@@ -834,5 +860,35 @@ pub mod unicorn {
         let mut a = super::MicroliftOracle::default();
         let mut b = UnicornOracle::new();
         super::differential(&mut a, &mut b, code, code_va, init, mem, max_insns, opts)
+    }
+
+    /// [`differential_unicorn`] with microlift lifting under `spec`.
+    ///
+    /// This is the check that the target-specialized lowerings agree with the
+    /// *hardware*, not merely with microlift's own portable expansion. Both are
+    /// worth having and they prove different things:
+    /// `tests/specialize_tests.rs` proves specialized == portable for every
+    /// instruction and every target, and this proves portable == hardware. It
+    /// is the second that would catch a case where both of microlift's paths
+    /// are wrong the same way.
+    pub fn differential_unicorn_spec(
+        code: &[u8],
+        code_va: u64,
+        init: &CpuState,
+        max_insns: u64,
+        spec: crate::core::specialize::Specialization,
+    ) -> Option<super::StateDiff> {
+        let mut a = super::MicroliftOracle::default().specialized(spec);
+        let mut b = UnicornOracle::new();
+        super::differential(
+            &mut a,
+            &mut b,
+            code,
+            code_va,
+            init,
+            &[],
+            max_insns,
+            super::DiffOptions::default(),
+        )
     }
 }

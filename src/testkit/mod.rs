@@ -18,6 +18,7 @@
 use crate::arch::x86_64::X86_64;
 use crate::backend::CraneliftBackend;
 use crate::context::{ExitReason, MemorySegment, RegisterContext};
+use crate::core::specialize::Specialization;
 use crate::core::srcloc::GuestCodeMap;
 use crate::core::{
     AddressMode, Atomic128Mode, ExecutionMode, LifterConfig, VmResumptionPoints, lift_to_code,
@@ -166,6 +167,19 @@ impl<'a> LiftTest<'a> {
     /// Toggle native `I64X2` XMM variables (`config.use_vector_xmm`).
     pub fn vector_xmm(mut self, on: bool) -> Self {
         self.config.use_vector_xmm = on;
+        self
+    }
+
+    /// Enable target-directed instruction specialization
+    /// (`config.specialization`).
+    ///
+    /// Note this does **not** change what the JIT compiles for - it is always
+    /// the host - so a `.specialize(Specialization::for_target(Aarch64))` run on
+    /// an x86 host produces IR the x86 backend still has to lower. That is
+    /// exactly what the equivalence suite wants (it proves the sequences agree
+    /// on results), but it is not a performance measurement.
+    pub fn specialize(mut self, spec: Specialization) -> Self {
+        self.config.specialization = spec;
         self
     }
 
@@ -692,5 +706,6 @@ pub fn run_test(bytes: &[u8], ctx: RegisterContext) -> RegisterContext {
 pub mod prelude {
     pub use super::{Harness, LiftTest, Opt, RetAddr, RunOutcome, TestError, run_test};
     pub use crate::context::{ExitReason, RegisterContext};
+    pub use crate::core::specialize::{Spec, SpecTarget, Specialization};
     pub use crate::core::{AddressMode, Atomic128Mode, VmResumptionPoints};
 }

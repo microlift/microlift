@@ -405,6 +405,9 @@ impl<'a> Lifter<'a> {
         op: HorizOp,
         width: PackedWidth,
     ) -> crate::Result<()> {
+        if self.try_horizontal_int_spec(instruction, op, width)? {
+            return Ok(());
+        }
         let dst_idx = self.xmm_operand_index(instruction, 0, "phadd")?;
         let dst_lo = self.get_xmm_lo(dst_idx);
         let dst_hi = self.get_xmm_hi(dst_idx);
@@ -442,6 +445,9 @@ impl<'a> Lifter<'a> {
         instruction: &Instruction,
         signed: bool,
     ) -> crate::Result<()> {
+        if self.try_pmuldq_spec(instruction, signed)? {
+            return Ok(());
+        }
         let who = if signed { "pmuldq" } else { "pmuludq" };
         let dst_idx = self.xmm_operand_index(instruction, 0, who)?;
 
@@ -490,6 +496,9 @@ impl<'a> Lifter<'a> {
     /// The one input pair that overflows a dword, `-32768 * -32768` twice, wraps
     /// - matching hardware, which does not saturate here.
     pub(super) fn handle_pmaddwd(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        if self.try_pmaddwd_spec(instruction)? {
+            return Ok(());
+        }
         let dst_idx = self.xmm_operand_index(instruction, 0, "pmaddwd")?;
         let dst_lo = self.get_xmm_lo(dst_idx);
         let dst_hi = self.get_xmm_hi(dst_idx);
@@ -514,10 +523,14 @@ impl<'a> Lifter<'a> {
     /// PMADDUBSW - multiply *unsigned* destination bytes by *signed* source
     /// bytes and add adjacent products into signed word lanes, saturating.
     pub(super) fn handle_pmaddubsw(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        // No vector fast path: the pairwise multiply-accumulate has no portable
-        // Cranelift expansion (`x86_pmaddubsw` exists but lowers on x86 only),
-        // and open-coding the cross-lane adds is no cheaper than the scalar
-        // lane expansion below.
+        // No *portable* vector fast path: the pairwise multiply-accumulate has
+        // no Cranelift expansion that lowers well on every backend, and
+        // open-coding the cross-lane adds is no cheaper than the scalar lane
+        // expansion below. There is a target-specialized one - see
+        // [`Lifter::try_pmaddubsw_spec`](super::sse_spec).
+        if self.try_pmaddubsw_spec(instruction)? {
+            return Ok(());
+        }
         let dst_idx = self.xmm_operand_index(instruction, 0, "pmaddubsw")?;
         let dst_lo = self.get_xmm_lo(dst_idx);
         let dst_hi = self.get_xmm_hi(dst_idx);
@@ -543,6 +556,9 @@ impl<'a> Lifter<'a> {
     /// PMULHRSW - signed word multiply keeping the high 17 bits, rounded:
     /// `(((a * b) >> 14) + 1) >> 1`.
     pub(super) fn handle_pmulhrsw(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        if self.try_pmulhrsw_spec(instruction)? {
+            return Ok(());
+        }
         let dst_idx = self.xmm_operand_index(instruction, 0, "pmulhrsw")?;
 
         if self.vec_mode() {
@@ -580,6 +596,9 @@ impl<'a> Lifter<'a> {
     /// PSADBW - sum of absolute byte differences, one sum per 64-bit half,
     /// deposited in that half's low word with the rest of the half zeroed.
     pub(super) fn handle_psadbw(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        if self.try_psadbw_spec(instruction)? {
+            return Ok(());
+        }
         let dst_idx = self.xmm_operand_index(instruction, 0, "psadbw")?;
         let dst_lo = self.get_xmm_lo(dst_idx);
         let dst_hi = self.get_xmm_hi(dst_idx);

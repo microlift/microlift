@@ -176,3 +176,7 @@ required-features = ["testkit"]
 [[test]]
 name = "exit_resume_tests"
 required-features = ["testkit"]
+
+[[test]]
+name = "specialize_tests"
+required-features = ["testkit"]

@@ -1569,3 +1569,79 @@ fn mpsadbw_agrees() {
         }
     }
 }
+
+/// Every target-specialized SSE lowering, against real hardware semantics.
+///
+/// `tests/specialize_tests.rs` proves specialized == microlift's portable path;
+/// this proves the specialized path == Unicorn. The two together are what make
+/// a specialization trustworthy - the first alone would happily certify a
+/// specialization that faithfully reproduced a bug in the portable expansion.
+///
+/// Both [`SpecTarget`]s are exercised on whatever host this runs on. That is
+/// deliberate: the JIT compiles for the host either way, so this checks the IR
+/// each target's path *emits*, not the machine it was tuned for. Divergence
+/// here is a semantic error in the sequence, which is host-independent.
+#[test]
+fn specialized_lowerings_agree_with_unicorn() {
+    use microlift::testkit::oracle::unicorn::differential_unicorn_spec;
+
+    // (name, encoding without the trailing `ret`)
+    let cases: &[(&str, &[u8])] = &[
+        ("haddps", &[0xF2, 0x0F, 0x7C, 0xC1]),
+        ("hsubps", &[0xF2, 0x0F, 0x7D, 0xC1]),
+        ("haddpd", &[0x66, 0x0F, 0x7C, 0xC1]),
+        ("hsubpd", &[0x66, 0x0F, 0x7D, 0xC1]),
+        ("phaddw", &[0x66, 0x0F, 0x38, 0x01, 0xC1]),
+        ("phaddd", &[0x66, 0x0F, 0x38, 0x02, 0xC1]),
+        ("phaddsw", &[0x66, 0x0F, 0x38, 0x03, 0xC1]),
+        ("phsubw", &[0x66, 0x0F, 0x38, 0x05, 0xC1]),
+        ("phsubd", &[0x66, 0x0F, 0x38, 0x06, 0xC1]),
+        ("phsubsw", &[0x66, 0x0F, 0x38, 0x07, 0xC1]),
+        ("pmaddwd", &[0x66, 0x0F, 0xF5, 0xC1]),
+        ("pmaddubsw", &[0x66, 0x0F, 0x38, 0x04, 0xC1]),
+        ("psadbw", &[0x66, 0x0F, 0xF6, 0xC1]),
+        ("pmuludq", &[0x66, 0x0F, 0xF4, 0xC1]),
+        ("pmuldq", &[0x66, 0x0F, 0x38, 0x28, 0xC1]),
+        ("pmulhrsw", &[0x66, 0x0F, 0x38, 0x0B, 0xC1]),
+    ];
+
+    let mut all: Vec<(String, Vec<u8>)> = cases
+        .iter()
+        .map(|(n, b)| {
+            let mut v = b.to_vec();
+            v.push(0xC3);
+            ((*n).to_string(), v)
+        })
+        .collect();
+
+    // ROUNDPS / ROUNDPD sweep every rounding mode, since the imm8 selects the
+    // Cranelift opcode at lift time.
+    for imm in 0..8u8 {
+        all.push((
+            format!("roundps-{imm}"),
+            vec![0x66, 0x0F, 0x3A, 0x08, 0xC1, imm, 0xC3],
+        ));
+        all.push((
+            format!("roundpd-{imm}"),
+            vec![0x66, 0x0F, 0x3A, 0x09, 0xC1, imm, 0xC3],
+        ));
+    }
+
+    for target in [SpecTarget::X86_64, SpecTarget::Aarch64] {
+        let spec = Specialization::for_target(target);
+        for (name, code) in &all {
+            for &(dst, src) in PACKED_OPERANDS {
+                let mut init = CpuState::zeroed();
+                init.xmm[0] = dst;
+                init.xmm[1] = src;
+                let diff = differential_unicorn_spec(code, CODE_VA, &init, BUDGET, spec)
+                    .expect("clean halt");
+                assert!(
+                    diff.is_empty(),
+                    "{name} under {} {dst:#018x?},{src:#018x?} diverged: {diff:?}",
+                    target.name()
+                );
+            }
+        }
+    }
+}

@@ -11,6 +11,7 @@
 pub mod abi;
 pub mod bridge;
 pub mod exit;
+pub mod specialize;
 pub mod srcloc;
 
 use std::collections::BTreeSet;
@@ -19,6 +20,7 @@ use crate::arch::{ControlFlow, ControlFlowKind, InstructionEffects};
 use crate::core::abi::CallAbi;
 use crate::core::bridge::{BridgeImport, ImportKind, ImportRegistry};
 use crate::core::exit::{ExitReason, MemorySegment, TransferKind};
+use crate::core::specialize::Specialization;
 use crate::core::srcloc::SourceLocMap;
 use crate::function_traits::{DynamicSymbol, FunctionArgumentType};
 use crate::os::get_host_calling_conv;
@@ -677,6 +679,29 @@ pub struct LifterConfig {
     /// relying on Cranelift's vector lowering and is required for AOT targets
     /// that lack SIMD support (e.g. RISC-V64).
     pub use_vector_xmm: bool,
+    /// Which target-specific instruction specializations the lifter may apply.
+    ///
+    /// The semantics are written out of Cranelift ops that lower on *every*
+    /// backend, which is the only safe default for a lifter that does not know
+    /// what its IR will be compiled for. Several guest instructions - the
+    /// packed rounds, the horizontal and pairwise-accumulating forms, the
+    /// widening multiplies - are one machine instruction on a real SIMD target
+    /// and dozens of IR instructions in that portable form. Tell the lifter
+    /// what it is feeding and it will emit the short form instead.
+    ///
+    /// Defaults to [`Specialization::generic`]: no target, nothing enabled,
+    /// output identical to a lifter without this knob. Set it from the triple
+    /// the backend will compile for -
+    /// [`Specialization::host`] for the JIT, [`Specialization::for_triple`] for
+    /// AOT - and narrow it with [`Specialization::without`] if a particular one
+    /// needs to be bisected out.
+    ///
+    /// Every specialization today additionally requires
+    /// [`use_vector_xmm`](Self::use_vector_xmm); with that off this is inert.
+    /// **No specialization changes a result bit** - see
+    /// [`crate::core::specialize`] for the contract and the equivalence suite
+    /// that enforces it.
+    pub specialization: Specialization,
     /// How a guest 128-bit compare-and-swap (`CMPXCHG16B`) is lowered. See
     /// [`Atomic128Mode`]; defaults to the portable, non-atomic emulation.
     pub atomic128: Atomic128Mode,
@@ -840,6 +865,7 @@ impl Default for LifterConfig {
             import_registry: None,
             indirect_call_bridge: None,
             use_vector_xmm: false,
+            specialization: Specialization::generic(),
             atomic128: Atomic128Mode::default(),
             analysis_mode: false,
             outline_helpers: true,
