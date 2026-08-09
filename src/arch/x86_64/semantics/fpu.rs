@@ -53,6 +53,10 @@ const SW_C2: i64 = 1 << 10;
 const SW_C3: i64 = 1 << 14;
 const SW_CC_MASK: i64 = SW_C0 | SW_C1 | SW_C2 | SW_C3;
 
+/// Significand of an 80-bit value with only the explicit integer bit set - the
+/// mantissa of every power of two, and so of `1.0` (biased exponent `0x3FFF`).
+const F80_INT_BIT: i64 = 0x8000_0000_0000_0000u64 as i64;
+
 impl<'a> Lifter<'a> {
     // --- low-level x87 state access -------------------------------------
 
@@ -86,6 +90,12 @@ impl<'a> Lifter<'a> {
         let top = self.fpu_load_top();
         let raw = self.builder.ins().iadd_imm_s(top, i as i64);
         let phys = self.builder.ins().band_imm_u(raw, 7);
+        self.fpu_phys_ptr(phys)
+    }
+
+    /// Pointer to physical register slot `phys` (an `I32` value, 0-7), for the
+    /// cases where the slot is computed rather than an `ST(i)` offset.
+    fn fpu_phys_ptr(&mut self, phys: Value) -> Value {
         let byte_off = self.builder.ins().imul_imm_s(phys, 16);
         let byte_off = self.builder.ins().uextend(types::I64, byte_off);
         let ctx = self.fpu_ctx_ptr();
@@ -112,6 +122,16 @@ impl<'a> Lifter<'a> {
     /// Write a raw 80-bit `(mant, se)` pair into `ST(i)`.
     fn fpu_write_st_raw(&mut self, i: u32, mant: Value, se: Value) {
         let p = self.fpu_st_ptr(i);
+        self.fpu_write_ptr_raw(p, mant, se);
+    }
+
+    /// Write a raw 80-bit `(mant, se)` pair into physical slot `phys`.
+    fn fpu_write_phys_raw(&mut self, phys: Value, mant: Value, se: Value) {
+        let p = self.fpu_phys_ptr(phys);
+        self.fpu_write_ptr_raw(p, mant, se);
+    }
+
+    fn fpu_write_ptr_raw(&mut self, p: Value, mant: Value, se: Value) {
         let se16 = self.builder.ins().ireduce(types::I16, se);
         self.builder
             .ins()
@@ -758,7 +778,7 @@ impl<'a> Lifter<'a> {
                 F80Kernel::Mul => softfloat::emit_f80_mul(b, args[0], args[1], args[2], args[3]),
                 F80Kernel::Div => softfloat::emit_f80_div(b, args[0], args[1], args[2], args[3]),
                 F80Kernel::Sqrt => softfloat::emit_f80_sqrt(b, args[0], args[1]),
-                F80Kernel::Cos => softfloat::emit_f80_cos(b, args[0], args[1]),
+                F80Kernel::Trig => softfloat::emit_f80_trig(b, args[0], args[1], args[2]),
                 F80Kernel::Cmp => {
                     let (unord, eq, lt) =
                         softfloat::emit_f80_cmp(b, args[0], args[1], args[2], args[3]);
@@ -837,15 +857,17 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// FCOS - `ST(0) = cos(ST(0))`, with the x87 out-of-range protocol.
-    ///
-    /// The hardware only reduces arguments with `|ST(0)| < 2^63`; outside that
-    /// it leaves `ST(0)` untouched and sets `C2`, which is the signal for the
-    /// caller's own `FPREM1` reduction loop. `C1` is cleared (nothing was
-    /// rounded up and no stack fault occurred); `C0`/`C3` are architecturally
-    /// undefined here, and come out cleared.
-    pub(super) fn handle_fcos(&mut self, _instruction: &Instruction) -> crate::Result<()> {
-        let (m, se) = self.fpu_read_st_raw(0);
+    // --- transcendentals ------------------------------------------------
+    //
+    // `FSIN`/`FCOS`/`FSINCOS`/`FPTAN` share one out-of-range protocol and one
+    // softfloat kernel, and differ only in what they leave on the stack.
+
+    /// The x87 trig range check: the hardware only reduces arguments with
+    /// `|ST(0)| < 2^63`. Outside that (and only for *finite* arguments - a NaN
+    /// or infinity is an invalid operation, not a range error) the instruction
+    /// does nothing at all and reports `C2`, which is the signal for the
+    /// caller's own `FPREM1` reduction loop.
+    fn fpu_trig_out_of_range(&mut self, se: Value) -> Value {
         let exp = self.builder.ins().band_imm_u(se, 0x7FFF);
         let finite = self.builder.ins().icmp_imm_s(IntCC::NotEqual, exp, 0x7FFF);
         // 2^63 has biased exponent 16383 + 63.
@@ -853,17 +875,102 @@ impl<'a> Lifter<'a> {
             self.builder
                 .ins()
                 .icmp_imm_s(IntCC::SignedGreaterThanOrEqual, exp, 16383 + 63);
-        let out_of_range = self.builder.ins().band(finite, too_big);
+        self.builder.ins().band(finite, too_big)
+    }
 
-        let (rm, rse) = self.f80_value_kernel(F80Kernel::Cos, &[m, se]);
-        let nm = self.builder.ins().select(out_of_range, m, rm);
-        let nse = self.builder.ins().select(out_of_range, se, rse);
-        self.fpu_write_st_raw(0, nm, nse);
-
+    /// Report the trig range check in the status word: `C2` is the result, `C1`
+    /// is cleared (nothing was rounded up and no stack fault occurred), and
+    /// `C0`/`C3` are architecturally undefined here and come out cleared.
+    fn fpu_trig_store_c2(&mut self, out_of_range: Value) {
         let c2 = self.builder.ins().uextend(types::I32, out_of_range);
         let cc = self.builder.ins().ishl_imm_u(c2, 10);
         self.fpu_store_cc(cc);
+    }
+
+    /// One call into the shared sin/cos kernel. `phase` is
+    /// [`softfloat::TRIG_PHASE_SIN`] or [`softfloat::TRIG_PHASE_COS`].
+    fn f80_trig(&mut self, m: Value, se: Value, phase: i64) -> F80 {
+        let phase = self.builder.ins().iconst(types::I32, phase);
+        self.f80_value_kernel(F80Kernel::Trig, &[m, se, phase])
+    }
+
+    /// FCOS - `ST(0) = cos(ST(0))`.
+    pub(super) fn handle_fcos(&mut self, _instruction: &Instruction) -> crate::Result<()> {
+        let (m, se) = self.fpu_read_st_raw(0);
+        let out_of_range = self.fpu_trig_out_of_range(se);
+        let (rm, rse) = self.f80_trig(m, se, softfloat::TRIG_PHASE_COS);
+        let nm = self.builder.ins().select(out_of_range, m, rm);
+        let nse = self.builder.ins().select(out_of_range, se, rse);
+        self.fpu_write_st_raw(0, nm, nse);
+        self.fpu_trig_store_c2(out_of_range);
         Ok(())
+    }
+
+    /// FSIN - `ST(0) = sin(ST(0))`.
+    pub(super) fn handle_fsin(&mut self, _instruction: &Instruction) -> crate::Result<()> {
+        let (m, se) = self.fpu_read_st_raw(0);
+        let out_of_range = self.fpu_trig_out_of_range(se);
+        let (rm, rse) = self.f80_trig(m, se, softfloat::TRIG_PHASE_SIN);
+        let nm = self.builder.ins().select(out_of_range, m, rm);
+        let nse = self.builder.ins().select(out_of_range, se, rse);
+        self.fpu_write_st_raw(0, nm, nse);
+        self.fpu_trig_store_c2(out_of_range);
+        Ok(())
+    }
+
+    /// FSINCOS - `ST(0) = sin(x)`, then push `cos(x)`, so the cosine ends up in
+    /// `ST(0)` and the sine in `ST(1)`.
+    pub(super) fn handle_fsincos(&mut self, _instruction: &Instruction) -> crate::Result<()> {
+        let (m, se) = self.fpu_read_st_raw(0);
+        let out_of_range = self.fpu_trig_out_of_range(se);
+        let (sm, sse) = self.f80_trig(m, se, softfloat::TRIG_PHASE_SIN);
+        let (cm, cse) = self.f80_trig(m, se, softfloat::TRIG_PHASE_COS);
+        self.fpu_trig_push_pair(out_of_range, (m, se), (sm, sse), (cm, cse));
+        self.fpu_trig_store_c2(out_of_range);
+        Ok(())
+    }
+
+    /// FPTAN - `ST(0) = tan(x)`, then push `1.0` (the divisor of the implied
+    /// ratio, which is what makes `FPTAN`/`FPATAN` compose).
+    pub(super) fn handle_fptan(&mut self, _instruction: &Instruction) -> crate::Result<()> {
+        let (m, se) = self.fpu_read_st_raw(0);
+        let out_of_range = self.fpu_trig_out_of_range(se);
+        let (sm, sse) = self.f80_trig(m, se, softfloat::TRIG_PHASE_SIN);
+        let (cm, cse) = self.f80_trig(m, se, softfloat::TRIG_PHASE_COS);
+        // tan = sin/cos through the exact divide kernel rather than a series of
+        // its own: an argument near an odd multiple of pi/2 has a tiny cosine,
+        // and the division is where that (correctly) blows up.
+        let (tm, tse) = self.f80_value_kernel(F80Kernel::Div, &[sm, sse, cm, cse]);
+        let one_m = self.builder.ins().iconst(types::I64, F80_INT_BIT);
+        let one_se = self.builder.ins().iconst(types::I32, 0x3FFF);
+        self.fpu_trig_push_pair(out_of_range, (m, se), (tm, tse), (one_m, one_se));
+        self.fpu_trig_store_c2(out_of_range);
+        Ok(())
+    }
+
+    /// The stack half of `FSINCOS`/`FPTAN`: replace `ST(0)` with `lower` and
+    /// push `upper` - unless the argument was out of range, in which case
+    /// `ST(0)` keeps `orig` and **nothing is pushed**.
+    ///
+    /// Done without a branch. The push would write slot `top-1` and move `TOP`
+    /// there; when out of range `TOP` stays put and *both* stores land on the
+    /// original `ST(0)` slot, writing the same untouched value twice.
+    fn fpu_trig_push_pair(&mut self, out_of_range: Value, orig: F80, lower: F80, upper: F80) {
+        let top = self.fpu_load_top();
+        let dec = self.builder.ins().iadd_imm_s(top, -1);
+        let dec = self.builder.ins().band_imm_u(dec, 7);
+        let new_top = self.builder.ins().select(out_of_range, top, dec);
+
+        let lo_m = self.builder.ins().select(out_of_range, orig.0, lower.0);
+        let lo_se = self.builder.ins().select(out_of_range, orig.1, lower.1);
+        let up_m = self.builder.ins().select(out_of_range, orig.0, upper.0);
+        let up_se = self.builder.ins().select(out_of_range, orig.1, upper.1);
+
+        // `top` is the argument's slot - ST(1) once the push lands.
+        self.fpu_write_phys_raw(top, lo_m, lo_se);
+        self.fpu_write_phys_raw(new_top, up_m, up_se);
+        self.fpu_store_top(new_top);
+        self.fpu_set_tag_phys(new_top, true);
     }
 
     /// Compute the three ordered/equal/unordered predicates for `a <=> b`,

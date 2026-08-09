@@ -91,11 +91,11 @@ fn outlined_kernels_match_inline_emission() {
 }
 
 #[test]
-fn outlined_cos_matches_inline_emission() {
+fn outlined_trig_matches_inline_emission() {
     // The transcendental kernel is unary, so it takes its own program shape:
-    // `fld tbyte [rdi]; fcos; fstp tbyte [rdx]; ret`.
-    let bytes = [0xDB, 0x2F, 0xD9, 0xFF, 0xDB, 0x3A, 0xC3];
-    let run = |arg: [u64; 2], outline: bool| {
+    // `fld tbyte [rdi]; <op>; fstp tbyte [rdx]; ret`.
+    let run = |op: u8, arg: [u64; 2], outline: bool| {
+        let bytes = [0xDB, 0x2F, 0xD9, op, 0xDB, 0x3A, 0xC3];
         let mut input = arg;
         let mut out = [0u64; 2];
         LiftTest::new(&bytes)
@@ -109,21 +109,26 @@ fn outlined_cos_matches_inline_emission() {
         out
     };
 
-    for arg in [F80_ONE, F80_TWO, F80_THREE, F80_SIX] {
-        assert_eq!(
-            run(arg, true),
-            run(arg, false),
-            "outlined and inlined fcos disagree for {arg:#x?}"
-        );
+    // 0xFF = fcos, 0xFE = fsin: one shared kernel body, two phases.
+    for op in [0xFFu8, 0xFE] {
+        for arg in [F80_ONE, F80_TWO, F80_THREE, F80_SIX] {
+            assert_eq!(
+                run(op, arg, true),
+                run(op, arg, false),
+                "outlined and inlined {op:#04x} disagree for {arg:#x?}"
+            );
+        }
     }
-    // cos(0) == 1 exactly, in both strategies.
+    // cos(0) == 1 and sin(0) == 0 exactly, in both strategies.
     let zero = [0u64, 0];
-    assert_eq!(run(zero, true), F80_ONE);
-    assert_eq!(run(zero, false), F80_ONE);
+    assert_eq!(run(0xFF, zero, true), F80_ONE);
+    assert_eq!(run(0xFF, zero, false), F80_ONE);
+    assert_eq!(run(0xFE, zero, true), zero);
+    assert_eq!(run(0xFE, zero, false), zero);
 }
 
 #[test]
-fn cos_kernel_cross_compiles() {
+fn trig_kernel_cross_compiles() {
     // The kernel is written out of Cranelift ops that lower everywhere; the
     // 128-bit fixed-point sequences in particular must not need a host x86-64.
     let bytes = [0xDB, 0x2F, 0xD9, 0xFF, 0xDB, 0x3A, 0xC3];
@@ -137,11 +142,35 @@ fn cos_kernel_cross_compiles() {
     assert!(
         code.helpers
             .iter()
-            .any(|h| h.name == F80Kernel::Cos.symbol()),
-        "FCOS should outline the cos kernel"
+            .any(|h| h.name == F80Kernel::Trig.symbol()),
+        "FCOS should outline the trig kernel"
     );
     ArtifactBackend::compile_lifted_to_object(code, Some(triple), None, &[])
         .unwrap_or_else(|e| panic!("compile for {triple}: {e}"));
+}
+
+#[test]
+fn every_trig_instruction_shares_one_helper() {
+    // FSIN/FCOS/FSINCOS/FPTAN differ only in a runtime phase argument and what
+    // they leave on the stack, so a region using all four must outline exactly
+    // one trig body (plus the divide FPTAN needs).
+    // `fsin; fcos; fsincos; fptan; ret`
+    let bytes = [0xD9, 0xFE, 0xD9, 0xFF, 0xD9, 0xFB, 0xD9, 0xF2, 0xC3];
+    let code =
+        lift_to_code::<X86_64>(&bytes, DEFAULT_LIFT_BASE, LifterConfig::default()).expect("lift");
+    let names: Vec<&str> = code.helpers.iter().map(|h| h.name).collect();
+    assert_eq!(
+        names
+            .iter()
+            .filter(|n| **n == F80Kernel::Trig.symbol())
+            .count(),
+        1,
+        "one shared trig body for all four instructions, got {names:?}"
+    );
+    assert!(
+        names.contains(&F80Kernel::Div.symbol()),
+        "FPTAN divides sin by cos, got {names:?}"
+    );
 }
 
 /// Compile a region both ways and return `(outlined_bytes, inlined_bytes)` of

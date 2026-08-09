@@ -1171,11 +1171,23 @@ fn emit_trig_reduce(b: &mut FunctionBuilder, m: Value, e: Value) -> (Value, Valu
     (n, r_sig, r_exp, r_sign)
 }
 
-/// Emit `cos(a)` for a raw 80-bit value.
+/// [`emit_f80_trig`]'s `phase` for `cos`: the quadrant is used as reduced.
+pub const TRIG_PHASE_COS: i64 = 0;
+/// [`emit_f80_trig`]'s `phase` for `sin`: `sin(x) == cos(x - pi/2)`, one
+/// quadrant back, plus the odd-function sign of the argument.
+pub const TRIG_PHASE_SIN: i64 = 1;
+
+/// Emit `cos(a)` or `sin(a)` for a raw 80-bit value, selected by `phase`
+/// ([`TRIG_PHASE_COS`] / [`TRIG_PHASE_SIN`], an `I32`).
+///
+/// `phase` is a *runtime* value rather than a Rust-level flag on purpose: the
+/// quadrant selection it feeds is already a chain of `select`s, so both
+/// functions come out of one shared body - one outlined helper serving `FSIN`,
+/// `FCOS`, `FSINCOS` and `FPTAN` instead of near-identical copies.
 ///
 /// The caller is responsible for the x87 out-of-range protocol: this assumes
-/// `|a| < 2^63` (the domain on which `FCOS` computes at all) and returns the
-/// QNaN indefinite for a NaN or infinite input.
+/// `|a| < 2^63` (the domain on which these instructions compute at all) and
+/// returns the QNaN indefinite for a NaN or infinite input.
 ///
 /// Shape: Payne-Hanek reduction against a 256-bit `2/pi` gives the quadrant and
 /// a remainder `|r| <= pi/4`; a twelve-term Horner evaluation in `u = r^2` gives
@@ -1187,33 +1199,47 @@ fn emit_trig_reduce(b: &mut FunctionBuilder, m: Value, e: Value) -> (Value, Valu
 /// *normalised* `r` rather than a fixed-point one, so an argument that lands
 /// almost exactly on a multiple of `pi/2` keeps its relative accuracy.
 ///
-/// Accuracy: faithful to the 64-bit significand - every case in
-/// `fpu_tests::test_fcos_full_80_bit_precision`, checked against a 90-digit
-/// reference, comes out correctly rounded, including an argument on the 80-bit
-/// `pi/2` where the true result is ~3.4e-20 and survives only because of the
-/// reduction's spare bits. Correct rounding is *not* guaranteed in general
-/// (nothing here bounds the Q126 accumulator against a hard case), so the test
-/// allows a bit of slack. Real x87 hardware reduces against a 66-bit `pi` and is
-/// far *less* accurate than this for large arguments, so no bit-exact agreement
-/// with it is possible or attempted.
-pub fn emit_f80_cos(b: &mut FunctionBuilder, am: Value, ase: Value) -> (Value, Value) {
+/// Accuracy: faithful to the 64-bit significand. Against the 90-digit reference
+/// tables in `fpu_tests::test_fcos_full_80_bit_precision` and its `fsin`
+/// sibling, every case is correctly rounded but one, which is 1 ulp out - so the
+/// tests bound the error at 1 ulp rather than asserting correct rounding, which
+/// nothing here proves (the Q126 accumulator is not bounded against a hard
+/// case). That includes the arguments that sit on the 80-bit `pi/2` and `pi`,
+/// where the true result is ~3.4e-20 and survives only because of the
+/// reduction's spare bits. Real x87 hardware reduces against a 66-bit `pi` and
+/// is far *less* accurate than this for large arguments, so no bit-exact
+/// agreement with it is possible or attempted.
+pub fn emit_f80_trig(
+    b: &mut FunctionBuilder,
+    am: Value,
+    ase: Value,
+    phase: Value,
+) -> (Value, Value) {
     let i128 = types::I128;
     let i32t = types::I32;
 
     let e = exp_of(b, ase);
     let a_nan = is_nan(b, am, ase);
     let a_inf = is_inf(b, am, ase);
+    let a_sign = sign_of(b, ase);
 
-    // cos is even, so the sign of the argument is dropped entirely.
+    // Both functions are reduced against the same |x|: cos is even, and sin's
+    // oddness is re-applied to the result at the end.
     let (n, r_sig, r_exp, r_sign) = emit_trig_reduce(b, am, e);
 
-    // cos(n*pi/2 + r) is cos(r), -sin(r), -cos(r), sin(r) for n mod 4 = 0..3.
+    // cos(n*pi/2 + r) is cos(r), -sin(r), -cos(r), sin(r) for n mod 4 = 0..3;
+    // sin is the same table one quadrant back. `n - phase` is >= -1, so the
+    // `n + 1` below stays non-negative and the logical shift is safe.
+    let nq = {
+        let p = b.ins().uextend(types::I64, phase);
+        b.ins().isub(n, p)
+    };
     let use_sin = {
-        let o = b.ins().band_imm_u(n, 1);
+        let o = b.ins().band_imm_u(nq, 1);
         b.ins().icmp_imm_s(IntCC::NotEqual, o, 0)
     };
     let base_sign = {
-        let p = b.ins().iadd_imm_s(n, 1);
+        let p = b.ins().iadd_imm_s(nq, 1);
         let s = b.ins().ushr_imm_u(p, 1);
         let s = b.ins().band_imm_u(s, 1);
         b.ins().ireduce(i32t, s)
@@ -1287,15 +1313,21 @@ pub fn emit_f80_cos(b: &mut FunctionBuilder, am: Value, ase: Value) -> (Value, V
         let zero32 = b.ins().iconst(i32t, 0);
         let rs = b.ins().uextend(i32t, r_sign);
         let s = b.ins().select(use_sin, rs, zero32);
-        b.ins().bxor(base_sign, s)
+        let sign = b.ins().bxor(base_sign, s);
+        // sin is odd, so it carries the argument's sign; cos is even and does
+        // not. This is also what preserves `sin(-0) == -0`, which falls out of
+        // the zero remainder rather than needing a special case.
+        let is_sin_fn = b.ins().icmp_imm_s(IntCC::NotEqual, phase, 0);
+        let arg = b.ins().select(is_sin_fn, a_sign, zero32);
+        b.ins().bxor(sign, arg)
     };
     let se = {
         let mag = b.ins().band_imm_u(vse, EXP_MAX);
         compose_se(b, sign, mag)
     };
 
-    // cos of an infinity is an invalid operation, and of a NaN a NaN; both
-    // deliver the QNaN indefinite.
+    // An infinite argument is an invalid operation, and a NaN one propagates;
+    // both deliver the QNaN indefinite.
     let (qm, qse) = qnan(b);
     let bad = b.ins().bor(a_nan, a_inf);
     let m = b.ins().select(bad, qm, vm);
@@ -1325,8 +1357,9 @@ pub enum F80Kernel {
     Mul,
     Div,
     Sqrt,
-    /// Cosine, on the reduced domain `|x| < 2^63` (see [`emit_f80_cos`]).
-    Cos,
+    /// Sine or cosine, selected by a third `phase` argument, on the reduced
+    /// domain `|x| < 2^63` (see [`emit_f80_trig`]).
+    Trig,
     /// Ordered compare, returning the `(unordered, equal, less_than)` triple.
     Cmp,
 }
@@ -1338,7 +1371,7 @@ pub const F80_KERNELS: [F80Kernel; 7] = [
     F80Kernel::Mul,
     F80Kernel::Div,
     F80Kernel::Sqrt,
-    F80Kernel::Cos,
+    F80Kernel::Trig,
     F80Kernel::Cmp,
 ];
 
@@ -1353,7 +1386,7 @@ impl F80Kernel {
             F80Kernel::Mul => "__microlift_f80_mul",
             F80Kernel::Div => "__microlift_f80_div",
             F80Kernel::Sqrt => "__microlift_f80_sqrt",
-            F80Kernel::Cos => "__microlift_f80_cos",
+            F80Kernel::Trig => "__microlift_f80_trig",
             F80Kernel::Cmp => "__microlift_f80_cmp",
         }
     }
@@ -1362,7 +1395,7 @@ impl F80Kernel {
     /// parameter pair).
     fn operand_count(self) -> usize {
         match self {
-            F80Kernel::Sqrt | F80Kernel::Cos => 1,
+            F80Kernel::Sqrt | F80Kernel::Trig => 1,
             _ => 2,
         }
     }
@@ -1377,6 +1410,10 @@ impl F80Kernel {
         let mut sig = Signature::new(call_conv);
         for _ in 0..self.operand_count() {
             sig.params.push(AbiParam::new(types::I64));
+            sig.params.push(AbiParam::new(types::I32));
+        }
+        if self == F80Kernel::Trig {
+            // The quadrant phase selecting sin vs cos.
             sig.params.push(AbiParam::new(types::I32));
         }
         match self {
@@ -1417,8 +1454,8 @@ impl F80Kernel {
                 let (m, se) = emit_f80_sqrt(b, p[0], p[1]);
                 b.ins().return_(&[m, se]);
             }
-            F80Kernel::Cos => {
-                let (m, se) = emit_f80_cos(b, p[0], p[1]);
+            F80Kernel::Trig => {
+                let (m, se) = emit_f80_trig(b, p[0], p[1], p[2]);
                 b.ins().return_(&[m, se]);
             }
             _ => {
@@ -1427,7 +1464,7 @@ impl F80Kernel {
                     F80Kernel::Sub => emit_f80_sub(b, p[0], p[1], p[2], p[3]),
                     F80Kernel::Mul => emit_f80_mul(b, p[0], p[1], p[2], p[3]),
                     F80Kernel::Div => emit_f80_div(b, p[0], p[1], p[2], p[3]),
-                    F80Kernel::Sqrt | F80Kernel::Cos | F80Kernel::Cmp => {
+                    F80Kernel::Sqrt | F80Kernel::Trig | F80Kernel::Cmp => {
                         unreachable!("handled above")
                     }
                 };

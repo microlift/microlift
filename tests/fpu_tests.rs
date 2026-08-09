@@ -499,3 +499,356 @@ fn test_f80_conversion_matches_lifter() {
     assert_eq!(mant, lifted_mant, "mantissa must match lifter");
     assert_eq!(se, lifted_se, "sign+exp must match lifter");
 }
+
+/// `fld qword [rax]; fcos; ret` over a single `f64` input.
+fn fcos(v: f64) -> RegisterContext {
+    let bytes = [0xDD, 0x00, 0xD9, 0xFF, 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.rax = &v as *const f64 as u64;
+    run_test(&bytes, ctx)
+}
+
+/// Relative agreement with the host libm, which does the same Payne-Hanek
+/// reduction. The lifted kernel carries a 64-bit significand and libm 53, so
+/// the comparison is only ever as sharp as `f64` - a slack of a few `f64` ulp
+/// catches every reduction or quadrant error while tolerating the last bits.
+fn assert_close(got: f64, want: f64, what: &str) {
+    let tol = 8.0 * f64::EPSILON * want.abs().max(f64::MIN_POSITIVE);
+    assert!(
+        (got - want).abs() <= tol,
+        "{what}: got {got:e}, want {want:e} (tolerance {tol:e})"
+    );
+}
+
+#[test]
+fn test_fcos_small_arguments() {
+    // Below 1/2 no reduction happens: the argument is its own remainder.
+    for &v in &[0.0f64, -0.0, 0.25, -0.25, 0.5, -0.5, 1e-10, 1e-30, 1e-300] {
+        let ctx = fcos(v);
+        assert_close(st(&ctx, 0), v.cos(), &format!("cos({v:e})"));
+        assert_eq!(ctx.fpu_sw & (1 << 10), 0, "C2 clear for in-range {v:e}");
+    }
+}
+
+#[test]
+fn test_fcos_all_quadrants() {
+    // One argument per quadrant of the reduction, plus the sign symmetry: the
+    // quadrant index and the remainder's sign are what the result's sign and
+    // sin/cos selection are built out of.
+    for &v in &[
+        1.0f64,
+        2.0,
+        3.0,
+        4.0,
+        5.0,
+        6.0,
+        7.0,
+        -1.0,
+        -2.0,
+        -3.0,
+        -4.0,
+        std::f64::consts::FRAC_PI_4,
+        std::f64::consts::FRAC_PI_2,
+        std::f64::consts::PI,
+        std::f64::consts::TAU,
+        100.0,
+        -100.0,
+        1234.5678,
+    ] {
+        let ctx = fcos(v);
+        assert_close(st(&ctx, 0), v.cos(), &format!("cos({v})"));
+    }
+}
+
+#[test]
+fn test_fcos_large_arguments() {
+    // The whole point of a 256-bit 2/pi: naive reduction against a rounded pi
+    // loses every significant bit out here.
+    for &v in &[1e6f64, 1e10, 1e15, 1e18, 4.611686018427388e18, -1e18] {
+        let ctx = fcos(v);
+        assert_close(st(&ctx, 0), v.cos(), &format!("cos({v:e})"));
+        assert_eq!(ctx.fpu_sw & (1 << 10), 0, "C2 clear for in-range {v:e}");
+    }
+}
+
+#[test]
+fn test_fcos_near_multiple_of_half_pi() {
+    // Worst case for the reduction: almost all of the argument cancels, so the
+    // remainder's accuracy comes entirely from the low bits of the 2/pi window.
+    for &v in &[
+        std::f64::consts::FRAC_PI_2,
+        3.0 * std::f64::consts::FRAC_PI_2,
+        5.0 * std::f64::consts::FRAC_PI_2,
+        7074237752028440.0, // ~ a multiple of pi/2 to within 1e-10
+    ] {
+        let ctx = fcos(v);
+        assert_close(st(&ctx, 0), v.cos(), &format!("cos({v:e})"));
+    }
+}
+
+#[test]
+fn test_fcos_out_of_range_sets_c2() {
+    // |x| >= 2^63 is outside the reduction domain: ST(0) is left untouched and
+    // C2 signals that the caller must reduce it itself.
+    let v = 1e19f64;
+    let ctx = fcos(v);
+    assert_eq!(st(&ctx, 0), v, "out-of-range argument must be left alone");
+    assert_ne!(ctx.fpu_sw & (1 << 10), 0, "C2 must be set out of range");
+
+    // Just inside the boundary the instruction does compute.
+    let v = 9.223372036854775e18f64; // < 2^63
+    let ctx = fcos(v);
+    assert_eq!(ctx.fpu_sw & (1 << 10), 0, "C2 clear just inside 2^63");
+    assert_close(st(&ctx, 0), v.cos(), "cos just below 2^63");
+}
+
+#[test]
+fn test_fcos_nan_and_infinity() {
+    // Checked on the raw 80-bit encoding: `f80_to_f64_bits` does not model the
+    // NaN/infinity exponent, so `st()` cannot see one.
+    for &v in &[f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let ctx = fcos(v);
+        let phys = ctx.fpu_top as usize;
+        let [mant, se] = ctx.fpr[phys];
+        assert_eq!(
+            (mant, se as u16),
+            (0xC000_0000_0000_0000, 0xFFFF),
+            "cos({v}) must be the QNaN indefinite"
+        );
+        assert_eq!(
+            ctx.fpu_sw & (1 << 10),
+            0,
+            "C2 clear for {v} (not a range error)"
+        );
+    }
+}
+
+#[test]
+fn test_fcos_does_not_move_the_stack() {
+    let ctx = fcos(1.0);
+    assert_eq!(ctx.fpu_top, 7, "one fld, no push or pop from fcos");
+}
+
+#[test]
+fn test_fcos_full_80_bit_precision() {
+    // The `f64` comparisons above only ever check 53 bits. This table is
+    // `cos(x)` computed to 90 decimal digits and rounded to the 80-bit format,
+    // over arguments that are *not* `f64`-representable - so it exercises the
+    // reduction against a full 64-bit significand, including the extreme
+    // cancellation of an argument sitting on the 80-bit `pi/2` (where the true
+    // result is ~3.4e-20 and every bit of it comes from the low end of the 2/pi
+    // window).
+    //
+    // `fld tbyte [rax]; fcos; ret`
+    let bytes = [0xDB, 0x28, 0xD9, 0xFF, 0xC3];
+    #[rustfmt::skip]
+    const CASES: &[((u64, u16), (u64, u16))] = &[
+    ((0x8000000000000000, 0x3fff), (0x8a51407da8345c92, 0x3ffe)),
+    ((0xc90fdaa22168c235, 0x3fff), (0xece675d1fc8f8cbb, 0xbfbd)),
+    ((0xc90fdaa22168c235, 0x4000), (0x8000000000000000, 0xbfff)),
+    ((0xc90fdaa22168c235, 0x4001), (0x8000000000000000, 0x3fff)),
+    ((0xb504f333f9de6484, 0x3ffe), (0xc29f63d166890d28, 0x3ffe)),
+    ((0x9e3779b97f4a7c15, 0x4020), (0x8b76571692d1110a, 0xbffe)),
+    ((0xf4a2b3c1d5e60718, 0x403d), (0xb25add342b6e5ee7, 0x3ffe)),
+    ((0xffffffffffffffff, 0x403d), (0xfac035ec484929c2, 0x3ffd)),
+    ((0x8000000000000000, 0x3f00), (0x8000000000000000, 0x3fff)),
+    ((0xdeadbeefcafef00d, 0x400a), (0xf51617aa5b87f178, 0x3ffe)),
+    ((0xc90fdaa22168c235, 0xbfff), (0xece675d1fc8f8cbb, 0xbfbd)),
+    ((0x9e3779b97f4a7c15, 0xc020), (0x8b76571692d1110a, 0xbffe)),
+    ((0x8000000000000000, 0x3ffe), (0xe0a94032dbea7cee, 0x3ffe)),
+    ((0xffffffffffffffff, 0x3ffe), (0x8a51407da8345c93, 0x3ffe)),
+    ];
+
+    for &((am, ase), (wm, wse)) in CASES {
+        let arg = [am, ase as u64];
+        let mut ctx = RegisterContext::default();
+        ctx.rax = arg.as_ptr() as u64;
+        let ctx = run_test(&bytes, ctx);
+        let [gm, gse] = ctx.fpr[ctx.fpu_top as usize];
+        let gse = gse as u16;
+        assert_eq!(
+            gse, wse,
+            "cos({am:#018x},{ase:#06x}): exponent {gse:#06x}, want {wse:#06x}"
+        );
+        // Faithful, not provably correctly-rounded: allow the last bit to move
+        // (exactly one case in this table actually does).
+        let err = gm.abs_diff(wm);
+        assert!(
+            err <= 1,
+            "cos({am:#018x},{ase:#06x}): significand {gm:#018x}, want {wm:#018x} ({err} ulp)"
+        );
+    }
+}
+
+/// `fld qword [rax]; <op>; ret` for the one-byte-pair x87 opcodes.
+fn trig_op(op: [u8; 2], v: f64) -> RegisterContext {
+    let bytes = [0xDD, 0x00, op[0], op[1], 0xC3];
+    let mut ctx = RegisterContext::default();
+    ctx.rax = &v as *const f64 as u64;
+    run_test(&bytes, ctx)
+}
+
+const FSIN: [u8; 2] = [0xD9, 0xFE];
+const FSINCOS: [u8; 2] = [0xD9, 0xFB];
+const FPTAN: [u8; 2] = [0xD9, 0xF2];
+
+#[test]
+fn test_fsin_matches_libm() {
+    for &v in &[
+        0.0f64,
+        0.25,
+        -0.25,
+        0.5,
+        1.0,
+        2.0,
+        3.0,
+        4.0,
+        5.0,
+        6.0,
+        7.0,
+        -1.0,
+        -2.0,
+        -3.0,
+        std::f64::consts::FRAC_PI_4,
+        std::f64::consts::FRAC_PI_2,
+        std::f64::consts::PI,
+        std::f64::consts::TAU,
+        100.0,
+        -100.0,
+        1234.5678,
+        1e-10,
+        1e6,
+        1e10,
+        1e15,
+        1e18,
+        -1e18,
+        4.611686018427388e18,
+    ] {
+        let ctx = trig_op(FSIN, v);
+        assert_close(st(&ctx, 0), v.sin(), &format!("sin({v:e})"));
+        assert_eq!(ctx.fpu_sw & (1 << 10), 0, "C2 clear for in-range {v:e}");
+    }
+}
+
+#[test]
+fn test_fsin_is_odd_about_zero() {
+    // sin(-0) == -0: the sign has to survive a zero result, which it does by
+    // coming from the argument rather than from a special case.
+    let ctx = trig_op(FSIN, -0.0);
+    let [mant, se] = ctx.fpr[ctx.fpu_top as usize];
+    assert_eq!(mant, 0, "sin(-0) is a zero");
+    assert_eq!(se as u16 >> 15, 1, "sin(-0) keeps the sign: -0");
+
+    let ctx = trig_op(FSIN, 0.0);
+    let [mant, se] = ctx.fpr[ctx.fpu_top as usize];
+    assert_eq!((mant, se as u16 >> 15), (0, 0), "sin(+0) is +0");
+}
+
+#[test]
+fn test_fsin_out_of_range_sets_c2() {
+    let v = 1e19f64;
+    let ctx = trig_op(FSIN, v);
+    assert_eq!(st(&ctx, 0), v, "out-of-range argument must be left alone");
+    assert_ne!(ctx.fpu_sw & (1 << 10), 0, "C2 must be set out of range");
+}
+
+#[test]
+fn test_fsin_nan_and_infinity() {
+    for &v in &[f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let ctx = trig_op(FSIN, v);
+        let [mant, se] = ctx.fpr[ctx.fpu_top as usize];
+        assert_eq!(
+            (mant, se as u16),
+            (0xC000_0000_0000_0000, 0xFFFF),
+            "sin({v}) must be the QNaN indefinite"
+        );
+    }
+}
+
+#[test]
+fn test_fsincos_leaves_cos_over_sin() {
+    // ST(0) = cos(x), ST(1) = sin(x), TOP decremented once.
+    for &v in &[0.0f64, 1.0, -1.0, 2.0, 5.0, 1234.5678, 1e18] {
+        let ctx = trig_op(FSINCOS, v);
+        assert_eq!(ctx.fpu_top, 6, "fld pushed once, fsincos once more");
+        assert_close(st(&ctx, 0), v.cos(), &format!("fsincos cos({v:e})"));
+        assert_close(st(&ctx, 1), v.sin(), &format!("fsincos sin({v:e})"));
+        assert_eq!(ctx.fpu_tag & (1 << 6), 1 << 6, "pushed slot marked valid");
+    }
+}
+
+#[test]
+fn test_fsincos_out_of_range_does_not_push() {
+    let v = 1e19f64;
+    let ctx = trig_op(FSINCOS, v);
+    assert_ne!(ctx.fpu_sw & (1 << 10), 0, "C2 must be set out of range");
+    assert_eq!(ctx.fpu_top, 7, "no push when out of range");
+    assert_eq!(st(&ctx, 0), v, "ST(0) must be untouched");
+}
+
+#[test]
+fn test_fptan_leaves_one_over_tan() {
+    // ST(0) = 1.0, ST(1) = tan(x).
+    for &v in &[0.0f64, 0.25, 1.0, -1.0, 2.0, 5.0, 1234.5678] {
+        let ctx = trig_op(FPTAN, v);
+        assert_eq!(ctx.fpu_top, 6, "fptan pushes 1.0");
+        assert_eq!(st(&ctx, 0), 1.0, "fptan pushes exactly 1.0");
+        assert_close(st(&ctx, 1), v.tan(), &format!("tan({v})"));
+    }
+}
+
+#[test]
+fn test_fptan_out_of_range_does_not_push() {
+    let v = 1e19f64;
+    let ctx = trig_op(FPTAN, v);
+    assert_ne!(ctx.fpu_sw & (1 << 10), 0, "C2 must be set out of range");
+    assert_eq!(ctx.fpu_top, 7, "no push when out of range");
+    assert_eq!(st(&ctx, 0), v, "ST(0) must be untouched");
+}
+
+#[test]
+fn test_fsin_full_80_bit_precision() {
+    // The `fcos` table's counterpart, same construction: `sin(x)` to 90 decimal
+    // digits over arguments with a full 64-bit significand. Two cases carry
+    // their weight here - the 80-bit `pi` (where sin cancels to ~-3.4e-20) and
+    // an argument of 2^-255, whose sine is the argument itself and so proves the
+    // unreduced path keeps relative, not just absolute, precision.
+    //
+    // `fld tbyte [rax]; fsin; ret`
+    let bytes = [0xDB, 0x28, 0xD9, 0xFE, 0xC3];
+    #[rustfmt::skip]
+    const CASES: &[((u64, u16), (u64, u16))] = &[
+    ((0x8000000000000000, 0x3fff), (0xd76aa47848677021, 0x3ffe)),
+    ((0xc90fdaa22168c235, 0x3fff), (0x8000000000000000, 0x3fff)),
+    ((0xc90fdaa22168c235, 0x4000), (0xece675d1fc8f8cbb, 0xbfbe)),
+    ((0xc90fdaa22168c235, 0x4001), (0xece675d1fc8f8cbb, 0x3fbf)),
+    ((0xb504f333f9de6484, 0x3ffe), (0xa64e9b3f9f566d57, 0x3ffe)),
+    ((0x9e3779b97f4a7c15, 0x4020), (0xd6ad595348042405, 0x3ffe)),
+    ((0xf4a2b3c1d5e60718, 0x403d), (0xb7a52418ea05b817, 0xbffe)),
+    ((0xffffffffffffffff, 0x403d), (0xdf327e112abeef8f, 0x3ffe)),
+    ((0x8000000000000000, 0x3f00), (0x8000000000000000, 0x3f00)),
+    ((0xdeadbeefcafef00d, 0x400a), (0x93e6c25502aca735, 0x3ffd)),
+    ((0xc90fdaa22168c235, 0xbfff), (0x8000000000000000, 0xbfff)),
+    ((0x9e3779b97f4a7c15, 0xc020), (0xd6ad595348042405, 0xbffe)),
+    ((0x8000000000000000, 0x3ffe), (0xf57743a2582f7f44, 0x3ffd)),
+    ((0xffffffffffffffff, 0x3ffe), (0xd76aa47848677020, 0x3ffe)),
+    ];
+
+    for &((am, ase), (wm, wse)) in CASES {
+        let arg = [am, ase as u64];
+        let mut ctx = RegisterContext::default();
+        ctx.rax = arg.as_ptr() as u64;
+        let ctx = run_test(&bytes, ctx);
+        let [gm, gse] = ctx.fpr[ctx.fpu_top as usize];
+        let gse = gse as u16;
+        assert_eq!(
+            gse, wse,
+            "sin({am:#018x},{ase:#06x}): exponent {gse:#06x}, want {wse:#06x}"
+        );
+        let err = gm.abs_diff(wm);
+        assert!(
+            err <= 1,
+            "sin({am:#018x},{ase:#06x}): significand {gm:#018x}, want {wm:#018x} ({err} ulp)"
+        );
+    }
+}
