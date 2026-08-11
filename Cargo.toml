@@ -184,3 +184,7 @@ required-features = ["testkit"]
 [[test]]
 name = "specialize_tests"
 required-features = ["testkit"]
+
+[[test]]
+name = "overflow_flags_tests"
+required-features = ["testkit"]

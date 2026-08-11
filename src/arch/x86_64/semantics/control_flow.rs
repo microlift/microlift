@@ -552,13 +552,13 @@ impl<'a> Lifter<'a> {
                 } else {
                     lo
                 };
-                self.builder.ins().bitcast(cl_ty, MemFlagsData::new(), bits)
+                self.builder.ins().bitcast(cl_ty, Self::get_regcontext_flags(), bits)
             }
             ArgLocation::Stack(offset) => {
                 let rsp = self.get_reg_val(Register::RSP)?;
                 self.builder
                     .ins()
-                    .load(cl_ty, MemFlagsData::new(), rsp, offset as i32)
+                    .load(cl_ty, Self::get_regcontext_flags(), rsp, offset as i32)
             }
         };
         Ok(val)
@@ -580,12 +580,12 @@ impl<'a> Lifter<'a> {
                     let i32_val =
                         self.builder
                             .ins()
-                            .bitcast(types::I32, MemFlagsData::new(), ret_val);
+                            .bitcast(types::I32, Self::get_regcontext_flags(), ret_val);
                     self.builder.ins().uextend(types::I64, i32_val)
                 } else {
                     self.builder
                         .ins()
-                        .bitcast(types::I64, MemFlagsData::new(), ret_val)
+                        .bitcast(types::I64, Self::get_regcontext_flags(), ret_val)
                 };
                 let zero = self.builder.ins().iconst(types::I64, 0);
                 self.set_xmm_lo(idx, bits);

@@ -44,18 +44,16 @@ impl<'a> Lifter<'a> {
             OpKind::Register => {
                 let reg = instruction.op0_register();
                 let dst_val = self.get_reg_val(reg)?;
-                let result = self.builder.ins().iadd(dst_val, src_val);
+                let result = self.add_with_flags(dst_val, src_val, size)?;
                 self.set_reg_val(reg, result)?;
-                self.update_flags_add(dst_val, src_val, result, size)?;
             }
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 0)?;
                 let dst_val = self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0);
-                let result = self.builder.ins().iadd(dst_val, src_val);
+                let result = self.add_with_flags(dst_val, src_val, size)?;
                 self.builder
                     .ins()
                     .store(MemFlagsData::new(), result, ptr, 0);
-                self.update_flags_add(dst_val, src_val, result, size)?;
             }
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -104,18 +102,16 @@ impl<'a> Lifter<'a> {
             OpKind::Register => {
                 let reg = instruction.op0_register();
                 let dst_val = self.get_reg_val(reg)?;
-                let result = self.builder.ins().isub(dst_val, src_val);
+                let result = self.sub_with_flags(dst_val, src_val, size)?;
                 self.set_reg_val(reg, result)?;
-                self.update_flags_sub(dst_val, src_val, result, size)?;
             }
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 0)?;
                 let dst_val = self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0);
-                let result = self.builder.ins().isub(dst_val, src_val);
+                let result = self.sub_with_flags(dst_val, src_val, size)?;
                 self.builder
                     .ins()
                     .store(MemFlagsData::new(), result, ptr, 0);
-                self.update_flags_sub(dst_val, src_val, result, size)?;
             }
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -172,39 +168,16 @@ impl<'a> Lifter<'a> {
             OpKind::Register => {
                 let reg = instruction.op0_register();
                 let dst_val = self.get_reg_val(reg)?;
-                // Two-step add to properly propagate carry.
-                let tmp = self.builder.ins().iadd(dst_val, src_val);
-                let cf1 = self
-                    .builder
-                    .ins()
-                    .icmp(IntCC::UnsignedLessThan, tmp, dst_val);
-                let result = self.builder.ins().iadd(tmp, cf_ext);
-                let cf2 = self
-                    .builder
-                    .ins()
-                    .icmp(IntCC::UnsignedLessThan, result, tmp);
-                let cf_out = self.builder.ins().bor(cf1, cf2);
+                let result = self.adc_sbb_with_flags(dst_val, src_val, cf_ext, true, size)?;
                 self.set_reg_val(reg, result)?;
-                self.update_flags_adc(dst_val, src_val, result, cf_out, size)?;
             }
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 0)?;
                 let dst_val = self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0);
-                let tmp = self.builder.ins().iadd(dst_val, src_val);
-                let cf1 = self
-                    .builder
-                    .ins()
-                    .icmp(IntCC::UnsignedLessThan, tmp, dst_val);
-                let result = self.builder.ins().iadd(tmp, cf_ext);
-                let cf2 = self
-                    .builder
-                    .ins()
-                    .icmp(IntCC::UnsignedLessThan, result, tmp);
-                let cf_out = self.builder.ins().bor(cf1, cf2);
+                let result = self.adc_sbb_with_flags(dst_val, src_val, cf_ext, true, size)?;
                 self.builder
                     .ins()
                     .store(MemFlagsData::new(), result, ptr, 0);
-                self.update_flags_adc(dst_val, src_val, result, cf_out, size)?;
             }
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -261,39 +234,16 @@ impl<'a> Lifter<'a> {
             OpKind::Register => {
                 let reg = instruction.op0_register();
                 let dst_val = self.get_reg_val(reg)?;
-                // Two-step sub to properly propagate borrow.
-                let tmp = self.builder.ins().isub(dst_val, src_val);
-                let borrow1 = self
-                    .builder
-                    .ins()
-                    .icmp(IntCC::UnsignedLessThan, dst_val, src_val);
-                let result = self.builder.ins().isub(tmp, cf_ext);
-                let borrow2 = self
-                    .builder
-                    .ins()
-                    .icmp(IntCC::UnsignedLessThan, tmp, cf_ext);
-                let cf_out = self.builder.ins().bor(borrow1, borrow2);
+                let result = self.adc_sbb_with_flags(dst_val, src_val, cf_ext, false, size)?;
                 self.set_reg_val(reg, result)?;
-                self.update_flags_sbb(dst_val, src_val, result, cf_out, size)?;
             }
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 0)?;
                 let dst_val = self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0);
-                let tmp = self.builder.ins().isub(dst_val, src_val);
-                let borrow1 = self
-                    .builder
-                    .ins()
-                    .icmp(IntCC::UnsignedLessThan, dst_val, src_val);
-                let result = self.builder.ins().isub(tmp, cf_ext);
-                let borrow2 = self
-                    .builder
-                    .ins()
-                    .icmp(IntCC::UnsignedLessThan, tmp, cf_ext);
-                let cf_out = self.builder.ins().bor(borrow1, borrow2);
+                let result = self.adc_sbb_with_flags(dst_val, src_val, cf_ext, false, size)?;
                 self.builder
                     .ins()
                     .store(MemFlagsData::new(), result, ptr, 0);
-                self.update_flags_sbb(dst_val, src_val, result, cf_out, size)?;
             }
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -310,7 +260,9 @@ impl<'a> Lifter<'a> {
         let src_reg = instruction.op1_register();
         let src_val = self.get_reg_val(src_reg)?;
 
-        let result = self.builder.ins().iadd(dst_val, src_val);
+        // Flags first: they are a function of the two values just read, and the
+        // operand writes below are ordered against each other, not against them.
+        let result = self.add_with_flags(dst_val, src_val, size)?;
         // Hardware order: TEMP <- SRC + DEST; SRC <- DEST; DEST <- TEMP. The
         // destination write must come last so `xadd r, r` (same register both
         // ways) ends up holding the sum, not the old value. For a memory
@@ -324,7 +276,6 @@ impl<'a> Lifter<'a> {
             self.write_operand(instruction, 0, result)?;
             self.set_reg_val(src_reg, dst_val)?;
         }
-        self.update_flags_add(dst_val, src_val, result, size)?;
         Ok(())
     }
 
@@ -375,8 +326,8 @@ impl<'a> Lifter<'a> {
             }
         };
 
-        let result = self.builder.ins().isub(dst_val, src_val);
-        self.update_flags_sub(dst_val, src_val, result, size)?;
+        // CMP is a SUB that keeps only the flags.
+        self.sub_with_flags(dst_val, src_val, size)?;
         Ok(())
     }
 
@@ -385,9 +336,8 @@ impl<'a> Lifter<'a> {
         let ty = size_to_type(size);
         let dst_val = self.read_operand(instruction, 0, size)?;
         let one = self.builder.ins().iconst(ty, 1);
-        let result = self.builder.ins().iadd(dst_val, one);
+        let result = self.inc_dec_with_flags(dst_val, one, true, size)?;
         self.write_operand(instruction, 0, result)?;
-        self.update_flags_inc_dec(dst_val, one, result, true, size)?;
         Ok(())
     }
 
@@ -396,9 +346,8 @@ impl<'a> Lifter<'a> {
         let ty = size_to_type(size);
         let dst_val = self.read_operand(instruction, 0, size)?;
         let one = self.builder.ins().iconst(ty, 1);
-        let result = self.builder.ins().isub(dst_val, one);
+        let result = self.inc_dec_with_flags(dst_val, one, false, size)?;
         self.write_operand(instruction, 0, result)?;
-        self.update_flags_inc_dec(dst_val, one, result, false, size)?;
         Ok(())
     }
 
@@ -407,10 +356,10 @@ impl<'a> Lifter<'a> {
         let ty = size_to_type(size);
         let val = self.read_operand(instruction, 0, size)?;
         let zero = self.builder.ins().iconst(ty, 0);
-        let result = self.builder.ins().isub(zero, val);
+        // NEG is `0 - val`, flags included: CF is the borrow (set unless the
+        // operand was zero) and OF the signed overflow (only at INT_MIN).
+        let result = self.sub_with_flags(zero, val, size)?;
         self.write_operand(instruction, 0, result)?;
-        // NEG sets flags as if doing 0 - val
-        self.update_flags_sub(zero, val, result, size)?;
         Ok(())
     }
 
@@ -477,28 +426,16 @@ impl<'a> Lifter<'a> {
                 let size = self.operand_size(instruction, 0)?;
                 let dst = self.read_operand(instruction, 0, size)?;
                 let src = self.read_operand(instruction, 1, size)?;
-                let result = self.builder.ins().imul(dst, src);
+                let result = self.imul_with_flags(dst, src, size)?;
                 self.write_operand(instruction, 0, result)?;
-                // OF/CF: set if result != sign-extended truncation
-                let hi = self.builder.ins().smulhi(dst, src);
-                let sign_ext = self.builder.ins().sshr_imm_u(result, (size * 8 - 1) as i64);
-                let of_cf = self.builder.ins().icmp(IntCC::NotEqual, sign_ext, hi);
-                self.set_flag(crate::lifter::X86Flag::Carry, of_cf)?;
-                self.set_flag(crate::lifter::X86Flag::Overflow, of_cf)?;
             }
             3 => {
                 // 3-operand: dst = src1 * imm
                 let size = self.operand_size(instruction, 0)?;
                 let src = self.read_operand(instruction, 1, size)?;
                 let imm = self.read_operand(instruction, 2, size)?;
-                let result = self.builder.ins().imul(src, imm);
+                let result = self.imul_with_flags(src, imm, size)?;
                 self.write_operand(instruction, 0, result)?;
-                // OF/CF
-                let hi = self.builder.ins().smulhi(src, imm);
-                let sign_ext = self.builder.ins().sshr_imm_u(result, (size * 8 - 1) as i64);
-                let of_cf = self.builder.ins().icmp(IntCC::NotEqual, sign_ext, hi);
-                self.set_flag(crate::lifter::X86Flag::Carry, of_cf)?;
-                self.set_flag(crate::lifter::X86Flag::Overflow, of_cf)?;
             }
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {

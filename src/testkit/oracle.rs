@@ -226,9 +226,16 @@ pub struct MicroliftOracle {
     /// Defaults to [`Specialization::generic`]. Setting it points the oracle at
     /// the specialized lowerings, which is how those get differential coverage
     /// against real hardware semantics rather than only against microlift's own
-    /// portable path. Every specialization additionally needs
-    /// [`vector_xmm`](Self::vector_xmm).
+    /// portable path. The vector specializations additionally need
+    /// [`vector_xmm`](Self::vector_xmm), and
+    /// [`Spec::IntegerOverflowFlags`](crate::core::specialize::Spec::IntegerOverflowFlags)
+    /// needs [`eliminate_dead_flags`](Self::eliminate_dead_flags);
+    /// [`specialized`](Self::specialized) sets both.
     pub specialization: Specialization,
+    /// Whether to run the dead-flag liveness pass (`config.eliminate_dead_flags`).
+    ///
+    /// Defaults off, matching [`LifterConfig`](crate::core::LifterConfig).
+    pub eliminate_dead_flags: bool,
 }
 
 impl MicroliftOracle {
@@ -239,9 +246,18 @@ impl MicroliftOracle {
         }
     }
 
-    /// Lift with vector-backed XMM registers and `spec` applied.
+    /// Lift with `spec` applied, and with everything the specializations need
+    /// to be reachable at all: vector-backed XMM registers, and the dead-flag
+    /// liveness pass.
+    ///
+    /// Both prerequisites are turned on together rather than per-`Spec` so that
+    /// a caller enabling a whole target's set gets a lift where every member of
+    /// it can fire. Neither changes an architectural result, which is what
+    /// makes that safe to do behind one method - and both are separately proven
+    /// not to (`specialize_tests`, `dead_flag_tests`).
     pub fn specialized(mut self, spec: Specialization) -> Self {
         self.vector_xmm = true;
+        self.eliminate_dead_flags = true;
         self.specialization = spec;
         self
     }
@@ -270,8 +286,13 @@ impl CpuOracle for MicroliftOracle {
             .vector_xmm(self.vector_xmm)
             .specialize(self.specialization)
             .ctx(ctx)
-            .ret_addr(RetAddr::Trampoline)
-            .run();
+            .ret_addr(RetAddr::Trampoline);
+        let out = if self.eliminate_dead_flags {
+            out.eliminate_dead_flags()
+        } else {
+            out
+        }
+        .run();
 
         let state = CpuState::from_ctx(&out.ctx);
         match out.exit {

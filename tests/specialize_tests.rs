@@ -42,6 +42,14 @@ struct Case {
     /// it must be byte-identical to the portable lowering - a specialization
     /// that fires and does not pay is a bug, not a wash.
     improves: &'static [SpecTarget],
+    /// Whether this case must be lifted with
+    /// [`LifterConfig::eliminate_dead_flags`] on.
+    ///
+    /// Only [`Spec::IntegerOverflowFlags`] needs it, and needs it absolutely:
+    /// that specialization declines outright without flag liveness to consult,
+    /// so every check here would be measuring an inert feature. See its
+    /// module note for why it is wired that way.
+    lean: bool,
 }
 
 /// Both families.
@@ -67,6 +75,7 @@ fn cases() -> Vec<Case> {
             bytes: v,
             spec,
             improves,
+            lean: false,
         });
     };
 
@@ -148,8 +157,68 @@ fn cases() -> Vec<Case> {
         ARM,
     );
 
+    // `<insn> ; seto dl ; setb bl`, REPEATS times. The two `setcc`s are what
+    // make the measurement mean anything: they give CF and OF a reader, so the
+    // liveness pass reports them live and the specialization is reached at all.
+    // Without them every copy but the last has both flags dead and the honest
+    // answer is a plain `iadd`.
+    let mut push_n = |name: &str, bytes: &[u8], spec: Spec, improves: &'static [SpecTarget]| {
+        let mut unit = bytes.to_vec();
+        unit.extend_from_slice(&[0x0F, 0x90, 0xC2]); // seto dl
+        unit.extend_from_slice(&[0x0F, 0x92, 0xC3]); // setb bl
+        let mut v: Vec<u8> = unit.repeat(REPEATS);
+        v.push(0xC3); // ret
+        out.push(Case {
+            name: name.to_string(),
+            bytes: v,
+            spec,
+            improves,
+            lean: true,
+        });
+    };
+
+    // Scalar integer CF/OF. Register forms only - the locked ones need a live
+    // pointer and live in `overflow_flags_tests.rs` - and every destination is
+    // RAX so `assert_same` sees the result as well as the flags.
+    //
+    // Each is repeated [`REPEATS`] times, for the reason documented there: this
+    // is the one specialization whose per-instruction effect is smaller than
+    // the size of one region's fixed overhead.
+    //
+    // Widths are swept on ADD alone: the width reaches the specialization only
+    // as the operand type, and every backend here lowers all four the same way.
+    let o = Spec::IntegerOverflowFlags;
+    push_n("add-r64", &[0x48, 0x01, 0xC8], o, BOTH);
+    push_n("add-r32", &[0x01, 0xC8], o, BOTH);
+    push_n("add-r16", &[0x66, 0x01, 0xC8], o, BOTH);
+    push_n("add-r8", &[0x00, 0xC8], o, BOTH);
+    push_n("sub-r64", &[0x48, 0x29, 0xC8], o, BOTH);
+    push_n("cmp-r64", &[0x48, 0x39, 0xC8], o, BOTH);
+    push_n("adc-r64", &[0x48, 0x11, 0xC8], o, BOTH);
+    push_n("sbb-r64", &[0x48, 0x19, 0xC8], o, BOTH);
+    push_n("inc-r64", &[0x48, 0xFF, 0xC0], o, BOTH);
+    push_n("dec-r64", &[0x48, 0xFF, 0xC8], o, BOTH);
+    push_n("neg-r64", &[0x48, 0xF7, 0xD8], o, BOTH);
+    push_n("xadd-r64", &[0x48, 0x0F, 0xC1, 0xC8], o, BOTH);
+    // `smul_overflow` is x64's *one-operand* `imul`, which pins RAX and RDX;
+    // the moves that costs are worse than the second multiply it saves, so the
+    // multiply forms are aarch64-only. See `try_native_imul_flags`.
+    push_n("imul-r64", &[0x48, 0x0F, 0xAF, 0xC1], o, ARM);
+    push_n("imul-imm32", &[0x69, 0xC1, 0x34, 0x12, 0x00, 0x00], o, ARM);
+
     out
 }
+
+/// Copies of the guest instruction in the scalar-integer snippets.
+///
+/// Every other specialization here replaces a dozen-instruction expansion with
+/// one or two, so a single copy stands well clear of the measurement noise
+/// [`code_len`] describes. [`Spec::IntegerOverflowFlags`] replaces about six
+/// host instructions with about three - single digits of `.text` against a
+/// region whose fixed prologue and context sync are some 1500 bytes - and at
+/// that scale the noise floor is not a floor but the whole signal. Repeating
+/// the instruction scales the effect and leaves the overhead where it was.
+const REPEATS: usize = 32;
 
 /// Seeded XMM/GPR state, identical across every configuration under test.
 fn seeded_state(seed: u64) -> RegisterContext {
@@ -166,19 +235,29 @@ fn seeded_state(seed: u64) -> RegisterContext {
 }
 
 /// Run `bytes` from `init` under a given specialization, vector-backed XMM.
-fn run_spec(bytes: &[u8], init: RegisterContext, spec: Specialization) -> RegisterContext {
-    LiftTest::new(bytes)
+fn run_spec(
+    bytes: &[u8],
+    init: RegisterContext,
+    spec: Specialization,
+    lean: bool,
+) -> RegisterContext {
+    let t = LiftTest::new(bytes)
         .ctx(init)
         .vector_xmm(true)
-        .specialize(spec)
-        .run()
-        .ctx
+        .specialize(spec);
+    let t = if lean { t.eliminate_dead_flags() } else { t };
+    t.run().ctx
 }
 
 #[track_caller]
 fn assert_same(name: &str, seed: u64, what: &str, a: &RegisterContext, b: &RegisterContext) {
     assert_eq!(a.xmm, b.xmm, "{name}: xmm diverged {what} (seed {seed})");
-    assert_eq!(a.rax, b.rax, "{name}: rax diverged {what} (seed {seed})");
+    let gprs = |c: &RegisterContext| (c.rax, c.rcx, c.rdx);
+    assert_eq!(
+        gprs(a),
+        gprs(b),
+        "{name}: GPRs diverged {what} (seed {seed})"
+    );
     let flags = |c: &RegisterContext| (c.cf, c.pf, c.af, c.zf, c.sf, c.of);
     assert_eq!(
         flags(a),
@@ -201,16 +280,22 @@ fn agrees_with_portable() {
         for seed in 0..24u64 {
             let init = seeded_state(seed);
 
-            let scalar = LiftTest::new(&case.bytes)
-                .ctx(init)
-                .vector_xmm(false)
-                .run()
-                .ctx;
-            let vector = run_spec(&case.bytes, init, Specialization::generic());
+            let plain = LiftTest::new(&case.bytes).ctx(init).vector_xmm(false);
+            let scalar = if case.lean {
+                plain.eliminate_dead_flags().run().ctx
+            } else {
+                plain.run().ctx
+            };
+            let vector = run_spec(&case.bytes, init, Specialization::generic(), case.lean);
             assert_same(&case.name, seed, "scalar vs vector", &scalar, &vector);
 
             for target in targets {
-                let spec = run_spec(&case.bytes, init, Specialization::for_target(target));
+                let spec = run_spec(
+                    &case.bytes,
+                    init,
+                    Specialization::for_target(target),
+                    case.lean,
+                );
                 assert_same(&case.name, seed, target.name(), &scalar, &spec);
             }
         }
@@ -312,7 +397,7 @@ fn agrees_on_the_saturation_edges() {
 
         let scalar = LiftTest::new(bytes).ctx(init).vector_xmm(false).run().ctx;
         for target in [SpecTarget::X86_64, SpecTarget::Aarch64] {
-            let spec = run_spec(bytes, init, Specialization::for_target(target));
+            let spec = run_spec(bytes, init, Specialization::for_target(target), false);
             assert_same(name, 0, target.name(), &scalar, &spec);
         }
     }
@@ -371,7 +456,7 @@ fn agrees_on_float_horizontal_nans() {
 
             let scalar = LiftTest::new(bytes).ctx(init).vector_xmm(false).run().ctx;
             for target in [SpecTarget::X86_64, SpecTarget::Aarch64] {
-                let spec = run_spec(bytes, init, Specialization::for_target(target));
+                let spec = run_spec(bytes, init, Specialization::for_target(target), false);
                 assert_same(name, i as u64, target.name(), &scalar, &spec);
             }
         }
@@ -380,10 +465,11 @@ fn agrees_on_float_horizontal_nans() {
 
 /// Count the IR instructions a lift emits, which is the closest lift-time proxy
 /// for what the specialization buys.
-fn ir_len(bytes: &[u8], spec: Specialization) -> usize {
+fn ir_len(bytes: &[u8], spec: Specialization, lean: bool) -> usize {
     let config = LifterConfig {
         use_vector_xmm: true,
         specialization: spec,
+        eliminate_dead_flags: lean,
         ..Default::default()
     };
     let code = lift_to_code::<X86_64>(bytes, 0x1000, config).expect("lift");
@@ -395,10 +481,11 @@ fn ir_len(bytes: &[u8], spec: Specialization) -> usize {
 }
 
 /// One compile of `bytes` under `spec` for `triple`, returning `.text` size.
-fn compile_once(bytes: &[u8], spec: Specialization, triple: &str) -> usize {
+fn compile_once(bytes: &[u8], spec: Specialization, triple: &str, lean: bool) -> usize {
     let config = LifterConfig {
         use_vector_xmm: true,
         specialization: spec,
+        eliminate_dead_flags: lean,
         ..Default::default()
     };
     let mut code = lift_to_code::<X86_64>(bytes, 0x1000, config).expect("lift");
@@ -434,9 +521,9 @@ fn compile_once(bytes: &[u8], spec: Specialization, triple: &str) -> usize {
 /// compiles pulls each measurement most of the way to the floor for its IR
 /// shape; the residue is absorbed by [`noise_floor`], which is what the
 /// comparisons are made modulo.
-fn code_len(bytes: &[u8], spec: Specialization, triple: &str) -> usize {
+fn code_len(bytes: &[u8], spec: Specialization, triple: &str, lean: bool) -> usize {
     (0..SAMPLES)
-        .map(|_| compile_once(bytes, spec, triple))
+        .map(|_| compile_once(bytes, spec, triple, lean))
         .min()
         .expect("at least one sample")
 }
@@ -493,30 +580,42 @@ fn specializations_shrink_the_compiled_code() {
             bytes,
             spec,
             improves,
+            lean,
         } = case;
         for (target, triple) in targets {
-            let base = code_len(&bytes, Specialization::generic(), triple);
-            // Only the one specialization under test, so the measurement cannot
+            // Only the one specialization under test, so a measurement cannot
             // be explained by a different one firing.
             let only = Specialization::for_target(target).only(&[spec]);
-            let n = code_len(&bytes, only, triple);
-
-            let delta = n as i64 - base as i64;
-            let noise = noise_floor(target);
 
             if improves.contains(&target) {
+                let base = code_len(&bytes, Specialization::generic(), triple, lean);
+                let n = code_len(&bytes, only, triple, lean);
+                let delta = n as i64 - base as i64;
                 assert!(
-                    delta < -noise,
+                    delta < -noise_floor(target),
                     "{name}: {} compiled to {n} bytes with {}, {base} without ({delta:+}) - it \
                      did not fire, or it is not an improvement",
                     target.name(),
                     spec.name()
                 );
             } else {
-                assert!(
-                    delta.abs() <= noise,
-                    "{name}: {} is not expected to benefit from {}, but the compiled code \
-                     changed by {delta:+} bytes ({base} -> {n})",
+                // The other direction is checked in IR rather than in `.text`.
+                // "Did not fire" is a statement about what the lifter emitted,
+                // and the lifter is deterministic there, so this is exact -
+                // where a `.text` comparison has to be made modulo
+                // [`noise_floor`], and that floor was calibrated on
+                // single-instruction regions. It does not cover the repeated
+                // snippets [`REPEATS`] produces, whose noise is proportionally
+                // larger and did in fact exceed it.
+                //
+                // The improving direction cannot be checked this way: IR count
+                // is not a proxy for lowering quality - see [`code_len`] on
+                // `PMULUDQ`, five IR instructions replacing one.
+                assert_eq!(
+                    ir_len(&bytes, only, lean),
+                    ir_len(&bytes, Specialization::generic(), lean),
+                    "{name}: {} is not expected to benefit from {}, but enabling it changed \
+                     the emitted IR",
                     target.name(),
                     spec.name()
                 );
@@ -532,14 +631,14 @@ fn specializations_shrink_the_compiled_code() {
 #[test]
 fn disabling_restores_the_portable_ir() {
     for case in cases() {
-        let (name, bytes, spec) = (case.name, case.bytes, case.spec);
-        let base = ir_len(&bytes, Specialization::generic());
+        let (name, bytes, spec, lean) = (case.name, case.bytes, case.spec, case.lean);
+        let base = ir_len(&bytes, Specialization::generic(), lean);
         for target in [SpecTarget::X86_64, SpecTarget::Aarch64] {
             let off = Specialization::for_target(target).without(spec);
             // Other specializations do not apply - each snippet is one guest
             // instruction - so the whole set minus this one must be inert.
             assert_eq!(
-                ir_len(&bytes, off),
+                ir_len(&bytes, off, lean),
                 base,
                 "{name}: disabling {} on {} changed the IR",
                 spec.name(),
@@ -563,11 +662,12 @@ fn each_target_lowers_its_own_ir() {
     ];
 
     for case in cases() {
-        let (name, bytes) = (case.name, case.bytes);
+        let (name, bytes, lean) = (case.name, case.bytes, case.lean);
         for (target, triple) in pairs {
             let config = LifterConfig {
                 use_vector_xmm: true,
                 specialization: Specialization::for_target(target),
+                eliminate_dead_flags: lean,
                 ..Default::default()
             };
             let mut code = lift_to_code::<X86_64>(&bytes, 0x1000, config).expect("lift");
@@ -581,18 +681,22 @@ fn each_target_lowers_its_own_ir() {
     }
 }
 
-/// A specialization is inert without vector-backed XMM registers.
+/// A vector specialization is inert without vector-backed XMM registers.
 ///
-/// Every sequence here is a whole-register vector one, so there is nothing to
-/// build it out of in scalar mode. Asking for it anyway must be a no-op rather
-/// than an error or a partial application.
+/// Those sequences are whole-register vector ones, so there is nothing to build
+/// them out of in scalar mode; asking anyway must be a no-op rather than an
+/// error or a partial application. [`Spec::IntegerOverflowFlags`] declares
+/// itself exempt - it rewrites scalar integer arithmetic and has no opinion
+/// about how XMM registers are stored - so it is checked for the opposite.
 #[test]
 fn inert_without_vector_xmm() {
     for case in cases() {
-        let (name, bytes) = (case.name, case.bytes);
+        let (name, bytes, needs_vec) = (case.name, case.bytes, case.spec.requires_vector_xmm());
+        let lean = case.lean;
         let config = |spec| LifterConfig {
             use_vector_xmm: false,
             specialization: spec,
+            eliminate_dead_flags: lean,
             ..Default::default()
         };
         let base = lift_to_code::<X86_64>(&bytes, 0x1000, config(Specialization::generic()))
@@ -611,11 +715,20 @@ fn inert_without_vector_xmm() {
                 .map(|b| c.func.layout.block_insts(b).count())
                 .sum()
         };
-        assert_eq!(
-            count(&base),
-            count(&spec),
-            "{name}: specialization was not inert in scalar mode"
-        );
+        if needs_vec {
+            assert_eq!(
+                count(&base),
+                count(&spec),
+                "{name}: specialization was not inert in scalar mode"
+            );
+        } else {
+            assert_ne!(
+                count(&base),
+                count(&spec),
+                "{name}: specialization declares it does not need vector XMM, but did \
+                 nothing in scalar mode"
+            );
+        }
     }
 }
 
@@ -630,11 +743,11 @@ fn dump_code_sizes() {
     ] {
         println!("== {}", target.name());
         for case in cases() {
-            let (name, bytes, spec) = (case.name, case.bytes, case.spec);
-            let base = code_len(&bytes, Specialization::generic(), triple);
+            let (name, bytes, spec, lean) = (case.name, case.bytes, case.spec, case.lean);
+            let base = code_len(&bytes, Specialization::generic(), triple, lean);
             let only = Specialization::for_target(target).none().with(spec);
             // Bypass supported_on so unsupported pairs are measured too.
-            let n = code_len(&bytes, only, triple);
+            let n = code_len(&bytes, only, triple, lean);
             println!(
                 "{name:24} {spec:?} base={base} spec={n} delta={}",
                 n as i64 - base as i64

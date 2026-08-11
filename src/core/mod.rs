@@ -717,8 +717,18 @@ pub struct LifterConfig {
     /// AOT - and narrow it with [`Specialization::without`] if a particular one
     /// needs to be bisected out.
     ///
-    /// Every specialization today additionally requires
-    /// [`use_vector_xmm`](Self::use_vector_xmm); with that off this is inert.
+    /// Each specialization declares what else it needs, and both of the
+    /// switches below are hard requirements rather than hints - a
+    /// specialization whose prerequisite is off is silently inert:
+    ///
+    /// - Every vector specialization needs
+    ///   [`use_vector_xmm`](Self::use_vector_xmm), which is all of them bar
+    ///   [`Spec::IntegerOverflowFlags`](crate::core::specialize::Spec::IntegerOverflowFlags).
+    /// - IntegerOverflowFlags needs [`eliminate_dead_flags`](Self::eliminate_dead_flags)
+    ///   instead: without knowing which condition flags are read it is a
+    ///   measured regression, not an improvement. Its own documentation has the
+    ///   why.
+    ///
     /// **No specialization changes a result bit** - see
     /// [`crate::core::specialize`] for the contract and the equivalence suite
     /// that enforces it.
@@ -876,6 +886,11 @@ pub struct LifterConfig {
     /// Inert on a frontend that does not implement
     /// [`GuestArch::flag_effects`] - every instruction classifies conservatively
     /// and nothing is elided.
+    ///
+    /// It also unlocks
+    /// [`Spec::IntegerOverflowFlags`](crate::core::specialize::Spec::IntegerOverflowFlags),
+    /// which is inert without it: knowing a flag is dead is what makes taking
+    /// the other two from the machine's own arithmetic pay rather than cost.
     pub eliminate_dead_flags: bool,
     /// Exit rather than guess when the entry PC matches no resume point.
     ///

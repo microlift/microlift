@@ -106,6 +106,39 @@ pub enum Spec {
     /// with a compare-and-select and is still shorter than the portable
     /// widening expansion.
     RoundedMultiplyHigh,
+    /// CF and OF from the machine's own overflow-producing add, subtract and
+    /// multiply, rather than from arithmetic on the result.
+    ///
+    /// The portable definitions of those two flags are the expensive half of
+    /// every `ADD`/`SUB`/`CMP`/`INC`/`DEC`/`NEG`/`ADC`/`SBB`/`XADD` and their
+    /// locked forms: CF is a second compare of values the machine already
+    /// compared, and OF is a four-instruction `(lhs ^ res) & (rhs ^ res)`
+    /// sign-bit dance. Both are a *single condition bit the hardware produced
+    /// as a side effect of the arithmetic* - which is exactly what Cranelift's
+    /// `uadd_overflow` / `sadd_overflow` / `usub_overflow` / `ssub_overflow`
+    /// (and `smul_overflow` for the truncating `IMUL` forms) model.
+    ///
+    /// aarch64: `ADDS`/`SUBS` and a `CSET` on `HS`/`VS`.
+    /// x86-64: `add`/`sub` and a `setb`/`seto` - the guest's own instruction,
+    /// reading the guest's own flag, after a round trip through the IR.
+    ///
+    /// Not claimed elsewhere because the coverage is genuinely partial:
+    /// riscv64 lowers `uadd_overflow` alone, and only at `I32`/`I64`, so a
+    /// `SUB` at any width would be a hard lowering failure there. `IMUL`'s
+    /// truncating forms are aarch64-only for a second reason - x64 lowers
+    /// `smul_overflow` through the register-pinning one-operand `imul`, which
+    /// measured as a loss.
+    /// 
+    /// It requires [`eliminate_dead_flags`](crate::core::LifterConfig::eliminate_dead_flags),
+    /// and is entirely inert without it. Unlike a vector specialization,
+    /// this one is not an improvement wherever it applies: the portable flag
+    /// arithmetic is dataflow over the sum and dies to ordinary DCE when
+    /// nothing reads it, while an overflow op's condition bit is welded to
+    /// the instruction producing the result and survives. Without liveness
+    /// every site looks live and the feature is a measured regression; with
+    /// it, the dead sites emit a plain `iadd` and the live ones get the short
+    /// form. See `arch/x86_64/semantics/arith_spec.rs`.
+    IntegerOverflowFlags,
 }
 
 impl Spec {
@@ -118,6 +151,7 @@ impl Spec {
         Spec::SumOfAbsoluteDifferences,
         Spec::WideningEvenMultiply,
         Spec::RoundedMultiplyHigh,
+        Spec::IntegerOverflowFlags,
     ];
 
     fn bit(self) -> u32 {
@@ -134,6 +168,7 @@ impl Spec {
             Spec::SumOfAbsoluteDifferences => "sum-of-absolute-differences",
             Spec::WideningEvenMultiply => "widening-even-multiply",
             Spec::RoundedMultiplyHigh => "rounded-multiply-high",
+            Spec::IntegerOverflowFlags => "integer-overflow-flags",
         }
     }
 
@@ -149,8 +184,20 @@ impl Spec {
                     | Spec::PairwiseMultiplyAdd
                     | Spec::MultiplyAddUnsignedSigned
                     | Spec::SumOfAbsoluteDifferences
+                    | Spec::IntegerOverflowFlags
             ),
         }
+    }
+
+    /// Whether this specialization is inert without
+    /// [`LifterConfig::use_vector_xmm`](crate::core::LifterConfig::use_vector_xmm).
+    ///
+    /// True for every whole-register vector sequence, which is all of them bar
+    /// [`IntegerOverflowFlags`](Spec::IntegerOverflowFlags): that one rewrites
+    /// scalar integer arithmetic and has nothing to do with how XMM registers
+    /// are represented.
+    pub fn requires_vector_xmm(self) -> bool {
+        !matches!(self, Spec::IntegerOverflowFlags)
     }
 }
 

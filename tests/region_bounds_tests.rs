@@ -316,14 +316,14 @@ const TWO_EXITS: [u8; 9] = [
 /// terminated its block, phase 2 stopped there, and everything after the
 /// `CPUID` was neither lifted nor enterable. [`VmResumptionPoints::All`] covered
 /// it by making *every* instruction a resume point, which is why that mode
-/// looked mandatory — and is exactly the cost this file exists to avoid paying.
+/// looked mandatory - and is exactly the cost this file exists to avoid paying.
 #[test]
 fn a_resumable_exit_offers_the_address_it_resumes_at() {
     let lifted = lift_to_code::<X86_64>(&TWO_EXITS, BASE, LifterConfig::default()).unwrap();
     assert_eq!(
         lifted.resume_points,
         vec![BASE, BASE + 4, BASE + 8],
-        "the entry, and where each exit comes back to — nothing else"
+        "the entry, and where each exit comes back to - nothing else"
     );
 }
 

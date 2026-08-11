@@ -6,8 +6,11 @@ use cranelift::prelude::*;
 use iced_x86::Instruction;
 
 impl<'a> Lifter<'a> {
+    /// Whether `spec` may be applied at this site: the target implements it,
+    /// the caller enabled it, and - for the vector ones - the XMM registers are
+    /// in the representation their sequences are written against.
     pub(super) fn specialized(&self, spec: Spec) -> bool {
-        self.vec_mode() && self.config.specialization.allows(spec)
+        (self.vec_mode() || !spec.requires_vector_xmm()) && self.config.specialization.allows(spec)
     }
 
     /// Gather the even and odd lanes of `(a, b)` into two vectors, in the order

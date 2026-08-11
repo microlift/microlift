@@ -1570,6 +1570,110 @@ fn mpsadbw_agrees() {
     }
 }
 
+/// `Spec::IntegerOverflowFlags` against real hardware.
+///
+/// The half `specialize_tests` cannot prove. That file shows the specialized
+/// CF and OF match microlift's own portable formulas; this shows the formulas
+/// match the CPU - which is what would catch both microlift paths being wrong
+/// the same way, and CF/OF are exactly the pair where that is plausible, since
+/// the unsigned and signed overflow conditions are easy to conflate and
+/// `usub_overflow`'s operand order is easy to get backwards.
+///
+/// The operands straddle both boundaries at every width. The `seto`/`setb`
+/// after each instruction is not decoration: without a reader the liveness pass
+/// reports both flags dead and the specialization correctly declines, leaving
+/// this measuring the portable path twice.
+#[test]
+fn integer_overflow_flags_agree_with_unicorn() {
+    use microlift::testkit::oracle::unicorn::differential_unicorn_spec;
+
+    // seto dl ; setb bl - readers that keep CF and OF live.
+    const READ: &[u8] = &[0x0F, 0x90, 0xC2, 0x0F, 0x92, 0xC3];
+    // xor esi, esi - a fully-defined flag write, appended after `READ` for the
+    // instructions whose ZF/SF/AF/PF the architecture leaves *undefined*.
+    //
+    // `IMUL`'s truncating forms are the only ones here. Microlift leaves those
+    // four as they were (which is what `flag_effects` classifies, and what
+    // `dead_flag_tests` pins down); real silicon sets them from the product.
+    // Neither is wrong, and neither is comparable - so this overwrites all five
+    // defined flags on both engines and leaves the two this test is about in DL
+    // and BL, where the GPR comparison sees them.
+    const NORMALIZE: &[u8] = &[0x31, 0xF6];
+    let cases: &[(&str, &[u8])] = &[
+        ("add r64", &[0x48, 0x01, 0xC8]),
+        ("add r32", &[0x01, 0xC8]),
+        ("add r16", &[0x66, 0x01, 0xC8]),
+        ("add r8", &[0x00, 0xC8]),
+        ("sub r64", &[0x48, 0x29, 0xC8]),
+        ("sub r32", &[0x29, 0xC8]),
+        ("sub r16", &[0x66, 0x29, 0xC8]),
+        ("sub r8", &[0x28, 0xC8]),
+        ("cmp r64", &[0x48, 0x39, 0xC8]),
+        ("adc r64", &[0x48, 0x11, 0xC8]),
+        ("adc r8", &[0x10, 0xC8]),
+        ("sbb r64", &[0x48, 0x19, 0xC8]),
+        ("sbb r8", &[0x18, 0xC8]),
+        ("inc r64", &[0x48, 0xFF, 0xC0]),
+        ("dec r64", &[0x48, 0xFF, 0xC8]),
+        ("neg r64", &[0x48, 0xF7, 0xD8]),
+        ("neg r8", &[0xF6, 0xD8]),
+        ("xadd r64", &[0x48, 0x0F, 0xC1, 0xC8]),
+        ("imul r64,r64", &[0x48, 0x0F, 0xAF, 0xC1]),
+        ("imul r32,r32,imm", &[0x69, 0xC1, 0x34, 0x12, 0x00, 0x00]),
+    ];
+
+    // (rax, rcx, carry in)
+    let operands: &[(u64, u64, bool)] = &[
+        (0, 0, false),
+        (0, 1, false),
+        (1, 0, false),
+        (0, 0, true),
+        (u64::MAX, 1, false),
+        (u64::MAX, 1, true),
+        (u64::MAX, u64::MAX, true),
+        (0x7FFF_FFFF_FFFF_FFFF, 1, false),
+        (0x7FFF_FFFF_FFFF_FFFF, 1, true),
+        (0x8000_0000_0000_0000, 1, false),
+        (0x8000_0000_0000_0000, u64::MAX, false),
+        (0x8000_0000_0000_0000, 0x8000_0000_0000_0000, false),
+        (0x7F, 1, false),
+        (0x80, 0xFF, false),
+        (0xFF, 1, true),
+        (0x7FFF, 1, false),
+        (0x8000, 0xFFFF, false),
+        (0x7FFF_FFFF, 1, false),
+        (0xFFFF_FFFF, 1, false),
+        (0x0123_4567_89AB_CDEF, 0xFEDC_BA98_7654_3210, true),
+    ];
+
+    for target in [SpecTarget::X86_64, SpecTarget::Aarch64] {
+        let spec = Specialization::for_target(target);
+        for (name, insn) in cases {
+            let mut code = insn.to_vec();
+            code.extend_from_slice(READ);
+            if name.starts_with("imul") {
+                code.extend_from_slice(NORMALIZE);
+            }
+            code.push(0xC3);
+            for &(rax, rcx, cf) in operands {
+                let mut init = CpuState::zeroed();
+                init.gpr[gpr::RAX] = rax;
+                init.gpr[gpr::RCX] = rcx;
+                if cf {
+                    init.rflags |= 1;
+                }
+                let diff = differential_unicorn_spec(&code, CODE_VA, &init, BUDGET, spec)
+                    .expect("clean halt");
+                assert!(
+                    diff.is_empty(),
+                    "{name} under {} with rax={rax:#x} rcx={rcx:#x} cf={cf} diverged: {diff:?}",
+                    target.name()
+                );
+            }
+        }
+    }
+}
+
 /// Every target-specialized SSE lowering, against real hardware semantics.
 ///
 /// `tests/specialize_tests.rs` proves specialized == microlift's portable path;

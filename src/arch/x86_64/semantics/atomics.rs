@@ -78,8 +78,7 @@ impl<'a> Lifter<'a> {
                         .atomic_cas(MemFlagsData::new(), ptr, acc_narrow, src_val);
 
                 // Update flags as CMP acc, old  (acc - old)
-                let cmp_result = self.builder.ins().isub(acc_narrow, old);
-                self.update_flags_sub(acc_narrow, old, cmp_result, size)?;
+                self.sub_with_flags(acc_narrow, old, size)?;
 
                 // If CAS failed (old != acc), write old into accumulator.
                 let succeeded = self.builder.ins().icmp(IntCC::Equal, old, acc_narrow);
@@ -90,8 +89,7 @@ impl<'a> Lifter<'a> {
                 let dst_val = self.read_operand(instruction, 0, size)?;
 
                 // Update flags as CMP acc, dst  (acc - dst)
-                let cmp_result = self.builder.ins().isub(acc_narrow, dst_val);
-                self.update_flags_sub(acc_narrow, dst_val, cmp_result, size)?;
+                self.sub_with_flags(acc_narrow, dst_val, size)?;
 
                 let equal = self.builder.ins().icmp(IntCC::Equal, acc_narrow, dst_val);
 
@@ -280,8 +278,7 @@ impl<'a> Lifter<'a> {
             self.builder
                 .ins()
                 .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::Add, ptr, src);
-        let result = self.builder.ins().iadd(old, src);
-        self.update_flags_add(old, src, result, size)?;
+        self.add_with_flags(old, src, size)?;
         Ok(())
     }
 
@@ -294,8 +291,7 @@ impl<'a> Lifter<'a> {
             self.builder
                 .ins()
                 .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::Sub, ptr, src);
-        let result = self.builder.ins().isub(old, src);
-        self.update_flags_sub(old, src, result, size)?;
+        self.sub_with_flags(old, src, size)?;
         Ok(())
     }
 
@@ -339,7 +335,9 @@ impl<'a> Lifter<'a> {
 
         self.builder.switch_to_block(loop_b);
         let cur = self.builder.block_params(loop_b)[0];
-        let (result, _) = self.emit_adc_sbb(cur, src, cf, is_adc);
+        // The speculative iterations want the value only; the flags belong to
+        // the iteration whose `atomic_cas` won, and are computed once below.
+        let result = self.adc_sbb_value(cur, src, cf, is_adc);
         let observed = self
             .builder
             .ins()
@@ -353,34 +351,8 @@ impl<'a> Lifter<'a> {
         self.builder.switch_to_block(done_b);
         self.builder.seal_block(done_b);
         let old = self.builder.block_params(done_b)[0];
-        let (result, cf_out) = self.emit_adc_sbb(old, src, cf, is_adc);
-        if is_adc {
-            self.update_flags_adc(old, src, result, cf_out, size)
-        } else {
-            self.update_flags_sbb(old, src, result, cf_out, size)
-        }
-    }
-
-    /// `dst + src + cf` (ADC) or `dst - src - cf` (SBB), returning the result
-    /// and the carry/borrow out. Both are computed in two steps so the carry out
-    /// of each half can be OR-ed together, matching the non-locked handlers.
-    fn emit_adc_sbb(&mut self, dst: Value, src: Value, cf: Value, is_adc: bool) -> (Value, Value) {
-        if is_adc {
-            let tmp = self.builder.ins().iadd(dst, src);
-            let c1 = self.builder.ins().icmp(IntCC::UnsignedLessThan, tmp, dst);
-            let result = self.builder.ins().iadd(tmp, cf);
-            let c2 = self
-                .builder
-                .ins()
-                .icmp(IntCC::UnsignedLessThan, result, tmp);
-            (result, self.builder.ins().bor(c1, c2))
-        } else {
-            let tmp = self.builder.ins().isub(dst, src);
-            let b1 = self.builder.ins().icmp(IntCC::UnsignedLessThan, dst, src);
-            let result = self.builder.ins().isub(tmp, cf);
-            let b2 = self.builder.ins().icmp(IntCC::UnsignedLessThan, tmp, cf);
-            (result, self.builder.ins().bor(b1, b2))
-        }
+        self.adc_sbb_with_flags(old, src, cf, is_adc, size)?;
+        Ok(())
     }
 
     fn handle_lock_and(&mut self, instruction: &Instruction) -> crate::Result<()> {
@@ -434,8 +406,7 @@ impl<'a> Lifter<'a> {
             self.builder
                 .ins()
                 .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::Add, ptr, one);
-        let result = self.builder.ins().iadd(old, one);
-        self.update_flags_inc_dec(old, one, result, true, size)?;
+        self.inc_dec_with_flags(old, one, true, size)?;
         Ok(())
     }
 
@@ -448,8 +419,7 @@ impl<'a> Lifter<'a> {
             self.builder
                 .ins()
                 .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::Sub, ptr, one);
-        let result = self.builder.ins().isub(old, one);
-        self.update_flags_inc_dec(old, one, result, false, size)?;
+        self.inc_dec_with_flags(old, one, false, size)?;
         Ok(())
     }
 
@@ -472,8 +442,7 @@ impl<'a> Lifter<'a> {
                 .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::Add, ptr, src);
         // src register gets the pre-add memory value
         self.set_reg_val(src_reg, old)?;
-        let result = self.builder.ins().iadd(old, src);
-        self.update_flags_add(old, src, result, size)?;
+        self.add_with_flags(old, src, size)?;
         Ok(())
     }
 
@@ -549,8 +518,7 @@ impl<'a> Lifter<'a> {
         self.builder.seal_block(done_b);
         let old = self.builder.block_params(done_b)[0];
         let zero = self.builder.ins().iconst(ty, 0);
-        let result = self.builder.ins().isub(zero, old);
-        self.update_flags_sub(zero, old, result, size)?;
+        self.sub_with_flags(zero, old, size)?;
         Ok(())
     }
 

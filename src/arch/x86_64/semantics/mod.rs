@@ -3,6 +3,7 @@
 //! This module is the dispatch hub. The actual implementations live in the
 //! sub-modules below, each focused on a specific instruction category.
 
+pub mod arith_spec;
 pub mod arithmetic;
 pub mod atomics;
 pub mod bitops;

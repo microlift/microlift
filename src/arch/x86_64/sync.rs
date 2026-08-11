@@ -12,6 +12,10 @@ use cranelift::prelude::*;
 use iced_x86::Register;
 
 impl<'a> Lifter<'a> {
+    pub(super) fn get_regcontext_flags() -> MemFlagsData {
+        MemFlagsData::trusted()
+    }
+
     /// Store exactly the registers in `mask` into the `RegisterContext`, and
     /// nothing else - no PC, no `exit_reason`, no `exit_code`.
     ///
@@ -36,7 +40,7 @@ impl<'a> Lifter<'a> {
             let offset = RegisterState::get_gpr_offset(reg)?;
             self.builder
                 .ins()
-                .store(MemFlagsData::trusted(), val, ctx_ptr, offset);
+                .store(Self::get_regcontext_flags(), val, ctx_ptr, offset);
         }
 
         if mask.flags {
@@ -45,7 +49,7 @@ impl<'a> Lifter<'a> {
                 let offset = RegisterState::get_flag_offset(flag)?;
                 self.builder
                     .ins()
-                    .store(MemFlagsData::trusted(), val, ctx_ptr, offset);
+                    .store(Self::get_regcontext_flags(), val, ctx_ptr, offset);
             }
         }
 
@@ -56,7 +60,7 @@ impl<'a> Lifter<'a> {
             if self.state.use_vector_xmm {
                 let val = self.builder.use_var(self.state.xmms_vec[&i]);
                 self.builder.ins().store(
-                    MemFlagsData::new().with_notrap(),
+                    Self::get_regcontext_flags(),
                     val,
                     ctx_ptr,
                     RegisterState::get_xmm_vec_offset(i),
@@ -65,13 +69,13 @@ impl<'a> Lifter<'a> {
                 let lo_val = self.builder.use_var(self.state.xmms_lo[&i]);
                 let hi_val = self.builder.use_var(self.state.xmms_hi[&i]);
                 self.builder.ins().store(
-                    MemFlagsData::trusted(),
+                    Self::get_regcontext_flags(),
                     lo_val,
                     ctx_ptr,
                     RegisterState::get_xmm_offset(i, false),
                 );
                 self.builder.ins().store(
-                    MemFlagsData::trusted(),
+                    Self::get_regcontext_flags(),
                     hi_val,
                     ctx_ptr,
                     RegisterState::get_xmm_offset(i, true),
@@ -82,14 +86,14 @@ impl<'a> Lifter<'a> {
         if mask.segment_bases {
             let fs_base_val = self.builder.use_var(self.state.fs_base);
             self.builder.ins().store(
-                MemFlagsData::trusted(),
+                Self::get_regcontext_flags(),
                 fs_base_val,
                 ctx_ptr,
                 RegisterState::get_fs_base_offset(),
             );
             let gs_base_val = self.builder.use_var(self.state.gs_base);
             self.builder.ins().store(
-                MemFlagsData::trusted(),
+                Self::get_regcontext_flags(),
                 gs_base_val,
                 ctx_ptr,
                 RegisterState::get_gs_base_offset(),
@@ -120,7 +124,7 @@ impl<'a> Lifter<'a> {
             let val = self
                 .builder
                 .ins()
-                .load(types::I64, MemFlagsData::trusted(), ctx_ptr, offset);
+                .load(types::I64, Self::get_regcontext_flags(), ctx_ptr, offset);
             let var = self.state.gprs[&reg];
             self.builder.def_var(var, val);
         }
@@ -133,7 +137,7 @@ impl<'a> Lifter<'a> {
                 let val =
                     self.builder
                         .ins()
-                        .load(types::I8, MemFlagsData::trusted(), ctx_ptr, offset);
+                        .load(types::I8, Self::get_regcontext_flags(), ctx_ptr, offset);
                 self.builder.def_var(var, val);
             }
         }
@@ -145,7 +149,7 @@ impl<'a> Lifter<'a> {
             if self.state.use_vector_xmm {
                 let val = self.builder.ins().load(
                     types::I64X2,
-                    MemFlagsData::new().with_notrap(),
+                    Self::get_regcontext_flags(),
                     ctx_ptr,
                     RegisterState::get_xmm_vec_offset(i),
                 );
@@ -153,13 +157,13 @@ impl<'a> Lifter<'a> {
             } else {
                 let lo_val = self.builder.ins().load(
                     types::I64,
-                    MemFlagsData::trusted(),
+                    Self::get_regcontext_flags(),
                     ctx_ptr,
                     RegisterState::get_xmm_offset(i, false),
                 );
                 let hi_val = self.builder.ins().load(
                     types::I64,
-                    MemFlagsData::trusted(),
+                    Self::get_regcontext_flags(),
                     ctx_ptr,
                     RegisterState::get_xmm_offset(i, true),
                 );
@@ -171,14 +175,14 @@ impl<'a> Lifter<'a> {
         if mask.segment_bases {
             let fs_base_val = self.builder.ins().load(
                 types::I64,
-                MemFlagsData::trusted(),
+                Self::get_regcontext_flags(),
                 ctx_ptr,
                 RegisterState::get_fs_base_offset(),
             );
             self.builder.def_var(self.state.fs_base, fs_base_val);
             let gs_base_val = self.builder.ins().load(
                 types::I64,
-                MemFlagsData::trusted(),
+                Self::get_regcontext_flags(),
                 ctx_ptr,
                 RegisterState::get_gs_base_offset(),
             );
@@ -202,7 +206,7 @@ impl<'a> Lifter<'a> {
             let offset = RegisterState::get_gpr_offset(reg)?;
             self.builder
                 .ins()
-                .store(MemFlagsData::trusted(), val, ctx_ptr, offset);
+                .store(Self::get_regcontext_flags(), val, ctx_ptr, offset);
         }
 
         for (&flag, &var) in &self.state.flags {
@@ -210,7 +214,7 @@ impl<'a> Lifter<'a> {
             let offset = RegisterState::get_flag_offset(flag)?;
             self.builder
                 .ins()
-                .store(MemFlagsData::trusted(), val, ctx_ptr, offset);
+                .store(Self::get_regcontext_flags(), val, ctx_ptr, offset);
         }
 
         if self.state.use_vector_xmm {
@@ -218,7 +222,7 @@ impl<'a> Lifter<'a> {
                 let var = *self.state.xmms_vec.get(&i).unwrap();
                 let val = self.builder.use_var(var);
                 self.builder.ins().store(
-                    MemFlagsData::new().with_notrap(),
+                    Self::get_regcontext_flags(),
                     val,
                     ctx_ptr,
                     RegisterState::get_xmm_vec_offset(i),
@@ -231,13 +235,13 @@ impl<'a> Lifter<'a> {
                 let lo_val = self.builder.use_var(lo_var);
                 let hi_val = self.builder.use_var(hi_var);
                 self.builder.ins().store(
-                    MemFlagsData::trusted(),
+                    Self::get_regcontext_flags(),
                     lo_val,
                     ctx_ptr,
                     RegisterState::get_xmm_offset(i, false),
                 );
                 self.builder.ins().store(
-                    MemFlagsData::trusted(),
+                    Self::get_regcontext_flags(),
                     hi_val,
                     ctx_ptr,
                     RegisterState::get_xmm_offset(i, true),
@@ -247,14 +251,14 @@ impl<'a> Lifter<'a> {
 
         let fs_base_val = self.builder.use_var(self.state.fs_base);
         self.builder.ins().store(
-            MemFlagsData::trusted(),
+            Self::get_regcontext_flags(),
             fs_base_val,
             ctx_ptr,
             RegisterState::get_fs_base_offset(),
         );
         let gs_base_val = self.builder.use_var(self.state.gs_base);
         self.builder.ins().store(
-            MemFlagsData::trusted(),
+            Self::get_regcontext_flags(),
             gs_base_val,
             ctx_ptr,
             RegisterState::get_gs_base_offset(),
@@ -312,7 +316,7 @@ impl<'a> Lifter<'a> {
                 let offset = RegisterState::get_gpr_offset(reg)?;
                 self.builder
                     .ins()
-                    .store(MemFlagsData::trusted(), val, ctx_ptr, offset);
+                    .store(Self::get_regcontext_flags(), val, ctx_ptr, offset);
             }
         }
 
@@ -322,7 +326,7 @@ impl<'a> Lifter<'a> {
                 let offset = RegisterState::get_flag_offset(flag)?;
                 self.builder
                     .ins()
-                    .store(MemFlagsData::trusted(), val, ctx_ptr, offset);
+                    .store(Self::get_regcontext_flags(), val, ctx_ptr, offset);
             }
         }
 
@@ -332,7 +336,7 @@ impl<'a> Lifter<'a> {
                 let var = *self.state.xmms_vec.get(&idx).unwrap();
                 let val = self.builder.use_var(var);
                 self.builder.ins().store(
-                    MemFlagsData::new().with_notrap(),
+                    Self::get_regcontext_flags(),
                     val,
                     ctx_ptr,
                     RegisterState::get_xmm_vec_offset(idx),
@@ -345,13 +349,13 @@ impl<'a> Lifter<'a> {
                 let lo_val = self.builder.use_var(lo_var);
                 let hi_val = self.builder.use_var(hi_var);
                 self.builder.ins().store(
-                    MemFlagsData::trusted(),
+                    Self::get_regcontext_flags(),
                     lo_val,
                     ctx_ptr,
                     RegisterState::get_xmm_offset(idx, false),
                 );
                 self.builder.ins().store(
-                    MemFlagsData::trusted(),
+                    Self::get_regcontext_flags(),
                     hi_val,
                     ctx_ptr,
                     RegisterState::get_xmm_offset(idx, true),
@@ -362,7 +366,7 @@ impl<'a> Lifter<'a> {
         if self.state.dirty_fs_base {
             let fs_base_val = self.builder.use_var(self.state.fs_base);
             self.builder.ins().store(
-                MemFlagsData::trusted(),
+                Self::get_regcontext_flags(),
                 fs_base_val,
                 ctx_ptr,
                 RegisterState::get_fs_base_offset(),
@@ -371,7 +375,7 @@ impl<'a> Lifter<'a> {
         if self.state.dirty_gs_base {
             let gs_base_val = self.builder.use_var(self.state.gs_base);
             self.builder.ins().store(
-                MemFlagsData::trusted(),
+                Self::get_regcontext_flags(),
                 gs_base_val,
                 ctx_ptr,
                 RegisterState::get_gs_base_offset(),
@@ -391,7 +395,7 @@ impl<'a> Lifter<'a> {
             let val = self
                 .builder
                 .ins()
-                .load(types::I64, MemFlagsData::trusted(), ctx_ptr, offset);
+                .load(types::I64, Self::get_regcontext_flags(), ctx_ptr, offset);
             self.builder.def_var(var, val);
         }
 
@@ -400,7 +404,7 @@ impl<'a> Lifter<'a> {
             let val = self
                 .builder
                 .ins()
-                .load(types::I8, MemFlagsData::trusted(), ctx_ptr, offset);
+                .load(types::I8, Self::get_regcontext_flags(), ctx_ptr, offset);
             self.builder.def_var(var, val);
         }
 
@@ -412,7 +416,7 @@ impl<'a> Lifter<'a> {
                 let offset = RegisterState::get_xmm_vec_offset(i);
                 let val = self.builder.ins().load(
                     types::I64X2,
-                    MemFlagsData::new().with_notrap(),
+                    Self::get_regcontext_flags(),
                     ctx_ptr,
                     offset,
                 );
@@ -425,13 +429,13 @@ impl<'a> Lifter<'a> {
                 let hi_offset = RegisterState::get_xmm_offset(i, true);
                 let lo_val = self.builder.ins().load(
                     types::I64,
-                    MemFlagsData::trusted(),
+                    Self::get_regcontext_flags(),
                     ctx_ptr,
                     lo_offset,
                 );
                 let hi_val = self.builder.ins().load(
                     types::I64,
-                    MemFlagsData::trusted(),
+                    Self::get_regcontext_flags(),
                     ctx_ptr,
                     hi_offset,
                 );
@@ -444,7 +448,7 @@ impl<'a> Lifter<'a> {
 
         let fs_base_val = self.builder.ins().load(
             types::I64,
-            MemFlagsData::trusted(),
+            Self::get_regcontext_flags(),
             ctx_ptr,
             RegisterState::get_fs_base_offset(),
         );
@@ -452,7 +456,7 @@ impl<'a> Lifter<'a> {
 
         let gs_base_val = self.builder.ins().load(
             types::I64,
-            MemFlagsData::trusted(),
+            Self::get_regcontext_flags(),
             ctx_ptr,
             RegisterState::get_gs_base_offset(),
         );

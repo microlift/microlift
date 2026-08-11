@@ -75,6 +75,46 @@ proptest! {
         );
     }
 
+    /// Taking CF and OF from the machine's own arithmetic may not change a
+    /// single bit either.
+    ///
+    /// Both targets, on whatever host this runs on: the JIT compiles for the
+    /// host regardless, so this checks the IR each target's path *emits*, and a
+    /// divergence is a semantic error in the sequence rather than a
+    /// host-specific one.
+    ///
+    /// `eliminate_dead_flags` is on in every arm because the specialization is
+    /// inert without it - with it off this would compare the portable path to
+    /// itself. The snippet ends in `ret`, which publishes every flag, so CF and
+    /// OF are live and the specialization is genuinely reached.
+    #[test]
+    fn native_overflow_flags_change_nothing(
+        op in any_alu_op(),
+        a in any::<u64>(),
+        b in any::<u64>(),
+    ) {
+        let bytes = alu_snippet(op, a, b);
+        let run = |spec| {
+            fingerprint(
+                &LiftTest::new(&bytes)
+                    .opt(Opt::Speed)
+                    .eliminate_dead_flags()
+                    .specialize(spec)
+                    .run()
+                    .ctx,
+            )
+        };
+        let base = run(Specialization::generic());
+        for target in [SpecTarget::X86_64, SpecTarget::Aarch64] {
+            prop_assert_eq!(
+                run(Specialization::for_target(target)),
+                base.clone(),
+                "overflow-flag divergence on {} for {:?} {:#x},{:#x}",
+                target.name(), op, a, b
+            );
+        }
+    }
+
     /// `AddressMode::Direct` bakes lift-time VAs in as constants instead of
     /// rebasing them onto `image_base`. When the image is loaded exactly where
     /// it was lifted - which `LiftTest` does by default - the two must be
