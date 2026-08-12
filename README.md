@@ -15,6 +15,8 @@ Due to its ability to also be used as a general purpose binary lifter, it has al
 
 Microlift integrates various techniques to maximize performance - the primary feature that gains the most performance is the elimination of unused CPU flags. CPU flags are represented as SSA variables, which allows them to be eliminated if they are set but unused by an instruction. This optimization is performed by Cranelift at lowering time. Due to this design choice, Cranelift IR emitted by Microlift may appear far messier than the source at first, but then compile into much cleaner assembly. If you wish to look at the Cranelift IR directly, it may help to run a dead store/load pass on it to eliminate unused CPU flags. Optimization passes from Cranelift should not affect the semantic equivalence of the code, although it will definitely mutate its structure.
 
+Additionally, we also recommend enabling the `enable_alias_analysis` option in Cranelift flags if you wish to inspect IR. This will eliminate dead load/stores done on the CPU context structure.
+
 ## Notes for non-JIT users
 
 Microlift is primarily designed for JIT recompilation, however, it also has support for a RuntimeAssisted execution mode. In RuntimeAssisted, helper code is adjusted to assume that the `lifter` is gone, and that instead a custom runtime will be present specific to your architecture and platform. RuntimeAssisted code may be slower or lower quality than JIT code due to the extra VM exits and necessity for more VM entry dispatch points.

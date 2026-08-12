@@ -16,6 +16,7 @@ pub mod specialize;
 pub mod srcloc;
 
 use std::collections::BTreeSet;
+use std::ops::Range;
 
 use crate::arch::{ControlFlow, ControlFlowKind, InstructionEffects};
 use crate::core::abi::CallAbi;
@@ -631,7 +632,17 @@ pub struct LifterConfig {
     /// NOTE: Do NOT use this on writable data! This is assumed to be *immutable*
     /// memory. There is a `writable` property incase future optimizations permit
     /// mutable memory to be valid for hints.
-    pub segments: Vec<MemorySegment>,
+    /// Behind an [`Arc`] for the same reason [`imports`](Self::imports) is, and
+    /// more urgently: a `MemorySegment` owns a **copy of the guest bytes it
+    /// describes**, so a host that registers its program's mapped images here
+    /// is holding megabytes, and cloning the config per lifted region copies
+    /// all of them. Measured through rosetta3 on UNDERTALE - three segments,
+    /// one image - that clone was 311 µs per region and 7% of the process's
+    /// wall clock, for a deep copy of bytes nothing writes to.
+    ///
+    /// Use [`set_segments`](Self::set_segments), or `Arc::make_mut` if the
+    /// existing contents matter.
+    pub segments: Arc<Vec<MemorySegment>>,
     pub interpreter_fallback: bool,
     /// Which guest addresses the region can be **re-entered** at. See
     /// [`VmResumptionPoints`]; defaults to
@@ -671,7 +682,16 @@ pub struct LifterConfig {
     /// only become imports *later* (a `dlopen`ed image, a lazily bound stub)
     /// belong in [`import_registry`](Self::import_registry) instead, which the
     /// engine queries while lifting.
-    pub imports: HashMap<u64, ImportKind>,
+    /// Behind an [`Arc`] because a host clones this config **once per lifted
+    /// region**, and a program's import map is the same for all of them: a
+    /// thousand entries deep-copied per region is time proportional to
+    /// (imports x regions) spent producing an identical map. Measured through
+    /// rosetta3 on UNDERTALE, the clone alone was 478ms of a 935ms lift budget
+    /// - half of it, and 7% of the process's whole wall clock.
+    ///
+    /// Mutate through [`register_fast_import`](Self::register_fast_import) and
+    /// friends, which copy on write.
+    pub imports: Arc<HashMap<u64, ImportKind>>,
     /// A live view of which addresses are imports, queried per call site at lift
     /// time rather than snapshotted here.
     ///
@@ -842,6 +862,38 @@ pub struct LifterConfig {
     /// Only [`page_bounded_extent`](Self::page_bounded_extent) reads it;
     /// lifting itself is told an extent and does not ask where it came from.
     pub page_size: u64,
+    /// The sub-ranges of the byte slice that are actually **code**, when the
+    /// host knows and the slice is not all of it.
+    ///
+    /// Empty - the default - means the whole slice, which is what every caller
+    /// wanted while a region was a contiguous run of instructions.
+    ///
+    /// ## Why a lift needs to be told about holes
+    ///
+    /// A host that discovers a region by following the guest's control flow
+    /// finds a *set of basic blocks*, not an interval. Between them lie bytes no
+    /// block reaches: a jump table embedded in the middle of a function,
+    /// alignment padding, the inline argument a trampoline reads through its own
+    /// return address. Handing the lift the interval that spans those blocks
+    /// hands it the holes as well, and it has no way to tell them apart - the
+    /// linear sweep in phase 1 decodes a jump table into whatever those bytes
+    /// happen to mean, and any in-region branch target that falls out of that
+    /// reading becomes a block leader with real IR behind it.
+    ///
+    /// Naming the ranges closes that. Everything outside them is *not part of
+    /// this lift*: it is never decoded, never a leader, and an edge into it is
+    /// an ordinary out-of-region exit that the host answers with a region of its
+    /// own. Which is the same answer the engine already gives for an edge past
+    /// the end of the slice - a hole is an end that has more slice after it.
+    ///
+    /// ## Contract
+    ///
+    /// Ascending, disjoint, non-empty, contained in the slice. They are clamped,
+    /// sorted and merged on the way in, so overlapping or unordered input is
+    /// normalised rather than rejected, and ranges wholly outside the slice are
+    /// dropped. A lift whose entry address falls in no range has nothing to
+    /// enter and fails as it would for an entry past the end of the slice.
+    pub block_ranges: Vec<Range<u64>>,
     /// Extra addresses the host wants the entry dispatch to offer, on top of
     /// whatever [`resumption`](Self::resumption) produces.
     ///
@@ -916,17 +968,23 @@ pub struct LifterConfig {
     pub strict_resume: bool,
 }
 
+// `ImportKind` carries the host address a fast import resolved to, so the map
+// is not `Send`/`Sync` and clippy suggests `Rc`. `Arc` is deliberate: a host may
+// move a config - or a cache holding one - between threads under its own safety
+// argument (rosetta3's `unsafe impl Send for CodeCache`), and a non-atomic
+// refcount would make that unsound where an atomic one does not.
+#[allow(clippy::arc_with_non_send_sync)]
 impl Default for LifterConfig {
     fn default() -> Self {
         Self {
             execution_mode: ExecutionMode::Jit,
             address_mode: AddressMode::ImageBaseRelative,
             syscall_handler_call_conv: CallConv::SystemV,
-            segments: Vec::new(),
+            segments: Arc::new(Vec::new()),
             interpreter_fallback: false,
             resumption: VmResumptionPoints::default(),
             analyze_jump_tables: false,
-            imports: HashMap::new(),
+            imports: Arc::new(HashMap::new()),
             import_registry: None,
             indirect_call_bridge: None,
             use_vector_xmm: false,
@@ -937,6 +995,7 @@ impl Default for LifterConfig {
             emit_source_locs: true,
             region_tail_exit: false,
             page_size: 4096,
+            block_ranges: Vec::new(),
             resume_points: Vec::new(),
             strict_resume: false,
             eliminate_dead_flags: false,
@@ -945,6 +1004,11 @@ impl Default for LifterConfig {
 }
 
 impl LifterConfig {
+    /// Replace the immutable-memory hints. See [`segments`](Self::segments).
+    pub fn set_segments(&mut self, segments: Vec<MemorySegment>) {
+        self.segments = Arc::new(segments);
+    }
+
     /// Register an import with full fast-call metadata.
     ///
     /// `abi` describes how the *guest* passes arguments to this function - the
@@ -956,14 +1020,13 @@ impl LifterConfig {
     /// Imports are demoted to slow `ImportedFunctionCall` exits when they are
     /// variadic, or when `abi` cannot place all of their arguments.
     pub fn register_fast_import(&mut self, va: u64, symbol: DynamicSymbol, abi: CallAbi) {
-        self.imports
-            .insert(va, ImportKind::Fast(FastImport { symbol, abi }));
+        Arc::make_mut(&mut self.imports).insert(va, ImportKind::Fast(FastImport { symbol, abi }));
     }
 
     /// Register an import address with no fast-call metadata. Every call to this
     /// address produces an `ImportedFunctionCall` VM exit.
     pub fn register_slow_import(&mut self, va: u64) {
-        self.imports.insert(va, ImportKind::Slow);
+        Arc::make_mut(&mut self.imports).insert(va, ImportKind::Slow);
     }
 
     /// Register an import reached through a runtime-supplied bridge.
@@ -987,7 +1050,7 @@ impl LifterConfig {
     /// means AOT output containing one is only valid for a process that maps
     /// the bridge (or its slot) at the same address.
     pub fn register_bridge_import(&mut self, va: u64, bridge: BridgeImport) {
-        self.imports.insert(va, ImportKind::Bridge(bridge));
+        Arc::make_mut(&mut self.imports).insert(va, ImportKind::Bridge(bridge));
     }
 
     /// Install the live import view queried at lift time. See
@@ -1050,6 +1113,40 @@ impl LifterConfig {
     }
 }
 
+/// [`LifterConfig::block_ranges`] made fit to index a slice with.
+///
+/// Clamped to `[base, end)`, sorted, and merged where they touch or overlap, so
+/// that the result is what the rest of the engine assumes: ascending, disjoint,
+/// non-empty, in bounds. An empty input means the host named no holes, which is
+/// the whole slice.
+///
+/// Merging *touching* ranges matters as much as merging overlapping ones: two
+/// blocks that abut are one run of code, and leaving them as two would make the
+/// boundary between them behave like the end of a region - cutting an
+/// instruction that legitimately spans it.
+fn normalize_ranges(ranges: &[Range<u64>], base: u64, end: u64) -> Vec<Range<u64>> {
+    if ranges.is_empty() {
+        // One range covering everything, not an iterator of addresses - which
+        // is what clippy's `single_range_in_vec_init` reads this as.
+        #[allow(clippy::single_range_in_vec_init)]
+        return vec![base..end];
+    }
+    let mut clamped: Vec<Range<u64>> = ranges
+        .iter()
+        .map(|r| r.start.max(base)..r.end.min(end))
+        .filter(|r| r.start < r.end)
+        .collect();
+    clamped.sort_unstable_by_key(|r| r.start);
+    let mut merged: Vec<Range<u64>> = Vec::with_capacity(clamped.len());
+    for r in clamped {
+        match merged.last_mut() {
+            Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+            _ => merged.push(r),
+        }
+    }
+    merged
+}
+
 /// The generic lift engine. `A` selects the guest architecture frontend.
 pub struct LiftEngine<'a, A: GuestArch = crate::arch::x86_64::X86_64> {
     pub builder: FunctionBuilder<'a>,
@@ -1061,6 +1158,14 @@ pub struct LiftEngine<'a, A: GuestArch = crate::arch::x86_64::X86_64> {
     pub lift_base: u64,
     /// One past the last byte of the lifted region (`lift_base + bytes.len()`).
     pub lift_end: u64,
+    /// The bytes of `[lift_base, lift_end)` this lift actually covers, ascending
+    /// and disjoint - [`LifterConfig::block_ranges`] normalised, or the single
+    /// range `lift_base..lift_end` when the host named none.
+    ///
+    /// Every "is this address part of the region" question goes through
+    /// [`in_region`](Self::in_region) rather than comparing against the two
+    /// bounds, because with holes present the bounds are no longer the answer.
+    covered: Vec<Range<u64>>,
     /// `next_ip` of the instruction currently being lifted - the value the PC
     /// would hold after that instruction retires.
     pub current_ip: u64,
@@ -1106,11 +1211,6 @@ pub struct LiftEngine<'a, A: GuestArch = crate::arch::x86_64::X86_64> {
     /// Ordered external functions for object/JIT backends. Index `i` corresponds
     /// to `ExternalName::user(0, i)`. Entry = `(symbol_name, fn_ptr, signature)`.
     pub aot_imports: Vec<(&'static str, *const u8, Signature)>,
-    /// Virtual addresses registered in [`LifterConfig::imports`], whatever their
-    /// kind. Addresses that only the [`ImportRegistry`] knows about are *not*
-    /// here (a registry is not enumerable) - use
-    /// [`is_import`](Self::is_import), which consults both.
-    pub import_vas: HashSet<u64>,
     /// Records what kind of transfer targets each unvisited (out-of-region)
     /// block, so `finish()` can emit the correct `TransferKind`.
     pub block_transfer_kinds: HashMap<Block, TransferKind>,
@@ -1189,29 +1289,23 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             }
         };
 
-        // Build fast-call data for every statically registered non-variadic
-        // import. Imports the `ImportRegistry` reports are built the same way,
-        // lazily, when a call site referencing them is lifted.
-        let mut fast_calls: HashMap<u64, FastCall> = HashMap::new();
-        let mut aot_imports: Vec<(&'static str, *const u8, Signature)> = Vec::new();
-        let mut import_vas: HashSet<u64> = HashSet::new();
-        let mut fast_call_by_name: HashMap<&'static str, FastCall> = HashMap::new();
-
-        for (&va, kind) in &config.imports {
-            import_vas.insert(va);
-            let ImportKind::Fast(import) = kind else {
-                continue;
-            };
-            if let Some(fast_call) = build_fast_call(
-                &mut builder,
-                config.execution_mode,
-                &mut aot_imports,
-                &mut fast_call_by_name,
-                import,
-            ) {
-                fast_calls.insert(va, fast_call);
-            }
-        }
+        // Fast-call data is built **lazily**, by `fast_call_for`, when a call
+        // site referencing an import is actually lifted.
+        //
+        // It used to be built eagerly here for every statically registered
+        // import, which made constructing an engine cost time proportional to
+        // the size of the whole program's import table - paid once per region,
+        // for a region that calls two of them. `fast_call_for` already had the
+        // lazy path, because an import the `ImportRegistry` reports cannot be
+        // known up front; the eager loop was only ever an optimisation for the
+        // other source, and a losing one.
+        //
+        // It also declared every import as an external of the emitted function,
+        // whether or not anything referenced it. Building on demand leaves
+        // `aot_imports` holding exactly what the region calls.
+        let fast_calls: HashMap<u64, FastCall> = HashMap::new();
+        let aot_imports: Vec<(&'static str, *const u8, Signature)> = Vec::new();
+        let fast_call_by_name: HashMap<&'static str, FastCall> = HashMap::new();
 
         Self {
             builder,
@@ -1221,6 +1315,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             sealed_blocks: HashSet::new(),
             lift_base: 0,
             lift_end: 0,
+            covered: Vec::new(),
             current_ip: 0,
             visited_blocks: HashSet::new(),
             block_terminated: false,
@@ -1234,7 +1329,6 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             fast_call_by_name,
             bridge_sig: None,
             aot_imports,
-            import_vas,
             block_transfer_kinds: HashMap::new(),
             analysis_call_targets: Vec::new(),
             analysis_call_sig: None,
@@ -1565,7 +1659,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
     /// Out-of-region addresses are ignored: the resume point is then the host's
     /// problem in the ordinary way, and it will translate a region there.
     pub fn resumes_at(&mut self, va: u64) {
-        if va >= self.lift_base && va < self.lift_end {
+        if self.in_region(va) {
             self.exit_resumes.insert(va);
             self.get_block(va);
         }
@@ -1603,14 +1697,41 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
     ///   sees the whole encoding and reports the genuine invalid if that is what
     ///   it is.
     ///
-    /// Never true at `lift_base`, which is what makes the exit terminate rather
-    /// than repeat; see [`LifterConfig::region_tail_exit`].
+    /// Never true at the first address of the range `addr` falls in, which is
+    /// what makes the exit terminate rather than repeat; see
+    /// [`LifterConfig::region_tail_exit`].
+    ///
+    /// "The end" is the end of that range rather than `lift_end`, so a block
+    /// that abuts a hole is cut exactly as one that abuts the end of the slice -
+    /// see [`LifterConfig::block_ranges`].
     fn runs_off_region(&self, addr: u64, inst: &A::Instr) -> bool {
+        let Some(range) = self.covering(addr) else {
+            return false;
+        };
         self.config.region_tail_exit
-            && addr != self.lift_base
-            && addr < self.lift_end
-            && (A::instr_next_ip(inst) > self.lift_end
-                || (A::is_invalid(inst) && self.lift_end - addr < A::MAX_INSTRUCTION_LEN))
+            && addr != range.start
+            && (A::instr_next_ip(inst) > range.end
+                || (A::is_invalid(inst) && range.end - addr < A::MAX_INSTRUCTION_LEN))
+    }
+
+    /// The covered range holding `va`, if any. See
+    /// [`LifterConfig::block_ranges`].
+    fn covering(&self, va: u64) -> Option<&Range<u64>> {
+        // Ascending and disjoint, so the last range starting at or before `va`
+        // is the only one that can hold it.
+        let i = self
+            .covered
+            .partition_point(|r| r.start <= va)
+            .checked_sub(1)?;
+        self.covered.get(i).filter(|r| va < r.end)
+    }
+
+    /// Whether `va` is a byte this lift covers.
+    ///
+    /// The replacement for `va >= lift_base && va < lift_end`, which stopped
+    /// being the same question once a region could have holes in it.
+    pub fn in_region(&self, va: u64) -> bool {
+        self.covering(va).is_some()
     }
 
     /// Whether the instruction being lifted has to compute flag `bit`.
@@ -1730,6 +1851,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
     pub fn lift(&mut self, bytes: &[u8], ip: u64) -> crate::Result<()> {
         self.lift_base = ip;
         self.lift_end = ip + bytes.len() as u64;
+        self.covered = normalize_ranges(&self.config.block_ranges, ip, self.lift_end);
         // Guest addresses are encoded relative to the region base, so the map
         // has to be established before any IR is emitted.
         self.source_map = SourceLocMap::new(ip);
@@ -1753,9 +1875,16 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         // identical to the old sweep for non-overlapping code, and it iterates
         // to a fixpoint so overlapping instructions that themselves branch are
         // handled too.
+        //
+        // The sweep runs per covered range rather than over the whole slice, so
+        // that a hole between two blocks is never decoded at all; see
+        // [`LifterConfig::block_ranges`].
         let mut decoded: HashMap<u64, A::Instr> = HashMap::new();
-        for inst in A::decode_region(bytes, ip) {
-            decoded.entry(A::instr_ip(&inst)).or_insert(inst);
+        for range in &self.covered {
+            let (lo, hi) = ((range.start - ip) as usize, (range.end - ip) as usize);
+            for inst in A::decode_region(&bytes[lo..hi], range.start) {
+                decoded.entry(A::instr_ip(&inst)).or_insert(inst);
+            }
         }
 
         // Experimental: recover jump-table successors so an indirect branch
@@ -1776,7 +1905,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         // predecessor and would otherwise be a block with nothing behind it.
         if self.config.resumption != VmResumptionPoints::None {
             for &p in &self.config.resume_points {
-                if p >= self.lift_base && p < self.lift_end {
+                if self.in_region(p) {
                     leaders.insert(p);
                     work.push(p);
                 }
@@ -1790,7 +1919,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         let mut processed: HashSet<u64> = HashSet::new();
 
         while let Some(addr) = work.pop() {
-            if addr < self.lift_base || addr >= self.lift_end {
+            if !self.in_region(addr) {
                 continue;
             }
             if !processed.insert(addr) {
@@ -1842,10 +1971,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                 }
                 ControlFlowKind::Call { static_target } => {
                     if let Some(target) = static_target {
-                        if !self.is_import(target)
-                            && target >= self.lift_base
-                            && target < self.lift_end
-                        {
+                        if !self.is_import(target) && self.in_region(target) {
                             // In-region call: the callee is a block leader.
                             leaders.insert(target);
                             work.push(target);
@@ -1869,7 +1995,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                     // host's problem and keep the exit path they already had.
                     if let Some(targets) = self.jump_tables.get(&addr) {
                         for &t in targets {
-                            if t >= self.lift_base && t < self.lift_end {
+                            if self.in_region(t) {
                                 leaders.insert(t);
                                 work.push(t);
                             }
@@ -1892,12 +2018,17 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                 .filter(|(addr, inst)| self.runs_off_region(**addr, inst))
                 .map(|(addr, _)| *addr)
                 .collect();
-            self.flag_liveness = Some(flags::analyze::<A>(
-                &decoded,
-                self.lift_base,
-                self.lift_end,
-                |addr, _| truncated.contains(&addr),
-            ));
+            let covered = self.covered.clone();
+            let in_region = |va: u64| {
+                covered
+                    .partition_point(|r: &Range<u64>| r.start <= va)
+                    .checked_sub(1)
+                    .and_then(|i| covered.get(i))
+                    .is_some_and(|r| va < r.end)
+            };
+            self.flag_liveness = Some(flags::analyze::<A>(&decoded, &in_region, |addr, _| {
+                truncated.contains(&addr)
+            }));
         }
 
         // Entry block receives the context pointer as its first parameter.
@@ -1962,11 +2093,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             let next_leader = self
                 .blocks
                 .iter()
-                .filter(|(off, b)| {
-                    **off >= self.lift_base
-                        && **off < self.lift_end
-                        && !self.visited_blocks.contains(b)
-                })
+                .filter(|(off, b)| self.in_region(**off) && !self.visited_blocks.contains(b))
                 .map(|(off, _)| *off)
                 .min();
             let Some(leader) = next_leader else { break };
@@ -1980,7 +2107,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             let mut first = true;
             loop {
                 // Fell through past the end of the region.
-                if cur < self.lift_base || cur >= self.lift_end {
+                if !self.in_region(cur) {
                     self.current_ip = cur;
                     self.set_source_loc(cur);
                     A::sync_to_context(self, None, ExitReason::None)?;
@@ -2128,7 +2255,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                     //   [`LifterConfig::region_tail_exit`]. Its block is the
                     //   tail exit, and the host's answer to that exit is a
                     //   region beginning at the address - which this is not.
-                    let in_region = offset >= self.lift_base && offset < self.lift_end;
+                    let in_region = self.in_region(offset);
                     let tail = decoded
                         .get(&offset)
                         .is_some_and(|inst| self.runs_off_region(offset, inst));

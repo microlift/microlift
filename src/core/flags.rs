@@ -215,8 +215,7 @@ fn successors<A: GuestArch>(
     inst: &A::Instr,
     cf: &ControlFlow,
     truncated: bool,
-    lift_base: u64,
-    lift_end: u64,
+    in_region: &impl Fn(u64) -> bool,
     decoded: &HashMap<u64, A::Instr>,
 ) -> Option<Vec<u64>> {
     if truncated {
@@ -246,7 +245,7 @@ fn successors<A: GuestArch>(
     let _ = addr;
     if targets
         .iter()
-        .any(|t| *t < lift_base || *t >= lift_end || !decoded.contains_key(t))
+        .any(|t| !in_region(*t) || !decoded.contains_key(t))
     {
         return None;
     }
@@ -261,8 +260,7 @@ fn successors<A: GuestArch>(
 /// partly present.
 pub(crate) fn analyze<A: GuestArch>(
     decoded: &HashMap<u64, A::Instr>,
-    lift_base: u64,
-    lift_end: u64,
+    in_region: &impl Fn(u64) -> bool,
     truncated: impl Fn(u64, &A::Instr) -> bool,
 ) -> FlagLiveness {
     // Successors and effects, resolved once. Both are pure functions of the
@@ -273,19 +271,11 @@ pub(crate) fn analyze<A: GuestArch>(
     let mut preds: HashMap<u64, Vec<u64>> = HashMap::new();
 
     for (&addr, inst) in decoded {
-        if addr < lift_base || addr >= lift_end {
+        if !in_region(addr) {
             continue;
         }
         let cf = A::control_flow(inst);
-        let s = successors::<A>(
-            addr,
-            inst,
-            &cf,
-            truncated(addr, inst),
-            lift_base,
-            lift_end,
-            decoded,
-        );
+        let s = successors::<A>(addr, inst, &cf, truncated(addr, inst), in_region, decoded);
         if let Some(targets) = &s {
             for &t in targets {
                 preds.entry(t).or_default().push(addr);

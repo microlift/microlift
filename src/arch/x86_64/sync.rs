@@ -13,7 +13,7 @@ use iced_x86::Register;
 
 impl<'a> Lifter<'a> {
     pub(super) fn get_regcontext_flags() -> MemFlagsData {
-        MemFlagsData::trusted()
+        MemFlagsData::trusted().with_can_move()
     }
 
     /// Store exactly the registers in `mask` into the `RegisterContext`, and
@@ -121,10 +121,10 @@ impl<'a> Lifter<'a> {
                 continue;
             }
             let offset = RegisterState::get_gpr_offset(reg)?;
-            let val = self
-                .builder
-                .ins()
-                .load(types::I64, Self::get_regcontext_flags(), ctx_ptr, offset);
+            let val =
+                self.builder
+                    .ins()
+                    .load(types::I64, Self::get_regcontext_flags(), ctx_ptr, offset);
             let var = self.state.gprs[&reg];
             self.builder.def_var(var, val);
         }
@@ -134,10 +134,12 @@ impl<'a> Lifter<'a> {
                 self.state.flags.iter().map(|(&f, &v)| (f, v)).collect();
             for (flag, var) in flags {
                 let offset = RegisterState::get_flag_offset(flag)?;
-                let val =
-                    self.builder
-                        .ins()
-                        .load(types::I8, Self::get_regcontext_flags(), ctx_ptr, offset);
+                let val = self.builder.ins().load(
+                    types::I8,
+                    Self::get_regcontext_flags(),
+                    ctx_ptr,
+                    offset,
+                );
                 self.builder.def_var(var, val);
             }
         }
@@ -392,19 +394,19 @@ impl<'a> Lifter<'a> {
         // RIP is materialised from current_ip on sync, not kept as a variable.
         for (&reg, &var) in &self.state.gprs {
             let offset = RegisterState::get_gpr_offset(reg)?;
-            let val = self
-                .builder
-                .ins()
-                .load(types::I64, Self::get_regcontext_flags(), ctx_ptr, offset);
+            let val =
+                self.builder
+                    .ins()
+                    .load(types::I64, Self::get_regcontext_flags(), ctx_ptr, offset);
             self.builder.def_var(var, val);
         }
 
         for (&flag, &var) in &self.state.flags {
             let offset = RegisterState::get_flag_offset(flag)?;
-            let val = self
-                .builder
-                .ins()
-                .load(types::I8, Self::get_regcontext_flags(), ctx_ptr, offset);
+            let val =
+                self.builder
+                    .ins()
+                    .load(types::I8, Self::get_regcontext_flags(), ctx_ptr, offset);
             self.builder.def_var(var, val);
         }
 

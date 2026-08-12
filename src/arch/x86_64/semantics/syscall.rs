@@ -16,7 +16,7 @@ impl<'a> Lifter<'a> {
             ExecutionMode::RuntimeAssisted => {
                 let next = instruction.next_ip();
                 self.resumes_at(next);
-                let in_region = next >= self.lift_base && next < self.lift_end;
+                let in_region = self.in_region(next);
 
                 let ctx_ptr = self.builder.use_var(self.state.context_ptr);
                 let handler_offset =

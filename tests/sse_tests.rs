@@ -3712,22 +3712,38 @@ fn test_complex_multiply_sequence() {
 fn test_addsub_agrees_in_vector_mode() {
     // The vector-XMM lift is a different path through the same semantics, so it
     // has to produce the same registers - NaN and infinity lanes included.
-    let states: &[([u64; 2], [u64; 2])] = &[
-        (xmm_f32([1.5, 2.5, 3.0, 4.0]), xmm_f32([1.0, 2.0, 5.0, 6.0])),
+    //
+    // The third field opts a state out of the automatic Unicorn cross-check.
+    // It is off for the state whose lanes pair *two* QNaNs, because the two
+    // engines legitimately disagree there: SSE returns the NaN in SRC1 (so the
+    // destination's payload wins), while QEMU - and so Unicorn - applies the
+    // x87 rule to SSE as well and returns whichever NaN has the larger
+    // significand. Nothing about ADDSUB* provokes it; plain ADDPS/MULPS
+    // diverge the same way whenever the source operand carries the larger
+    // payload. The other states keep the oracle.
+    let states: &[([u64; 2], [u64; 2], bool)] = &[
+        (
+            xmm_f32([1.5, 2.5, 3.0, 4.0]),
+            xmm_f32([1.0, 2.0, 5.0, 6.0]),
+            true,
+        ),
         (
             xmm_bits32([0x7F80_0000, 0x7F80_0000, 0xFF80_0000, 0x7FC0_1234]),
             xmm_bits32([0x7F80_0000, 0xFF80_0000, 0xFF80_0000, 0xFFC0_5678]),
+            false,
         ),
         (
             xmm_f32([-0.0, -0.0, 0.0, 0.0]),
             xmm_f32([0.0, 0.0, 0.0, -0.0]),
+            true,
         ),
         (
             [0xDEAD_BEEF_CAFE_BABE, 0x1234_5678_9ABC_DEF0],
             [0x1122_3344_5566_7788, 0xFEDC_BA98_7654_3210],
+            true,
         ),
     ];
-    for &(dst, src) in states {
+    for &(dst, src, oracle) in states {
         let mut ctx = RegisterContext::default();
         ctx.xmm[0] = dst;
         ctx.xmm[1] = src;
@@ -3735,9 +3751,16 @@ fn test_addsub_agrees_in_vector_mode() {
             [0xF2, 0x0F, 0xD0, 0xC1, 0xC3], // addsubps
             [0x66, 0x0F, 0xD0, 0xC1, 0xC3], // addsubpd
         ] {
+            let scalar = LiftTest::new(&bytes).ctx(ctx);
+            let vector = LiftTest::new(&bytes).vector_xmm(true).ctx(ctx);
+            let (scalar, vector) = if oracle {
+                (scalar, vector)
+            } else {
+                (scalar.no_unicorn(), vector.no_unicorn())
+            };
             assert_eq!(
-                run_test(&bytes, ctx).xmm,
-                run_test_vec(&bytes, ctx).xmm,
+                scalar.run().ctx.xmm,
+                vector.run().ctx.xmm,
                 "{bytes:02X?} on {dst:#018X?},{src:#018X?}"
             );
         }

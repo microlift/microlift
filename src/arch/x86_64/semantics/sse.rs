@@ -3597,8 +3597,6 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    // --- MXCSR ----------------------------------------------------------
-
     /// STMXCSR m32 (and its AVX alias `VSTMXCSR`) - store `MXCSR` to memory.
     ///
     /// A plain 32-bit copy out of the context. The register form of the opcode

@@ -5,7 +5,7 @@
 //! function here is a guarded early return that either emits the specialized
 //! form and hands back a result, or returns `None` having emitted nothing so
 //! the caller falls through to its portable path.
-//! 
+//!
 //! Nothing here works without
 //! [`eliminate_dead_flags`](crate::core::LifterConfig::eliminate_dead_flags).
 //! That is not a stylistic pairing, it is what the measurement says, and the

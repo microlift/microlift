@@ -128,7 +128,7 @@ pub enum Spec {
     /// truncating forms are aarch64-only for a second reason - x64 lowers
     /// `smul_overflow` through the register-pinning one-operand `imul`, which
     /// measured as a loss.
-    /// 
+    ///
     /// It requires [`eliminate_dead_flags`](crate::core::LifterConfig::eliminate_dead_flags),
     /// and is entirely inert without it. Unlike a vector specialization,
     /// this one is not an improvement wherever it applies: the portable flag

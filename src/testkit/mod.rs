@@ -228,7 +228,7 @@ impl<'a> LiftTest<'a> {
 
     /// Provide static memory segments (rodata hints etc.) to the lifter.
     pub fn segments(mut self, segments: Vec<MemorySegment>) -> Self {
-        self.config.segments = segments;
+        self.config.set_segments(segments);
         self
     }
 

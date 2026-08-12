@@ -222,7 +222,7 @@ impl<'a> Lifter<'a> {
                 // (a registered import whose callee is always a native function).
                 // For DirectCall the callee may itself be a virtualized function,
                 // which the runtime will have to account for appropriately.
-                if target < self.lift_base || target >= self.lift_end {
+                if !self.in_region(target) {
                     self.get_block(self.current_ip);
 
                     let rebased_callee = self.runtime_addr(target);
@@ -552,7 +552,9 @@ impl<'a> Lifter<'a> {
                 } else {
                     lo
                 };
-                self.builder.ins().bitcast(cl_ty, Self::get_regcontext_flags(), bits)
+                self.builder
+                    .ins()
+                    .bitcast(cl_ty, Self::get_regcontext_flags(), bits)
             }
             ArgLocation::Stack(offset) => {
                 let rsp = self.get_reg_val(Register::RSP)?;
@@ -577,10 +579,11 @@ impl<'a> Lifter<'a> {
                 // Float -> raw bits, zero-extended into the low half of the
                 // vector register; the high half is cleared.
                 let bits = if ty == FunctionArgumentType::SinglePrecisionFp {
-                    let i32_val =
-                        self.builder
-                            .ins()
-                            .bitcast(types::I32, Self::get_regcontext_flags(), ret_val);
+                    let i32_val = self.builder.ins().bitcast(
+                        types::I32,
+                        Self::get_regcontext_flags(),
+                        ret_val,
+                    );
                     self.builder.ins().uextend(types::I64, i32_val)
                 } else {
                     self.builder
