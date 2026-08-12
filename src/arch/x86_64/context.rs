@@ -23,6 +23,15 @@ pub const MXCSR_MASK: u32 = 0x0000_FFFF;
 /// masks set, extended (64-bit) precision, round to nearest-even.
 pub const X87_CW_RESET: u16 = 0x037F;
 
+/// `CS` in 64-bit user mode on Darwin (`USER64_CS`).
+pub const CS_USER64_DARWIN: u16 = 0x2B;
+/// `SS` in 64-bit user mode on Darwin (`USER_DS`).
+pub const SS_USER64_DARWIN: u16 = 0x23;
+/// `CS` in 64-bit user mode on Linux (`__USER_CS`, RPL 3).
+pub const CS_USER64_LINUX: u16 = 0x33;
+/// `SS` in 64-bit user mode on Linux (`__USER_DS`, RPL 3).
+pub const SS_USER64_LINUX: u16 = 0x2B;
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct RegisterContext {
@@ -115,6 +124,39 @@ pub struct RegisterContext {
     /// that changes the rounding mode and expects arithmetic to follow it, or
     /// that polls the sticky exception flags, does not.
     pub mxcsr: u32,
+
+    /// The six segment *selectors*, as read by `MOV r/m16, Sreg` and
+    /// `PUSH FS`/`PUSH GS`.
+    ///
+    /// These are **selectors, not bases**: the address a `fs:`/`gs:`-prefixed
+    /// access forms comes from [`fs_base`](Self::fs_base) /
+    /// [`gs_base`](Self::gs_base), which are entirely independent fields here.
+    /// That mirrors 64-bit hardware, where `WRFSBASE`/`arch_prctl` move a base
+    /// without touching the selector - but it also means the reverse does *not*
+    /// hold: writing `fs` or `gs` (`MOV Sreg, r/m16`, `POP FS`) stores the
+    /// selector and leaves the base alone, where hardware would reload the base
+    /// from the descriptor table. A guest that changes its TLS by loading a
+    /// selector is therefore not modelled; one that reads its selectors for a
+    /// diagnostic record - which is what these exist for - is.
+    ///
+    /// Like `MXCSR`, they are faithful storage rather than a control input:
+    /// nothing in the lifter interprets them, and a segment override other than
+    /// `FS`/`GS` is ignored when forming an address (all four have base 0 in
+    /// long mode).
+    ///
+    /// Written by the lifter only through the segment-register semantics; the
+    /// host is expected to seed them, since their correct values are a property
+    /// of the guest OS rather than of the code being lifted
+    /// ([`CS_USER64_DARWIN`] / [`CS_USER64_LINUX`] and friends).
+    pub cs: u16,
+    pub ss: u16,
+    pub ds: u16,
+    pub es: u16,
+    /// `FS` selector. Distinct from [`fs_base`](Self::fs_base); a real 64-bit
+    /// user process reports 0 here even with a non-zero base.
+    pub fs: u16,
+    /// `GS` selector. Distinct from [`gs_base`](Self::gs_base).
+    pub gs: u16,
 }
 
 impl Default for RegisterContext {
@@ -124,6 +166,15 @@ impl Default for RegisterContext {
     /// "every floating-point exception unmasked", which no real thread starts
     /// out in and which would make `STMXCSR`/`FNSTCW` report an impossible
     /// state.
+    ///
+    /// `cs`/`ss` are the same kind of exception, for the same reason - a
+    /// 64-bit thread with `CS = 0` is not a state that exists - but unlike the
+    /// FP fields their value is a property of the *guest OS*, not of the
+    /// processor. The default is Darwin's ([`CS_USER64_DARWIN`],
+    /// [`SS_USER64_DARWIN`]); a host running a Linux or Windows guest should
+    /// overwrite them ([`CS_USER64_LINUX`], [`SS_USER64_LINUX`]). `ds`/`es` and
+    /// the `fs`/`gs` *selectors* are 0, which is what a real 64-bit user-mode
+    /// process reports.
     fn default() -> Self {
         Self {
             rax: 0,
@@ -165,6 +216,12 @@ impl Default for RegisterContext {
             fpu_cw: X87_CW_RESET,
             fpu_tag: 0,
             mxcsr: MXCSR_RESET,
+            cs: CS_USER64_DARWIN,
+            ss: SS_USER64_DARWIN,
+            ds: 0,
+            es: 0,
+            fs: 0,
+            gs: 0,
         }
     }
 }

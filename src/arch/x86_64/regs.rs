@@ -44,6 +44,22 @@ pub const GPR_ORDER: [Register; 16] = [
     Register::R15,
 ];
 
+/// The six segment-selector registers, in architectural encoding order
+/// (`ES`=0, `CS`=1, `SS`=2, `DS`=3, `FS`=4, `GS`=5).
+pub const SEGMENT_ORDER: [Register; 6] = [
+    Register::ES,
+    Register::CS,
+    Register::SS,
+    Register::DS,
+    Register::FS,
+    Register::GS,
+];
+
+/// Whether `reg` is one of the six segment-selector registers.
+pub fn is_segment_register(reg: Register) -> bool {
+    SEGMENT_ORDER.contains(&reg)
+}
+
 /// The [`GPR_ORDER`] index of `reg`'s full 64-bit form, or `None` if `reg` is
 /// not a general-purpose register. Sub-registers map to their containing GPR
 /// (`EAX`, `AX`, `AL` and `AH` all give `RAX`'s index).
@@ -194,6 +210,28 @@ impl RegisterState {
     pub fn get_xmm_vec_offset(idx: u8) -> i32 {
         let base = std::mem::offset_of!(RegisterContext, xmm) as i32;
         base + (idx as i32) * 16
+    }
+
+    /// Byte offset of a segment *selector* within `RegisterContext`.
+    ///
+    /// Unlike every other register accessor here this has no matching
+    /// `Variable`: the selectors are deliberately **not** part of the SSA
+    /// register file, and are loaded from / stored to the context in place at
+    /// each use (see [`Lifter::get_reg_val`](crate::arch::x86_64::Lifter::get_reg_val)).
+    /// A guest reads them roughly once - into a diagnostic struct, never into
+    /// control flow - so an SSA variable would buy nothing and cost six more
+    /// values live across every block reachable from the entry dispatch, which
+    /// is exactly what regalloc time is superlinear in.
+    pub fn get_segment_offset(reg: Register) -> crate::Result<i32> {
+        match reg {
+            Register::CS => Ok(std::mem::offset_of!(RegisterContext, cs) as i32),
+            Register::SS => Ok(std::mem::offset_of!(RegisterContext, ss) as i32),
+            Register::DS => Ok(std::mem::offset_of!(RegisterContext, ds) as i32),
+            Register::ES => Ok(std::mem::offset_of!(RegisterContext, es) as i32),
+            Register::FS => Ok(std::mem::offset_of!(RegisterContext, fs) as i32),
+            Register::GS => Ok(std::mem::offset_of!(RegisterContext, gs) as i32),
+            _ => Err(MicroliftError::UnsupportedRegister(format!("{reg:?}"))),
+        }
     }
 
     pub fn get_fs_base_offset() -> i32 {

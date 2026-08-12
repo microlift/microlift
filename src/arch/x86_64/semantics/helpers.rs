@@ -1,4 +1,5 @@
 use crate::MicroliftError;
+use crate::arch::x86_64::regs::{RegisterState, is_segment_register};
 use crate::lifter::{Lifter, X86Flag};
 use cranelift::prelude::*;
 use iced_x86::{Instruction, OpKind, Register};
@@ -94,6 +95,10 @@ impl<'a> Lifter<'a> {
             return Ok(self.runtime_current_ip());
         }
 
+        if is_segment_register(reg) {
+            return self.get_segment_selector(reg);
+        }
+
         let base_reg = get_base_reg_64(reg);
         let size = reg.size();
         let is_high_8 = is_high_8_reg(reg);
@@ -122,6 +127,10 @@ impl<'a> Lifter<'a> {
             return Err(MicroliftError::UnsupportedInstruction {
                 mnemonic: "set-RIP (direct write to RIP is illegal in x86-64)".into(),
             });
+        }
+
+        if is_segment_register(reg) {
+            return self.set_segment_selector(reg, val);
         }
 
         let base_reg = get_base_reg_64(reg);
@@ -163,6 +172,49 @@ impl<'a> Lifter<'a> {
                 mnemonic: format!("set-reg-{:?}", reg),
             })
         }
+    }
+
+    /// Read a segment selector (`CS`/`SS`/`DS`/`ES`/`FS`/`GS`) as an `I16`.
+    ///
+    /// The selectors live in the `RegisterContext` and are read in place rather
+    /// than through an SSA variable - see
+    /// [`RegisterState::get_segment_offset`] for why. The load is emitted in
+    /// analysis mode too: unlike a GPR there is no SSA value for it to be pure
+    /// over, and the whole point of the instruction is that it reads state the
+    /// host supplied.
+    fn get_segment_selector(&mut self, reg: Register) -> crate::Result<Value> {
+        let offset = RegisterState::get_segment_offset(reg)?;
+        let ctx_ptr = self.builder.use_var(self.state.context_ptr);
+        Ok(self
+            .builder
+            .ins()
+            .load(types::I16, Self::get_regcontext_flags(), ctx_ptr, offset))
+    }
+
+    /// Write a segment selector, storing it straight into the
+    /// `RegisterContext`.
+    ///
+    /// This is selector storage only: the `FS`/`GS` *bases* the lifter actually
+    /// forms addresses with are separate fields and are deliberately left
+    /// alone, where hardware would reload each from the loaded descriptor. See
+    /// [`RegisterContext::cs`](crate::arch::x86_64::context::RegisterContext::cs).
+    fn set_segment_selector(&mut self, reg: Register, val: Value) -> crate::Result<()> {
+        if reg == Register::CS {
+            // `MOV CS, r/m16` does not encode - the only architectural writes
+            // to CS are far transfers, which are not lifted. Reaching here
+            // means a decode produced something impossible, so say so rather
+            // than silently storing.
+            return Err(MicroliftError::UnsupportedInstruction {
+                mnemonic: "set-CS (CS is not writable by MOV in x86-64)".into(),
+            });
+        }
+        let offset = RegisterState::get_segment_offset(reg)?;
+        let ctx_ptr = self.builder.use_var(self.state.context_ptr);
+        let val_i16 = self.narrow_to(types::I16, val);
+        self.builder
+            .ins()
+            .store(Self::get_regcontext_flags(), val_i16, ctx_ptr, offset);
+        Ok(())
     }
 
     /// Whether the instruction being lifted has to compute `flag`.

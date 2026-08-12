@@ -29,6 +29,25 @@ const LOW_BYTE_FLAG_BITS: [(X86Flag, u8); 5] = [
     (X86Flag::Sign, 7),
 ];
 
+/// The stack slot `PUSH`/`POP` of a segment register uses, or `None` if the
+/// instruction is not one.
+///
+/// A register operand's own width is the slot width for every other push, but
+/// not here: `PUSH FS` in 64-bit mode moves `RSP` by **8** and zero-extends the
+/// 16-bit selector into the slot, while `FS`'s `Register::size()` is 2. Only
+/// the `0x66`-prefixed spelling is a 2-byte push. (`FS` and `GS` are the only
+/// segment registers whose push/pop encode at all in long mode.)
+fn segment_stack_slot_size(instruction: &Instruction) -> Option<usize> {
+    use iced_x86::Code;
+    if !crate::arch::x86_64::regs::is_segment_register(instruction.op0_register()) {
+        return None;
+    }
+    match instruction.code() {
+        Code::Pushw_FS | Code::Pushw_GS | Code::Popw_FS | Code::Popw_GS => Some(2),
+        _ => Some(8),
+    }
+}
+
 impl<'a> Lifter<'a> {
     pub(super) fn handle_nop(&mut self, _instruction: &Instruction) -> crate::Result<()> {
         Ok(())
@@ -37,6 +56,25 @@ impl<'a> Lifter<'a> {
     pub(super) fn handle_mov(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let size = self.operand_size(instruction, 0)?;
         let src_val = self.read_operand(instruction, 1, size)?;
+        // `MOV r/m16, Sreg` is the one MOV whose two operands can be different
+        // widths: the source is always a 16-bit selector, while the destination
+        // register may be 32 or 64 bits (`mov eax, cs` / `mov rax, cs`), in
+        // which case the selector is zero-extended into it. `read_operand`
+        // hands back a register at its own width, so widen here rather than
+        // handing `write_operand` a value narrower than the register it is
+        // writing - Cranelift's verifier, not the guest, is what notices that.
+        //
+        // A memory destination is *not* widened: `mov [rax], cs` writes 16 bits
+        // whatever the operand size is, and iced reports `memory_size` = 2 for
+        // it, so `size` is already right.
+        let src_val = if crate::arch::x86_64::regs::is_segment_register(
+            self.operand_register(instruction, 1),
+        ) && size > 2
+        {
+            self.builder.ins().uextend(size_to_type(size), src_val)
+        } else {
+            src_val
+        };
         self.write_operand(instruction, 0, src_val)?;
         Ok(())
     }
@@ -124,7 +162,8 @@ impl<'a> Lifter<'a> {
         // operand-size prefix (a 16-bit push). 32-bit pushes are not encodable
         // in long mode. The slot decrement must match the value width.
         let push_size: usize = match op0 {
-            OpKind::Register => instruction.op0_register().size(),
+            OpKind::Register => segment_stack_slot_size(instruction)
+                .unwrap_or_else(|| instruction.op0_register().size()),
             OpKind::Memory => instruction.memory_size().size(),
             // 16-bit pushes: `push imm16` and 0x66-prefixed `push imm8`.
             OpKind::Immediate16 | OpKind::Immediate8to16 => 2,
@@ -133,7 +172,16 @@ impl<'a> Lifter<'a> {
         let ty = size_to_type(push_size);
 
         let val = match op0 {
-            OpKind::Register => self.get_reg_val(instruction.op0_register())?,
+            OpKind::Register => {
+                let v = self.get_reg_val(instruction.op0_register())?;
+                // `PUSH FS`/`PUSH GS` write a full 8-byte slot with the 16-bit
+                // selector zero-extended into it.
+                if self.builder.func.dfg.value_type(v) == ty {
+                    v
+                } else {
+                    self.builder.ins().uextend(ty, v)
+                }
+            }
             OpKind::Immediate8to64 => {
                 // Must use immediate8to64() - immediate32to64() does not
                 // sign-extend from 8 bits and returns the raw unsigned value.
@@ -183,7 +231,8 @@ impl<'a> Lifter<'a> {
 
         // Match the operand size: 8 by default, 2 for a 0x66-prefixed pop.
         let pop_size: usize = match op0 {
-            OpKind::Register => instruction.op0_register().size(),
+            OpKind::Register => segment_stack_slot_size(instruction)
+                .unwrap_or_else(|| instruction.op0_register().size()),
             OpKind::Memory => instruction.memory_size().size(),
             _ => 8,
         };
