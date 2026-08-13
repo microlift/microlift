@@ -1267,6 +1267,15 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
+    /// EMMS - mark all x87/MMX registers empty without changing TOP, the
+    /// status word, or the register contents. MMX registers alias the x87
+    /// stack, and EMMS ends MMX use by setting every tag to empty.
+    pub(super) fn handle_emms(&mut self, _instruction: &Instruction) -> crate::Result<()> {
+        let empty = self.builder.ins().iconst(types::I32, 0);
+        self.fpu_store_tag(empty);
+        Ok(())
+    }
+
     /// FNOP / FWAIT - no observable effect in this FPU model.
     ///
     /// `FWAIT`/`WAIT` waits for pending *unmasked* x87 exceptions to be

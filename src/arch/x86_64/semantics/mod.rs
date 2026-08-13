@@ -796,6 +796,7 @@ impl<'a> Lifter<'a> {
             Mnemonic::Fincstp => self.handle_fincstp(instruction),
             Mnemonic::Fdecstp => self.handle_fdecstp(instruction),
             Mnemonic::Ffree => self.handle_ffree(instruction),
+            Mnemonic::Emms => self.handle_emms(instruction),
             // `FNOP` does nothing; `WAIT`/`FWAIT` has nothing to wait for (see
             // `handle_fpu_nop`) and is also the `9B` prefix byte iced splits
             // off the `FSTENV`/`FCLEX`/`FINIT` spellings.
