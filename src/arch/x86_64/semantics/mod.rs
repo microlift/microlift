@@ -9,6 +9,7 @@ pub mod atomics;
 pub mod bitops;
 pub mod bridge;
 pub mod control_flow;
+pub mod crc32;
 pub mod flags;
 pub mod fpu;
 pub mod helpers;
@@ -18,6 +19,7 @@ pub mod softfloat;
 pub mod sse;
 pub mod sse_int;
 pub mod sse_spec;
+pub mod sse_str;
 pub mod sse_vec;
 pub mod syscall;
 pub mod unimplemented;
@@ -26,6 +28,7 @@ use crate::MicroliftError;
 use crate::arch::x86_64::semantics::fpu::FpuOp;
 use crate::arch::x86_64::semantics::sse::{PackedLaneOp, PackedShiftOp, PackedWidth};
 use crate::arch::x86_64::semantics::sse_int::HorizOp;
+use crate::arch::x86_64::semantics::sse_str::PcmpstrForm;
 use crate::lifter::Lifter;
 use iced_x86::{Instruction, Mnemonic, OpKind, Register};
 
@@ -338,6 +341,24 @@ impl<'a> Lifter<'a> {
                 PackedWidth::Qword,
             ),
 
+            // SSE4.2 - the packed string compares. All four share one handler;
+            // which of them it is decides only where the operand lengths come
+            // from and where the result goes (see `sse_str::PcmpstrForm`).
+            // The `REX.W` spellings are separate mnemonics in iced, not a flag
+            // on the base one.
+            Mnemonic::Pcmpistri
+            | Mnemonic::Pcmpistrm
+            | Mnemonic::Pcmpestri
+            | Mnemonic::Pcmpestrm
+            | Mnemonic::Pcmpestri64
+            | Mnemonic::Pcmpestrm64 => match PcmpstrForm::of(instruction) {
+                Some(form) => self.handle_pcmpstr(instruction, form),
+                // The mnemonic is one of the four but the encoding is not - a
+                // VEX spelling this frontend does not decode into these
+                // handlers. Exit rather than lift it wrongly.
+                None => self.handle_unimplemented_instruction(instruction),
+            },
+
             // SSE / SSE2 - packed integer min / max / average / multiply
             Mnemonic::Pminub => self.handle_packed_lane_op(
                 instruction,
@@ -620,6 +641,9 @@ impl<'a> Lifter<'a> {
             Mnemonic::Bsr => self.handle_bsr(instruction),
             Mnemonic::Tzcnt => self.handle_tzcnt(instruction),
             Mnemonic::Lzcnt => self.handle_lzcnt(instruction),
+            Mnemonic::Popcnt => self.handle_popcnt(instruction),
+            // SSE4.2 - CRC-32C accumulation.
+            Mnemonic::Crc32 => self.handle_crc32(instruction),
             Mnemonic::Bswap => self.handle_bswap(instruction),
 
             // Unconditional Control Flow

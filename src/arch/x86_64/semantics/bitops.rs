@@ -946,6 +946,28 @@ impl<'a> Lifter<'a> {
         self.write_count_zeros_result(instruction, src, result)
     }
 
+    /// POPCNT - population count.
+    pub(super) fn handle_popcnt(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let size = self.operand_size(instruction, 1)?;
+        let src = self.read_operand(instruction, 1, size)?;
+        let result = self.builder.ins().popcnt(src);
+
+        let zf = self.builder.ins().icmp_imm_s(IntCC::Equal, src, 0);
+        self.set_flag(X86Flag::Zero, zf)?;
+        let zero = self.builder.ins().iconst(types::I8, 0);
+        for flag in [
+            X86Flag::Carry,
+            X86Flag::Overflow,
+            X86Flag::Sign,
+            X86Flag::Auxiliary,
+            X86Flag::Parity,
+        ] {
+            self.set_flag(flag, zero)?;
+        }
+
+        self.write_operand(instruction, 0, result)
+    }
+
     /// The shared tail of `TZCNT` and `LZCNT`: write the result and set the two
     /// flags they define.
     fn write_count_zeros_result(

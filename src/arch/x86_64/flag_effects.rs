@@ -129,6 +129,17 @@ pub fn flag_effects(i: &Instruction) -> Option<FlagEffects> {
         Mnemonic::Bt | Mnemonic::Bts | Mnemonic::Btr | Mnemonic::Btc => FlagEffects::writing(CF),
         Mnemonic::Bsf | Mnemonic::Bsr => FlagEffects::writing(ZF),
         Mnemonic::Tzcnt | Mnemonic::Lzcnt => FlagEffects::writing(CF.union(ZF)),
+        // `handle_popcnt` sets ZF and *clears* the other five, which is a write
+        // of each of them - unlike the bit scans above, none is left alone.
+        Mnemonic::Popcnt => FlagEffects::writing(ARITH),
+        // The SSE4.2 string compares define CF/ZF/SF/OF from the comparison and
+        // clear AF/PF; `pcmpstr_flags` assigns all six.
+        Mnemonic::Pcmpistri
+        | Mnemonic::Pcmpistrm
+        | Mnemonic::Pcmpestri
+        | Mnemonic::Pcmpestrm
+        | Mnemonic::Pcmpestri64
+        | Mnemonic::Pcmpestrm64 => FlagEffects::writing(ARITH),
 
         Mnemonic::Stc | Mnemonic::Clc => FlagEffects::writing(CF),
         Mnemonic::Cmc => FlagEffects {
@@ -222,6 +233,7 @@ fn is_flag_free(m: Mnemonic) -> bool {
             | Mnemonic::Cmpps
             | Mnemonic::Cmpss
             | Mnemonic::Cqo
+            | Mnemonic::Crc32
             | Mnemonic::Cvtdq2pd
             | Mnemonic::Cvtdq2ps
             | Mnemonic::Cvtpd2dq
@@ -754,6 +766,13 @@ mod tests {
             Mnemonic::Bsr,
             Mnemonic::Tzcnt,
             Mnemonic::Lzcnt,
+            Mnemonic::Popcnt,
+            Mnemonic::Pcmpistri,
+            Mnemonic::Pcmpistrm,
+            Mnemonic::Pcmpestri,
+            Mnemonic::Pcmpestrm,
+            Mnemonic::Pcmpestri64,
+            Mnemonic::Pcmpestrm64,
             Mnemonic::Stc,
             Mnemonic::Clc,
             Mnemonic::Cmc,

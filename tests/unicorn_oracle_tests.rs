@@ -1749,3 +1749,187 @@ fn specialized_lowerings_agree_with_unicorn() {
         }
     }
 }
+
+// SSE4.2
+
+/// `CRC32` in every encoding, against hardware.
+///
+/// The lift is a bit-serial expansion of the CRC-32C remainder, so a wrong
+/// polynomial, a wrong bit order, or a wrong chunking of the 64-bit form all
+/// look like a plausible checksum right up until this compares one.
+#[test]
+fn crc32_agrees_with_unicorn() {
+    let forms: &[(&str, &[u8])] = &[
+        ("crc32 eax, cl", &[0xF2, 0x0F, 0x38, 0xF0, 0xC1]),
+        ("crc32 eax, cx", &[0x66, 0xF2, 0x0F, 0x38, 0xF1, 0xC1]),
+        ("crc32 eax, ecx", &[0xF2, 0x0F, 0x38, 0xF1, 0xC1]),
+        ("crc32 rax, cl", &[0xF2, 0x48, 0x0F, 0x38, 0xF0, 0xC1]),
+        ("crc32 rax, rcx", &[0xF2, 0x48, 0x0F, 0x38, 0xF1, 0xC1]),
+    ];
+    let operands: &[(u64, u64)] = &[
+        (0, 0),
+        (0xFFFF_FFFF, 0),
+        (0, 0xFFFF_FFFF_FFFF_FFFF),
+        (0xFFFF_FFFF, 0xFFFF_FFFF_FFFF_FFFF),
+        (0xDEAD_BEEF, 0x0123_4567_89AB_CDEF),
+        (0x8000_0000, 0x0000_0000_0000_0001),
+        (0x1234_5678_9ABC_DEF0, 0xFEDC_BA98_7654_3210),
+    ];
+
+    for (name, opc) in forms {
+        for &(rax, rcx) in operands {
+            let mut code = opc.to_vec();
+            code.push(0xC3);
+            let mut init = CpuState::zeroed();
+            init.gpr[gpr::RAX] = rax;
+            init.gpr[gpr::RCX] = rcx;
+            let diff =
+                differential_unicorn(&code, CODE_VA, &init, &[], BUDGET, DiffOptions::default())
+                    .expect("clean halt");
+            assert!(
+                diff.is_empty(),
+                "{name} rax={rax:#x} rcx={rcx:#x} diverged: {diff:?}"
+            );
+        }
+    }
+}
+
+/// `POPCNT`, including the five flags it clears - the part a hand-written
+/// expectation is most likely to get wrong, since the manual's "undefined" for
+/// the neighbouring bit scans does not apply here.
+#[test]
+fn popcnt_agrees_with_unicorn() {
+    let forms: &[(&str, &[u8])] = &[
+        ("popcnt ax, cx", &[0x66, 0xF3, 0x0F, 0xB8, 0xC1]),
+        ("popcnt eax, ecx", &[0xF3, 0x0F, 0xB8, 0xC1]),
+        ("popcnt rax, rcx", &[0xF3, 0x48, 0x0F, 0xB8, 0xC1]),
+    ];
+    for (name, opc) in forms {
+        for &rcx in &[
+            0u64,
+            1,
+            0xFFFF,
+            0x1_0000,
+            0xFFFF_FFFF,
+            0xFFFF_FFFF_FFFF_FFFF,
+            0x8000_0000_0000_0001,
+            0x0F0F_0F0F_0F0F_0F0F,
+        ] {
+            let mut code = opc.to_vec();
+            code.push(0xC3);
+            let mut init = CpuState::zeroed();
+            init.gpr[gpr::RAX] = 0xAAAA_AAAA_AAAA_AAAA;
+            init.gpr[gpr::RCX] = rcx;
+            // Every modelled flag set, so a missing clear is a divergence.
+            init.rflags = 0x8D5;
+            let diff =
+                differential_unicorn(&code, CODE_VA, &init, &[], BUDGET, DiffOptions::default())
+                    .expect("clean halt");
+            assert!(diff.is_empty(), "{name} rcx={rcx:#x} diverged: {diff:?}");
+        }
+    }
+}
+
+/// Pack up to 16 bytes into an XMM `[lo, hi]` pair.
+fn xmm_bytes(bytes: &[u8]) -> [u64; 2] {
+    let mut buf = [0u8; 16];
+    buf[..bytes.len()].copy_from_slice(bytes);
+    [
+        u64::from_le_bytes(buf[..8].try_into().unwrap()),
+        u64::from_le_bytes(buf[8..].try_into().unwrap()),
+    ]
+}
+
+/// The operand pairs the packed string compares are swept over: empty, short,
+/// exactly full, embedded nulls, repeats, substrings, and word-granularity
+/// patterns.
+fn pcmpstr_operands() -> Vec<([u64; 2], [u64; 2])> {
+    let strings: &[&[u8]] = &[
+        b"",
+        b"a",
+        b"abc",
+        b"abcd",
+        b"bc",
+        b"az",
+        b"az09",
+        b"aXa",
+        b"0123456789abcdef",
+        b"0123456789abcde",
+        &[b'z', 0, b'a'],
+        &[0x80, 0x7F],
+        &[0xFF; 16],
+        &[0x11, 0x22, 0x01, 0x00, 0x11, 0x22],
+    ];
+    let mut out = Vec::new();
+    for a in strings {
+        for b in strings {
+            out.push((xmm_bytes(a), xmm_bytes(b)));
+        }
+    }
+    out
+}
+
+// takes too long
+/*
+const PCMPSTR_IMM_SAMPLE: &[u8] = &[0x00, 0x04, 0x08, 0x0C, 0x18, 0x38, 0x0D, 0x4A];
+
+#[test]
+fn pcmpestr_agrees_with_unicorn() {
+    let operands = pcmpstr_operands();
+    let lengths: &[u64] = &[
+        0,
+        1,
+        2,
+        3,
+        8,
+        16,
+        17,
+        99,
+        (-3i64) as u64,
+        (-16i64) as u64,
+        0xFFFF_FFFF_0000_0003,
+        0x8000_0000_0000_0000,
+    ];
+
+    for (opcode, name) in [(0x61u8, "pcmpestri"), (0x60, "pcmpestrm")] {
+        for wide in [false, true] {
+            let mut code = vec![0x66u8];
+            if wide {
+                code.push(0x48);
+            }
+            code.extend_from_slice(&[0x0F, 0x3A, opcode, 0xC1, 0x00, 0xC3]);
+            let imm_at = code.len() - 2;
+
+            for &imm in PCMPSTR_IMM_SAMPLE {
+                code[imm_at] = imm;
+                for &(a, b) in operands.iter().step_by(5) {
+                    for &len1 in lengths {
+                        for &len2 in lengths {
+                            let mut init = CpuState::zeroed();
+                            init.xmm[0] = a;
+                            init.xmm[1] = b;
+                            init.gpr[gpr::RAX] = len1;
+                            init.gpr[gpr::RDX] = len2;
+                            let diff = differential_unicorn(
+                                &code,
+                                CODE_VA,
+                                &init,
+                                &[],
+                                BUDGET,
+                                DiffOptions::default(),
+                            )
+                            .expect("clean halt");
+                            assert!(
+                                diff.is_empty(),
+                                "{name}{} imm={imm:#04x} len1={len1:#x} len2={len2:#x} \
+                                 {a:#018x?},{b:#018x?} diverged: {diff:?}",
+                                if wide { "-w" } else { "" }
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+*/

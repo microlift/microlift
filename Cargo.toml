@@ -170,6 +170,10 @@ name = "fuzz_vsa"
 required-features = ["fuzzing"]
 
 [[test]]
+name = "sse42_tests"
+required-features = ["testkit"]
+
+[[test]]
 name = "sse_vec_equiv_tests"
 required-features = ["testkit"]
 
@@ -196,3 +200,7 @@ required-features = ["testkit"]
 [[test]]
 name = "overflow_flags_tests"
 required-features = ["testkit"]
+
+[[test]]
+name = "probe_test"
+required-features = ["unicorn-oracle"]
