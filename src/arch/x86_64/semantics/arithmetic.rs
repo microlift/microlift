@@ -689,13 +689,17 @@ impl<'a> Lifter<'a> {
     ///
     /// The backend lacks native `udiv.i128`/`urem.i128`, but it does support
     /// i128 shifts, adds, subtracts and comparisons, which is all this needs.
-    /// It emits a 128-iteration runtime loop; 64-bit division is not on the hot
-    /// path for typical lifted code, so the simplicity is worth the cost.
+    /// The dividend is normalized once with its leading-zero count, so a value
+    /// whose significant part is only 64 bits takes 64 iterations rather than
+    /// 128. Within the loop all shifts are by the constant one: this matters
+    /// on x64 because variable shifts of an `I128` lower to comparatively
+    /// expensive multi-instruction sequences.
     ///
     /// Blocks use explicit parameters (not `Variable`s) to carry the loop state,
     /// so they need no manual sealing beyond the engine's final `seal_all_blocks`.
     fn emit_udivmod128(&mut self, n: Value, d: Value) -> (Value, Value) {
         let i128 = types::I128;
+        let i64 = types::I64;
         let zero = {
             let z = self.builder.ins().iconst(types::I64, 0);
             self.builder.ins().uextend(i128, z)
@@ -705,69 +709,124 @@ impl<'a> Lifter<'a> {
             self.builder.ins().uextend(i128, o)
         };
 
+        // Count leading zeros using the two native 64-bit CLZ operations. A
+        // zero dividend has clz=128; it is handled by the n < d fast path
+        // below, but the select also keeps the normalization shift in range
+        // for the benefit of IR validation and targets with strict shifts.
+        let hi = self.builder.ins().ushr_imm_u(n, 64);
+        let hi = self.builder.ins().ireduce(types::I64, hi);
+        let lo = self.builder.ins().ireduce(types::I64, n);
+        let hi_nonzero = self.builder.ins().icmp_imm_s(IntCC::NotEqual, hi, 0);
+        let clz_hi = self.builder.ins().clz(hi);
+        let clz_lo_base = self.builder.ins().clz(lo);
+        let clz_lo = self.builder.ins().iadd_imm_s(clz_lo_base, 64);
+        let clz = self.builder.ins().select(hi_nonzero, clz_hi, clz_lo);
+        let n_is_zero = self.builder.ins().icmp_imm_s(IntCC::Equal, n, 0);
+        let zero_i64 = self.builder.ins().iconst(i64, 0);
+        let shift = self.builder.ins().select(n_is_zero, zero_i64, clz);
+        let n_shifted = self.builder.ins().ishl(n, shift);
+        let bit_width = self.builder.ins().iconst(i64, 128);
+        let bits = self.builder.ins().isub(bit_width, clz);
+        let n_lt_d = self.builder.ins().icmp(IntCC::UnsignedLessThan, n, d);
+
         let loop_b = self.builder.create_block();
-        self.builder.append_block_param(loop_b, types::I64); // k: bit counter 0..=128
+        self.builder.append_block_param(loop_b, i64); // remaining significant bits
+        self.builder.append_block_param(loop_b, i128); // normalized dividend
         self.builder.append_block_param(loop_b, i128); // q: quotient so far
         self.builder.append_block_param(loop_b, i128); // r: remainder so far
         let body = self.builder.create_block();
-        self.builder.append_block_param(body, types::I64);
+        self.builder.append_block_param(body, i64);
+        self.builder.append_block_param(body, i128);
         self.builder.append_block_param(body, i128);
         self.builder.append_block_param(body, i128);
         let exit = self.builder.create_block();
         self.builder.append_block_param(exit, i128); // final q
         self.builder.append_block_param(exit, i128); // final r
+        let fast_exit = self.builder.create_block();
+        self.builder.append_block_param(fast_exit, i128); // q = 0
+        self.builder.append_block_param(fast_exit, i128); // r = n
 
-        let k0 = self.builder.ins().iconst(types::I64, 0);
-        self.builder
-            .ins()
-            .jump(loop_b, &[k0.into(), zero.into(), zero.into()]);
+        // Since d is known non-zero at the call site, n < d is already a
+        // complete result. This is especially useful for the common small
+        // dividend cases and avoids entering the loop at all.
+        self.builder.ins().brif(
+            n_lt_d,
+            fast_exit,
+            &[zero.into(), n.into()],
+            loop_b,
+            &[bits.into(), n_shifted.into(), zero.into(), zero.into()],
+        );
 
-        // loop_b(k, q, r): stop after 128 bits, else fall through to `body`.
+        // loop_b(remaining, n, q, r): stop after the significant bits.
         self.builder.switch_to_block(loop_b);
-        let k = self.builder.block_params(loop_b)[0];
-        let q = self.builder.block_params(loop_b)[1];
-        let r = self.builder.block_params(loop_b)[2];
-        let done = self.builder.ins().icmp_imm_s(IntCC::Equal, k, 128);
+        let remaining = self.builder.block_params(loop_b)[0];
+        let n_work = self.builder.block_params(loop_b)[1];
+        let q = self.builder.block_params(loop_b)[2];
+        let r = self.builder.block_params(loop_b)[3];
+        let done = self.builder.ins().icmp_imm_s(IntCC::Equal, remaining, 0);
         self.builder.ins().brif(
             done,
             exit,
             &[q.into(), r.into()],
             body,
-            &[k.into(), q.into(), r.into()],
+            &[remaining.into(), n_work.into(), q.into(), r.into()],
         );
 
-        // body(k, q, r): process bit (127 - k), MSB first.
+        // body: consume the current MSB, then shift the normalized dividend
+        // and quotient left for the next iteration.
         self.builder.switch_to_block(body);
-        let k = self.builder.block_params(body)[0];
-        let q = self.builder.block_params(body)[1];
-        let r = self.builder.block_params(body)[2];
-        let onetwentyseven = self.builder.ins().iconst(types::I64, 127);
-        let bit_pos = self.builder.ins().isub(onetwentyseven, k); // 127 - k
-        // r = (r << 1) | ((n >> bit_pos) & 1)
+        let remaining = self.builder.block_params(body)[0];
+        let n_work = self.builder.block_params(body)[1];
+        let q = self.builder.block_params(body)[2];
+        let r = self.builder.block_params(body)[3];
+        let n_bit = self.builder.ins().ushr_imm_u(n_work, 127);
+        let n_next = self.builder.ins().ishl_imm_u(n_work, 1);
         let r_shifted = self.builder.ins().ishl_imm_u(r, 1);
-        let n_bit_raw = self.builder.ins().ushr(n, bit_pos);
-        let n_bit = self.builder.ins().band(n_bit_raw, one);
         let r_new = self.builder.ins().bor(r_shifted, n_bit);
-        // if r >= d: r -= d; set quotient bit.
         let ge = self
             .builder
             .ins()
             .icmp(IntCC::UnsignedGreaterThanOrEqual, r_new, d);
         let r_sub = self.builder.ins().isub(r_new, d);
         let r_out = self.builder.ins().select(ge, r_sub, r_new);
-        let q_bit = self.builder.ins().ishl(one, bit_pos);
-        let q_set = self.builder.ins().bor(q, q_bit);
-        let q_out = self.builder.ins().select(ge, q_set, q);
-        let k_next = self.builder.ins().iadd_imm_s(k, 1);
-        self.builder
-            .ins()
-            .jump(loop_b, &[k_next.into(), q_out.into(), r_out.into()]);
+        let q_shifted = self.builder.ins().ishl_imm_u(q, 1);
+        let q_set = self.builder.ins().bor(q_shifted, one);
+        let q_out = self.builder.ins().select(ge, q_set, q_shifted);
+        let remaining_next = self.builder.ins().iadd_imm_s(remaining, -1);
+        self.builder.ins().jump(
+            loop_b,
+            &[
+                remaining_next.into(),
+                n_next.into(),
+                q_out.into(),
+                r_out.into(),
+            ],
+        );
 
         // exit(q, r): division complete.
         self.builder.switch_to_block(exit);
         let quot = self.builder.block_params(exit)[0];
         let rem = self.builder.block_params(exit)[1];
-        (quot, rem)
+
+        // fast_exit(q, r): n < d, so q=0 and r=n.
+        self.builder.switch_to_block(fast_exit);
+        let fast_quot = self.builder.block_params(fast_exit)[0];
+        let fast_rem = self.builder.block_params(fast_exit)[1];
+
+        // Merge the normal loop exit and the n < d fast exit before returning
+        // to the caller's current block.
+        let merge = self.builder.create_block();
+        self.builder.append_block_param(merge, i128);
+        self.builder.append_block_param(merge, i128);
+        self.builder
+            .ins()
+            .jump(merge, &[fast_quot.into(), fast_rem.into()]);
+        self.builder.switch_to_block(exit);
+        self.builder.ins().jump(merge, &[quot.into(), rem.into()]);
+        self.builder.switch_to_block(merge);
+        let merged_q = self.builder.block_params(merge)[0];
+        let merged_r = self.builder.block_params(merge)[1];
+        (merged_q, merged_r)
     }
 
     // Sign-extension conversions (implicit operand form)
