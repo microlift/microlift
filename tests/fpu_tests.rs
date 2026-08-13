@@ -467,6 +467,29 @@ fn test_ffree_marks_empty() {
 }
 
 #[test]
+fn test_emms_marks_all_registers_empty() {
+    // fld1; fldz; emms; ret -> D9 E8 D9 EE 0F 77 C3
+    let bytes = [0xD9, 0xE8, 0xD9, 0xEE, 0x0F, 0x77, 0xC3];
+    let ctx = run_test(&bytes, RegisterContext::default());
+
+    assert_eq!(ctx.fpu_top, 6, "EMMS must preserve TOP");
+    assert_eq!(
+        ctx.fpu_tag, 0,
+        "EMMS must mark every x87/MMX register empty"
+    );
+    assert_eq!(
+        st(&ctx, 0),
+        0.0,
+        "EMMS must not overwrite register contents"
+    );
+    assert_eq!(
+        st(&ctx, 1),
+        1.0,
+        "EMMS must not overwrite register contents"
+    );
+}
+
+#[test]
 fn test_f80_conversion_roundtrip() {
     use microlift::context::{f64_bits_to_f80, f80_to_f64_bits};
     for &v in &[0.0f64, -0.0, 1.0, -1.0, 2.5, 1234.5, -7.25, 1e300, 1e-300] {
