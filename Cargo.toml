@@ -92,10 +92,6 @@ name = "subencoded_tests"
 required-features = ["testkit"]
 
 [[test]]
-name = "atomic128_native_tests"
-required-features = ["testkit"]
-
-[[test]]
 name = "atomic_tests"
 required-features = ["testkit"]
 
