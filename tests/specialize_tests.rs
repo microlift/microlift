@@ -58,6 +58,9 @@ const BOTH: &[SpecTarget] = &[SpecTarget::X86_64, SpecTarget::Aarch64];
 /// replacement is a measured regression there. See [`Spec::supported_on`] and
 /// `Lifter::try_horizontal_int_spec` for which is which.
 const ARM: &[SpecTarget] = &[SpecTarget::Aarch64];
+/// x86-64 only - so far, exactly the sub-word scalar widths, which aarch64 has
+/// no flag-setting arithmetic for. See `Lifter::native_overflow_width_ok`.
+const X64: &[SpecTarget] = &[SpecTarget::X86_64];
 
 /// Every specialization, paired with a guest encoding that reaches it.
 ///
@@ -186,12 +189,15 @@ fn cases() -> Vec<Case> {
     // the size of one region's fixed overhead.
     //
     // Widths are swept on ADD alone: the width reaches the specialization only
-    // as the operand type, and every backend here lowers all four the same way.
+    // as the operand type, and every other form here is 64-bit. The two narrow
+    // ones are x86-64-only - aarch64's `ADDS`/`SUBS` start at 32 bits, so
+    // Cranelift synthesizes the sub-word overflow ops there and the result is a
+    // measured regression. See `Lifter::native_overflow_width_ok`.
     let o = Spec::IntegerOverflowFlags;
     push_n("add-r64", &[0x48, 0x01, 0xC8], o, BOTH);
     push_n("add-r32", &[0x01, 0xC8], o, BOTH);
-    push_n("add-r16", &[0x66, 0x01, 0xC8], o, BOTH);
-    push_n("add-r8", &[0x00, 0xC8], o, BOTH);
+    push_n("add-r16", &[0x66, 0x01, 0xC8], o, X64);
+    push_n("add-r8", &[0x00, 0xC8], o, X64);
     push_n("sub-r64", &[0x48, 0x29, 0xC8], o, BOTH);
     push_n("cmp-r64", &[0x48, 0x39, 0xC8], o, BOTH);
     push_n("adc-r64", &[0x48, 0x11, 0xC8], o, BOTH);
@@ -693,6 +699,11 @@ fn inert_without_vector_xmm() {
     for case in cases() {
         let (name, bytes, needs_vec) = (case.name, case.bytes, case.spec.requires_vector_xmm());
         let lean = case.lean;
+        // A target the case is actually claimed on, not a fixed one: a spec can
+        // decline for a target-specific reason that has nothing to do with
+        // vector XMM (`IntegerOverflowFlags` at sub-word widths on aarch64),
+        // and that would read here as the exemption being wrong.
+        let target = case.improves[0];
         let config = |spec| LifterConfig {
             use_vector_xmm: false,
             specialization: spec,
@@ -701,12 +712,9 @@ fn inert_without_vector_xmm() {
         };
         let base = lift_to_code::<X86_64>(&bytes, 0x1000, config(Specialization::generic()))
             .expect("lift");
-        let spec = lift_to_code::<X86_64>(
-            &bytes,
-            0x1000,
-            config(Specialization::for_target(SpecTarget::Aarch64)),
-        )
-        .expect("lift");
+        let spec =
+            lift_to_code::<X86_64>(&bytes, 0x1000, config(Specialization::for_target(target)))
+                .expect("lift");
 
         let count = |c: &microlift::core::LiftedCode| -> usize {
             c.func

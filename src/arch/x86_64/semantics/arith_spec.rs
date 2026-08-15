@@ -40,15 +40,41 @@ impl Wanted {
 
 impl<'a> Lifter<'a> {
     /// The flags this site needs from the hardware, or `None` if the
-    /// specialization is not available here at all.
-    fn overflow_flags_wanted(&self) -> Option<Wanted> {
+    /// specialization is not available at this site at all.
+    ///
+    /// `lhs` is the site's operand, and so its width: aarch64 declines below 32
+    /// bits, see [`Lifter::native_overflow_width_ok`].
+    fn overflow_flags_wanted(&self, lhs: Value) -> Option<Wanted> {
         if !self.specialized(Spec::IntegerOverflowFlags) || !self.config.eliminate_dead_flags {
+            return None;
+        }
+        if !self.native_overflow_width_ok(lhs) {
             return None;
         }
         Some(Wanted {
             carry: self.flag_needed(X86Flag::Carry),
             overflow: self.flag_needed(X86Flag::Overflow),
         })
+    }
+
+    /// Whether this site's operand width is one the target's flag-setting
+    /// arithmetic actually has.
+    ///
+    /// x86-64 has `ADD`/`SUB` at all four widths and takes every one; aarch64's
+    /// `ADDS`/`SUBS` exist only at 32 and 64 bits, so a Cranelift
+    /// `uadd_overflow` on `I8`/`I16` is *synthesized* there - extend, operate,
+    /// compare the result back against its own width - and that is no cheaper
+    /// than the portable arithmetic it replaces. It is in fact dearer, for the
+    /// reason the whole specialization is gated on liveness: the portable CF/OF
+    /// is ordinary dataflow that DCE deletes wherever nothing reads it, while
+    /// an overflow op welds the condition bit to a result that is read. Measured
+    /// at **+60 bytes** of `.text` per 32-instruction snippet, against -300 or
+    /// better at 32 and 64 bits (`specialize_tests::dump_code_sizes`).
+    fn native_overflow_width_ok(&self, lhs: Value) -> bool {
+        if self.config.specialization.target() != SpecTarget::Aarch64 {
+            return true;
+        }
+        self.builder.func.dfg.value_type(lhs).bits() >= 32
     }
 
     /// `lhs + rhs` with CF and/or OF taken from the add itself.
@@ -62,7 +88,7 @@ impl<'a> Lifter<'a> {
         lhs: Value,
         rhs: Value,
     ) -> crate::Result<Option<Value>> {
-        let Some(want) = self.overflow_flags_wanted() else {
+        let Some(want) = self.overflow_flags_wanted(lhs) else {
             return Ok(None);
         };
         if want.none() {
@@ -93,7 +119,7 @@ impl<'a> Lifter<'a> {
         lhs: Value,
         rhs: Value,
     ) -> crate::Result<Option<Value>> {
-        let Some(want) = self.overflow_flags_wanted() else {
+        let Some(want) = self.overflow_flags_wanted(lhs) else {
             return Ok(None);
         };
         if want.none() {
@@ -124,7 +150,7 @@ impl<'a> Lifter<'a> {
         rhs: Value,
         is_add: bool,
     ) -> crate::Result<Option<Value>> {
-        let Some(want) = self.overflow_flags_wanted() else {
+        let Some(want) = self.overflow_flags_wanted(lhs) else {
             return Ok(None);
         };
         if !want.overflow {
@@ -153,7 +179,7 @@ impl<'a> Lifter<'a> {
         cf_in: Value,
         is_adc: bool,
     ) -> crate::Result<Option<(Value, Value)>> {
-        let Some(want) = self.overflow_flags_wanted() else {
+        let Some(want) = self.overflow_flags_wanted(lhs) else {
             return Ok(None);
         };
         if !want.carry {
@@ -201,7 +227,7 @@ impl<'a> Lifter<'a> {
         lhs: Value,
         rhs: Value,
     ) -> crate::Result<Option<Value>> {
-        let Some(want) = self.overflow_flags_wanted() else {
+        let Some(want) = self.overflow_flags_wanted(lhs) else {
             return Ok(None);
         };
         if want.none() || self.config.specialization.target() != SpecTarget::Aarch64 {
