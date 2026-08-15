@@ -200,7 +200,3 @@ required-features = ["testkit"]
 [[test]]
 name = "overflow_flags_tests"
 required-features = ["testkit"]
-
-[[test]]
-name = "probe_test"
-required-features = ["unicorn-oracle"]
