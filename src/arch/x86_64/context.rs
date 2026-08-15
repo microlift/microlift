@@ -75,6 +75,32 @@ pub struct RegisterContext {
     /// function that was called. `rip` points to the instruction *after* the
     /// `CALL` - the resume point once the host has handled the call.
     pub imported_function_va: u64,
+    /// Padding, so that [`xmm`](Self::xmm) begins at a **16-byte-aligned
+    /// offset**. Not a placeholder and not spare space: it is worth twenty-two
+    /// host instructions on every region entry.
+    ///
+    /// aarch64's `ldr q`/`str q` reach a 12-bit immediate *scaled by sixteen*,
+    /// so a vector slot at an offset that is not a multiple of sixteen cannot
+    /// use it. Without this field `xmm` sat at `0xb8`, and the emitted prologue
+    /// fell back twice over: `ldur` (unscaled, ±255) for the first five
+    /// registers, and then, past `0xff`, an address materialised into a scratch
+    /// register for each of the remaining eleven —
+    ///
+    /// ```text
+    ///   ldur q19, [x0, #0xf8]
+    ///   mov  x1, #0x108
+    ///   ldr  q18, [x0, x1]      ; and ten more like it, on entry and on
+    ///                           ; every exit path
+    /// ```
+    ///
+    /// — against `ldr q18, [x0, #0x110]` once the offset is aligned. A Hat in
+    /// Time enters a region fifteen million times a second, which made this
+    /// eight bytes of padding worth roughly three hundred million instructions
+    /// a second. See rosetta3's `docs/HOTSPOTS.md`.
+    ///
+    /// Public because the struct is `#[repr(C)]` and a host constructing one
+    /// field by field has to name it; [`RegisterContext::new`] zeroes it.
+    pub _align_xmm: u64,
     /// XMM0–XMM15, each stored as [lo_64, hi_64].
     pub xmm: [[u64; 2]; 16],
     /// FS segment base address. In x86-64 user mode this is set via
@@ -207,6 +233,7 @@ impl Default for RegisterContext {
             exit_reason: 0,
             exit_code: 0,
             imported_function_va: 0,
+            _align_xmm: 0,
             xmm: [[0; 2]; 16],
             fs_base: 0,
             gs_base: 0,
