@@ -182,7 +182,10 @@ fn popcnt_counts_and_sets_flags() {
         assert_eq!(out.ctx.rax, expect, "popcnt of {src:#x}");
         assert_eq!(out.ctx.zf, u8::from(src == 0));
         // POPCNT *clears* the other five rather than leaving them undefined.
-        assert_eq!((out.ctx.cf, out.ctx.pf, out.ctx.af, out.ctx.sf, out.ctx.of), (0, 0, 0, 0, 0));
+        assert_eq!(
+            (out.ctx.cf, out.ctx.pf, out.ctx.af, out.ctx.sf, out.ctx.of),
+            (0, 0, 0, 0, 0)
+        );
     }
 }
 
@@ -228,7 +231,12 @@ fn estrm(imm: u8) -> Vec<u8> {
 
 /// Run a string compare over `(xmm0, xmm1)`, under every configuration that is
 /// supposed to make no difference to the answer.
-fn strcmp_run(code: &[u8], a: &[u8], b: &[u8], seed: impl Fn(&mut RegisterContext) + Copy) -> RunOutcome {
+fn strcmp_run(
+    code: &[u8],
+    a: &[u8],
+    b: &[u8],
+    seed: impl Fn(&mut RegisterContext) + Copy,
+) -> RunOutcome {
     let mut first: Option<(u64, [u64; 2], (u8, u8, u8, u8, u8, u8))> = None;
     let mut last = None;
     for (vector, outline) in [(false, true), (true, true), (false, false), (true, false)] {
@@ -245,12 +253,7 @@ fn strcmp_run(code: &[u8], a: &[u8], b: &[u8], seed: impl Fn(&mut RegisterContex
             out.ctx.rcx,
             out.ctx.xmm[0],
             (
-                out.ctx.cf,
-                out.ctx.zf,
-                out.ctx.sf,
-                out.ctx.of,
-                out.ctx.af,
-                out.ctx.pf,
+                out.ctx.cf, out.ctx.zf, out.ctx.sf, out.ctx.of, out.ctx.af, out.ctx.pf,
             ),
         );
         match &first {

@@ -517,10 +517,7 @@ impl<'a> Lifter<'a> {
         len2: Value,
         n: usize,
     ) -> crate::Result<()> {
-        let cf = self
-            .builder
-            .ins()
-            .icmp_imm_s(IntCC::NotEqual, int_res2, 0);
+        let cf = self.builder.ins().icmp_imm_s(IntCC::NotEqual, int_res2, 0);
         self.set_flag(X86Flag::Carry, cf)?;
 
         let zf = self
