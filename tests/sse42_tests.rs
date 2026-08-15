@@ -237,12 +237,38 @@ fn strcmp_run(
     b: &[u8],
     seed: impl Fn(&mut RegisterContext) + Copy,
 ) -> RunOutcome {
+    strcmp_run_inner(code, a, b, seed, true)
+}
+
+/// [`strcmp_run`] with the automatic Unicorn cross-check suppressed, for the
+/// one case where the oracle is the engine that is wrong. See
+/// [`pcmpestri_length_absolute_value_and_saturation`].
+fn strcmp_run_no_unicorn(
+    code: &[u8],
+    a: &[u8],
+    b: &[u8],
+    seed: impl Fn(&mut RegisterContext) + Copy,
+) -> RunOutcome {
+    strcmp_run_inner(code, a, b, seed, false)
+}
+
+fn strcmp_run_inner(
+    code: &[u8],
+    a: &[u8],
+    b: &[u8],
+    seed: impl Fn(&mut RegisterContext) + Copy,
+    unicorn: bool,
+) -> RunOutcome {
     let mut first: Option<(u64, [u64; 2], (u8, u8, u8, u8, u8, u8))> = None;
     let mut last = None;
     for (vector, outline) in [(false, true), (true, true), (false, false), (true, false)] {
-        let out = LiftTest::new(code)
+        let mut t = LiftTest::new(code)
             .vector_xmm(vector)
-            .with_config(|c| c.outline_helpers = outline)
+            .with_config(|c| c.outline_helpers = outline);
+        if !unicorn {
+            t = t.no_unicorn();
+        }
+        let out = t
             .reg(|c| {
                 c.xmm[0] = xmm(a);
                 c.xmm[1] = xmm(b);
@@ -519,7 +545,14 @@ fn pcmpestri_length_absolute_value_and_saturation() {
     assert_eq!(out.ctx.rcx, 2);
 
     // With REX.W it is not - and this value's absolute value saturates to 16.
-    let out = strcmp_run(&estri(0x00, true), b"a", data, |c| {
+    //
+    // No Unicorn differential on this one case: QEMU's `pcmp_elen` computes the
+    // 64-bit absolute value and then stores it in an `int`, so `RDX` here comes
+    // out as -3 rather than 4294967293 and it reports `ZF = |RDX| < 16 = 1`.
+    // The SDM takes the whole of RDX under REX.W, which saturates - so the
+    // divergence is Unicorn's, and this is the encoding that proves the
+    // 64-bit half of `explicit_len` is not silently truncating the same way.
+    let out = strcmp_run_no_unicorn(&estri(0x00, true), b"a", data, |c| {
         c.rax = 1;
         c.rdx = 0xFFFF_FFFF_0000_0003;
     });

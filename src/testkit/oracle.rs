@@ -394,7 +394,8 @@ pub fn differential<A: CpuOracle, B: CpuOracle>(
 /// pointer-is-the-host-address JIT be diffed against an external emulator that
 /// maps the same VA into its own space.
 ///
-/// Unix only (uses `mmap` with `MAP_FIXED_NOREPLACE` where available).
+/// Unix only, and it never displaces an existing mapping - see
+/// [`IdentityArena::map`], which is where the interesting part is.
 #[cfg(unix)]
 pub struct IdentityArena {
     ptr: *mut u8,
@@ -405,19 +406,36 @@ pub struct IdentityArena {
 impl IdentityArena {
     /// Map `len` bytes read/write at exactly `va`. `va` and `len` should be page
     /// aligned and in a normally-free range (e.g. `0x1_0000_0000`). Returns
-    /// `None` if the fixed mapping could not be established (e.g. the range is
-    /// already occupied).
+    /// `None` if the mapping could not be established there, which callers are
+    /// expected to treat as "skip this test" rather than as a failure.
+    ///
+    /// **Never `MAP_FIXED`.** `MAP_FIXED` does not fail on a collision, it
+    /// *replaces* the mapping that was there - and in a test binary the thing
+    /// that was there is another thread's JIT code or heap, chosen by the
+    /// kernel precisely because this range was free a moment ago. That corrupts
+    /// the other thread, and worse, survives being noticed: the owner's own
+    /// `munmap` then tears down what is now *this* arena, and the fault lands
+    /// here, in a test that did nothing wrong, at exactly `va`. It reproduced
+    /// as an intermittent SIGSEGV in `unicorn_oracle_tests` under `--release`
+    /// with no failing test - the parallel harness is what made it likely
+    /// enough to see, not what made it possible.
+    ///
+    /// Linux has `MAP_FIXED_NOREPLACE`, which is the flag `MAP_FIXED` is
+    /// mistaken for: same exact placement, but `EEXIST` instead of a silent
+    /// replacement. Everywhere else this passes `va` as a plain **hint** with
+    /// no fixed flag at all - the kernel places the mapping at `va` when that
+    /// range is free and somewhere else when it is not, and the exact-address
+    /// check below turns "somewhere else" into `None`. Both spellings are
+    /// therefore atomic with respect to other threads; neither can clobber.
     pub fn map(va: u64, len: usize) -> Option<Self> {
-        // MAP_FIXED_NOREPLACE fails (rather than clobbering) on collision where
-        // supported; fall back to MAP_FIXED elsewhere.
         #[cfg(target_os = "linux")]
         let fixed = libc_flags::MAP_FIXED_NOREPLACE;
         #[cfg(not(target_os = "linux"))]
-        let fixed = libc_flags::MAP_FIXED;
+        let fixed = 0;
 
         let prot = libc_flags::PROT_READ | libc_flags::PROT_WRITE;
         let flags = libc_flags::MAP_PRIVATE | libc_flags::MAP_ANON | fixed;
-        // SAFETY: standard anonymous fixed mapping; we own the returned range.
+        // SAFETY: standard anonymous mapping; we own the returned range.
         let p = unsafe { mmap_raw(va as *mut core::ffi::c_void, len, prot, flags) };
         if p.is_null() || p as isize == -1 || p as u64 != va {
             if !p.is_null() && p as isize != -1 {
@@ -469,7 +487,6 @@ mod libc_flags {
     pub const MAP_FIXED_NOREPLACE: i32 = 0x100000;
     #[cfg(not(target_os = "linux"))]
     pub const MAP_ANON: i32 = 0x1000;
-    pub const MAP_FIXED: i32 = 0x10;
 }
 
 #[cfg(unix)]

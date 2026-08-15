@@ -9,7 +9,9 @@
 //! Unicorn means writing a real descriptor selector into an emulated CPU that
 //! is already in long mode, and the values a guest sees are a property of the
 //! guest OS rather than of the code, so there is nothing an oracle could agree
-//! with us about.
+//! with us about. `CpuState` carries no selectors, so the oracle starts every
+//! one at zero and would report a divergence for every read below - hence the
+//! `no_unicorn()` on each of them.
 
 use microlift::arch::x86_64::context::{
     CS_USER64_DARWIN, CS_USER64_LINUX, SS_USER64_DARWIN, SS_USER64_LINUX,
@@ -34,6 +36,7 @@ fn crashpad_capture_context_tail() {
     // mov dx, gs   ; 66 8C EA
     // ret          ; C3
     let out = LiftTest::new(&[0x66, 0x8C, 0xC8, 0x66, 0x8C, 0xE1, 0x66, 0x8C, 0xEA, 0xC3])
+        .no_unicorn()
         .reg(|c| {
             c.cs = CS_USER64_LINUX;
             c.ss = SS_USER64_LINUX;
@@ -61,6 +64,7 @@ fn read_every_selector_16_bit() {
         0x66, 0x8C, 0xC0, 0x66, 0x8C, 0xC9, 0x66, 0x8C, 0xD2, 0x66, 0x8C, 0xDB, 0x66, 0x8C, 0xE6,
         0x66, 0x8C, 0xEF, 0xC3,
     ])
+    .no_unicorn()
     .reg(|c| {
         c.es = 0x0011;
         c.cs = 0x0022;
@@ -87,6 +91,7 @@ fn read_selector_into_wider_register_zero_extends() {
     // mov rcx, gs ; 48 8C E9
     // ret         ; C3
     let out = LiftTest::new(&[0x8C, 0xC8, 0x48, 0x8C, 0xE9, 0xC3])
+        .no_unicorn()
         .reg(|c| {
             c.cs = 0x002B;
             c.gs = 0x1234;
@@ -106,6 +111,7 @@ fn store_selector_to_memory() {
     // ret           ; C3
     let mut buf: [u16; 2] = [0xDEAD, 0xBEEF];
     let out = LiftTest::new(&[0x8C, 0x08, 0xC3])
+        .no_unicorn()
         .reg(|c| {
             c.cs = 0x0033;
             c.rax = buf.as_mut_ptr() as u64;
@@ -123,6 +129,7 @@ fn write_selector_from_register() {
     // mov es, cx ; 66 8E C1
     // ret        ; C3
     let out = LiftTest::new(&[0x66, 0x8E, 0xD8, 0x66, 0x8E, 0xC1, 0xC3])
+        .no_unicorn()
         .reg(|c| {
             c.rax = 0xFFFF_FFFF_0000_1234;
             c.rcx = 0x5678;
@@ -141,6 +148,7 @@ fn selector_write_leaves_segment_base_alone() {
     // mov fs, ax ; 66 8E E0
     // ret        ; C3
     let out = LiftTest::new(&[0x66, 0x8E, 0xE0, 0xC3])
+        .no_unicorn()
         .reg(|c| {
             c.rax = 0x0053;
             c.fs = 0;
@@ -162,6 +170,7 @@ fn push_segment_uses_an_eight_byte_slot() {
     // pop rcx  ; 59
     // ret      ; C3
     let out = LiftTest::new(&[0x51, 0x0F, 0xA8, 0x58, 0x59, 0xC3])
+        .no_unicorn()
         .reg(|c| {
             c.gs = 0x1234;
             c.rax = 0xFFFF_FFFF_FFFF_FFFF;
@@ -192,6 +201,7 @@ fn push_segment_16_bit_uses_a_two_byte_slot() {
     // `pop ax`, and `pop rcx` would come back with something other than the
     // sentinel.
     let out = LiftTest::new(&[0x51, 0x66, 0x0F, 0xA0, 0x66, 0x58, 0x59, 0xC3])
+        .no_unicorn()
         .reg(|c| {
             c.fs = 0x4321;
             c.rax = 0xFFFF_FFFF_FFFF_0000;
@@ -212,6 +222,7 @@ fn pop_segment_loads_the_low_16_bits() {
     // pop fs   ; 0F A1
     // ret      ; C3
     let out = LiftTest::new(&[0x50, 0x0F, 0xA1, 0xC3])
+        .no_unicorn()
         .reg(|c| {
             c.rax = 0xDEAD_BEEF_CAFE_0053;
             c.fs = 0;
@@ -233,6 +244,7 @@ fn selector_reads_track_the_host_between_entries() {
     // ret        ; C3
     let out = LiftTest::new(&[0x66, 0x8C, 0xC8, 0xC3])
         .resumable()
+        .no_unicorn()
         .reg(|c| c.cs = 0x0033)
         .run();
     assert_eq!(out.ctx.rax & 0xFFFF, 0x33);

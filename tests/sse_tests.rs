@@ -4323,10 +4323,16 @@ fn test_extractps_imm_selector_masks_to_two_bits() {
 fn test_extractps_to_memory_writes_one_dword() {
     // extractps dword ptr [rax], xmm1, 3; ret  ->  66 0F 3A 17 08 03  C3
     let bytes = [0x66, 0x0F, 0x3A, 0x17, 0x08, 0x03, 0xC3];
-    let mem = [0xAAAA_AAAAu32, 0xBBBB_BBBB];
+    // `mut`, and reached through `as_mut_ptr`: the lifted code stores into this
+    // array, and a shared reference to an immutable local tells LLVM the bytes
+    // never change. In release it then folds the reads below to the initializer
+    // - which showed up as `assert_eq!` failing between two values that print
+    // identically, the comparison seeing the constant and the panic message
+    // re-reading the (correctly stored) memory.
+    let mut mem = [0xAAAA_AAAAu32, 0xBBBB_BBBB];
     let mut ctx = RegisterContext::default();
     ctx.xmm[1] = EXTRACTPS_SRC;
-    ctx.rax = mem.as_ptr() as u64;
+    ctx.rax = mem.as_mut_ptr() as u64;
     run_test(&bytes, ctx);
     assert_eq!(mem[0], 0x4444_4444, "lane 3 stored");
     assert_eq!(mem[1], 0xBBBB_BBBB, "only four bytes written");

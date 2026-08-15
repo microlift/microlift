@@ -148,6 +148,18 @@ fn compile_x86_64_elf_with(source: &str, basename: &str, extra: &[&str]) -> Opti
     compile_x86_64_elf_multi(&[("main", source)], basename, extra)
 }
 
+/// Serializes the compile-and-read below.
+///
+/// `basename` names a file in a directory shared by the whole binary, and two
+/// tests here pass the same one (`process_string`). Run in parallel, one test's
+/// `gcc` truncates the `.so` while the other is reading it, and the reader gets
+/// a valid-but-wrong or half-written image - which surfaced as an intermittent
+/// `expect("function symbol")`, the symbol genuinely absent from the bytes that
+/// were read. Unique per-call paths would work too, at the cost of leaving a
+/// fresh artifact behind on every run; the compile is not on any hot path, so
+/// serializing is the cheaper answer.
+static COMPILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Compile several translation units into one shared object. Link order is the
 /// given order, which is what decides `.text` layout - the only way to pin a
 /// specific function at the front of the image, since GCC emits callees before
@@ -158,6 +170,7 @@ fn compile_x86_64_elf_multi(
     extra: &[&str],
 ) -> Option<Vec<u8>> {
     let cc = x86_64_elf_compiler()?;
+    let _guard = COMPILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let dir = artifact_dir();
     std::fs::create_dir_all(&dir).expect("failed to create artifact dir");

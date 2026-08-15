@@ -212,11 +212,50 @@ fn no_overflow_ops_without_liveness() {
     }
 }
 
+/// A snippet whose operands are narrower than 32 bits.
+///
+/// aarch64's `ADDS`/`SUBS` start at 32 bits, so Cranelift has to synthesize the
+/// overflow ops below that and the result is a measured regression; the lifter
+/// declines there. See `Lifter::native_overflow_width_ok` and
+/// `specialize_tests::specializations_shrink_the_compiled_code`.
+fn is_sub_word(name: &str) -> bool {
+    name.ends_with(" r16") || name.ends_with(" r8")
+}
+
+/// The width gate, in both directions: a sub-word site declines on aarch64 and
+/// still fires on x86-64, with CF and OF live either way.
+///
+/// The two halves are both required. Without the first, a lifter that ignored
+/// the width would pass every equivalence test while emitting the sequence that
+/// was measured as a regression; without the second, a gate that was accidentally
+/// unconditional would look exactly the same from here.
+#[test]
+fn sub_word_overflow_ops_are_aarch64_only() {
+    for (name, bytes) in snippets().into_iter().filter(|(n, _)| is_sub_word(n)) {
+        assert_eq!(
+            overflow_ops(
+                &bytes,
+                Specialization::for_target(SpecTarget::Aarch64),
+                true
+            ),
+            0,
+            "{name}: aarch64 has no flag-setting arithmetic at this width"
+        );
+        assert!(
+            overflow_ops(&bytes, Specialization::for_target(SpecTarget::X86_64), true) > 0,
+            "{name}: x86-64 has ADD/SUB at every width and should still specialize"
+        );
+    }
+}
+
 #[test]
 fn liveness_lets_the_overflow_ops_through() {
     for (name, bytes) in snippets() {
         for target in [SpecTarget::X86_64, SpecTarget::Aarch64] {
             if name.starts_with("imul") && target == SpecTarget::X86_64 {
+                continue;
+            }
+            if is_sub_word(name) && target == SpecTarget::Aarch64 {
                 continue;
             }
             let n = overflow_ops(&bytes, Specialization::for_target(target), true);
