@@ -13,6 +13,7 @@ pub mod bridge;
 pub mod exit;
 pub mod flags;
 pub mod link;
+pub mod pin;
 pub mod specialize;
 pub mod srcloc;
 
@@ -25,6 +26,7 @@ use crate::core::bridge::{BridgeImport, ImportKind, ImportRegistry};
 use crate::core::exit::{ExitReason, MemorySegment, TransferKind};
 use crate::core::flags::{FlagEffects, FlagLiveness, FlagSet};
 use crate::core::link::{BlockLinkConfig, BlockLinkOffsets};
+use crate::core::pin::{PinnedAbi, PinnedReg};
 use crate::core::specialize::Specialization;
 use crate::core::srcloc::SourceLocMap;
 use crate::function_traits::{DynamicSymbol, FunctionArgumentType};
@@ -82,6 +84,41 @@ pub trait GuestArch: Sized {
     /// published `#[repr(C)]` layout, which is a decision per guest rather than
     /// something the engine can assume. See [`crate::core::link`].
     fn block_link_offsets() -> Option<BlockLinkOffsets> {
+        None
+    }
+
+    // --- pinned register file (see [`crate::core::pin`]) ---
+
+    /// The Cranelift type a pinned `reg` is passed as, or `None` if this guest
+    /// will not pin that register **under this config**.
+    ///
+    /// `None` from any slot disables pinning for the whole lift, which is what
+    /// makes this the place to refuse: x86-64 declines a
+    /// [`RegClass::Vector`](crate::core::pin::RegClass::Vector) slot without
+    /// [`LifterConfig::use_vector_xmm`], because in the scalar representation
+    /// that register is two variables and a slot is one value. The default
+    /// declines everything, so a frontend that has not thought about pinning
+    /// never gets it.
+    ///
+    /// Must agree with [`pinned_slot_var`](GuestArch::pinned_slot_var): the type
+    /// here is the signature the variable there is loaded from and returned in.
+    fn pinned_slot_type(_reg: PinnedReg, _config: &LifterConfig) -> Option<types::Type> {
+        None
+    }
+
+    /// The SSA variable holding pinned `reg`'s value, or `None` for a register
+    /// this guest does not pin.
+    fn pinned_slot_var(_state: &Self::RegState, _reg: PinnedReg) -> Option<Variable> {
+        None
+    }
+
+    /// Byte offset of pinned `reg` within this guest's `RegisterContext` - where
+    /// the entry thunk loads it from and stores it back to.
+    ///
+    /// This is the same field [`sync_to_context`](GuestArch::sync_to_context)
+    /// would have written, which is exactly the point: pinning moves *when* that
+    /// store happens, never where.
+    fn pinned_slot_offset(_reg: PinnedReg) -> Option<i32> {
         None
     }
 
@@ -242,6 +279,127 @@ pub struct LiftedCode {
     /// under [`None`](VmResumptionPoints::None). Empty under
     /// [`LifterConfig::analysis_mode`], whose IR is not runnable at all.
     pub resume_points: Vec<u64>,
+    /// The `extern "C" fn(*mut RegisterContext)` a **pinned** region is entered
+    /// through, or `None` when the region is host-callable on its own.
+    ///
+    /// Present exactly when [`pinned_abi_for`] answered yes for this lift.
+    /// [`func`](Self::func) is then the region *body*, which carries the tail
+    /// calling convention and a signature the host cannot call: the thunk is
+    /// what loads the pinned slots out of the context, calls the body, and
+    /// stores the returned values back. It is the whole of the fill and spill,
+    /// paid once per entry from the host rather than once per region - a chain
+    /// of linked regions runs between the two halves of one thunk call.
+    ///
+    /// Backends declare the body **after** the helpers, continuing the same
+    /// `ExternalName::user(0, i)` index space, and export the thunk as the
+    /// region's entry point. See [`crate::backend`].
+    pub entry_thunk: Option<Function>,
+}
+
+/// The pinned ABI a lift will actually run under, or `None` for a lift that
+/// keeps the whole register file in the context.
+///
+/// **The one place the question is asked** - by the signature builder, the entry
+/// prologue, the exit paths and the link probe alike - so that they cannot
+/// disagree. Four conditions, and all four fall silently back to the older shape
+/// rather than erroring:
+///
+/// - the host asked for linking at all, and for [`link::LinkDispatch::Pinned`];
+/// - the ABI is non-empty;
+/// - this guest has somewhere in its context for the link fields
+///   ([`GuestArch::block_link_offsets`]);
+/// - this guest can type **every** slot under this config
+///   ([`GuestArch::pinned_slot_type`]).
+///
+/// The last is what makes a partly-supported frontend safe: one slot it cannot
+/// type takes the whole ABI down to `HostResume`, rather than producing a
+/// signature the frontend cannot fill.
+pub fn pinned_abi_for<A: GuestArch>(config: &LifterConfig) -> Option<PinnedAbi> {
+    if config.analysis_mode {
+        return None;
+    }
+    A::block_link_offsets()?;
+    let abi = config.block_link?.pinned_abi()?;
+    abi.slots()
+        .iter()
+        .all(|&reg| A::pinned_slot_type(reg, config).is_some())
+        .then_some(abi)
+}
+
+/// The Cranelift type of each slot of `abi`, in order.
+fn pinned_slot_types<A: GuestArch>(abi: &PinnedAbi, config: &LifterConfig) -> Vec<types::Type> {
+    abi.slots()
+        .iter()
+        .map(|&reg| {
+            A::pinned_slot_type(reg, config).expect("pinned_abi_for typed every slot already")
+        })
+        .collect()
+}
+
+/// Build the `extern "C"` entry thunk for a pinned region: fill the pinned
+/// registers from the context, call the body, spill them back.
+///
+/// `body_index` is the body's slot in the namespace-0 index space, which is
+/// after the imports and the helpers - hence this being built at the end of a
+/// lift, when both counts are final.
+fn build_entry_thunk<A: GuestArch>(
+    abi: &PinnedAbi,
+    slot_types: &[types::Type],
+    body_sig: Signature,
+    body_index: u32,
+) -> Function {
+    let mut sig = Signature::new(get_host_calling_conv());
+    sig.params.push(AbiParam::new(types::I64));
+    let mut func = Function::with_name_signature(UserFuncName::user(0, body_index + 1), sig);
+
+    let name_ref = func.declare_imported_user_function(UserExternalName {
+        namespace: 0,
+        index: body_index,
+    });
+
+    let mut builder_ctx = FunctionBuilderContext::new();
+    let mut builder = FunctionBuilder::new(&mut func, &mut builder_ctx);
+
+    let sig_ref = builder.import_signature(body_sig);
+    let callee = builder.import_function(ExtFuncData {
+        name: ExternalName::user(name_ref),
+        signature: sig_ref,
+        colocated: false,
+        patchable: false,
+    });
+
+    let entry = builder.create_block();
+    builder.append_block_params_for_function_params(entry);
+    builder.switch_to_block(entry);
+    builder.seal_block(entry);
+
+    let ctx_ptr = builder.block_params(entry)[0];
+    let flags = MemFlagsData::trusted().with_can_move();
+    let mut args = vec![ctx_ptr];
+    for (&reg, &ty) in abi.slots().iter().zip(slot_types) {
+        let offset =
+            A::pinned_slot_offset(reg).expect("a guest that types a pinned slot must place it");
+        args.push(builder.ins().load(ty, flags, ctx_ptr, offset));
+    }
+
+    let call = builder.ins().call(callee, &args);
+    // Result 0 is the context pointer handed back - see `core::pin` for why it
+    // is in the signature at all. The stores go through the pointer the *thunk*
+    // was given, which is the same value and one fewer live range.
+    let results: Vec<Value> = builder.inst_results(call)[1..].to_vec();
+    for (&reg, value) in abi.slots().iter().zip(results) {
+        let offset = A::pinned_slot_offset(reg).expect("placed above");
+        builder.ins().store(flags, value, ctx_ptr, offset);
+    }
+    builder.ins().return_(&[]);
+    // As for an outlined helper: `finalize` only consults this to lay out stack
+    // maps, which the thunk never requests.
+    builder.finalize(isa::TargetFrontendConfig {
+        default_call_conv: get_host_calling_conv(),
+        pointer_width: target_lexicon::PointerWidth::U64,
+        page_size_align_log2: 12,
+    });
+    func
 }
 
 /// Lift a region of guest code to a Cranelift [`Function`] plus the external
@@ -257,12 +415,24 @@ pub fn lift_to_code<A: GuestArch>(
     ip: u64,
     config: LifterConfig,
 ) -> crate::Result<LiftedCode> {
-    let mut func = Function::with_name_signature(
-        UserFuncName::user(0, 0),
-        Signature::new(get_host_calling_conv()),
-    );
-    // The lifted function takes a single argument: `*mut RegisterContext`.
-    func.signature.params.push(AbiParam::new(types::I64));
+    // A pinned region is a `tail` function whose parameters *are* the pinned
+    // half of the guest register file; everything else is the historical
+    // `extern "C" fn(*mut RegisterContext)`. Both start with the context
+    // pointer, which is why nothing below this line has to care which it got.
+    let pinned = pinned_abi_for::<A>(&config);
+    let slot_types = pinned
+        .map(|abi| pinned_slot_types::<A>(&abi, &config))
+        .unwrap_or_default();
+    let signature = match pinned {
+        Some(_) => pin::pinned_signature(&slot_types),
+        None => {
+            let mut sig = Signature::new(get_host_calling_conv());
+            sig.params.push(AbiParam::new(types::I64));
+            sig
+        }
+    };
+
+    let mut func = Function::with_name_signature(UserFuncName::user(0, 0), signature.clone());
 
     let mut builder_ctx = FunctionBuilderContext::new();
     let builder = FunctionBuilder::new(&mut func, &mut builder_ctx);
@@ -278,6 +448,13 @@ pub fn lift_to_code<A: GuestArch>(
     // Release the mutable borrow of `func` held by the builder/engine.
     drop(engine);
 
+    // The body is declared after the imports and the helpers, continuing their
+    // index space; only now are both counts final.
+    let entry_thunk = pinned.map(|abi| {
+        let body_index = (imports.len() + helpers.len()) as u32;
+        build_entry_thunk::<A>(&abi, &slot_types, signature, body_index)
+    });
+
     Ok(LiftedCode {
         func,
         imports,
@@ -285,6 +462,7 @@ pub fn lift_to_code<A: GuestArch>(
         analysis_call_targets,
         source_map,
         resume_points,
+        entry_thunk,
     })
 }
 
@@ -326,6 +504,13 @@ pub fn lift_to_function<A: GuestArch>(
 /// silently hand back IR with unresolvable `call`s, they refuse and name the
 /// two ways out.
 fn require_no_helpers(code: LiftedCode) -> crate::Result<(Function, Vec<u64>)> {
+    if code.entry_thunk.is_some() {
+        return Err(crate::MicroliftError::CraneliftError(
+            "a lift with a pinned register file produces a region body plus the entry thunk \
+             that calls it, which a bare `Function` cannot carry - use `lift_to_code`"
+                .into(),
+        ));
+    }
     if !code.helpers.is_empty() {
         let names: Vec<&str> = code.helpers.iter().map(|h| h.name).collect();
         return Err(crate::MicroliftError::CraneliftError(format!(
@@ -1276,6 +1461,19 @@ pub struct LiftEngine<'a, A: GuestArch = crate::arch::x86_64::X86_64> {
     /// guest PC to look up, which is *not* always `ctx.rip` as the exit left it -
     /// a bridge may have moved it - so each site names the value it means.
     link_block: Option<Block>,
+    /// The pinned register file this lift runs under, resolved once by
+    /// [`pinned_abi_for`], with each slot's variable and type looked up.
+    ///
+    /// Empty for a lift that keeps the whole file in the context, which is what
+    /// every path here tests: an empty slot list makes
+    /// [`Self::emit_host_return`] a bare `return_` and
+    /// [`Self::pinned_call_args`] the empty argument list, so the unpinned shape
+    /// is not a branch in the code but the degenerate case of the pinned one.
+    pinned_slots: Vec<(PinnedReg, Variable, types::Type)>,
+    /// Signature of a pinned region, imported once so the link probe's
+    /// `return_call_indirect` and the tail-call sites share it. `None` until
+    /// first use, and forever when nothing is pinned.
+    pinned_sig: Option<SigRef>,
 }
 
 /// A helper under construction: its body plus the `UserExternalName` slot whose
@@ -1308,6 +1506,23 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
     pub fn with_config(builder: FunctionBuilder<'a>, config: LifterConfig) -> Self {
         let mut builder = builder;
         let state = A::new_state(&mut builder, &config);
+        // Resolved here, next to the register file it names, so that every
+        // later question ("is this register pinned?", "what do I return?") is a
+        // lookup rather than a re-derivation.
+        let pinned_slots: Vec<(PinnedReg, Variable, types::Type)> = pinned_abi_for::<A>(&config)
+            .map(|abi| {
+                abi.slots()
+                    .iter()
+                    .map(|&reg| {
+                        let var = A::pinned_slot_var(&state, reg)
+                            .expect("a guest that types a pinned slot must have a variable for it");
+                        let ty =
+                            A::pinned_slot_type(reg, &config).expect("typed by pinned_abi_for");
+                        (reg, var, ty)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let syscall_handler_sig = match config.execution_mode {
             ExecutionMode::Jit => None,
             ExecutionMode::RuntimeAssisted => {
@@ -1367,6 +1582,136 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             emitted_resume_points: Vec::new(),
             exit_resumes: HashSet::new(),
             link_block: None,
+            pinned_slots,
+            pinned_sig: None,
+        }
+    }
+
+    /// Whether `reg` is carried in a machine register across region boundaries
+    /// rather than in the `RegisterContext`.
+    ///
+    /// **For the full sync and the entry load only.** A frontend calls this to
+    /// skip a register in [`GuestArch::load_state_from_context`] and
+    /// [`GuestArch::sync_to_context`], because the entry thunk does both around
+    /// the outside. It must *not* be consulted by a masked sync: a bridge or an
+    /// import runs while the region does, and the host reads the context then.
+    /// See [`crate::core::pin`].
+    pub fn is_pinned(&self, reg: PinnedReg) -> bool {
+        self.pinned_slots.iter().any(|&(r, _, _)| r == reg)
+    }
+
+    /// Whether this lift carries a pinned register file at all.
+    pub fn pinned(&self) -> bool {
+        !self.pinned_slots.is_empty()
+    }
+
+    /// The values a pinned region passes on: the context pointer, then every
+    /// pinned slot in ABI order. Empty when nothing is pinned.
+    ///
+    /// One list for both uses - the return and the linked tail call - because
+    /// they are the same list, and a signature whose results are its parameters
+    /// is what makes that true (see [`crate::core::pin`]).
+    fn pinned_call_args(&mut self) -> Vec<Value> {
+        if self.pinned_slots.is_empty() {
+            return Vec::new();
+        }
+        let mut args = Vec::with_capacity(self.pinned_slots.len() + 1);
+        args.push(self.builder.use_var(A::context_ptr_var(&self.state)));
+        let vars: Vec<Variable> = self.pinned_slots.iter().map(|&(_, v, _)| v).collect();
+        for var in vars {
+            args.push(self.builder.use_var(var));
+        }
+        args
+    }
+
+    /// Return to whoever called this region - the host's entry thunk, or the
+    /// host directly when nothing is pinned.
+    ///
+    /// **Every `return_` in a lifted region goes through here.** With no pinned
+    /// file it is exactly `return_(&[])`, which is what makes it safe to use
+    /// unconditionally; with one it hands back the registers the thunk will
+    /// store. A `return_` written by hand under a pinned ABI is a verifier
+    /// error at best and a silently truncated register file at worst.
+    pub fn emit_host_return(&mut self) {
+        let args = self.pinned_call_args();
+        self.builder.ins().return_(&args);
+    }
+
+    /// Store every pinned register into the `RegisterContext`, **before host
+    /// code runs inside this region**.
+    ///
+    /// The invariant it maintains is worth stating in one line: *a pinned
+    /// register is in the context whenever host code is executing.* Pinning
+    /// moves where a register lives between region entries; it must not move
+    /// where a host looks. A host that services an inline call may read guest
+    /// state - to find the guest stack, to marshal a struct argument, to call
+    /// back into guest code below the live frame - and it has only the context
+    /// to read it from.
+    ///
+    /// A no-op when nothing is pinned, and cheap when something is: one store
+    /// per slot, at a call site that is already a host call.
+    pub fn publish_pinned(&mut self) -> crate::Result<()> {
+        if self.pinned_slots.is_empty() {
+            return Ok(());
+        }
+        let ctx_ptr = self.builder.use_var(A::context_ptr_var(&self.state));
+        let slots = self.pinned_slots.clone();
+        for (reg, var, _) in slots {
+            let offset = A::pinned_slot_offset(reg).expect("a pinned slot has a context offset");
+            let val = self.builder.use_var(var);
+            self.builder.ins().store(
+                MemFlagsData::trusted().with_can_move(),
+                val,
+                ctx_ptr,
+                offset,
+            );
+        }
+        Ok(())
+    }
+
+    /// Reload every pinned register from the `RegisterContext`, **after host
+    /// code that may have written one**.
+    ///
+    /// The other half of [`Self::publish_pinned`], and needed only where the
+    /// host writes guest registers through the context rather than through a
+    /// return to it: a bridge's exiting path, where whatever the bridge stored
+    /// is what the host will see, and where the region's own SSA values would
+    /// otherwise be handed back by the entry thunk and overwrite them.
+    ///
+    /// A register the host did not touch reloads the value just published, so
+    /// this is correct without knowing which ones it wrote.
+    pub fn reload_pinned(&mut self) -> crate::Result<()> {
+        if self.pinned_slots.is_empty() {
+            return Ok(());
+        }
+        let ctx_ptr = self.builder.use_var(A::context_ptr_var(&self.state));
+        let slots = self.pinned_slots.clone();
+        for (reg, var, ty) in slots {
+            let offset = A::pinned_slot_offset(reg).expect("a pinned slot has a context offset");
+            let val = self.builder.ins().load(
+                ty,
+                MemFlagsData::trusted().with_can_move(),
+                ctx_ptr,
+                offset,
+            );
+            self.builder.def_var(var, val);
+        }
+        Ok(())
+    }
+
+    /// The imported signature of a pinned region, for the probe's indirect tail
+    /// call. Created on first use; the types come from this lift's own slots,
+    /// which is the same list every region under this ABI has.
+    fn pinned_signature_ref(&mut self) -> SigRef {
+        match self.pinned_sig {
+            Some(sig) => sig,
+            None => {
+                let types: Vec<types::Type> =
+                    self.pinned_slots.iter().map(|&(_, _, ty)| ty).collect();
+                let sig = self.builder.import_signature(pin::pinned_signature(&types));
+                self.pinned_sig = Some(sig);
+                sig
+            }
         }
     }
 
@@ -1926,9 +2271,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                 let block = self.link_probe_block();
                 self.builder.ins().jump(block, &[pc.into()]);
             }
-            None => {
-                self.builder.ins().return_(&[]);
-            }
+            None => self.emit_host_return(),
         }
     }
 
@@ -1958,6 +2301,18 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
     ///              ctx.pc = pc; ctx.link_hit = ent
     ///   out:       return
     /// ```
+    ///
+    /// Under [`LinkDispatch::Pinned`](crate::core::link::LinkDispatch::Pinned)
+    /// the hit arm ends differently - it publishes `image_base` from the row and
+    /// `return_call_indirect`s to `ent.code` with the pinned registers as
+    /// arguments, so the host is not involved at all. Everything up to the
+    /// address compare is the same code either way, which is deliberate: the
+    /// two shapes are one mechanism with two endings.
+    ///
+    /// A chain of those tail calls does not return to the host on its own, and
+    /// the intended way to end one is the check already at the top: a host that
+    /// wants control back nulls `ctx.link_table` for that thread, and the next
+    /// probe declines.
     ///
     /// The loads are `trusted` (notrap, aligned) but deliberately **not**
     /// `readonly`: the host rewrites rows between entries, and a readonly load
@@ -2016,13 +2371,46 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         self.builder
             .ins()
             .store(MemFlagsData::trusted(), pc, ctx_ptr, A::pc_offset());
-        self.builder
-            .ins()
-            .store(MemFlagsData::trusted(), entry, ctx_ptr, offsets.hit);
-        self.builder.ins().return_(&[]);
+        if self.pinned() {
+            // **The branch, rather than the answer.** The successor is entered
+            // from here with the pinned registers still in the registers it
+            // expects, so nothing is published for a host that is not going to
+            // run: not `link_hit`, and not the pinned half of the file.
+            //
+            // `image_base` is the exception that has to be published, because
+            // under `HostResume` the host sets it from the row before entering
+            // and here there is no host to do it. The callee reloads it from
+            // the context in its own prologue, as it always has.
+            let image_base = self.builder.ins().load(
+                types::I64,
+                MemFlagsData::trusted(),
+                entry,
+                crate::core::link::IMAGE_BASE_OFFSET,
+            );
+            self.builder.ins().store(
+                MemFlagsData::trusted(),
+                image_base,
+                ctx_ptr,
+                A::image_base_offset(),
+            );
+            let code = self.builder.ins().load(
+                types::I64,
+                MemFlagsData::trusted(),
+                entry,
+                crate::core::link::CODE_OFFSET,
+            );
+            let sig = self.pinned_signature_ref();
+            let args = self.pinned_call_args();
+            self.builder.ins().return_call_indirect(sig, code, &args);
+        } else {
+            self.builder
+                .ins()
+                .store(MemFlagsData::trusted(), entry, ctx_ptr, offsets.hit);
+            self.emit_host_return();
+        }
 
         self.builder.switch_to_block(out);
-        self.builder.ins().return_(&[]);
+        self.emit_host_return();
 
         for block in [block, probe, hit, out] {
             self.visited_blocks.insert(block);
@@ -2225,6 +2613,18 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
 
         A::load_state_from_context(self)?;
 
+        // The pinned half of the register file arrives in registers instead:
+        // parameter `1 + i` is slot `i`, and the frontend's state load skipped
+        // exactly these (see [`Self::is_pinned`]). This is the entry half of
+        // what the entry thunk does around the outside of the whole chain.
+        if self.pinned() {
+            let params: Vec<Value> = self.builder.block_params(entry_block)[1..].to_vec();
+            let vars: Vec<Variable> = self.pinned_slots.iter().map(|&(_, v, _)| v).collect();
+            for (var, value) in vars.into_iter().zip(params) {
+                self.builder.def_var(var, value);
+            }
+        }
+
         if self.config.resumption == VmResumptionPoints::All {
             for instruction in decoded.values() {
                 leaders.insert(A::instr_ip(instruction));
@@ -2365,7 +2765,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                     self.current_ip = A::instr_ip(inst);
                     self.set_source_loc(self.current_ip);
                     A::sync_to_context(self, None, ExitReason::InvalidInstruction)?;
-                    self.builder.ins().return_(&[]);
+                    self.emit_host_return();
                     self.block_terminated = true;
                     break;
                 }
@@ -2473,7 +2873,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                 // region at.
                 self.write_exit_reason(ExitReason::UnknownJump);
                 self.write_exit_code(TransferKind::NoResumePoint as u32);
-                self.builder.ins().return_(&[]);
+                self.emit_host_return();
                 self.visited_blocks.insert(refuse);
             }
         } else if !self.config.analysis_mode {
@@ -2506,7 +2906,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                 if self.config.analysis_mode {
                     // Inspection IR: out-of-region targets are bare returns; no
                     // context sync or exit code.
-                    self.builder.ins().return_(&[]);
+                    self.emit_host_return();
                 } else {
                     self.current_ip = offset;
                     A::sync_to_context(self, None, ExitReason::UnknownJump)?;

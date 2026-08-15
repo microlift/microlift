@@ -204,3 +204,7 @@ required-features = ["testkit"]
 [[test]]
 name = "block_link_tests"
 required-features = ["testkit"]
+
+[[test]]
+name = "pinned_link_tests"
+required-features = ["testkit"]

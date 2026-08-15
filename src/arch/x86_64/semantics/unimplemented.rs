@@ -30,7 +30,7 @@ impl<'a> Lifter<'a> {
             exit_code_offset,
         );
 
-        self.builder.ins().return_(&[]);
+        self.emit_host_return();
         self.block_terminated = true;
         Ok(())
     }
@@ -42,7 +42,7 @@ impl<'a> Lifter<'a> {
         let rip_at = self.rip_at(instruction);
         self.sync_to_context(Some(rip_at), ExitReason::Ud2)?;
         self.resumes_at(instruction.next_ip());
-        self.builder.ins().return_(&[]);
+        self.emit_host_return();
         self.block_terminated = true;
         Ok(())
     }
@@ -53,7 +53,7 @@ impl<'a> Lifter<'a> {
         let rip_at = self.rip_at(instruction);
         self.sync_to_context(Some(rip_at), ExitReason::Breakpoint)?;
         self.resumes_at(instruction.next_ip());
-        self.builder.ins().return_(&[]);
+        self.emit_host_return();
         self.block_terminated = true;
         Ok(())
     }
@@ -79,7 +79,7 @@ impl<'a> Lifter<'a> {
         self.sync_to_context(Some(rip_after), ExitReason::Interrupt)?;
         self.resumes_at(instruction.next_ip());
         self.write_exit_code(vector);
-        self.builder.ins().return_(&[]);
+        self.emit_host_return();
         self.block_terminated = true;
         Ok(())
     }
@@ -105,7 +105,7 @@ impl<'a> Lifter<'a> {
         let rip_after = self.rip_after(instruction);
         self.sync_to_context(Some(rip_after), ExitReason::Cpuid)?;
         self.resumes_at(instruction.next_ip());
-        self.builder.ins().return_(&[]);
+        self.emit_host_return();
         self.block_terminated = true;
         Ok(())
     }
@@ -114,7 +114,7 @@ impl<'a> Lifter<'a> {
         let rip_after = self.rip_after(instruction);
         self.sync_to_context(Some(rip_after), ExitReason::Xgetbv)?;
         self.resumes_at(instruction.next_ip());
-        self.builder.ins().return_(&[]);
+        self.emit_host_return();
         self.block_terminated = true;
         Ok(())
     }
@@ -127,7 +127,7 @@ impl<'a> Lifter<'a> {
         let rip_after = self.rip_after(instruction);
         self.sync_to_context(Some(rip_after), ExitReason::Rdtsc)?;
         self.resumes_at(instruction.next_ip());
-        self.builder.ins().return_(&[]);
+        self.emit_host_return();
         self.block_terminated = true;
         Ok(())
     }

@@ -8,6 +8,7 @@ use crate::arch::x86_64::Lifter;
 use crate::arch::x86_64::regs::{GPR_ORDER, RegisterState, X86Flag};
 use crate::core::bridge::RegMask;
 use crate::core::exit::ExitReason;
+use crate::core::pin::PinnedReg;
 use cranelift::prelude::*;
 use iced_x86::Register;
 
@@ -194,8 +195,33 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
+    /// Whether `reg` is carried out of the region in a machine register rather
+    /// than through the `RegisterContext`, and so must be skipped by the full
+    /// sync and the entry load.
+    ///
+    /// Not by the masked ones: those serve a call the host makes while this
+    /// region is still running, and the host reads the context then. See
+    /// [`crate::core::pin`].
+    fn pinned_gpr(&self, reg: Register) -> bool {
+        match crate::arch::x86_64::regs::gpr_index(reg) {
+            Some(i) => self.is_pinned(PinnedReg::gpr(i as u16)),
+            None => false,
+        }
+    }
+
+    /// Whether XMM `idx` is pinned. Only ever true in vector mode - the scalar
+    /// pair cannot be a slot, and `pinned_slot_type` refuses it there.
+    fn pinned_xmm(&self, idx: u8) -> bool {
+        self.is_pinned(PinnedReg::vector(idx as u16))
+    }
+
     /// Full sync - writes all GPRs, flags, XMMs and segment bases back to the
     /// `RegisterContext`. Used on context reload paths and unvisited exit stubs.
+    ///
+    /// Except the pinned ones ([`crate::core::pin`]): those leave the region
+    /// in registers, and the entry thunk stores them once the chain ends. A
+    /// store here would be the very cost pinning exists to delete, and would
+    /// also be stale by the time anything read it.
     pub fn sync_to_context(&mut self, pc: Option<Value>, reason: ExitReason) -> crate::Result<()> {
         // Analysis mode produces inspection IR with no context write-back.
         if self.config.analysis_mode {
@@ -203,7 +229,14 @@ impl<'a> Lifter<'a> {
         }
         let ctx_ptr = self.builder.use_var(self.state.context_ptr);
 
-        for (&reg, &var) in &self.state.gprs {
+        let gprs: Vec<(Register, Variable)> = self
+            .state
+            .gprs
+            .iter()
+            .map(|(&r, &v)| (r, v))
+            .filter(|&(r, _)| !self.pinned_gpr(r))
+            .collect();
+        for (reg, var) in gprs {
             let val = self.builder.use_var(var);
             let offset = RegisterState::get_gpr_offset(reg)?;
             self.builder
@@ -221,6 +254,9 @@ impl<'a> Lifter<'a> {
 
         if self.state.use_vector_xmm {
             for i in 0u8..16 {
+                if self.pinned_xmm(i) {
+                    continue;
+                }
                 let var = *self.state.xmms_vec.get(&i).unwrap();
                 let val = self.builder.use_var(var);
                 self.builder.ins().store(
@@ -388,11 +424,22 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
+    /// Load the region's entry state out of the `RegisterContext`.
+    ///
+    /// Pinned registers are skipped: they arrive as function parameters, and the
+    /// engine defines their variables from those immediately after this returns.
     pub fn load_state_from_context(&mut self) -> crate::Result<()> {
         let ctx_ptr = self.builder.use_var(self.state.context_ptr);
 
         // RIP is materialised from current_ip on sync, not kept as a variable.
-        for (&reg, &var) in &self.state.gprs {
+        let gprs: Vec<(Register, Variable)> = self
+            .state
+            .gprs
+            .iter()
+            .map(|(&r, &v)| (r, v))
+            .filter(|&(r, _)| !self.pinned_gpr(r))
+            .collect();
+        for (reg, var) in gprs {
             let offset = RegisterState::get_gpr_offset(reg)?;
             let val =
                 self.builder
@@ -415,6 +462,9 @@ impl<'a> Lifter<'a> {
 
         if self.state.use_vector_xmm {
             for i in 0u8..16 {
+                if self.pinned_xmm(i) {
+                    continue;
+                }
                 let offset = RegisterState::get_xmm_vec_offset(i);
                 let val = self.builder.ins().load(
                     types::I64X2,

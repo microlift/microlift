@@ -88,6 +88,107 @@ fn define_helpers<M: Module>(module: &mut M, pending: Vec<PendingHelper>) -> Res
     Ok(())
 }
 
+/// Define a [`LiftedCode`]'s region body and, when it has one, the entry thunk
+/// that calls it - returning the `FuncId` the *host* enters through and the
+/// body's guest-instruction map.
+///
+/// Two shapes, and the difference is which function the host may call:
+///
+/// - No thunk: The body is `extern "C" fn(*mut RegisterContext)` and is
+///   itself the entry, exported as `lifted_func` exactly as it always was.
+/// - Thunk: ([`crate::core::pin`]) The body carries the `tail` calling
+///   convention and a signature no host can call, so it is defined as a local
+///   `lifted_body` and `lifted_func` is the thunk. The body is declared *after*
+///   the helpers, continuing the same namespace-0 index space, which is the
+///   index the thunk's call was built against.
+///
+/// The body is **defined first** either way, so the map's offsets keep indexing
+/// from the start of the emitted `.text` (what
+/// [`ArtifactBackend::compile_lifted_to_raw`] hands back).
+fn define_region<M: Module>(
+    module: &mut M,
+    func: Function,
+    entry_thunk: Option<Function>,
+    source_map: SourceLocMap,
+) -> Result<(DefinedRegion, GuestCodeMap)> {
+    let body_linkage = match entry_thunk {
+        Some(_) => Linkage::Local,
+        None => Linkage::Export,
+    };
+    let body_name = match entry_thunk {
+        Some(_) => "lifted_body",
+        None => "lifted_func",
+    };
+
+    let mut ctx = cranelift_codegen::Context::for_function(func);
+    let body_id = module
+        .declare_function(body_name, body_linkage, &ctx.func.signature)
+        .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
+
+    let Some(thunk) = entry_thunk else {
+        module
+            .define_function(body_id, &mut ctx)
+            .map_err(|e| crate::MicroliftError::CraneliftError(format!("{e:?}")))?;
+        let map = guest_code_map(&ctx, source_map);
+        return Ok((
+            DefinedRegion {
+                entry: body_id,
+                link_target: body_id,
+            },
+            map,
+        ));
+    };
+
+    let thunk_id = module
+        .declare_function("lifted_func", Linkage::Export, &thunk.signature)
+        .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
+    module
+        .define_function(body_id, &mut ctx)
+        .map_err(|e| crate::MicroliftError::CraneliftError(format!("{e:?}")))?;
+    let map = guest_code_map(&ctx, source_map);
+
+    let mut thunk_ctx = cranelift_codegen::Context::for_function(thunk);
+    module
+        .define_function(thunk_id, &mut thunk_ctx)
+        .map_err(|e| crate::MicroliftError::CraneliftError(format!("{e:?}")))?;
+
+    Ok((
+        DefinedRegion {
+            entry: thunk_id,
+            link_target: body_id,
+        },
+        map,
+    ))
+}
+
+/// The two ways into a compiled region, as module ids.
+struct DefinedRegion {
+    entry: cranelift_module::FuncId,
+    link_target: cranelift_module::FuncId,
+}
+
+/// The two ways into a compiled region, as addresses.
+///
+/// They are the same address for an ordinary region, and different ones for a
+/// pinned region ([`crate::core::pin`]) - which is the whole reason this type
+/// exists, because using one where the other belongs is a wrong-code bug that
+/// nothing checks:
+///
+/// - [`entry`](Self::entry) is what a **host** calls. Always
+///   `extern "C" fn(*mut RegisterContext)`.
+/// - [`link_target`](Self::link_target) is what a host publishes in a
+///   [`BlockLinkEntry::code`](crate::core::link::BlockLinkEntry::code). Under a
+///   pinned ABI that is the region *body*, which is entered by a tail call with
+///   the guest registers already in place and cannot be called from Rust; the
+///   thunk in front of it would take those registers for its own ABI's.
+#[derive(Debug, Clone, Copy)]
+pub struct CompiledRegion {
+    /// Entry point for a host call.
+    pub entry: *const u8,
+    /// Entry point for a link row.
+    pub link_target: *const u8,
+}
+
 #[cfg(feature = "disasm")]
 use capstone::prelude::*;
 
@@ -167,6 +268,20 @@ impl CraneliftBackend {
         &mut self,
         code: LiftedCode,
     ) -> Result<(*const u8, GuestCodeMap)> {
+        let (region, map) = self.compile_lifted_region(code)?;
+        Ok((region.entry, map))
+    }
+
+    /// [`compile_lifted_with_map`](Self::compile_lifted_with_map), reporting
+    /// both entry points.
+    ///
+    /// A host that publishes block-link rows must use this one: under a pinned
+    /// ABI the address to call and the address to link to are different
+    /// functions. See [`CompiledRegion`].
+    pub fn compile_lifted_region(
+        &mut self,
+        code: LiftedCode,
+    ) -> Result<(CompiledRegion, GuestCodeMap)> {
         if !code.imports.is_empty() {
             return Err(crate::MicroliftError::CraneliftError(
                 "lifted code has relocatable imports; use compile_lifted_with_fast_imports".into(),
@@ -175,28 +290,22 @@ impl CraneliftBackend {
         let source_map = code.source_map;
         let pending = declare_externals(&mut self.module, &[], code.helpers)?;
 
-        let mut ctx = self.module.make_context();
-        ctx.func = code.func;
-
-        let id = self
-            .module
-            .declare_function("lifted_func", Linkage::Export, &ctx.func.signature)
-            .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
-
-        self.module
-            .define_function(id, &mut ctx)
-            .map_err(|e| crate::MicroliftError::CraneliftError(format!("{e:?}")))?;
-        // Read the compiled buffer's source locations before the context - and
-        // with it the compiled code - is recycled.
-        let map = guest_code_map(&ctx, source_map);
-        self.module.clear_context(&mut ctx);
+        // The map is read out of the body's compiled buffer inside
+        // `define_region`, before the context that owns it is recycled.
+        let (ids, map) = define_region(&mut self.module, code.func, code.entry_thunk, source_map)?;
 
         define_helpers(&mut self.module, pending)?;
         self.module
             .finalize_definitions()
             .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
 
-        Ok((self.module.get_finalized_function(id), map))
+        Ok((
+            CompiledRegion {
+                entry: self.module.get_finalized_function(ids.entry),
+                link_target: self.module.get_finalized_function(ids.link_target),
+            },
+            map,
+        ))
     }
 
     /// JIT-compile a single lifted `Function`.
@@ -211,6 +320,7 @@ impl CraneliftBackend {
             analysis_call_targets: Vec::new(),
             source_map: SourceLocMap::default(),
             resume_points: Vec::new(),
+            entry_thunk: None,
         })
     }
 
@@ -238,6 +348,7 @@ impl CraneliftBackend {
                 analysis_call_targets: Vec::new(),
                 source_map: SourceLocMap::default(),
                 resume_points: Vec::new(),
+                entry_thunk: None,
             },
             flags,
             isa_settings,
@@ -274,22 +385,18 @@ impl CraneliftBackend {
 
         let pending = declare_externals(&mut module, &code.imports, code.helpers)?;
 
-        let mut ctx = module.make_context();
-        ctx.func = code.func;
-        let id = module
-            .declare_function("lifted_func", Linkage::Export, &ctx.func.signature)
-            .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
-        module
-            .define_function(id, &mut ctx)
-            .map_err(|e| crate::MicroliftError::CraneliftError(format!("{e:?}")))?;
-        let map = guest_code_map(&ctx, source_map);
+        let (ids, map) = define_region(&mut module, code.func, code.entry_thunk, source_map)?;
 
         define_helpers(&mut module, pending)?;
         module
             .finalize_definitions()
             .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
 
-        Ok((module.get_finalized_function(id), map))
+        // This path owns its module and hands back a bare pointer, so there is
+        // nothing to keep a second address alive against; a `RuntimeAssisted`
+        // region that also wants to be linked to should go through
+        // `compile_lifted_region` on a backend it keeps.
+        Ok((module.get_finalized_function(ids.entry), map))
     }
 }
 
@@ -362,6 +469,7 @@ impl ArtifactBackend {
                 analysis_call_targets: Vec::new(),
                 source_map: SourceLocMap::default(),
                 resume_points: Vec::new(),
+                entry_thunk: None,
             },
             triple,
             flags,
@@ -404,14 +512,7 @@ impl ArtifactBackend {
 
         let pending = declare_externals(&mut module, &code.imports, code.helpers)?;
 
-        let mut ctx = cranelift_codegen::Context::for_function(code.func);
-        let id = module
-            .declare_function("lifted_func", Linkage::Export, &ctx.func.signature)
-            .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
-        module
-            .define_function(id, &mut ctx)
-            .map_err(|e| crate::MicroliftError::CraneliftError(format!("{e:?}")))?;
-        let map = guest_code_map(&ctx, source_map);
+        let (_id, map) = define_region(&mut module, code.func, code.entry_thunk, source_map)?;
 
         define_helpers(&mut module, pending)?;
 
@@ -435,6 +536,7 @@ impl ArtifactBackend {
                 analysis_call_targets: Vec::new(),
                 source_map: SourceLocMap::default(),
                 resume_points: Vec::new(),
+                entry_thunk: None,
             },
             triple,
             flags,
@@ -455,6 +557,7 @@ impl ArtifactBackend {
                 analysis_call_targets: Vec::new(),
                 source_map: SourceLocMap::default(),
                 resume_points: Vec::new(),
+                entry_thunk: None,
             },
             triple,
             flags,

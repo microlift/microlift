@@ -10,7 +10,7 @@ impl<'a> Lifter<'a> {
 
                 self.sync_to_context(Some(rip_after), crate::context::ExitReason::Syscall)?;
                 self.resumes_at(instruction.next_ip());
-                self.builder.ins().return_(&[]);
+                self.emit_host_return();
                 self.block_terminated = true;
             }
             ExecutionMode::RuntimeAssisted => {
@@ -54,7 +54,7 @@ impl<'a> Lifter<'a> {
                 self.builder.switch_to_block(exit_block);
                 let rip_after = self.runtime_addr(instruction.next_ip());
                 self.sync_to_context(Some(rip_after), crate::context::ExitReason::Syscall)?;
-                self.builder.ins().return_(&[]);
+                self.emit_host_return();
 
                 if in_region {
                     self.continue_in_fallthrough(resume_block);

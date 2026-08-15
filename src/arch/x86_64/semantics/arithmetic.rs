@@ -679,7 +679,7 @@ impl<'a> Lifter<'a> {
     fn emit_divide_error(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let rip_at = self.runtime_addr(instruction.ip());
         self.sync_to_context(Some(rip_at), ExitReason::DivideError)?;
-        self.builder.ins().return_(&[]);
+        self.emit_host_return();
         self.block_terminated = true;
         Ok(())
     }

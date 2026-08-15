@@ -454,6 +454,7 @@ fn test_cmpxchg16b_native_emits_the_instruction() {
             analysis_call_targets: Default::default(),
             source_map: Default::default(),
             resume_points: Vec::new(),
+            entry_thunk: None,
         },
         Some("x86_64-unknown-linux-gnu"),
         None,

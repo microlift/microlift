@@ -60,6 +60,7 @@ impl<'a> Lifter<'a> {
             .store(MemFlagsData::trusted(), callee, ctx_ptr, va_offset);
 
         self.sync_regs_masked(reads)?;
+        self.publish_pinned()?;
         self.flush_rip_and_reason(pc, reason)?;
 
         let bridge_ptr = self.bridge_target_ptr(&bridge.target);
@@ -85,6 +86,7 @@ impl<'a> Lifter<'a> {
         self.builder.switch_to_block(exit_block);
         self.builder.seal_block(exit_block);
         self.sync_regs_masked(effects.writes.complement())?;
+        self.reload_pinned()?;
         self.emit_bridge_exit(handled)?;
 
         // Handled inline: pull the declared clobbers back into SSA and carry on.
@@ -134,7 +136,7 @@ impl<'a> Lifter<'a> {
             self.builder.switch_to_block(plain_block);
             self.builder.seal_block(plain_block);
         }
-        self.builder.ins().return_(&[]);
+        self.emit_host_return();
         Ok(())
     }
 

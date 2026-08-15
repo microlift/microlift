@@ -121,7 +121,7 @@ impl<'a> Lifter<'a> {
             // Inspection IR: a return terminates the function. The runtime stack
             // pop + dispatch switch + trampoline check are execution-only
             // machinery that only obscure the control-flow view.
-            self.builder.ins().return_(&[]);
+            self.emit_host_return();
             self.block_terminated = true;
             return Ok(());
         }
@@ -194,7 +194,7 @@ impl<'a> Lifter<'a> {
         // Handle Return via Trampoline. Not linkable.
         self.builder.switch_to_block(exit_block);
         self.sync_to_context(Some(target_ip), ExitReason::Return)?;
-        self.builder.ins().return_(&[]);
+        self.emit_host_return();
 
         // Handle Unknown Jump/Return. Linkable.
         self.builder.switch_to_block(unknown_block);
@@ -432,7 +432,7 @@ impl<'a> Lifter<'a> {
             .store(MemFlagsData::trusted(), va_val, ctx_ptr, va_offset);
 
         self.sync_to_context(None, ExitReason::ImportedFunctionCall)?;
-        self.builder.ins().return_(&[]);
+        self.emit_host_return();
         self.block_terminated = true;
         Ok(())
     }
@@ -464,7 +464,7 @@ impl<'a> Lifter<'a> {
             .store(MemFlagsData::trusted(), target_val, ctx_ptr, va_offset);
 
         self.sync_to_context(None, ExitReason::IndirectCall)?;
-        self.builder.ins().return_(&[]);
+        self.emit_host_return();
         self.block_terminated = true;
         Ok(())
     }
@@ -509,6 +509,12 @@ impl<'a> Lifter<'a> {
         for (ty, loc) in placement {
             call_args.push(self.load_fast_call_arg(ty, loc)?);
         }
+
+        // Host code is about to run with this region's state still in
+        // registers. Anything pinned has to be in the context for the duration:
+        // a host import may look at the guest's stack, or call back into guest
+        // code below the live frame. See [`LiftEngine::publish_pinned`].
+        self.publish_pinned()?;
 
         let call = match target {
             FastCallTarget::Absolute { sig_ref, fn_ptr } => {

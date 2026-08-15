@@ -7,6 +7,7 @@ pub mod context;
 pub mod decode;
 pub mod flag_effects;
 pub mod jumptable;
+pub mod pin;
 pub mod regs;
 pub mod semantics;
 pub mod sync;
@@ -56,6 +57,51 @@ impl GuestArch for X86_64 {
             table: std::mem::offset_of!(RegisterContext, link_table) as i32,
             hit: std::mem::offset_of!(RegisterContext, link_hit) as i32,
         })
+    }
+
+    /// x86-64 pins a GPR as an `I64` and an XMM register as an `I64X2`.
+    ///
+    /// The XMM answer is `None` without
+    /// [`LifterConfig::use_vector_xmm`](crate::core::LifterConfig::use_vector_xmm),
+    /// because the scalar representation splits that register into two
+    /// variables and a slot carries one value - the prerequisite-switch pattern
+    /// the specializations already use. An index past the end of either bank is
+    /// `None` for the ordinary reason.
+    fn pinned_slot_type(
+        reg: crate::core::pin::PinnedReg,
+        config: &LifterConfig,
+    ) -> Option<cranelift::prelude::Type> {
+        use crate::core::pin::RegClass;
+        match reg.class {
+            RegClass::Gpr => (reg.index < 16).then_some(types::I64),
+            RegClass::Vector => (config.use_vector_xmm && reg.index < 16).then_some(types::I64X2),
+        }
+    }
+
+    fn pinned_slot_var(
+        state: &Self::RegState,
+        reg: crate::core::pin::PinnedReg,
+    ) -> Option<Variable> {
+        use crate::core::pin::RegClass;
+        match reg.class {
+            RegClass::Gpr => regs::GPR_ORDER
+                .get(reg.index as usize)
+                .and_then(|r| state.gprs.get(r))
+                .copied(),
+            RegClass::Vector => state.xmms_vec.get(&(reg.index as u8)).copied(),
+        }
+    }
+
+    fn pinned_slot_offset(reg: crate::core::pin::PinnedReg) -> Option<i32> {
+        use crate::core::pin::RegClass;
+        match reg.class {
+            RegClass::Gpr => regs::GPR_ORDER
+                .get(reg.index as usize)
+                .and_then(|&r| RegisterState::get_gpr_offset(r).ok()),
+            RegClass::Vector => {
+                (reg.index < 16).then(|| RegisterState::get_xmm_vec_offset(reg.index as u8))
+            }
+        }
     }
 
     fn context_ptr_var(state: &Self::RegState) -> Variable {

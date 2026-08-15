@@ -812,7 +812,7 @@ impl<'a> Lifter64<'a> {
             .store(MemFlagsData::trusted(), target, ctx_ptr, va_offset);
 
         self.sync_to_context(None, ExitReason::IndirectCall)?;
-        self.builder.ins().return_(&[]);
+        self.emit_host_return();
         self.block_terminated = true;
         Ok(())
     }
@@ -821,7 +821,7 @@ impl<'a> Lifter64<'a> {
         if self.config.analysis_mode {
             // Inspection IR: a return terminates the function (see the x86 RET
             // handler for rationale).
-            self.builder.ins().return_(&[]);
+            self.emit_host_return();
             self.block_terminated = true;
             return Ok(());
         }
@@ -835,21 +835,21 @@ impl<'a> Lifter64<'a> {
         let target = self.read_reg_val(target_reg, false, types::I64);
         self.sync_to_context(Some(target), ExitReason::Return)?;
         self.write_exit_code(TransferKind::Return as u32);
-        self.builder.ins().return_(&[]);
+        self.emit_host_return();
         self.block_terminated = true;
         Ok(())
     }
 
     fn handle_svc(&mut self) -> crate::Result<()> {
         self.sync_to_context(None, ExitReason::Syscall)?;
-        self.builder.ins().return_(&[]);
+        self.emit_host_return();
         self.block_terminated = true;
         Ok(())
     }
 
     fn exit_unimplemented(&mut self) -> crate::Result<()> {
         self.sync_to_context(None, ExitReason::UnimplementedInstruction)?;
-        self.builder.ins().return_(&[]);
+        self.emit_host_return();
         self.block_terminated = true;
         Ok(())
     }

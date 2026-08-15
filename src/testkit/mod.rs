@@ -323,9 +323,10 @@ impl<'a> LiftTest<'a> {
 
         let mut backend =
             CraneliftBackend::with_flags(self.opt.flags(), &[]).map_err(TestError::Compile)?;
-        let (code_ptr, code_map) = backend
-            .compile_lifted_with_map(code)
+        let (region, code_map) = backend
+            .compile_lifted_region(code)
             .map_err(TestError::Compile)?;
+        let code_ptr = region.entry;
 
         // The guest stack is a heap `Vec`; its backing allocation address is
         // stable across moves (only the handle moves), so `rsp` remains valid
@@ -358,6 +359,7 @@ impl<'a> LiftTest<'a> {
             ctx,
             initial_rsp,
             code_ptr,
+            link_target: region.link_target,
             code_map,
             _stack: stack,
             _backend: backend,
@@ -595,6 +597,11 @@ pub struct Harness {
     /// Host address the lifted function was compiled to. Base for
     /// [`GuestCodeMap::lookup_host_addr`].
     pub code_ptr: *const u8,
+    /// The address a block-link row must name to reach this region -
+    /// [`code_ptr`](Self::code_ptr) itself, except under a pinned ABI, where a
+    /// link enters the tail-convention body in front of which `code_ptr` is a
+    /// thunk. See [`CompiledRegion`](crate::backend::CompiledRegion).
+    pub link_target: *const u8,
     /// Which guest instruction each byte of the compiled region came from; see
     /// [`crate::core::srcloc`]. Empty if the test disabled
     /// [`LifterConfig::emit_source_locs`].
