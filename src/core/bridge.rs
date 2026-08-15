@@ -27,6 +27,14 @@
 //!   covers everything a slow `ImportedFunctionCall` exit covers today: an ABI
 //!   error the runtime stops on, `longjmp`, a control redirect, or a transfer
 //!   into another guest image.
+//! - [`RESUME_LINKED`] - a particular non-zero: the runtime wants out, and
+//!   the only thing left to do is continue at the `rip` it has written. Where
+//!   block linking is on, the lifted code probes the link table for that address
+//!   before returning, so a bridged indirect call into guest code - a C++
+//!   virtual call, which is a quarter of all exits in a real program - can be
+//!   resolved without a host round trip. Any other non-zero value returns
+//!   unconditionally, which is what a bridge that has parked an error, or that
+//!   wants its exit serviced, must do.
 //!
 //! `import_va` is passed as a second argument so one compiled bridge per symbol
 //! serves every stub and slot that names it - the runtime keeps its own side
@@ -35,6 +43,19 @@
 //! [`LifterConfig::register_fast_import`]: crate::core::LifterConfig::register_fast_import
 
 use std::sync::atomic::AtomicPtr;
+
+/// The bridge return value meaning "exit, and you may link".
+///
+/// Distinct from a bare non-zero because the two differ in what the host is
+/// still owed. An ordinary exit may have an error parked on the thread, a call
+/// left to service, or a `rip` that is a resume point rather than a
+/// destination - and a link would skip the host that was supposed to notice.
+/// This value asserts the opposite: guest state is complete, `rip` is where
+/// execution continues, and nothing is waiting.
+///
+/// Two, not one, so that a bridge written before this existed - returning `1`
+/// for every exit - keeps exactly the behaviour it had.
+pub const RESUME_LINKED: u32 = 2;
 
 /// Where the lifted code finds the bridge function's address.
 #[derive(Debug, Clone, Copy)]

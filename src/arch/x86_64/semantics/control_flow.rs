@@ -71,7 +71,9 @@ impl<'a> Lifter<'a> {
         self.builder.seal_block(external_block);
         self.sync_to_context(Some(target_val), ExitReason::UnknownJump)?;
         self.write_exit_code(TransferKind::IndirectJump as u32);
-        self.builder.ins().return_(&[]);
+        // Linkable: a `jmp` through a register to an address this region does
+        // not contain is answered by entering whatever covers it.
+        self.emit_exit(Some(target_val));
         self.block_terminated = true;
         Ok(())
     }
@@ -189,16 +191,16 @@ impl<'a> Lifter<'a> {
             .ins()
             .brif(is_trampoline, exit_block, &[], unknown_block, &[]);
 
-        // Handle Return via Trampoline
+        // Handle Return via Trampoline. Not linkable.
         self.builder.switch_to_block(exit_block);
         self.sync_to_context(Some(target_ip), ExitReason::Return)?;
         self.builder.ins().return_(&[]);
 
-        // Handle Unknown Jump/Return
+        // Handle Unknown Jump/Return. Linkable.
         self.builder.switch_to_block(unknown_block);
         self.sync_to_context(Some(target_ip), ExitReason::UnknownJump)?;
         self.write_exit_code(TransferKind::Return as u32);
-        self.builder.ins().return_(&[]);
+        self.emit_exit(Some(target_ip));
 
         self.block_terminated = true;
         Ok(())
@@ -249,7 +251,12 @@ impl<'a> Lifter<'a> {
 
                     self.sync_to_context(None, ExitReason::UnknownJump)?;
                     self.write_exit_code(TransferKind::DirectCall as u32);
-                    self.builder.ins().return_(&[]);
+                    // Linkable: the return address is already pushed and `rip`
+                    // is the callee, so the host has nothing left to do but
+                    // enter it. `Some(rebased_callee)` rather than `None`
+                    // because `current_ip` here is the *return* address, and it
+                    // is the callee that was synced.
+                    self.emit_exit(Some(rebased_callee));
                     self.block_terminated = true;
                     return Ok(());
                 }

@@ -51,6 +51,13 @@ impl GuestArch for X86_64 {
         std::mem::offset_of!(RegisterContext, exit_code) as i32
     }
 
+    fn block_link_offsets() -> Option<crate::core::link::BlockLinkOffsets> {
+        Some(crate::core::link::BlockLinkOffsets {
+            table: std::mem::offset_of!(RegisterContext, link_table) as i32,
+            hit: std::mem::offset_of!(RegisterContext, link_hit) as i32,
+        })
+    }
+
     fn context_ptr_var(state: &Self::RegState) -> Variable {
         state.context_ptr
     }

@@ -16,11 +16,13 @@
 //! The return value is the whole protocol: **0** means handled, and the lifted
 //! code falls through inline with the declared clobbers reloaded; **non-zero**
 //! means return to the host immediately, with `exit_reason`/`exit_code` left
-//! exactly as the bridge wrote them.
+//! exactly as the bridge wrote them - except
+//! [`RESUME_LINKED`](crate::core::bridge::RESUME_LINKED), which additionally
+//! declares the exit linkable.
 
 use crate::arch::x86_64::Lifter;
 use crate::context::{ExitReason, RegisterContext};
-use crate::core::bridge::{BridgeImport, BridgeTarget, RegMask};
+use crate::core::bridge::{BridgeImport, BridgeTarget, RESUME_LINKED, RegMask};
 use cranelift::prelude::*;
 
 impl<'a> Lifter<'a> {
@@ -83,13 +85,56 @@ impl<'a> Lifter<'a> {
         self.builder.switch_to_block(exit_block);
         self.builder.seal_block(exit_block);
         self.sync_regs_masked(effects.writes.complement())?;
-        self.builder.ins().return_(&[]);
+        self.emit_bridge_exit(handled)?;
 
         // Handled inline: pull the declared clobbers back into SSA and carry on.
         self.builder.switch_to_block(continue_block);
         self.builder.seal_block(continue_block);
         self.load_regs_masked(effects.writes)?;
         self.block_terminated = false;
+        Ok(())
+    }
+
+    /// Terminate the bridge's exiting path, linking when it asked to.
+    ///
+    /// The PC is **loaded back out of the context** rather than reused from the
+    /// value published before the call, because moving it is exactly what a
+    /// bridge that returns [`RESUME_LINKED`] does: an `objc_msgSend` standing in
+    /// for the send, a `longjmp`, an indirect call that turned out to target
+    /// guest code. The value published before the call is the resume point that
+    /// would have applied had the bridge handled it, which is the wrong address
+    /// to link on.
+    ///
+    /// With linking off - or on a guest with nowhere to put the answer - this
+    /// collapses to the bare `return_` it has always been, and the comparison
+    /// against `RESUME_LINKED` is not emitted at all.
+    fn emit_bridge_exit(&mut self, handled: Value) -> crate::Result<()> {
+        if self.block_link_active() {
+            let link_block = self.builder.create_block();
+            let plain_block = self.builder.create_block();
+            let linked = self
+                .builder
+                .ins()
+                .icmp_imm_u(IntCC::Equal, handled, RESUME_LINKED as i64);
+            self.builder
+                .ins()
+                .brif(linked, link_block, &[], plain_block, &[]);
+
+            self.builder.switch_to_block(link_block);
+            self.builder.seal_block(link_block);
+            let ctx_ptr = self.builder.use_var(self.state.context_ptr);
+            let pc = self.builder.ins().load(
+                types::I64,
+                MemFlagsData::trusted(),
+                ctx_ptr,
+                <crate::arch::x86_64::X86_64 as crate::core::GuestArch>::pc_offset(),
+            );
+            self.emit_exit(Some(pc));
+
+            self.builder.switch_to_block(plain_block);
+            self.builder.seal_block(plain_block);
+        }
+        self.builder.ins().return_(&[]);
         Ok(())
     }
 

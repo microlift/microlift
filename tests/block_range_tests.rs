@@ -1,7 +1,7 @@
 //! Regions with holes in them: [`LifterConfig::block_ranges`].
 //!
 //! A host that discovers a region by following the guest's control flow finds a
-//! *set of basic blocks*, and between them lie bytes no block reaches — a jump
+//! *set of basic blocks*, and between them lie bytes no block reaches - a jump
 //! table in the middle of a function, alignment padding, the inline argument a
 //! trampoline reads through its own return address. Naming the blocks is what
 //! keeps those bytes out of the lift; without it the interval spanning the
@@ -60,8 +60,8 @@ const OVER_A_TABLE_FULL: [u8; 12] = [
 
 #[test]
 fn without_ranges_the_hole_between_two_blocks_is_lifted() {
-    // The behaviour the field exists to replace. Nothing here is *wrong* — the
-    // engine was told these bytes are code, so it lifted them — but the four
+    // The behaviour the field exists to replace. Nothing here is *wrong* - the
+    // engine was told these bytes are code, so it lifted them - but the four
     // table bytes cost IR, and a table whose bytes happened to decode into a
     // branch would have cost a block as well.
     let addrs = lifted_addresses(&OVER_A_TABLE_FULL, BASE, LifterConfig::default());
@@ -133,7 +133,7 @@ fn falling_out_of_a_block_exits_at_the_hole() {
 }
 
 /// Two ranges that abut are one run of code, not two, so an instruction may
-/// span the join. Merging them on the way in is what makes that true — leaving
+/// span the join. Merging them on the way in is what makes that true - leaving
 /// them separate would cut the `mov` at `BASE + 2` in half.
 #[test]
 fn touching_ranges_are_one_range() {
@@ -236,7 +236,7 @@ fn an_instruction_straddling_a_hole_tail_exits() {
 
 /// And the exemption that makes that exit terminate follows the block too: the
 /// host's answer to a region-tail exit is a region starting at the address, so
-/// a block's own first instruction must never raise one — there would be
+/// a block's own first instruction must never raise one - there would be
 /// nowhere shorter to go.
 #[test]
 fn the_first_instruction_of_a_block_never_tail_exits() {

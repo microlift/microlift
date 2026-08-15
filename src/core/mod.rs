@@ -12,6 +12,7 @@ pub mod abi;
 pub mod bridge;
 pub mod exit;
 pub mod flags;
+pub mod link;
 pub mod specialize;
 pub mod srcloc;
 
@@ -23,6 +24,7 @@ use crate::core::abi::CallAbi;
 use crate::core::bridge::{BridgeImport, ImportKind, ImportRegistry};
 use crate::core::exit::{ExitReason, MemorySegment, TransferKind};
 use crate::core::flags::{FlagEffects, FlagLiveness, FlagSet};
+use crate::core::link::{BlockLinkConfig, BlockLinkOffsets};
 use crate::core::specialize::Specialization;
 use crate::core::srcloc::SourceLocMap;
 use crate::function_traits::{DynamicSymbol, FunctionArgumentType};
@@ -71,6 +73,17 @@ pub trait GuestArch: Sized {
     fn exit_code_offset() -> i32;
     /// Byte offset of the `image_base` relocation field.
     fn image_base_offset() -> i32;
+
+    /// Where this guest's context keeps the two block-linking fields, or `None`
+    /// if it has none - in which case [`LifterConfig::block_link`] is inert for
+    /// this guest and every exit returns to the host as it always did.
+    ///
+    /// Defaults to `None`: making room for them is a change to a guest's
+    /// published `#[repr(C)]` layout, which is a decision per guest rather than
+    /// something the engine can assume. See [`crate::core::link`].
+    fn block_link_offsets() -> Option<BlockLinkOffsets> {
+        None
+    }
 
     // --- universal SSA variables held inside the register file ---
 
@@ -966,6 +979,11 @@ pub struct LifterConfig {
     /// [`ExitReason::UnknownJump`]: crate::core::exit::ExitReason::UnknownJump
     /// [`TransferKind::NoResumePoint`]: crate::core::exit::TransferKind::NoResumePoint
     pub strict_resume: bool,
+    /// Let a region resolve its own successor out of a host-provided table,
+    /// instead of handing every guest call and return back to the host to look
+    /// up. See [`crate::core::link`] for what is emitted.
+    /// Off by default.
+    pub block_link: Option<BlockLinkConfig>,
 }
 
 // `ImportKind` carries the host address a fast import resolved to, so the map
@@ -999,6 +1017,7 @@ impl Default for LifterConfig {
             resume_points: Vec::new(),
             strict_resume: false,
             eliminate_dead_flags: false,
+            block_link: None,
         }
     }
 }
@@ -1248,6 +1267,15 @@ pub struct LiftEngine<'a, A: GuestArch = crate::arch::x86_64::X86_64> {
     /// In-region addresses a *resumable VM exit* continues at, collected while
     /// lifting rather than declared up front. See [`Self::resumes_at`].
     pub exit_resumes: HashSet<u64>,
+    /// The one block-link probe this function has, created the first time an
+    /// exit asks for it and filled in [`Self::finish`].
+    ///
+    /// One per function rather than one per exit site: the probe is the same
+    /// nine instructions wherever it is reached from, and a region has as many
+    /// exit stubs as it has edges leaving it. Its single block parameter is the
+    /// guest PC to look up, which is *not* always `ctx.rip` as the exit left it -
+    /// a bridge may have moved it - so each site names the value it means.
+    link_block: Option<Block>,
 }
 
 /// A helper under construction: its body plus the `UserExternalName` slot whose
@@ -1338,6 +1366,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             jump_tables: HashMap::new(),
             emitted_resume_points: Vec::new(),
             exit_resumes: HashSet::new(),
+            link_block: None,
         }
     }
 
@@ -1848,6 +1877,159 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         Ok(())
     }
 
+    /// Whether this lift emits link probes at all, for a semantics handler that
+    /// wants to know before building the branch that reaches one.
+    pub fn block_link_active(&self) -> bool {
+        self.block_link().is_some()
+    }
+
+    /// The geometry of the host's link table, if this lift is linking at all.
+    ///
+    /// `None` disables every path in this file that would emit a probe, so the
+    /// two conditions that matter - the host asked for it, and this guest's
+    /// context has somewhere to put the answer - are asked in exactly one place.
+    /// Analysis mode is excluded because its IR does not write to the context at
+    /// all, and a probe would be the only thing in it that did.
+    fn block_link(&self) -> Option<(BlockLinkConfig, BlockLinkOffsets)> {
+        if self.config.analysis_mode {
+            return None;
+        }
+        let config = self.config.block_link?;
+        Some((config, A::block_link_offsets()?))
+    }
+
+    /// Terminate a VM exit that the host answers by **continuing at a guest
+    /// address**, giving it a chance to resolve its own successor.
+    ///
+    /// `pc` is the address execution continues at, as a run-time value, and
+    /// must be the one just written to the context - this does not write it.
+    /// `None` means [`Self::current_ip`], i.e. exactly what
+    /// `sync_to_context(None, ..)` will have stored, and is the usual case; a
+    /// site that synced an explicit PC passes that same value here.
+    ///
+    /// Every caller is an exit whose entire servicing is "enter whatever is at
+    /// `ctx.rip`" - a `RET` out of the region, a jump out of it, a direct `CALL`
+    /// to unlifted code, a fallthrough past the end. An exit the host must
+    /// *do* something about first (an import call, a syscall, `CPUID`, a
+    /// refused resume point) must return the ordinary way, or the host would
+    /// never see it.
+    ///
+    /// With linking off this is exactly `return_`, which is what makes it safe
+    /// to use at every such site unconditionally.
+    pub fn emit_exit(&mut self, pc: Option<Value>) {
+        match self.block_link() {
+            Some(_) => {
+                let pc = match pc {
+                    Some(pc) => pc,
+                    None => self.runtime_current_ip(),
+                };
+                let block = self.link_probe_block();
+                self.builder.ins().jump(block, &[pc.into()]);
+            }
+            None => {
+                self.builder.ins().return_(&[]);
+            }
+        }
+    }
+
+    /// The function's link-probe block, created on first use.
+    ///
+    /// Only its parameter exists at this point; the body is emitted by
+    /// [`Self::fill_link_probe`] once lifting is done, because a block created
+    /// here would otherwise be filled in the middle of whichever exit stub
+    /// happened to be first.
+    fn link_probe_block(&mut self) -> Block {
+        match self.link_block {
+            Some(block) => block,
+            None => {
+                let block = self.builder.create_block();
+                self.builder.append_block_param(block, types::I64);
+                self.link_block = Some(block);
+                block
+            }
+        }
+    }
+
+    /// Emit the probe itself: one masked shift, one address compare, one store.
+    ///
+    /// ```text
+    ///   link(pc):  tbl = ctx.link_table;      if tbl == 0 goto out
+    ///              ent = tbl + slot(pc)*32;   if ent.guest_pc != pc goto out
+    ///              ctx.pc = pc; ctx.link_hit = ent
+    ///   out:       return
+    /// ```
+    ///
+    /// The loads are `trusted` (notrap, aligned) but deliberately **not**
+    /// `readonly`: the host rewrites rows between entries, and a readonly load
+    /// would license Cranelift to hoist this one out of nothing in particular
+    /// today and out of something that matters tomorrow.
+    ///
+    /// Nothing is stored on the miss path. `link_hit` is the host's to clear
+    /// before it enters - see [`BlockLinkOffsets::hit`] - which is what lets an
+    /// exit that has no probe at all report "no link" by doing nothing.
+    fn fill_link_probe(&mut self) -> crate::Result<()> {
+        let Some(block) = self.link_block else {
+            return Ok(());
+        };
+        let (link, offsets) = self
+            .block_link()
+            .expect("a link block exists only when linking is on");
+
+        let hit = self.builder.create_block();
+        let out = self.builder.create_block();
+
+        self.builder.switch_to_block(block);
+        let pc = self.builder.block_params(block)[0];
+        let ctx_ptr = self.builder.use_var(A::context_ptr_var(&self.state));
+        let table =
+            self.builder
+                .ins()
+                .load(types::I64, MemFlagsData::trusted(), ctx_ptr, offsets.table);
+        // A host that has not published a table for this thread is not an error
+        // and not a special case: it simply never links.
+        let probe = self.builder.create_block();
+        self.builder.ins().brif(table, probe, &[], out, &[]);
+
+        self.builder.switch_to_block(probe);
+        let slot = self.builder.ins().ushr_imm_u(pc, link.shift as i64);
+        let slot = self.builder.ins().band_imm_u(slot, link.mask());
+        let offset = self
+            .builder
+            .ins()
+            .ishl_imm_u(slot, crate::core::link::ENTRY_SIZE.trailing_zeros() as i64);
+        let entry = self.builder.ins().iadd(table, offset);
+        let key = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::trusted(), entry, 0);
+        let matches = self.builder.ins().icmp(IntCC::Equal, key, pc);
+        self.builder.ins().brif(matches, hit, &[], out, &[]);
+
+        // A hit *commits* the PC as well as naming the successor, which is what
+        // lets one probe serve an exit whose `rip` is not where it continues.
+        // The out-of-region direct `CALL` is that exit: it leaves `rip` at the
+        // return address and the callee in `imported_function_va`, for a host
+        // that services it by swapping the two. Storing `pc` here does that
+        // swap on the path that skips the host, and is a redundant store of the
+        // value already there at every other site.
+        self.builder.switch_to_block(hit);
+        self.builder
+            .ins()
+            .store(MemFlagsData::trusted(), pc, ctx_ptr, A::pc_offset());
+        self.builder
+            .ins()
+            .store(MemFlagsData::trusted(), entry, ctx_ptr, offsets.hit);
+        self.builder.ins().return_(&[]);
+
+        self.builder.switch_to_block(out);
+        self.builder.ins().return_(&[]);
+
+        for block in [block, probe, hit, out] {
+            self.visited_blocks.insert(block);
+        }
+        Ok(())
+    }
+
     pub fn lift(&mut self, bytes: &[u8], ip: u64) -> crate::Result<()> {
         self.lift_base = ip;
         self.lift_end = ip + bytes.len() as u64;
@@ -2110,8 +2292,10 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                 if !self.in_region(cur) {
                     self.current_ip = cur;
                     self.set_source_loc(cur);
+                    // Linkable: the host's whole answer to a fallthrough exit is
+                    // to enter a region at `cur`.
                     A::sync_to_context(self, None, ExitReason::None)?;
-                    self.builder.ins().return_(&[]);
+                    self.emit_exit(None);
                     self.block_terminated = true;
                     break;
                 }
@@ -2149,7 +2333,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                             self.current_ip = cur;
                             self.set_source_loc(cur);
                             A::sync_to_context(self, None, ExitReason::None)?;
-                            self.builder.ins().return_(&[]);
+                            self.emit_exit(None);
                             self.block_terminated = true;
                             break;
                         }
@@ -2164,15 +2348,20 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                 if self.runs_off_region(cur, inst) {
                     self.current_ip = cur;
                     self.set_source_loc(cur);
+                    // Linkable, and worth linking: the host answers this by
+                    // lifting a region that begins at `cur` - and once it has,
+                    // every later arrival at the same cut is a table hit.
                     A::sync_to_context(self, None, ExitReason::UnknownJump)?;
                     self.write_exit_code(TransferKind::RegionTail as u32);
-                    self.builder.ins().return_(&[]);
+                    self.emit_exit(None);
                     self.block_terminated = true;
                     break;
                 }
 
                 if A::is_invalid(inst) {
-                    // Sync PC to point AT the invalid instruction.
+                    // Sync PC to point AT the invalid instruction. Not linkable:
+                    // this is a fault the host reports, not an address it
+                    // continues at, and a translation for it cannot exist.
                     self.current_ip = A::instr_ip(inst);
                     self.set_source_loc(self.current_ip);
                     A::sync_to_context(self, None, ExitReason::InvalidInstruction)?;
@@ -2327,11 +2516,20 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                         .copied()
                         .unwrap_or(TransferKind::Unknown);
                     self.write_exit_code(kind as u32);
-                    self.builder.ins().return_(&[]);
+                    // Every stub here is a transfer *to* `offset` - a direct
+                    // jump, a conditional branch's taken edge, a direct call
+                    // whose return address is already pushed. All three are
+                    // answered by entering a region at `offset` and nothing
+                    // else, which is exactly what a link does.
+                    self.emit_exit(None);
                 }
                 processed_blocks.insert(block);
             }
         }
+
+        // After the stubs: the probe is reached from them, and a block cannot be
+        // jumped to before it exists.
+        self.fill_link_probe()?;
 
         self.clear_source_loc();
         self.builder.seal_all_blocks();

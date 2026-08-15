@@ -55,10 +55,12 @@ pub struct RegisterContext {
     pub image_base: u64,
     /// A syscall handler intended for the RuntimeAssisted execution mode.
     pub syscall_handler: Option<unsafe extern "C" fn(ctx: *mut RegisterContext)>,
-    /// FIXME:
-    /// # **DO NOT USE!!!**
-    /// Resume function pointer for AOT block dispatch (**not implemented yet** - this is a placeholder)
-    pub resume_function: Option<unsafe extern "C" fn(ctx: *mut RegisterContext)>,
+    /// The host's block-link table for the thread running this context, or null
+    /// when it has none. See [`crate::core::link`].
+    ///
+    /// Read by lifted code at every exit that continues at a guest address, and
+    /// written by nothing but the host.
+    pub link_table: *mut crate::core::link::BlockLinkEntry,
     // Flags as individual bytes for simpler IR load/store
     pub cf: u8,
     pub pf: u8,
@@ -84,7 +86,7 @@ pub struct RegisterContext {
     /// use it. Without this field `xmm` sat at `0xb8`, and the emitted prologue
     /// fell back twice over: `ldur` (unscaled, ±255) for the first five
     /// registers, and then, past `0xff`, an address materialised into a scratch
-    /// register for each of the remaining eleven —
+    /// register for each of the remaining eleven -
     ///
     /// ```text
     ///   ldur q19, [x0, #0xf8]
@@ -93,7 +95,7 @@ pub struct RegisterContext {
     ///                           ; every exit path
     /// ```
     ///
-    /// — against `ldr q18, [x0, #0x110]` once the offset is aligned. A Hat in
+    /// - against `ldr q18, [x0, #0x110]` once the offset is aligned. A Hat in
     /// Time enters a region fifteen million times a second, which made this
     /// eight bytes of padding worth roughly three hundred million instructions
     /// a second. See rosetta3's `docs/HOTSPOTS.md`.
@@ -183,6 +185,20 @@ pub struct RegisterContext {
     pub fs: u16,
     /// `GS` selector. Distinct from [`gs_base`](Self::gs_base).
     pub gs: u16,
+
+    /// Where the region that just exited says to go next: the address of a
+    /// [`BlockLinkEntry`](crate::core::link::BlockLinkEntry) in
+    /// [`link_table`](Self::link_table), or **zero for "no link - service this
+    /// exit yourself"**.
+    ///
+    /// The host clears it before every entry and reads it after; lifted code
+    /// writes it only on a table hit. Which is why zero is the answer for an
+    /// exit that has no probe at all - a syscall, an import call, a fault - with
+    /// nothing in those paths having to know that linking exists.
+    ///
+    /// Last in the struct on purpose: it is new, and everything above it has an
+    /// offset something already depends on.
+    pub link_hit: u64,
 }
 
 impl Default for RegisterContext {
@@ -222,7 +238,7 @@ impl Default for RegisterContext {
             rip: 0,
             image_base: 0,
             syscall_handler: None,
-            resume_function: None,
+            link_table: std::ptr::null_mut(),
             cf: 0,
             pf: 0,
             af: 0,
@@ -249,6 +265,7 @@ impl Default for RegisterContext {
             es: 0,
             fs: 0,
             gs: 0,
+            link_hit: 0,
         }
     }
 }
@@ -312,4 +329,35 @@ pub fn f64_bits_to_f80(bits: u64) -> (u64, u16) {
         exp64 + 15360
     };
     (mantissa, ((sign as u16) << 15) | exp80 as u16)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `xmm`'s alignment is worth twenty-two instructions per region entry and
+    /// is a property of every field declared *before* it. This is the assertion
+    /// that says so, rather than the comment on `_align_xmm` alone.
+    #[test]
+    fn the_vector_save_area_stays_sixteen_byte_aligned() {
+        assert_eq!(std::mem::offset_of!(RegisterContext, xmm) % 16, 0);
+    }
+
+    /// The link fields are pointer-sized and pointer-aligned, which is what the
+    /// probe's `trusted` (notrap, aligned) loads and stores assume.
+    #[test]
+    fn the_link_fields_are_aligned_for_the_probe() {
+        assert_eq!(std::mem::offset_of!(RegisterContext, link_table) % 8, 0);
+        assert_eq!(std::mem::offset_of!(RegisterContext, link_hit) % 8, 0);
+    }
+
+    /// A fresh context links nothing and claims nothing: a null table is what
+    /// turns the probe into a return, and a zero `link_hit` is what makes a host
+    /// that never looks at it behave as it did before linking existed.
+    #[test]
+    fn a_default_context_is_unlinked() {
+        let ctx = RegisterContext::new();
+        assert!(ctx.link_table.is_null());
+        assert_eq!(ctx.link_hit, 0);
+    }
 }
