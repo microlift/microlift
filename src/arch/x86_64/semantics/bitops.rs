@@ -4,6 +4,13 @@ use crate::lifter::{Lifter, X86Flag};
 use cranelift::prelude::*;
 use iced_x86::{Instruction, OpKind, Register};
 
+/// Which bitwise operation `logical_op` should emit.
+enum LogicalOp {
+    And,
+    Or,
+    Xor,
+}
+
 /// Which flavour of single-count shift `emit_shift` should emit.
 enum ShiftKind {
     Left,
@@ -13,183 +20,32 @@ enum ShiftKind {
 
 impl<'a> Lifter<'a> {
     pub(super) fn handle_xor(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let op0 = instruction.op0_kind();
-        let op1 = instruction.op1_kind();
-
-        let size = if op0 == OpKind::Register {
-            instruction.op0_register().size()
-        } else {
-            instruction.memory_size().size()
-        };
-        let ty = size_to_type(size);
-
-        let src_val = match op1 {
-            OpKind::Register => self.get_reg_val(instruction.op1_register())?,
-            OpKind::Immediate32to64 => self.builder.ins().iconst(ty, instruction.immediate32to64()),
-            OpKind::Immediate8
-            | OpKind::Immediate16
-            | OpKind::Immediate32
-            | OpKind::Immediate64
-            | OpKind::Immediate8to16
-            | OpKind::Immediate8to32
-            | OpKind::Immediate8to64 => {
-                self.builder.ins().iconst(ty, Self::read_imm64(instruction))
-            }
-            OpKind::Memory => {
-                let ptr = self.get_mem_ptr(instruction, 1)?;
-                self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0)
-            }
-            _ => {
-                return Err(MicroliftError::UnsupportedInstruction {
-                    mnemonic: format!("xor-src-{:?}", op1),
-                });
-            }
-        };
-
-        match op0 {
-            OpKind::Register => {
-                let reg = instruction.op0_register();
-                let dst_val = self.get_reg_val(reg)?;
-                let result = self.builder.ins().bxor(dst_val, src_val);
-                self.set_reg_val(reg, result)?;
-                self.update_flags_logical(result, size)?;
-            }
-            OpKind::Memory => {
-                let ptr = self.get_mem_ptr(instruction, 0)?;
-                let dst_val = self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0);
-                let result = self.builder.ins().bxor(dst_val, src_val);
-                self.builder
-                    .ins()
-                    .store(MemFlagsData::new(), result, ptr, 0);
-                self.update_flags_logical(result, size)?;
-            }
-            _ => {
-                return Err(MicroliftError::UnsupportedInstruction {
-                    mnemonic: "xor-dst".into(),
-                });
-            }
-        }
-        Ok(())
+        self.logical_op(instruction, LogicalOp::Xor)
     }
 
     pub(super) fn handle_and(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let op0 = instruction.op0_kind();
-        let op1 = instruction.op1_kind();
-
-        let size = if op0 == OpKind::Register {
-            instruction.op0_register().size()
-        } else {
-            instruction.memory_size().size()
-        };
-        let ty = size_to_type(size);
-
-        let src_val = match op1 {
-            OpKind::Register => self.get_reg_val(instruction.op1_register())?,
-            OpKind::Immediate32to64 => self.builder.ins().iconst(ty, instruction.immediate32to64()),
-            OpKind::Immediate8
-            | OpKind::Immediate16
-            | OpKind::Immediate32
-            | OpKind::Immediate64
-            | OpKind::Immediate8to16
-            | OpKind::Immediate8to32
-            | OpKind::Immediate8to64 => {
-                self.builder.ins().iconst(ty, Self::read_imm64(instruction))
-            }
-            OpKind::Memory => {
-                let ptr = self.get_mem_ptr(instruction, 1)?;
-                self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0)
-            }
-            _ => {
-                return Err(MicroliftError::UnsupportedInstruction {
-                    mnemonic: format!("and-src-{:?}", op1),
-                });
-            }
-        };
-
-        match op0 {
-            OpKind::Register => {
-                let reg = instruction.op0_register();
-                let dst_val = self.get_reg_val(reg)?;
-                let result = self.builder.ins().band(dst_val, src_val);
-                self.set_reg_val(reg, result)?;
-                self.update_flags_logical(result, size)?;
-            }
-            OpKind::Memory => {
-                let ptr = self.get_mem_ptr(instruction, 0)?;
-                let dst_val = self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0);
-                let result = self.builder.ins().band(dst_val, src_val);
-                self.builder
-                    .ins()
-                    .store(MemFlagsData::new(), result, ptr, 0);
-                self.update_flags_logical(result, size)?;
-            }
-            _ => {
-                return Err(MicroliftError::UnsupportedInstruction {
-                    mnemonic: "and-dst".into(),
-                });
-            }
-        }
-        Ok(())
+        self.logical_op(instruction, LogicalOp::And)
     }
 
     pub(super) fn handle_or(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let op0 = instruction.op0_kind();
-        let op1 = instruction.op1_kind();
+        self.logical_op(instruction, LogicalOp::Or)
+    }
 
-        let size = if op0 == OpKind::Register {
-            instruction.op0_register().size()
-        } else {
-            instruction.memory_size().size()
+    /// Shared implementation of `AND`/`OR`/`XOR`.
+    ///
+    /// All three write the destination and then set the logical flag set (CF
+    /// and OF cleared, ZF/SF/PF from the result, AF left alone - see
+    /// `update_flags_logical`); only the Cranelift opcode differs.
+    fn logical_op(&mut self, instruction: &Instruction, op: LogicalOp) -> crate::Result<()> {
+        let size = self.operand_size(instruction, 0)?;
+        let (place, dst, src) = self.read_binary_rmw(instruction, size)?;
+        let result = match op {
+            LogicalOp::And => self.builder.ins().band(dst, src),
+            LogicalOp::Or => self.builder.ins().bor(dst, src),
+            LogicalOp::Xor => self.builder.ins().bxor(dst, src),
         };
-        let ty = size_to_type(size);
-
-        let src_val = match op1 {
-            OpKind::Register => self.get_reg_val(instruction.op1_register())?,
-            OpKind::Immediate32to64 => self.builder.ins().iconst(ty, instruction.immediate32to64()),
-            OpKind::Immediate8
-            | OpKind::Immediate16
-            | OpKind::Immediate32
-            | OpKind::Immediate64
-            | OpKind::Immediate8to16
-            | OpKind::Immediate8to32
-            | OpKind::Immediate8to64 => {
-                self.builder.ins().iconst(ty, Self::read_imm64(instruction))
-            }
-            OpKind::Memory => {
-                let ptr = self.get_mem_ptr(instruction, 1)?;
-                self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0)
-            }
-            _ => {
-                return Err(MicroliftError::UnsupportedInstruction {
-                    mnemonic: format!("or-src-{:?}", op1),
-                });
-            }
-        };
-
-        match op0 {
-            OpKind::Register => {
-                let reg = instruction.op0_register();
-                let dst_val = self.get_reg_val(reg)?;
-                let result = self.builder.ins().bor(dst_val, src_val);
-                self.set_reg_val(reg, result)?;
-                self.update_flags_logical(result, size)?;
-            }
-            OpKind::Memory => {
-                let ptr = self.get_mem_ptr(instruction, 0)?;
-                let dst_val = self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0);
-                let result = self.builder.ins().bor(dst_val, src_val);
-                self.builder
-                    .ins()
-                    .store(MemFlagsData::new(), result, ptr, 0);
-                self.update_flags_logical(result, size)?;
-            }
-            _ => {
-                return Err(MicroliftError::UnsupportedInstruction {
-                    mnemonic: "or-dst".into(),
-                });
-            }
-        }
-        Ok(())
+        self.write_place(place, result)?;
+        self.update_flags_logical(result, size)
     }
 
     pub(super) fn handle_not(&mut self, instruction: &Instruction) -> crate::Result<()> {
@@ -204,55 +60,11 @@ impl<'a> Lifter<'a> {
     }
 
     pub(super) fn handle_test(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let op0 = instruction.op0_kind();
-        let op1 = instruction.op1_kind();
-
-        let size = if op0 == OpKind::Register {
-            instruction.op0_register().size()
-        } else {
-            instruction.memory_size().size()
-        };
-        let ty = size_to_type(size);
-
-        let src_val = match op1 {
-            OpKind::Register => self.get_reg_val(instruction.op1_register())?,
-            OpKind::Immediate32to64 => self.builder.ins().iconst(ty, instruction.immediate32to64()),
-            OpKind::Immediate8
-            | OpKind::Immediate16
-            | OpKind::Immediate32
-            | OpKind::Immediate64
-            | OpKind::Immediate8to16
-            | OpKind::Immediate8to32
-            | OpKind::Immediate8to64 => {
-                self.builder.ins().iconst(ty, Self::read_imm64(instruction))
-            }
-            OpKind::Memory => {
-                let ptr = self.get_mem_ptr(instruction, 1)?;
-                self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0)
-            }
-            _ => {
-                return Err(MicroliftError::UnsupportedInstruction {
-                    mnemonic: format!("test-src-{:?}", op1),
-                });
-            }
-        };
-
-        let dst_val = match op0 {
-            OpKind::Register => self.get_reg_val(instruction.op0_register())?,
-            OpKind::Memory => {
-                let ptr = self.get_mem_ptr(instruction, 0)?;
-                self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0)
-            }
-            _ => {
-                return Err(MicroliftError::UnsupportedInstruction {
-                    mnemonic: format!("test-dst-{:?}", op0),
-                });
-            }
-        };
-
-        let result = self.builder.ins().band(dst_val, src_val);
-        self.update_flags_logical(result, size)?;
-        Ok(())
+        let size = self.operand_size(instruction, 0)?;
+        let (dst, src) = self.read_binary_operands(instruction, size)?;
+        // TEST is an AND that keeps only the flags.
+        let result = self.builder.ins().band(dst, src);
+        self.update_flags_logical(result, size)
     }
 
     // Shift instructions

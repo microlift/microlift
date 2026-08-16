@@ -8,13 +8,13 @@ pub mod arithmetic;
 pub mod atomics;
 pub mod bitops;
 pub mod bridge;
+pub mod cond;
 pub mod control_flow;
 pub mod crc32;
 pub mod flags;
 pub mod fpu;
 pub mod helpers;
 pub mod memory;
-pub mod setcc;
 pub mod softfloat;
 pub mod sse;
 pub mod sse_int;
@@ -25,6 +25,7 @@ pub mod syscall;
 pub mod unimplemented;
 
 use crate::MicroliftError;
+use crate::arch::x86_64::semantics::cond::Cond;
 use crate::arch::x86_64::semantics::fpu::FpuOp;
 use crate::arch::x86_64::semantics::sse::{PackedLaneOp, PackedShiftOp, PackedWidth};
 use crate::arch::x86_64::semantics::sse_int::HorizOp;
@@ -655,66 +656,61 @@ impl<'a> Lifter<'a> {
             Mnemonic::Loope => self.handle_loope(instruction),
             Mnemonic::Loopne => self.handle_loopne(instruction),
 
-            // Conditional Jumps (unsigned)
-            Mnemonic::Jb => self.handle_jb(instruction), // JB / JNAE / JC
-            Mnemonic::Jbe => self.handle_jbe(instruction), // JBE / JNA
-            Mnemonic::Ja => self.handle_ja(instruction), // JA / JNBE
-            Mnemonic::Jae => self.handle_jae(instruction), // JAE / JNB / JNC
-
-            // Conditional Jumps (equality)
-            Mnemonic::Je => self.handle_jz(instruction), // JE / JZ
-            Mnemonic::Jne => self.handle_jnz(instruction), // JNE / JNZ
-
-            // Conditional Jumps (signed)
-            Mnemonic::Jg => self.handle_jg(instruction), // JG / JNLE
-            Mnemonic::Jge => self.handle_jge(instruction), // JGE / JNL
-            Mnemonic::Jl => self.handle_jl(instruction), // JL / JNGE
-            Mnemonic::Jle => self.handle_jle(instruction), // JLE / JNG
-
-            // Conditional Jumps (flag-based)
-            Mnemonic::Js => self.handle_js(instruction),
-            Mnemonic::Jns => self.handle_jns(instruction),
-            Mnemonic::Jo => self.handle_jo(instruction),
-            Mnemonic::Jno => self.handle_jno(instruction),
-            Mnemonic::Jp => self.handle_jp(instruction),
-            Mnemonic::Jnp => self.handle_jnp(instruction),
+            // Conditional Jumps - the flag condition is `Cond`; JRCXZ and
+            // the LOOP forms test a register instead and stay separate.
+            Mnemonic::Jb => self.handle_jcc(instruction, Cond::B),
+            Mnemonic::Jbe => self.handle_jcc(instruction, Cond::Be),
+            Mnemonic::Ja => self.handle_jcc(instruction, Cond::A),
+            Mnemonic::Jae => self.handle_jcc(instruction, Cond::Ae),
+            Mnemonic::Je => self.handle_jcc(instruction, Cond::E),
+            Mnemonic::Jne => self.handle_jcc(instruction, Cond::Ne),
+            Mnemonic::Jg => self.handle_jcc(instruction, Cond::G),
+            Mnemonic::Jge => self.handle_jcc(instruction, Cond::Ge),
+            Mnemonic::Jl => self.handle_jcc(instruction, Cond::L),
+            Mnemonic::Jle => self.handle_jcc(instruction, Cond::Le),
+            Mnemonic::Js => self.handle_jcc(instruction, Cond::S),
+            Mnemonic::Jns => self.handle_jcc(instruction, Cond::Ns),
+            Mnemonic::Jo => self.handle_jcc(instruction, Cond::O),
+            Mnemonic::Jno => self.handle_jcc(instruction, Cond::No),
+            Mnemonic::Jp => self.handle_jcc(instruction, Cond::P),
+            Mnemonic::Jnp => self.handle_jcc(instruction, Cond::Np),
             Mnemonic::Jrcxz => self.handle_jrcxz(instruction),
 
             // SETcc - set byte on condition
-            Mnemonic::Sete => self.handle_sete(instruction),
-            Mnemonic::Setne => self.handle_setne(instruction),
-            Mnemonic::Setb => self.handle_setb(instruction),
-            Mnemonic::Setae => self.handle_setae(instruction),
-            Mnemonic::Setbe => self.handle_setbe(instruction),
-            Mnemonic::Seta => self.handle_seta(instruction),
-            Mnemonic::Setl => self.handle_setl(instruction),
-            Mnemonic::Setge => self.handle_setge(instruction),
-            Mnemonic::Setle => self.handle_setle(instruction),
-            Mnemonic::Setg => self.handle_setg(instruction),
-            Mnemonic::Sets => self.handle_sets(instruction),
-            Mnemonic::Setns => self.handle_setns(instruction),
-            Mnemonic::Seto => self.handle_seto(instruction),
-            Mnemonic::Setno => self.handle_setno(instruction),
-            Mnemonic::Setp => self.handle_setp(instruction),
-            Mnemonic::Setnp => self.handle_setnp(instruction),
+            Mnemonic::Sete => self.handle_setcc(instruction, Cond::E),
+            Mnemonic::Setne => self.handle_setcc(instruction, Cond::Ne),
+            Mnemonic::Setb => self.handle_setcc(instruction, Cond::B),
+            Mnemonic::Setae => self.handle_setcc(instruction, Cond::Ae),
+            Mnemonic::Setbe => self.handle_setcc(instruction, Cond::Be),
+            Mnemonic::Seta => self.handle_setcc(instruction, Cond::A),
+            Mnemonic::Setl => self.handle_setcc(instruction, Cond::L),
+            Mnemonic::Setge => self.handle_setcc(instruction, Cond::Ge),
+            Mnemonic::Setle => self.handle_setcc(instruction, Cond::Le),
+            Mnemonic::Setg => self.handle_setcc(instruction, Cond::G),
+            Mnemonic::Sets => self.handle_setcc(instruction, Cond::S),
+            Mnemonic::Setns => self.handle_setcc(instruction, Cond::Ns),
+            Mnemonic::Seto => self.handle_setcc(instruction, Cond::O),
+            Mnemonic::Setno => self.handle_setcc(instruction, Cond::No),
+            Mnemonic::Setp => self.handle_setcc(instruction, Cond::P),
+            Mnemonic::Setnp => self.handle_setcc(instruction, Cond::Np),
 
             // Conditional Move (CMOVcc)
-            Mnemonic::Cmove => self.handle_cmove(instruction),
-            Mnemonic::Cmovne => self.handle_cmovne(instruction),
-            Mnemonic::Cmovb => self.handle_cmovb(instruction),
-            Mnemonic::Cmovae => self.handle_cmovae(instruction),
-            Mnemonic::Cmovbe => self.handle_cmovbe(instruction),
-            Mnemonic::Cmova => self.handle_cmova(instruction),
-            Mnemonic::Cmovl => self.handle_cmovl(instruction),
-            Mnemonic::Cmovge => self.handle_cmovge(instruction),
-            Mnemonic::Cmovle => self.handle_cmovle(instruction),
-            Mnemonic::Cmovg => self.handle_cmovg(instruction),
-            Mnemonic::Cmovs => self.handle_cmovs(instruction),
-            Mnemonic::Cmovns => self.handle_cmovns(instruction),
-            Mnemonic::Cmovo => self.handle_cmovo(instruction),
-            Mnemonic::Cmovno => self.handle_cmovno(instruction),
-            Mnemonic::Cmovp => self.handle_cmovp(instruction),
-            Mnemonic::Cmovnp => self.handle_cmovnp(instruction),
+            Mnemonic::Cmove => self.handle_cmovcc(instruction, Cond::E),
+            Mnemonic::Cmovne => self.handle_cmovcc(instruction, Cond::Ne),
+            Mnemonic::Cmovb => self.handle_cmovcc(instruction, Cond::B),
+            Mnemonic::Cmovae => self.handle_cmovcc(instruction, Cond::Ae),
+            Mnemonic::Cmovbe => self.handle_cmovcc(instruction, Cond::Be),
+            Mnemonic::Cmova => self.handle_cmovcc(instruction, Cond::A),
+            Mnemonic::Cmovl => self.handle_cmovcc(instruction, Cond::L),
+            Mnemonic::Cmovge => self.handle_cmovcc(instruction, Cond::Ge),
+            Mnemonic::Cmovle => self.handle_cmovcc(instruction, Cond::Le),
+            Mnemonic::Cmovg => self.handle_cmovcc(instruction, Cond::G),
+            Mnemonic::Cmovs => self.handle_cmovcc(instruction, Cond::S),
+            Mnemonic::Cmovns => self.handle_cmovcc(instruction, Cond::Ns),
+            Mnemonic::Cmovo => self.handle_cmovcc(instruction, Cond::O),
+            Mnemonic::Cmovno => self.handle_cmovcc(instruction, Cond::No),
+            Mnemonic::Cmovp => self.handle_cmovcc(instruction, Cond::P),
+            Mnemonic::Cmovnp => self.handle_cmovcc(instruction, Cond::Np),
 
             // Traps / faults
             Mnemonic::Ud2 => self.handle_ud2(instruction),

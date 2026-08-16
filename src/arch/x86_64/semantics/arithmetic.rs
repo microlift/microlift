@@ -1,257 +1,41 @@
 use crate::MicroliftError;
 use crate::arch::x86_64::semantics::helpers::size_to_type;
 use crate::context::ExitReason;
-use crate::lifter::{Lifter, X86Flag};
+use crate::lifter::Lifter;
 use cranelift::prelude::*;
 use iced_x86::{Instruction, OpKind, Register};
 
 impl<'a> Lifter<'a> {
     pub(super) fn handle_add(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let op0 = instruction.op0_kind();
-        let op1 = instruction.op1_kind();
-
-        let size = if op0 == OpKind::Register {
-            instruction.op0_register().size()
-        } else {
-            instruction.memory_size().size()
-        };
-        let ty = size_to_type(size);
-
-        let src_val = match op1 {
-            OpKind::Register => self.get_reg_val(instruction.op1_register())?,
-            OpKind::Immediate32to64 => self.builder.ins().iconst(ty, instruction.immediate32to64()),
-            OpKind::Immediate8
-            | OpKind::Immediate16
-            | OpKind::Immediate32
-            | OpKind::Immediate64
-            | OpKind::Immediate8to16
-            | OpKind::Immediate8to32
-            | OpKind::Immediate8to64 => {
-                self.builder.ins().iconst(ty, Self::read_imm64(instruction))
-            }
-            OpKind::Memory => {
-                let ptr = self.get_mem_ptr(instruction, 1)?;
-                self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0)
-            }
-            _ => {
-                return Err(MicroliftError::UnsupportedInstruction {
-                    mnemonic: format!("add-src-{:?}", op1),
-                });
-            }
-        };
-
-        match op0 {
-            OpKind::Register => {
-                let reg = instruction.op0_register();
-                let dst_val = self.get_reg_val(reg)?;
-                let result = self.add_with_flags(dst_val, src_val, size)?;
-                self.set_reg_val(reg, result)?;
-            }
-            OpKind::Memory => {
-                let ptr = self.get_mem_ptr(instruction, 0)?;
-                let dst_val = self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0);
-                let result = self.add_with_flags(dst_val, src_val, size)?;
-                self.builder
-                    .ins()
-                    .store(MemFlagsData::new(), result, ptr, 0);
-            }
-            _ => {
-                return Err(MicroliftError::UnsupportedInstruction {
-                    mnemonic: "add-dst".into(),
-                });
-            }
-        }
-        Ok(())
+        let size = self.operand_size(instruction, 0)?;
+        let (place, dst, src) = self.read_binary_rmw(instruction, size)?;
+        let result = self.add_with_flags(dst, src, size)?;
+        self.write_place(place, result)
     }
 
     pub(super) fn handle_sub(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let op0 = instruction.op0_kind();
-        let op1 = instruction.op1_kind();
-
-        let size = if op0 == OpKind::Register {
-            instruction.op0_register().size()
-        } else {
-            instruction.memory_size().size()
-        };
-        let ty = size_to_type(size);
-
-        let src_val = match op1 {
-            OpKind::Register => self.get_reg_val(instruction.op1_register())?,
-            OpKind::Immediate32to64 => self.builder.ins().iconst(ty, instruction.immediate32to64()),
-            OpKind::Immediate8
-            | OpKind::Immediate16
-            | OpKind::Immediate32
-            | OpKind::Immediate64
-            | OpKind::Immediate8to16
-            | OpKind::Immediate8to32
-            | OpKind::Immediate8to64 => {
-                self.builder.ins().iconst(ty, Self::read_imm64(instruction))
-            }
-            OpKind::Memory => {
-                let ptr = self.get_mem_ptr(instruction, 1)?;
-                self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0)
-            }
-            _ => {
-                return Err(MicroliftError::UnsupportedInstruction {
-                    mnemonic: format!("sub-src-{:?}", op1),
-                });
-            }
-        };
-
-        match op0 {
-            OpKind::Register => {
-                let reg = instruction.op0_register();
-                let dst_val = self.get_reg_val(reg)?;
-                let result = self.sub_with_flags(dst_val, src_val, size)?;
-                self.set_reg_val(reg, result)?;
-            }
-            OpKind::Memory => {
-                let ptr = self.get_mem_ptr(instruction, 0)?;
-                let dst_val = self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0);
-                let result = self.sub_with_flags(dst_val, src_val, size)?;
-                self.builder
-                    .ins()
-                    .store(MemFlagsData::new(), result, ptr, 0);
-            }
-            _ => {
-                return Err(MicroliftError::UnsupportedInstruction {
-                    mnemonic: "sub-dst".into(),
-                });
-            }
-        }
-        Ok(())
+        let size = self.operand_size(instruction, 0)?;
+        let (place, dst, src) = self.read_binary_rmw(instruction, size)?;
+        let result = self.sub_with_flags(dst, src, size)?;
+        self.write_place(place, result)
     }
 
     pub(super) fn handle_adc(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let op0 = instruction.op0_kind();
-        let op1 = instruction.op1_kind();
-
-        let size = if op0 == OpKind::Register {
-            instruction.op0_register().size()
-        } else {
-            instruction.memory_size().size()
-        };
-        let ty = size_to_type(size);
-
-        // Read CF (I8, 0 or 1), extend to operand type for arithmetic.
-        let cf_i8 = self.builder.use_var(self.state.flags[&X86Flag::Carry]);
-        let cf_ext = if ty == types::I8 {
-            cf_i8
-        } else {
-            self.builder.ins().uextend(ty, cf_i8)
-        };
-
-        let src_val = match op1 {
-            OpKind::Register => self.get_reg_val(instruction.op1_register())?,
-            OpKind::Immediate32to64 => self.builder.ins().iconst(ty, instruction.immediate32to64()),
-            OpKind::Immediate8
-            | OpKind::Immediate16
-            | OpKind::Immediate32
-            | OpKind::Immediate64
-            | OpKind::Immediate8to16
-            | OpKind::Immediate8to32
-            | OpKind::Immediate8to64 => {
-                self.builder.ins().iconst(ty, Self::read_imm64(instruction))
-            }
-            OpKind::Memory => {
-                let ptr = self.get_mem_ptr(instruction, 1)?;
-                self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0)
-            }
-            _ => {
-                return Err(MicroliftError::UnsupportedInstruction {
-                    mnemonic: format!("adc-src-{:?}", op1),
-                });
-            }
-        };
-
-        match op0 {
-            OpKind::Register => {
-                let reg = instruction.op0_register();
-                let dst_val = self.get_reg_val(reg)?;
-                let result = self.adc_sbb_with_flags(dst_val, src_val, cf_ext, true, size)?;
-                self.set_reg_val(reg, result)?;
-            }
-            OpKind::Memory => {
-                let ptr = self.get_mem_ptr(instruction, 0)?;
-                let dst_val = self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0);
-                let result = self.adc_sbb_with_flags(dst_val, src_val, cf_ext, true, size)?;
-                self.builder
-                    .ins()
-                    .store(MemFlagsData::new(), result, ptr, 0);
-            }
-            _ => {
-                return Err(MicroliftError::UnsupportedInstruction {
-                    mnemonic: "adc-dst".into(),
-                });
-            }
-        }
-        Ok(())
+        let size = self.operand_size(instruction, 0)?;
+        // CF is read before the operands, so a memory operand's load cannot be
+        // reordered ahead of a flag this same instruction goes on to redefine.
+        let cf = self.carry_in(size);
+        let (place, dst, src) = self.read_binary_rmw(instruction, size)?;
+        let result = self.adc_sbb_with_flags(dst, src, cf, true, size)?;
+        self.write_place(place, result)
     }
 
     pub(super) fn handle_sbb(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let op0 = instruction.op0_kind();
-        let op1 = instruction.op1_kind();
-
-        let size = if op0 == OpKind::Register {
-            instruction.op0_register().size()
-        } else {
-            instruction.memory_size().size()
-        };
-        let ty = size_to_type(size);
-
-        // Read CF (borrow-in), extend to operand type.
-        let cf_i8 = self.builder.use_var(self.state.flags[&X86Flag::Carry]);
-        let cf_ext = if ty == types::I8 {
-            cf_i8
-        } else {
-            self.builder.ins().uextend(ty, cf_i8)
-        };
-
-        let src_val = match op1 {
-            OpKind::Register => self.get_reg_val(instruction.op1_register())?,
-            OpKind::Immediate32to64 => self.builder.ins().iconst(ty, instruction.immediate32to64()),
-            OpKind::Immediate8
-            | OpKind::Immediate16
-            | OpKind::Immediate32
-            | OpKind::Immediate64
-            | OpKind::Immediate8to16
-            | OpKind::Immediate8to32
-            | OpKind::Immediate8to64 => {
-                self.builder.ins().iconst(ty, Self::read_imm64(instruction))
-            }
-            OpKind::Memory => {
-                let ptr = self.get_mem_ptr(instruction, 1)?;
-                self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0)
-            }
-            _ => {
-                return Err(MicroliftError::UnsupportedInstruction {
-                    mnemonic: format!("sbb-src-{:?}", op1),
-                });
-            }
-        };
-
-        match op0 {
-            OpKind::Register => {
-                let reg = instruction.op0_register();
-                let dst_val = self.get_reg_val(reg)?;
-                let result = self.adc_sbb_with_flags(dst_val, src_val, cf_ext, false, size)?;
-                self.set_reg_val(reg, result)?;
-            }
-            OpKind::Memory => {
-                let ptr = self.get_mem_ptr(instruction, 0)?;
-                let dst_val = self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0);
-                let result = self.adc_sbb_with_flags(dst_val, src_val, cf_ext, false, size)?;
-                self.builder
-                    .ins()
-                    .store(MemFlagsData::new(), result, ptr, 0);
-            }
-            _ => {
-                return Err(MicroliftError::UnsupportedInstruction {
-                    mnemonic: "sbb-dst".into(),
-                });
-            }
-        }
-        Ok(())
+        let size = self.operand_size(instruction, 0)?;
+        let cf = self.carry_in(size);
+        let (place, dst, src) = self.read_binary_rmw(instruction, size)?;
+        let result = self.adc_sbb_with_flags(dst, src, cf, false, size)?;
+        self.write_place(place, result)
     }
 
     pub(super) fn handle_xadd(&mut self, instruction: &Instruction) -> crate::Result<()> {
@@ -280,54 +64,10 @@ impl<'a> Lifter<'a> {
     }
 
     pub(super) fn handle_cmp(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let op0 = instruction.op0_kind();
-        let op1 = instruction.op1_kind();
-
-        let size = if op0 == OpKind::Register {
-            instruction.op0_register().size()
-        } else {
-            instruction.memory_size().size()
-        };
-        let ty = size_to_type(size);
-
-        let src_val = match op1 {
-            OpKind::Register => self.get_reg_val(instruction.op1_register())?,
-            OpKind::Immediate32to64 => self.builder.ins().iconst(ty, instruction.immediate32to64()),
-            OpKind::Immediate8
-            | OpKind::Immediate16
-            | OpKind::Immediate32
-            | OpKind::Immediate64
-            | OpKind::Immediate8to16
-            | OpKind::Immediate8to32
-            | OpKind::Immediate8to64 => {
-                self.builder.ins().iconst(ty, Self::read_imm64(instruction))
-            }
-            OpKind::Memory => {
-                let ptr = self.get_mem_ptr(instruction, 1)?;
-                self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0)
-            }
-            _ => {
-                return Err(MicroliftError::UnsupportedInstruction {
-                    mnemonic: format!("cmp-src-{:?}", op1),
-                });
-            }
-        };
-
-        let dst_val = match op0 {
-            OpKind::Register => self.get_reg_val(instruction.op0_register())?,
-            OpKind::Memory => {
-                let ptr = self.get_mem_ptr(instruction, 0)?;
-                self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0)
-            }
-            _ => {
-                return Err(MicroliftError::UnsupportedInstruction {
-                    mnemonic: format!("cmp-dst-{:?}", op0),
-                });
-            }
-        };
-
+        let size = self.operand_size(instruction, 0)?;
+        let (dst, src) = self.read_binary_operands(instruction, size)?;
         // CMP is a SUB that keeps only the flags.
-        self.sub_with_flags(dst_val, src_val, size)?;
+        self.sub_with_flags(dst, src, size)?;
         Ok(())
     }
 

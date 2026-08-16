@@ -6,6 +6,19 @@ use iced_x86::{Instruction, OpKind, Register};
 
 // Type helpers
 
+/// A resolved operand location: a guest register, or the already-computed
+/// effective address of a memory operand.
+///
+/// Exists so a read-modify-write instruction forms its address once. Reading
+/// and writing the same operand through `read_operand`/`write_operand` calls
+/// `get_mem_ptr` twice, which emits the base/index/displacement arithmetic
+/// twice and leaves it to Cranelift's GVN to notice.
+#[derive(Debug, Clone, Copy)]
+pub enum Place {
+    Reg(Register),
+    Mem(Value),
+}
+
 pub fn size_to_type(size: usize) -> Type {
     match size {
         1 => types::I8,
@@ -330,6 +343,94 @@ impl<'a> Lifter<'a> {
             _ => Err(MicroliftError::UnsupportedInstruction {
                 mnemonic: format!("read-op-{}-{:?}", op_index, op_kind),
             }),
+        }
+    }
+
+    /// Read both operands of a binary `r/m, r/m/imm` instruction, at the width
+    /// of the destination.
+    ///
+    /// Returns `(dst, src)` but reads **src first**, which is the order the
+    /// operands' side effects (a memory source's address computation, a load)
+    /// must appear in. `size` comes from operand 0 and is applied to operand 1
+    /// as well, so a sign-extended immediate (`ADD r64, imm32`) materialises as
+    /// a full-width constant rather than at its encoded width.
+    ///
+    /// For a read-modify-*write* instruction use
+    /// [`read_binary_rmw`](Self::read_binary_rmw) instead, which hands back the
+    /// destination as a [`Place`] so the store reuses the load's address.
+    pub fn read_binary_operands(
+        &mut self,
+        instruction: &Instruction,
+        size: usize,
+    ) -> crate::Result<(Value, Value)> {
+        let src = self.read_operand(instruction, 1, size)?;
+        let dst = self.read_operand(instruction, 0, size)?;
+        Ok((dst, src))
+    }
+
+    /// [`read_binary_operands`](Self::read_binary_operands) for an instruction
+    /// that writes its destination back, returning `(place, dst, src)`.
+    ///
+    /// The destination is resolved to a [`Place`] once and read through it, so
+    /// [`write_place`](Self::write_place) stores to the effective address the
+    /// load already computed rather than forming it a second time.
+    pub fn read_binary_rmw(
+        &mut self,
+        instruction: &Instruction,
+        size: usize,
+    ) -> crate::Result<(Place, Value, Value)> {
+        let src = self.read_operand(instruction, 1, size)?;
+        let place = self.resolve_place(instruction, 0)?;
+        let dst = self.read_place(place, size)?;
+        Ok((place, dst, src))
+    }
+
+    /// Resolve an operand to the location it names, computing a memory
+    /// operand's effective address exactly once.
+    pub fn resolve_place(
+        &mut self,
+        instruction: &Instruction,
+        op_index: u32,
+    ) -> crate::Result<Place> {
+        let op_kind = self.operand_kind(instruction, op_index);
+        match op_kind {
+            OpKind::Register => Ok(Place::Reg(self.operand_register(instruction, op_index))),
+            OpKind::Memory => Ok(Place::Mem(self.get_mem_ptr(instruction, op_index)?)),
+            _ => Err(MicroliftError::UnsupportedInstruction {
+                mnemonic: format!("place-{}-{:?}", op_index, op_kind),
+            }),
+        }
+    }
+
+    pub fn read_place(&mut self, place: Place, size: usize) -> crate::Result<Value> {
+        match place {
+            Place::Reg(reg) => self.get_reg_val(reg),
+            Place::Mem(ptr) => {
+                let ty = size_to_type(size);
+                Ok(self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0))
+            }
+        }
+    }
+
+    pub fn write_place(&mut self, place: Place, val: Value) -> crate::Result<()> {
+        match place {
+            Place::Reg(reg) => self.set_reg_val(reg, val),
+            Place::Mem(ptr) => {
+                self.builder.ins().store(MemFlagsData::new(), val, ptr, 0);
+                Ok(())
+            }
+        }
+    }
+
+    /// Read `CF` as the carry/borrow input of an `ADC`/`SBB`, widened to an
+    /// operand of `size` bytes.
+    pub fn carry_in(&mut self, size: usize) -> Value {
+        let ty = size_to_type(size);
+        let cf = self.builder.use_var(self.state.flags[&X86Flag::Carry]);
+        if ty == types::I8 {
+            cf
+        } else {
+            self.builder.ins().uextend(ty, cf)
         }
     }
 
