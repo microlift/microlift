@@ -19,6 +19,7 @@
 //!            Empty   (unreachable)
 //! ```
 
+use crate::arch::ControlFlowKind;
 use crate::cfg::ResolvedTargets;
 use crate::context::MemorySegment;
 use iced_x86::{
@@ -528,50 +529,37 @@ impl ValueSetAnalyzer {
             // Propagate to successors
             let next_ip = instruction.next_ip();
 
-            match instruction.mnemonic() {
-                Mnemonic::Jmp => {
-                    if instruction.op0_kind() != OpKind::Register
-                        && instruction.op0_kind() != OpKind::Memory
-                    {
-                        // Direct jump - propagate to target
-                        let target = instruction.near_branch_target();
+            // Successor edges come from the same classification the lifter's
+            // leader discovery uses. Sharing it is not a tidiness point: a
+            // cond-branch this pass fails to recognise loses a back-edge, and
+            // the fixpoint then under-approximates the value sets - unsound in
+            // the direction that resolves an indirect jump to too few targets.
+            let cf = crate::arch::x86_64::decode::control_flow(instruction);
+            match cf.kind {
+                ControlFlowKind::DirectBranch => {
+                    for &target in &cf.static_targets {
                         self.propagate(target, &post_state, instructions);
                     }
-                    // Indirect: targets resolved by caller via `indirect_jump_targets()`
                 }
-                Mnemonic::Je
-                | Mnemonic::Jne
-                | Mnemonic::Jb
-                | Mnemonic::Jbe
-                | Mnemonic::Ja
-                | Mnemonic::Jae
-                | Mnemonic::Jg
-                | Mnemonic::Jge
-                | Mnemonic::Jl
-                | Mnemonic::Jle
-                | Mnemonic::Js
-                | Mnemonic::Jns
-                | Mnemonic::Jo
-                | Mnemonic::Jno
-                | Mnemonic::Jp
-                | Mnemonic::Jnp
-                | Mnemonic::Loop
-                | Mnemonic::Loope
-                | Mnemonic::Loopne
-                | Mnemonic::Jrcxz => {
-                    // Conditional transfers: both the taken target and the
-                    // fallthrough are reachable. (Must match the cond-branch set
-                    // in `decode::control_flow`, or a back-edge is missed and the
-                    // fixpoint under-approximates the value sets - unsound.)
-                    let target = instruction.near_branch_target();
-                    self.propagate(target, &post_state, instructions);
+                ControlFlowKind::CondBranch => {
+                    // Both the taken target and the fallthrough are reachable.
+                    for &target in &cf.static_targets {
+                        self.propagate(target, &post_state, instructions);
+                    }
                     self.propagate(next_ip, &post_state, instructions);
                 }
-                Mnemonic::Ret | Mnemonic::Retf => {
+                ControlFlowKind::IndirectBranch => {
+                    // Targets resolved by the caller via `indirect_jump_targets()`.
+                }
+                ControlFlowKind::Ret => {
                     // Terminator; no fallthrough.
                 }
-                _ => {
-                    // Fallthrough to next instruction
+                // A `CALL` returns, and an invalid encoding is left to the
+                // lifter to fault on; both keep the fallthrough edge they had
+                // when this pass classified mnemonics itself.
+                ControlFlowKind::Fallthrough
+                | ControlFlowKind::Call { .. }
+                | ControlFlowKind::Invalid => {
                     if idx + 1 < instructions.len() {
                         let next_idx = idx + 1;
                         let next_inst_ip = instructions[next_idx].ip();
