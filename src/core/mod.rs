@@ -75,6 +75,8 @@ pub trait GuestArch: Sized {
     fn exit_code_offset() -> i32;
     /// Byte offset of the `image_base` relocation field.
     fn image_base_offset() -> i32;
+    /// Byte offset of the `imported_function_va` control field.
+    fn imported_function_va_offset() -> i32;
 
     /// Where this guest's context keeps the two block-linking fields, or `None`
     /// if it has none - in which case [`LifterConfig::block_link`] is inert for

@@ -156,10 +156,8 @@ fn test_execute_emitted_host_function() {
     let bytes = [0x48, 0xC7, 0xC0, 0x2A, 0x00, 0x00, 0x00, 0xC3];
     lifter.lift(&bytes, 0x1000).expect("lifting failed");
 
-    let mut ctx = RegisterContext {
-        image_base: 0x1000,
-        ..RegisterContext::default()
-    };
+    let mut ctx = RegisterContext::default();
+    ctx.image_base = 0x1000;
     let mut stack = [0u64; 1024];
     let stack_top = stack.as_mut_ptr() as u64 + (stack.len() * std::mem::size_of::<u64>()) as u64;
     ctx.rsp = stack_top - 8;

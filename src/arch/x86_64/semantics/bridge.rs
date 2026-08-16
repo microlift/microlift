@@ -21,9 +21,11 @@
 //! declares the exit linkable.
 
 use crate::arch::x86_64::Lifter;
-use crate::context::{ExitReason, RegisterContext};
+use crate::context::ExitReason;
 use crate::core::bridge::{BridgeImport, BridgeTarget, RESUME_LINKED, RegMask};
 use cranelift::prelude::*;
+use crate::arch::x86_64::X86_64;
+use crate::core::GuestArch;
 
 impl<'a> Lifter<'a> {
     /// Emit a call to `bridge`, and the two-way branch on its result.
@@ -54,7 +56,7 @@ impl<'a> Lifter<'a> {
         let reads = effects.reads.union(RegMask::gpr(RSP_GPR_INDEX));
 
         let ctx_ptr = self.builder.use_var(self.state.context_ptr);
-        let va_offset = std::mem::offset_of!(RegisterContext, imported_function_va) as i32;
+        let va_offset = <X86_64 as GuestArch>::imported_function_va_offset();
         self.builder
             .ins()
             .store(MemFlagsData::trusted(), callee, ctx_ptr, va_offset);

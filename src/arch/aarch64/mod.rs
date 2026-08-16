@@ -34,7 +34,7 @@ impl GuestArch for Aarch64 {
     type RegState = Aarch64RegState;
 
     fn image_base_offset() -> i32 {
-        std::mem::offset_of!(Aarch64RegisterContext, image_base) as i32
+        std::mem::offset_of!(Aarch64RegisterContext, control.image_base) as i32
     }
 
     fn pc_offset() -> i32 {
@@ -42,11 +42,15 @@ impl GuestArch for Aarch64 {
     }
 
     fn exit_reason_offset() -> i32 {
-        std::mem::offset_of!(Aarch64RegisterContext, exit_reason) as i32
+        std::mem::offset_of!(Aarch64RegisterContext, control.exit_reason) as i32
     }
 
     fn exit_code_offset() -> i32 {
-        std::mem::offset_of!(Aarch64RegisterContext, exit_code) as i32
+        std::mem::offset_of!(Aarch64RegisterContext, control.exit_code) as i32
+    }
+
+    fn imported_function_va_offset() -> i32 {
+        std::mem::offset_of!(Aarch64RegisterContext, control.imported_function_va) as i32
     }
 
     fn context_ptr_var(state: &Self::RegState) -> Variable {

@@ -385,6 +385,19 @@ impl<'a> Lifter<'a> {
         Ok((place, dst, src))
     }
 
+    /// read-modify-write of a unary instruction (`INC`, `NEG`,
+    /// `NOT`, the shifts and rotates): returns `(size, place, value)` for
+    /// operand 0, resolved once so the write-back reuses the load's address.
+    pub fn read_unary_rmw(
+        &mut self,
+        instruction: &Instruction,
+    ) -> crate::Result<(usize, Place, Value)> {
+        let size = self.operand_size(instruction, 0)?;
+        let place = self.resolve_place(instruction, 0)?;
+        let val = self.read_place(place, size)?;
+        Ok((size, place, val))
+    }
+
     /// Resolve an operand to the location it names, computing a memory
     /// operand's effective address exactly once.
     pub fn resolve_place(

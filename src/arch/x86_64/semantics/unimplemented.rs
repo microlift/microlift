@@ -1,4 +1,4 @@
-use crate::context::{ExitReason, RegisterContext};
+use crate::context::ExitReason;
 use crate::lifter::Lifter;
 use cranelift::prelude::*;
 use iced_x86::Instruction;
@@ -16,19 +16,8 @@ impl<'a> Lifter<'a> {
         self.sync_to_context(None, ExitReason::UnimplementedInstruction)?;
         self.resumes_at(instruction.next_ip());
 
-        // Store the instruction code for the host to identify what failed
-        let ctx_ptr = self.builder.use_var(self.state.context_ptr);
-        let exit_code_val = self
-            .builder
-            .ins()
-            .iconst(types::I32, instruction.code() as i64);
-        let exit_code_offset = std::mem::offset_of!(RegisterContext, exit_code) as i32;
-        self.builder.ins().store(
-            MemFlagsData::trusted(),
-            exit_code_val,
-            ctx_ptr,
-            exit_code_offset,
-        );
+        // Store the instruction code for the host to identify what failed.
+        self.write_exit_code(instruction.code() as u32);
 
         self.emit_host_return();
         self.block_terminated = true;

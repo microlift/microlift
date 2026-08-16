@@ -3,7 +3,7 @@ use crate::arch::x86_64::semantics::helpers::size_to_type;
 use crate::context::ExitReason;
 use crate::lifter::Lifter;
 use cranelift::prelude::*;
-use iced_x86::{Instruction, OpKind, Register};
+use iced_x86::{Instruction, Register};
 
 impl<'a> Lifter<'a> {
     pub(super) fn handle_add(&mut self, instruction: &Instruction) -> crate::Result<()> {
@@ -39,28 +39,24 @@ impl<'a> Lifter<'a> {
     }
 
     pub(super) fn handle_xadd(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let size = self.operand_size(instruction, 0)?;
-        let dst_val = self.read_operand(instruction, 0, size)?;
+        let (size, place, dst_val) = self.read_unary_rmw(instruction)?;
         let src_reg = instruction.op1_register();
         let src_val = self.get_reg_val(src_reg)?;
 
-        // Flags first: they are a function of the two values just read, and the
+        // Flags first since they are a function of the two values just read, and the
         // operand writes below are ordered against each other, not against them.
         let result = self.add_with_flags(dst_val, src_val, size)?;
         // Hardware order: TEMP <- SRC + DEST; SRC <- DEST; DEST <- TEMP. The
         // destination write must come last so `xadd r, r` (same register both
-        // ways) ends up holding the sum, not the old value. For a memory
-        // destination the store goes first instead: its effective address must
-        // be computed from the pre-instruction value of the source register
-        // (which may be a base/index of the address).
-        if instruction.op0_kind() == OpKind::Register {
-            self.set_reg_val(src_reg, dst_val)?;
-            self.write_operand(instruction, 0, result)?;
-        } else {
-            self.write_operand(instruction, 0, result)?;
-            self.set_reg_val(src_reg, dst_val)?;
-        }
-        Ok(())
+        // ways) ends up holding the sum, not the old value.
+        //
+        // A memory destination used to need the opposite order, because
+        // `write_operand` re-derived the effective address and so would have
+        // seen the source register after this instruction overwrote it. The
+        // address is now frozen in `place` before either write, so one order
+        // serves both operand kinds.
+        self.set_reg_val(src_reg, dst_val)?;
+        self.write_place(place, result)
     }
 
     pub(super) fn handle_cmp(&mut self, instruction: &Instruction) -> crate::Result<()> {
@@ -72,35 +68,29 @@ impl<'a> Lifter<'a> {
     }
 
     pub(super) fn handle_inc(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let size = self.operand_size(instruction, 0)?;
+        let (size, place, dst_val) = self.read_unary_rmw(instruction)?;
         let ty = size_to_type(size);
-        let dst_val = self.read_operand(instruction, 0, size)?;
         let one = self.builder.ins().iconst(ty, 1);
         let result = self.inc_dec_with_flags(dst_val, one, true, size)?;
-        self.write_operand(instruction, 0, result)?;
-        Ok(())
+        self.write_place(place, result)
     }
 
     pub(super) fn handle_dec(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let size = self.operand_size(instruction, 0)?;
+        let (size, place, dst_val) = self.read_unary_rmw(instruction)?;
         let ty = size_to_type(size);
-        let dst_val = self.read_operand(instruction, 0, size)?;
         let one = self.builder.ins().iconst(ty, 1);
         let result = self.inc_dec_with_flags(dst_val, one, false, size)?;
-        self.write_operand(instruction, 0, result)?;
-        Ok(())
+        self.write_place(place, result)
     }
 
     pub(super) fn handle_neg(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let size = self.operand_size(instruction, 0)?;
+        let (size, place, val) = self.read_unary_rmw(instruction)?;
         let ty = size_to_type(size);
-        let val = self.read_operand(instruction, 0, size)?;
         let zero = self.builder.ins().iconst(ty, 0);
         // NEG is `0 - val`, flags included: CF is the borrow (set unless the
         // operand was zero) and OF the signed overflow (only at INT_MIN).
         let result = self.sub_with_flags(zero, val, size)?;
-        self.write_operand(instruction, 0, result)?;
-        Ok(())
+        self.write_place(place, result)
     }
 
     /// IMUL - handles 1, 2, and 3-operand forms.

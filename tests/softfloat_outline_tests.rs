@@ -398,9 +398,9 @@ fn imports_and_helpers_share_one_index_space() {
     unsafe { *(rsp as *mut u64) = 0xFFFF_FFFF_FFFF_FFFF };
     let mut ctx = RegisterContext {
         rsp,
-        image_base: LIFT_BASE,
         ..RegisterContext::default()
     };
+    ctx.image_base = LIFT_BASE;
 
     let f: unsafe extern "C" fn(*mut RegisterContext) = unsafe { std::mem::transmute(code_ptr) };
     unsafe { f(&mut ctx) };

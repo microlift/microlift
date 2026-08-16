@@ -49,14 +49,12 @@ impl<'a> Lifter<'a> {
     }
 
     pub(super) fn handle_not(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let size = self.operand_size(instruction, 0)?;
+        let (size, place, dst_val) = self.read_unary_rmw(instruction)?;
         let ty = size_to_type(size);
-        let dst_val = self.read_operand(instruction, 0, size)?;
         let all_ones = self.builder.ins().iconst(ty, -1);
         let result = self.builder.ins().bxor(dst_val, all_ones);
-        self.write_operand(instruction, 0, result)?;
         // NOT does not affect flags
-        Ok(())
+        self.write_place(place, result)
     }
 
     pub(super) fn handle_test(&mut self, instruction: &Instruction) -> crate::Result<()> {
@@ -128,10 +126,9 @@ impl<'a> Lifter<'a> {
     /// mask already guarantees `count < width`, so the working type equals the
     /// operand type and this is a no-op widening.)
     fn emit_shift(&mut self, instruction: &Instruction, kind: ShiftKind) -> crate::Result<()> {
-        let size = self.operand_size(instruction, 0)?;
+        let (size, place, val) = self.read_unary_rmw(instruction)?;
         let ty = size_to_type(size);
         let bit_width = (size * 8) as i64;
-        let val = self.read_operand(instruction, 0, size)?;
         let count = self.shift_count(instruction, ty)?;
 
         // Working type: widen sub-32-bit operands so the masked count fits.
@@ -192,22 +189,21 @@ impl<'a> Lifter<'a> {
         } else {
             shifted_w
         };
-        self.write_operand(instruction, 0, result)?;
+        self.write_place(place, result)?;
         self.update_flags_shift(val, result, cf_bit, count_w, size)?;
         Ok(())
     }
 
     pub(super) fn handle_rol(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let size = self.operand_size(instruction, 0)?;
+        let (size, place, val) = self.read_unary_rmw(instruction)?;
         let ty = size_to_type(size);
-        let val = self.read_operand(instruction, 0, size)?;
         let count = self.shift_count(instruction, ty)?;
         let bits = self.builder.ins().iconst(ty, (size * 8) as i64);
         let right_count = self.builder.ins().isub(bits, count);
         let left = self.builder.ins().ishl(val, count);
         let right = self.builder.ins().ushr(val, right_count);
         let result = self.builder.ins().bor(left, right);
-        self.write_operand(instruction, 0, result)?;
+        self.write_place(place, result)?;
         // CF = low bit of result (the bit that rotated out of MSB).
         let one = self.builder.ins().iconst(ty, 1);
         let cf_bit = self.builder.ins().band(result, one);
@@ -220,16 +216,15 @@ impl<'a> Lifter<'a> {
     }
 
     pub(super) fn handle_ror(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        let size = self.operand_size(instruction, 0)?;
+        let (size, place, val) = self.read_unary_rmw(instruction)?;
         let ty = size_to_type(size);
-        let val = self.read_operand(instruction, 0, size)?;
         let count = self.shift_count(instruction, ty)?;
         let bits = self.builder.ins().iconst(ty, (size * 8) as i64);
         let left_count = self.builder.ins().isub(bits, count);
         let right = self.builder.ins().ushr(val, count);
         let left = self.builder.ins().ishl(val, left_count);
         let result = self.builder.ins().bor(right, left);
-        self.write_operand(instruction, 0, result)?;
+        self.write_place(place, result)?;
         // CF = MSB of result (the bit that rotated out of bit 0).
         let cf_bit = self.builder.ins().ushr_imm_u(result, (size * 8 - 1) as i64);
         self.set_rotate_cf(cf_bit, count)?;
@@ -323,7 +318,8 @@ impl<'a> Lifter<'a> {
             }
         };
 
-        let val = self.read_operand(instruction, 0, size)?;
+        let place = self.resolve_place(instruction, 0)?;
+        let val = self.read_place(place, size)?;
         let cf = self.builder.use_var(self.state.flags[&X86Flag::Carry]);
         // Masked count (5/6 bits) in the operand type.
         let count = self.shift_count(instruction, ty)?;
@@ -358,7 +354,7 @@ impl<'a> Lifter<'a> {
 
         // dst' = low N bits of the rotated value.
         let result = self.builder.ins().ireduce(ty, rotated);
-        self.write_operand(instruction, 0, result)?;
+        self.write_place(place, result)?;
 
         // CF' = bit N of the rotated value. This is also correct for c == 0
         // (a masked count of 0), where bit N still holds the original CF.
@@ -396,7 +392,8 @@ impl<'a> Lifter<'a> {
             }
         };
 
-        let val = self.read_operand(instruction, 0, size)?;
+        let place = self.resolve_place(instruction, 0)?;
+        let val = self.read_place(place, size)?;
         let cf = self.builder.use_var(self.state.flags[&X86Flag::Carry]);
         // Masked count (5/6 bits) in the operand type.
         let count = self.shift_count(instruction, ty)?;
@@ -428,7 +425,7 @@ impl<'a> Lifter<'a> {
 
         // dst' = low N bits of the rotated value.
         let result = self.builder.ins().ireduce(ty, rotated);
-        self.write_operand(instruction, 0, result)?;
+        self.write_place(place, result)?;
 
         // CF' = bit N of the rotated value. This is also correct for c == 0
         // (a masked count of 0), where bit N still holds the original CF.
@@ -488,7 +485,8 @@ impl<'a> Lifter<'a> {
         let ty = size_to_type(size);
         let bits = self.builder.ins().iconst(ty, (size * 8) as i64);
 
-        let dst = self.read_operand(instruction, 0, size)?;
+        let place = self.resolve_place(instruction, 0)?;
+        let dst = self.read_place(place, size)?;
         let src = self.get_reg_val(instruction.op1_register())?;
         // get_reg_val returns the natural width of the register, which matches
         // the destination size for well-formed SHLD.
@@ -506,7 +504,7 @@ impl<'a> Lifter<'a> {
         let is_zero = self.builder.ins().icmp_imm_s(IntCC::Equal, count, 0);
         let result = self.builder.ins().select(is_zero, dst, combined);
 
-        self.write_operand(instruction, 0, result)?;
+        self.write_place(place, result)?;
 
         // CF = (dst >> (N - count)) & 1  (last bit shifted out of dst's MSB)
         let cf_raw = self.builder.ins().ushr(dst, right_count);
@@ -526,7 +524,8 @@ impl<'a> Lifter<'a> {
         let ty = size_to_type(size);
         let bits = self.builder.ins().iconst(ty, (size * 8) as i64);
 
-        let dst = self.read_operand(instruction, 0, size)?;
+        let place = self.resolve_place(instruction, 0)?;
+        let dst = self.read_place(place, size)?;
         let src = self.get_reg_val(instruction.op1_register())?;
         let count = self.double_shift_count(instruction, ty)?;
 
@@ -540,7 +539,7 @@ impl<'a> Lifter<'a> {
         let is_zero = self.builder.ins().icmp_imm_s(IntCC::Equal, count, 0);
         let result = self.builder.ins().select(is_zero, dst, combined);
 
-        self.write_operand(instruction, 0, result)?;
+        self.write_place(place, result)?;
 
         // CF = (dst >> (count - 1)) & 1  (last bit shifted out of dst's LSB)
         let one = self.builder.ins().iconst(ty, 1);

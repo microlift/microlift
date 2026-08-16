@@ -1934,3 +1934,94 @@ fn pcmpestr_agrees_with_unicorn() {
     }
 }
 */
+
+/// `XADD` when its two operands alias.
+///
+/// `XADD` writes both operands, so their order matters, and the destination is
+/// resolved to a `Place` (its effective address frozen) before either write.
+/// The register cases pin the write order against hardware; the memory case is
+/// the one where a naive lowering re-derives the address *after* the source
+/// register has been overwritten with the old memory value.
+#[test]
+fn xadd_operand_aliasing_agrees() {
+    // xadd rax, rax - one register named twice.
+    let mut init = CpuState::zeroed();
+    init.gpr[gpr::RAX] = 9;
+    agree(&[0x48, 0x0F, 0xC1, 0xC0, 0xC3], &init);
+
+    // xadd rbx, rax - distinct registers, for contrast.
+    let mut init = CpuState::zeroed();
+    init.gpr[gpr::RAX] = 5;
+    init.gpr[gpr::RBX] = 7;
+    agree(&[0x48, 0x0F, 0xC1, 0xC3, 0xC3], &init);
+
+    // xadd r8, r8 - same, through the REX.B encoding. (`gpr` names only the
+    // low eight; r8..r15 continue the array at index 8.)
+    let mut init = CpuState::zeroed();
+    init.gpr[8] = 0xFFFF_FFFF_FFFF_FFFF;
+    agree(&[0x4D, 0x0F, 0xC1, 0xC0, 0xC3], &init);
+}
+
+/// The memory-destination half of [`xadd_operand_aliasing_agrees`], including
+/// the case where the source register is also the address base.
+///
+/// This cannot go through `differential_unicorn`: that runs the two engines
+/// back to back over the *same* identity-mapped arena, so a program that
+/// writes memory leaves the second engine reading the first one's output. An
+/// `XADD` with a memory destination does exactly that, so the arena is
+/// re-seeded between the runs here.
+#[cfg(unix)]
+#[test]
+fn xadd_memory_aliasing_agrees() {
+    const ARENA_VA: u64 = 0x3_4000_0000;
+    const ARENA_LEN: usize = 0x1000;
+
+    let Some(mut arena) = IdentityArena::map(ARENA_VA, ARENA_LEN) else {
+        eprintln!("identity arena unavailable at {ARENA_VA:#x}; skipping");
+        return;
+    };
+
+    // (label, code, seed offset, seed value, initial registers)
+    let cases: &[(&str, &[u8], usize, u64, fn(&mut CpuState))] = &[
+        // xadd [rax], rcx - no aliasing; the control case.
+        ("plain", &[0x48, 0x0F, 0xC1, 0x08, 0xC3], 0, 55, |s| {
+            s.gpr[gpr::RAX] = ARENA_VA;
+            s.gpr[gpr::RCX] = 2;
+        }),
+        // xadd [rbx], rbx - the source register is the address base.
+        ("base-is-src", &[0x48, 0x0F, 0xC1, 0x1B, 0xC3], 0, 100, |s| {
+            s.gpr[gpr::RBX] = ARENA_VA;
+        }),
+        // xadd [rax+rcx*8], rcx - the source register is the address index.
+        ("index-is-src", &[0x48, 0x0F, 0xC1, 0x0C, 0xC8, 0xC3], 16, 55, |s| {
+            s.gpr[gpr::RAX] = ARENA_VA;
+            s.gpr[gpr::RCX] = 2;
+        }),
+    ];
+
+    for (label, code, off, seed, setup) in cases {
+        let mut init = CpuState::zeroed();
+        setup(&mut init);
+
+        arena.write_at(*off, &seed.to_le_bytes());
+        let mut ml = MicroliftOracle::default();
+        let out_ml = ml.run(code, CODE_VA, &init, &[], BUDGET);
+        assert!(out_ml.is_halted(), "{label}: microlift should halt");
+        let ml_state = *out_ml.state();
+        let ml_mem = u64::from_le_bytes(
+            arena.as_mut_slice()[*off..*off + 8].try_into().unwrap(),
+        );
+
+        arena.write_at(*off, &seed.to_le_bytes());
+        let mut uc = UnicornOracle::new();
+        let out_uc = uc.run(code, CODE_VA, &init, &[], BUDGET);
+        assert!(out_uc.is_halted(), "{label}: unicorn should halt");
+        let uc_mem = u64::from_le_bytes(
+            arena.as_mut_slice()[*off..*off + 8].try_into().unwrap(),
+        );
+
+        let diff = diff_states(&ml_state, out_uc.state(), DiffOptions::default());
+        assert!(diff.is_empty(), "{label}: engines diverged: {diff:?}");
+        assert_eq!(ml_mem, uc_mem, "{label}: engines wrote different memory");
+    }
+}

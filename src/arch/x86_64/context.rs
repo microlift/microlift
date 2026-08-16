@@ -1,10 +1,12 @@
 //! x86-64 guest register context (the FFI struct passed to lifted code).
 //!
 //! Kept as a flat `#[repr(C)]` struct so existing host/test code that reads
-//! fields by name (`ctx.rax`, `ctx.rip`, `ctx.exit_reason`, ) is unaffected.
-//! The architecture-neutral control fields (`exit_reason`, `exit_code`,
-//! `imported_function_va`, `image_base`) mirror [`crate::core::exit::ControlHeader`]
-//! conceptually but stay inline to preserve the established layout.
+//! fields by name (`ctx.rax`, `ctx.rip`, ) is unaffected. The
+//! architecture-neutral control fields are **not** inline: they are the
+//! embedded [`ControlHeader`], which is the one definition every guest shares.
+//! `Deref`/`DerefMut` forward to it, so `ctx.exit_reason` and
+//! `ctx.image_base = base` keep working as if the fields were still declared
+//! here.
 
 /// The value `MXCSR` holds after a processor reset / `FXRSTOR` of a fresh
 /// state: all six exception flags clear, all six exception masks set, round to
@@ -32,6 +34,8 @@ pub const CS_USER64_LINUX: u16 = 0x33;
 /// `SS` in 64-bit user mode on Linux (`__USER_DS`, RPL 3).
 pub const SS_USER64_LINUX: u16 = 0x2B;
 
+use crate::core::exit::ControlHeader;
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct RegisterContext {
@@ -52,7 +56,6 @@ pub struct RegisterContext {
     pub r14: u64,
     pub r15: u64,
     pub rip: u64,
-    pub image_base: u64,
     /// A syscall handler intended for the RuntimeAssisted execution mode.
     pub syscall_handler: Option<unsafe extern "C" fn(ctx: *mut RegisterContext)>,
     /// The host's block-link table for the thread running this context, or null
@@ -71,37 +74,9 @@ pub struct RegisterContext {
     /// Direction flag (DF, RFLAGS bit 10). Controls whether string operations
     /// advance their pointers upward (`DF=0`) or downward (`DF=1`).
     pub df: u8,
-    pub exit_reason: u32,
-    pub exit_code: u32,
-    /// On `ImportedFunctionCall` exits, the virtual address of the imported
-    /// function that was called. `rip` points to the instruction *after* the
-    /// `CALL` - the resume point once the host has handled the call.
-    pub imported_function_va: u64,
-    /// Padding, so that [`xmm`](Self::xmm) begins at a **16-byte-aligned
-    /// offset**. Not a placeholder and not spare space: it is worth twenty-two
-    /// host instructions on every region entry.
-    ///
-    /// aarch64's `ldr q`/`str q` reach a 12-bit immediate *scaled by sixteen*,
-    /// so a vector slot at an offset that is not a multiple of sixteen cannot
-    /// use it. Without this field `xmm` sat at `0xb8`, and the emitted prologue
-    /// fell back twice over: `ldur` (unscaled, ±255) for the first five
-    /// registers, and then, past `0xff`, an address materialised into a scratch
-    /// register for each of the remaining eleven -
-    ///
-    /// ```text
-    ///   ldur q19, [x0, #0xf8]
-    ///   mov  x1, #0x108
-    ///   ldr  q18, [x0, x1]      ; and ten more like it, on entry and on
-    ///                           ; every exit path
-    /// ```
-    ///
-    /// - against `ldr q18, [x0, #0x110]` once the offset is aligned. A Hat in
-    /// Time enters a region fifteen million times a second, which made this
-    /// eight bytes of padding worth roughly three hundred million instructions
-    /// a second. See rosetta3's `docs/HOTSPOTS.md`.
-    ///
-    /// Public because the struct is `#[repr(C)]` and a host constructing one
-    /// field by field has to name it; [`RegisterContext::new`] zeroes it.
+    pub control: ControlHeader,
+    /// Padding, so that [`xmm`](Self::xmm) begins at a 16-byte-aligned
+    /// offset.
     pub _align_xmm: u64,
     /// XMM0–XMM15, each stored as [lo_64, hi_64].
     pub xmm: [[u64; 2]; 16],
@@ -236,7 +211,6 @@ impl Default for RegisterContext {
             r14: 0,
             r15: 0,
             rip: 0,
-            image_base: 0,
             syscall_handler: None,
             link_table: std::ptr::null_mut(),
             cf: 0,
@@ -246,9 +220,7 @@ impl Default for RegisterContext {
             sf: 0,
             of: 0,
             df: 0,
-            exit_reason: 0,
-            exit_code: 0,
-            imported_function_va: 0,
+            control: ControlHeader::ZERO,
             _align_xmm: 0,
             xmm: [[0; 2]; 16],
             fs_base: 0,
@@ -273,6 +245,23 @@ impl Default for RegisterContext {
 impl RegisterContext {
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+/// The control fields read as if they were still declared inline, which is what
+/// keeps `ctx.exit_reason` / `ctx.image_base` working at every host and test
+/// call site after they moved into [`ControlHeader`].
+impl std::ops::Deref for RegisterContext {
+    type Target = ControlHeader;
+
+    fn deref(&self) -> &ControlHeader {
+        &self.control
+    }
+}
+
+impl std::ops::DerefMut for RegisterContext {
+    fn deref_mut(&mut self) -> &mut ControlHeader {
+        &mut self.control
     }
 }
 

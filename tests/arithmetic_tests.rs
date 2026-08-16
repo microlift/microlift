@@ -945,3 +945,77 @@ fn test_idiv_8bit_uses_ax_as_dividend() {
         "AH (remainder) should be -2"
     );
 }
+
+// XADD operand aliasing
+//
+// XADD writes both of its operands, so the two writes have to be ordered
+// against each other. `handle_xadd` resolves the destination to a `Place`
+// before either write, which freezes a memory operand's effective address;
+// these are the cases that ordering exists for.
+
+#[test]
+fn test_xadd_distinct_registers() {
+    // xadd rbx, rax  ->  rbx = rbx + rax, rax = old rbx
+    #[rustfmt::skip]
+    let bytes = [
+        0x48, 0xC7, 0xC0, 0x05, 0x00, 0x00, 0x00, // mov rax, 5
+        0x48, 0xC7, 0xC3, 0x07, 0x00, 0x00, 0x00, // mov rbx, 7
+        0x48, 0x0F, 0xC1, 0xC3,                   // xadd rbx, rax
+        0xC3,
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rbx, 12, "dst holds the sum");
+    assert_eq!(ctx.rax, 7, "src holds the old dst");
+}
+
+#[test]
+fn test_xadd_same_register() {
+    // xadd rax, rax. Hardware order is TEMP <- SRC + DEST; SRC <- DEST;
+    // DEST <- TEMP, so with one register named twice the sum wins.
+    #[rustfmt::skip]
+    let bytes = [
+        0x48, 0xC7, 0xC0, 0x09, 0x00, 0x00, 0x00, // mov rax, 9
+        0x48, 0x0F, 0xC1, 0xC0,                   // xadd rax, rax
+        0xC3,
+    ];
+    let ctx = run_test(&bytes, RegisterContext::default());
+    assert_eq!(ctx.rax, 18, "the destination write lands last");
+}
+
+#[test]
+fn test_xadd_memory_base_is_source() {
+    // xadd [rbx], rbx - the source register is also the address base, so the
+    // store must go to the address computed *before* the source was
+    // overwritten with the old memory value.
+    let mut cell: u64 = 100;
+    let addr = &mut cell as *mut u64 as u64;
+
+    let mut ctx = RegisterContext::default();
+    ctx.rbx = addr;
+
+    // 48 0F C1 1B: XADD [RBX], RBX
+    let bytes = [0x48, 0x0F, 0xC1, 0x1B, 0xC3];
+    let ctx = run_test(&bytes, ctx);
+
+    assert_eq!(cell, addr.wrapping_add(100), "[rbx] = old mem + old rbx");
+    assert_eq!(ctx.rbx, 100, "rbx holds the old memory value");
+}
+
+#[test]
+fn test_xadd_memory_index_is_source() {
+    // xadd [rax+rcx*8], rcx - the source is the *index* this time.
+    let mut cells: [u64; 4] = [0, 0, 55, 0];
+    let base = cells.as_mut_ptr() as u64;
+
+    let mut ctx = RegisterContext::default();
+    ctx.rax = base;
+    ctx.rcx = 2;
+
+    // 48 0F C1 0C C8: XADD [RAX+RCX*8], RCX
+    let bytes = [0x48, 0x0F, 0xC1, 0x0C, 0xC8, 0xC3];
+    let ctx = run_test(&bytes, ctx);
+
+    assert_eq!(cells[2], 57, "slot 2 = old mem + old rcx");
+    assert_eq!(ctx.rcx, 55, "rcx holds the old memory value");
+    assert_eq!(cells[0], 0, "no other slot is touched");
+}

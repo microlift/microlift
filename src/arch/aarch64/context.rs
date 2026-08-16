@@ -1,9 +1,11 @@
 //! aarch64 guest register context (the FFI struct passed to lifted code).
 //!
-//! Flat `#[repr(C)]` struct, mirroring the x86-64 design. The
-//! architecture-neutral control fields (`exit_reason`, `exit_code`,
-//! `imported_function_va`, `image_base`) correspond conceptually to
-//! [`crate::core::exit::ControlHeader`] but stay inline.
+//! Flat `#[repr(C)]` struct, mirroring the x86-64 design - including the
+//! embedded [`ControlHeader`], which is where the architecture-neutral control
+//! fields live for every guest. `Deref`/`DerefMut` forward to it, so
+//! `ctx.exit_reason` resolves as if the field were declared here.
+
+use crate::core::exit::ControlHeader;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -15,8 +17,6 @@ pub struct Aarch64RegisterContext {
     pub sp: u64,
     /// Program counter.
     pub pc: u64,
-    /// Runtime image base for ASLR-resilient PC reconciliation.
-    pub image_base: u64,
     /// A syscall handler intended for the RuntimeAssisted execution mode.
     pub syscall_handler: Option<unsafe extern "C" fn(ctx: *mut Aarch64RegisterContext)>,
     /// Resume function pointer for AOT block dispatch (placeholder, unused).
@@ -31,10 +31,9 @@ pub struct Aarch64RegisterContext {
     pub c: u8,
     /// Overflow flag.
     pub vf: u8,
-    pub exit_reason: u32,
-    pub exit_code: u32,
-    /// On `ImportedFunctionCall`/`IndirectCall` exits, the resolved callee VA.
-    pub imported_function_va: u64,
+    /// The architecture-neutral control fields, shared verbatim with the
+    /// x86-64 context. Reachable unqualified through this struct's `Deref`.
+    pub control: ControlHeader,
     /// SIMD/FP registers V0–V31, each stored as [lo_64, hi_64].
     pub v: [[u64; 2]; 32],
     /// Thread-pointer base (`TPIDR_EL0`), used for thread-local storage.
@@ -47,16 +46,13 @@ impl Default for Aarch64RegisterContext {
             x: [0; 31],
             sp: 0,
             pc: 0,
-            image_base: 0,
             syscall_handler: None,
             resume_function: None,
             n: 0,
             z: 0,
             c: 0,
             vf: 0,
-            exit_reason: 0,
-            exit_code: 0,
-            imported_function_va: 0,
+            control: ControlHeader::ZERO,
             v: [[0; 2]; 32],
             tpidr_el0: 0,
         }
@@ -66,5 +62,19 @@ impl Default for Aarch64RegisterContext {
 impl Aarch64RegisterContext {
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+impl std::ops::Deref for Aarch64RegisterContext {
+    type Target = ControlHeader;
+
+    fn deref(&self) -> &ControlHeader {
+        &self.control
+    }
+}
+
+impl std::ops::DerefMut for Aarch64RegisterContext {
+    fn deref_mut(&mut self) -> &mut ControlHeader {
+        &mut self.control
     }
 }

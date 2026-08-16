@@ -14,12 +14,13 @@
 
 use crate::MicroliftError;
 use crate::arch::aarch64::Lifter64;
-use crate::arch::aarch64::context::Aarch64RegisterContext;
 use crate::arch::aarch64::decode::A64Instr;
 use crate::arch::aarch64::regs::{Nzcv, ZR};
 use crate::core::exit::{ExitReason, TransferKind};
 use cranelift::prelude::*;
 use yaxpeax_arm::armv8::a64::{Opcode, Operand, ShiftStyle, SizeCode};
+use crate::arch::aarch64::Aarch64;
+use crate::core::GuestArch;
 
 /// Decode a register operand into `(reg_number, size, sp_form)`.
 /// `sp_form` is `true` when register 31 denotes SP rather than the zero register.
@@ -806,7 +807,7 @@ impl<'a> Lifter64<'a> {
         self.get_block(self.current_ip);
 
         let ctx_ptr = self.builder.use_var(self.state.context_ptr);
-        let va_offset = std::mem::offset_of!(Aarch64RegisterContext, imported_function_va) as i32;
+        let va_offset = <Aarch64 as GuestArch>::imported_function_va_offset();
         self.builder
             .ins()
             .store(MemFlagsData::trusted(), target, ctx_ptr, va_offset);

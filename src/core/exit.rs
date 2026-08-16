@@ -1,22 +1,25 @@
 //! Shared exit/control state exchanged between lifted guest code and the host.
 //!
-//! [`ControlHeader`] is the canonical description of the control fields every
-//! guest exposes (`exit_reason`, `exit_code`, `imported_function_va`,
-//! `image_base`). A guest's `RegisterContext` may either embed this struct or,
-//! as the x86-64 context does, carry the same fields inline. Either way the
-//! generic engine reaches them only through the arch's offset accessors
-//! ([`GuestArch::exit_reason_offset`] etc.), so the host's exit/dispatch loop
-//! reads why a region exited without knowing which guest ISA produced it. The
-//! per-arch register banks (and the architectural PC) live alongside these
-//! fields in the arch-specific context struct.
+//! [`ControlHeader`] is the definition of the control fields every guest
+//! exposes (`exit_reason`, `exit_code`, `imported_function_va`, `image_base`),
+//! and every guest's `RegisterContext` embeds it as its `control` field -
+//! one struct, not two declarations that have to be kept in agreement. Each
+//! context also derefs to it, so a host that wrote `ctx.exit_reason` before the
+//! header existed still does.
+//!
+//! The generic engine reaches the fields only through the arch's offset
+//! accessors ([`GuestArch::exit_reason_offset`] etc.), so the host's
+//! exit/dispatch loop reads why a region exited without knowing which guest ISA
+//! produced it. The per-arch register banks (and the architectural PC) live
+//! alongside the header in the arch-specific context struct.
 //!
 //! [`GuestArch::exit_reason_offset`]: crate::core::GuestArch::exit_reason_offset
 
 /// Architecture-neutral control fields shared by every guest's register
-/// context. A guest may embed this `#[repr(C)]` struct directly or mirror its
-/// fields inline (the x86-64 context does the latter); the engine always
-/// accesses them through the arch's offset accessors, so the host reads exit
-/// state uniformly across guests regardless of which layout a guest chose.
+/// context, embedded `#[repr(C)]` in each of them. The engine accesses them
+/// through the arch's offset accessors, so the host reads exit state uniformly
+/// across guests; `core::exit::tests::both_guests_locate_the_same_header` is
+/// what holds those accessors to this struct.
 #[repr(C)]
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ControlHeader {
@@ -30,6 +33,20 @@ pub struct ControlHeader {
     /// Runtime image base, used to reconcile PC against the lift-time base under
     /// ASLR (`pc = image_base + (current_ip - lift_base)`).
     pub image_base: u64,
+}
+
+impl ControlHeader {
+    /// An all-zero header: no exit reason, no callee, no image base.
+    ///
+    /// Spelled as a `const` rather than reached through [`Default`] so a guest
+    /// context's own `Default` stays a plain struct literal usable in `const`
+    /// context.
+    pub const ZERO: Self = Self {
+        exit_reason: 0,
+        exit_code: 0,
+        imported_function_va: 0,
+        image_base: 0,
+    };
 }
 
 #[repr(u32)]
@@ -375,5 +392,58 @@ mod tests {
             TransferKind::try_from(TransferKind::IndirectJump as u32),
             Ok(TransferKind::IndirectJump)
         );
+    }
+
+    use crate::arch::aarch64::Aarch64;
+    use crate::arch::aarch64::context::Aarch64RegisterContext;
+    use crate::arch::x86_64::X86_64;
+    use crate::arch::x86_64::context::RegisterContext;
+    use crate::core::GuestArch;
+    use std::mem::offset_of;
+
+    /// Every guest's control fields are the *same* struct, not two structs that
+    /// happen to agree - so each arch's `GuestArch` offsets must be its own
+    /// header's base plus the header's own field offsets.
+    ///
+    /// This is what the abstraction is for: before the header was embedded,
+    /// both contexts declared the four fields inline and nothing checked that
+    /// they stayed in step.
+    #[test]
+    fn both_guests_locate_the_same_header() {
+        macro_rules! check {
+            ($ctx:ty, $arch:ty) => {{
+                let base = offset_of!($ctx, control) as i32;
+                assert_eq!(
+                    <$arch as GuestArch>::exit_reason_offset(),
+                    base + offset_of!(ControlHeader, exit_reason) as i32,
+                );
+                assert_eq!(
+                    <$arch as GuestArch>::exit_code_offset(),
+                    base + offset_of!(ControlHeader, exit_code) as i32,
+                );
+                assert_eq!(
+                    <$arch as GuestArch>::imported_function_va_offset(),
+                    base + offset_of!(ControlHeader, imported_function_va) as i32,
+                );
+                assert_eq!(
+                    <$arch as GuestArch>::image_base_offset(),
+                    base + offset_of!(ControlHeader, image_base) as i32,
+                );
+            }};
+        }
+        check!(RegisterContext, X86_64);
+        check!(Aarch64RegisterContext, Aarch64);
+    }
+
+    /// The header is `#[repr(C)]` and read by hosts that are not written in
+    /// Rust, so its own shape is part of the published ABI.
+    #[test]
+    fn the_header_layout_is_the_published_one() {
+        assert_eq!(offset_of!(ControlHeader, exit_reason), 0);
+        assert_eq!(offset_of!(ControlHeader, exit_code), 4);
+        assert_eq!(offset_of!(ControlHeader, imported_function_va), 8);
+        assert_eq!(offset_of!(ControlHeader, image_base), 16);
+        assert_eq!(size_of::<ControlHeader>(), 24);
+        assert_eq!(align_of::<ControlHeader>(), 8);
     }
 }
