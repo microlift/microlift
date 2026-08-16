@@ -160,6 +160,44 @@ fn packed_fp_ops_agree_across_xmm_representations() {
     }
 }
 
+/// The scalar single/double arithmetic forms, whose vector fast path keeps
+/// lane 0 in the vector register file instead of routing it through a GPR.
+///
+/// The merge is the whole risk here: these instructions write bits[31:0] (or
+/// [63:0]) and *preserve* everything above, so the fast path's `insertlane`
+/// has to leave lanes 1.. exactly as the portable mask-and-OR expansion does.
+/// Seeded random XMM state is what catches a lane getting clobbered.
+#[test]
+fn scalar_fp_ops_agree_across_xmm_representations() {
+    let cases: &[(&str, &[u8])] = &[
+        ("addss", &[0xF3, 0x0F, 0x58, 0xC1]),
+        ("subss", &[0xF3, 0x0F, 0x5C, 0xC1]),
+        ("mulss", &[0xF3, 0x0F, 0x59, 0xC1]),
+        ("divss", &[0xF3, 0x0F, 0x5E, 0xC1]),
+        ("addsd", &[0xF2, 0x0F, 0x58, 0xC1]),
+        ("subsd", &[0xF2, 0x0F, 0x5C, 0xC1]),
+        ("mulsd", &[0xF2, 0x0F, 0x59, 0xC1]),
+        ("divsd", &[0xF2, 0x0F, 0x5E, 0xC1]),
+    ];
+    for (name, bytes) in cases {
+        assert_modes_agree(name, &snippet(bytes, None));
+    }
+
+    // The memory-source forms take a separate path in the fast lane read (a
+    // float-typed load rather than an `extractlane`), so they need their own
+    // cases. `[rsp]` is the harness's stack, which holds the exit trampoline
+    // address - an arbitrary but identical bit pattern under both modes.
+    let mem_cases: &[(&str, &[u8])] = &[
+        ("mulss-m32", &[0xF3, 0x0F, 0x59, 0x04, 0x24]),
+        ("addss-m32", &[0xF3, 0x0F, 0x58, 0x04, 0x24]),
+        ("divsd-m64", &[0xF2, 0x0F, 0x5E, 0x04, 0x24]),
+        ("subsd-m64", &[0xF2, 0x0F, 0x5C, 0x04, 0x24]),
+    ];
+    for (name, bytes) in mem_cases {
+        assert_modes_agree(name, &snippet(bytes, None));
+    }
+}
+
 #[test]
 fn movmsk_and_conversions_agree_across_xmm_representations() {
     let cases: &[(&str, &[u8])] = &[
@@ -295,6 +333,10 @@ fn vector_fast_paths_lower_on_every_target() {
         ("rsqrtps", &[0x0F, 0x52, 0xC1]),
         ("addsubps", &[0xF2, 0x0F, 0xD0, 0xC1]),
         ("addsubpd", &[0x66, 0x0F, 0xD0, 0xC1]),
+        ("mulss", &[0xF3, 0x0F, 0x59, 0xC1]),
+        ("divsd", &[0xF2, 0x0F, 0x5E, 0xC1]),
+        ("mulss-m32", &[0xF3, 0x0F, 0x59, 0x04, 0x24]),
+        ("divsd-m64", &[0xF2, 0x0F, 0x5E, 0x04, 0x24]),
         ("cvtdq2ps", &[0x0F, 0x5B, 0xC1]),
         ("cvttps2dq", &[0xF3, 0x0F, 0x5B, 0xC1]),
         ("cvtpd2ps", &[0x66, 0x0F, 0x5A, 0xC1]),
@@ -344,3 +386,4 @@ fn vector_fast_paths_lower_on_every_target() {
         }
     }
 }
+

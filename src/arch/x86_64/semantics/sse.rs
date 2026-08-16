@@ -20,6 +20,7 @@ use crate::MicroliftError;
 use crate::arch::x86_64::context::{MXCSR_MASK, RegisterContext};
 use crate::arch::x86_64::semantics::helpers::xmm_register_index;
 use crate::arch::x86_64::semantics::sse_vec::{B, PackedFpOp};
+use crate::core::GeneratedNan;
 use crate::lifter::{Lifter, X86Flag};
 use cranelift::codegen::ir::immediates::{Ieee32, Ieee64};
 use cranelift::prelude::*;
@@ -48,11 +49,18 @@ pub(super) const F64_INDEFINITE: Ieee64 = Ieee64::with_bits(0xFFF8_0000_0000_000
 /// to `sqrt`, which propagates it - quieting a signalling NaN - with its sign
 /// and payload intact, as x86 does.
 ///
+/// Under [`GeneratedNan::HostDefault`] the patch is skipped entirely and the
+/// host FPU's own default NaN stands - see that mode for what a guest has to do
+/// to notice.
+///
 /// A free function rather than a [`Lifter`] method so it can be passed directly
 /// as the `op` closure of the packed lane plumbing, which is handed only the
 /// builder.
-pub(super) fn fp_sqrt_x86(b: &mut FunctionBuilder, x: Value) -> Value {
+pub(super) fn fp_sqrt_x86(nan: GeneratedNan, b: &mut FunctionBuilder, x: Value) -> Value {
     let r = b.ins().sqrt(x);
+    if nan == GeneratedNan::HostDefault {
+        return r;
+    }
     let (zero, indefinite) = if b.func.dfg.value_type(x) == types::F32 {
         (b.ins().f32const(0.0f32), b.ins().f32const(F32_INDEFINITE))
     } else {
@@ -75,13 +83,21 @@ pub(super) fn fp_sqrt_x86(b: &mut FunctionBuilder, x: Value) -> Value {
 /// case, and it is exactly the set above. When an operand is already a NaN the
 /// host propagates it correctly - quieted, sign and payload intact, as x86
 /// does - so `Ordered(x, y)` leaves that path untouched.
+///
+/// All of which is what [`GeneratedNan::HostDefault`] buys out of: the
+/// propagating path was already free, so the whole sequence exists for the
+/// generated case alone and that mode drops it.
 pub(super) fn fp_arith_x86(
+    nan: GeneratedNan,
     b: &mut FunctionBuilder,
     x: Value,
     y: Value,
     op: impl FnOnce(&mut FunctionBuilder, Value, Value) -> Value,
 ) -> Value {
     let r = op(b, x, y);
+    if nan == GeneratedNan::HostDefault {
+        return r;
+    }
     let indefinite = if b.func.dfg.value_type(r) == types::F32 {
         b.ins().f32const(F32_INDEFINITE)
     } else {
@@ -93,25 +109,38 @@ pub(super) fn fp_arith_x86(
     b.ins().select(invalid, indefinite, r)
 }
 
-/// [`fp_arith_x86`] over `FADD` - the lane closure the packed/scalar plumbing
-/// expects.
-pub(super) fn fadd_x86(b: &mut FunctionBuilder, x: Value, y: Value) -> Value {
-    fp_arith_x86(b, x, y, |b, x, y| b.ins().fadd(x, y))
+/// [`fp_arith_x86`] over `FADD`, as the lane closure the packed and scalar
+/// plumbing expects, with `nan` bound in.
+///
+/// Curried rather than a plain function because that plumbing hands its `op`
+/// only the builder, and the generated-NaN policy is a property of the *lift*.
+/// Every caller therefore reads [`Lifter::generated_nan`] once and passes the
+/// result of one of these four.
+pub(super) fn fadd_x86<'a>(
+    nan: GeneratedNan,
+) -> impl Fn(&mut FunctionBuilder<'a>, Value, Value) -> Value + Copy {
+    move |b, x, y| fp_arith_x86(nan, b, x, y, |b, x, y| b.ins().fadd(x, y))
 }
 
-/// [`fp_arith_x86`] over `FSUB`.
-pub(super) fn fsub_x86(b: &mut FunctionBuilder, x: Value, y: Value) -> Value {
-    fp_arith_x86(b, x, y, |b, x, y| b.ins().fsub(x, y))
+/// [`fadd_x86`] over `FSUB`.
+pub(super) fn fsub_x86<'a>(
+    nan: GeneratedNan,
+) -> impl Fn(&mut FunctionBuilder<'a>, Value, Value) -> Value + Copy {
+    move |b, x, y| fp_arith_x86(nan, b, x, y, |b, x, y| b.ins().fsub(x, y))
 }
 
-/// [`fp_arith_x86`] over `FMUL`.
-pub(super) fn fmul_x86(b: &mut FunctionBuilder, x: Value, y: Value) -> Value {
-    fp_arith_x86(b, x, y, |b, x, y| b.ins().fmul(x, y))
+/// [`fadd_x86`] over `FMUL`.
+pub(super) fn fmul_x86<'a>(
+    nan: GeneratedNan,
+) -> impl Fn(&mut FunctionBuilder<'a>, Value, Value) -> Value + Copy {
+    move |b, x, y| fp_arith_x86(nan, b, x, y, |b, x, y| b.ins().fmul(x, y))
 }
 
-/// [`fp_arith_x86`] over `FDIV`.
-pub(super) fn fdiv_x86(b: &mut FunctionBuilder, x: Value, y: Value) -> Value {
-    fp_arith_x86(b, x, y, |b, x, y| b.ins().fdiv(x, y))
+/// [`fadd_x86`] over `FDIV`.
+pub(super) fn fdiv_x86<'a>(
+    nan: GeneratedNan,
+) -> impl Fn(&mut FunctionBuilder<'a>, Value, Value) -> Value + Copy {
+    move |b, x, y| fp_arith_x86(nan, b, x, y, |b, x, y| b.ins().fdiv(x, y))
 }
 
 /// The rounding a `ROUND*` instruction's `imm8` selects.
@@ -1536,6 +1565,9 @@ impl<'a> Lifter<'a> {
         who: &str,
         op: impl Fn(&mut FunctionBuilder<'a>, Value, Value) -> Value,
     ) -> crate::Result<()> {
+        if self.try_scalar_fp_vec(instruction, who, false, &op)? {
+            return Ok(());
+        }
         let dst_idx = self.xmm_operand_index(instruction, 0, who)?;
         let dst_lo = self.get_xmm_lo(dst_idx);
         let src_lo = self.read_scalar_f64_bits(instruction, 1)?;
@@ -1651,17 +1683,18 @@ impl<'a> Lifter<'a> {
         let d = [d0, d1, d2, d3];
         let s = [s0, s1, s2, s3];
 
+        let nan = self.generated_nan();
         let pos_zero = self.builder.ins().iconst(types::I32, 0);
         let mut terms = [pos_zero; 4];
         for (lane, term) in terms.iter_mut().enumerate() {
             if imm & (1 << (4 + lane)) != 0 {
-                *term = self.f32_bits_arith(d[lane], s[lane], &fmul_x86);
+                *term = self.f32_bits_arith(d[lane], s[lane], &fmul_x86(nan));
             }
         }
 
-        let left = self.f32_bits_arith(terms[0], terms[1], &fadd_x86);
-        let right = self.f32_bits_arith(terms[2], terms[3], &fadd_x86);
-        let sum = self.f32_bits_arith(left, right, &fadd_x86);
+        let left = self.f32_bits_arith(terms[0], terms[1], &fadd_x86(nan));
+        let right = self.f32_bits_arith(terms[2], terms[3], &fadd_x86(nan));
+        let sum = self.f32_bits_arith(left, right, &fadd_x86(nan));
 
         let pick = |lane: u8| {
             if imm & (1 << lane) != 0 {
@@ -1691,6 +1724,7 @@ impl<'a> Lifter<'a> {
         let imm = instruction.immediate8();
 
         let pos_zero = self.builder.ins().iconst(types::I64, 0);
+        let nan = self.generated_nan();
         let mut terms = [pos_zero; 2];
         for (lane, term) in terms.iter_mut().enumerate() {
             if imm & (1 << (4 + lane)) != 0 {
@@ -1699,10 +1733,10 @@ impl<'a> Lifter<'a> {
                 } else {
                     (dst_hi, src_hi)
                 };
-                *term = self.f64_bits_arith(a, b, &fmul_x86);
+                *term = self.f64_bits_arith(a, b, &fmul_x86(nan));
             }
         }
-        let sum = self.f64_bits_arith(terms[0], terms[1], &fadd_x86);
+        let sum = self.f64_bits_arith(terms[0], terms[1], &fadd_x86(nan));
 
         let res_lo = if imm & 0b01 != 0 { sum } else { pos_zero };
         let res_hi = if imm & 0b10 != 0 { sum } else { pos_zero };
@@ -1716,7 +1750,8 @@ impl<'a> Lifter<'a> {
         if self.try_horizontal_fp_spec(instruction, "haddpd", false, false)? {
             return Ok(());
         }
-        self.horizontal_double_arith(instruction, "haddpd", fadd_x86)
+        let nan = self.generated_nan();
+        self.horizontal_double_arith(instruction, "haddpd", fadd_x86(nan))
     }
 
     /// HSUBPD - horizontal subtract: `dst[0] - dst[1]`, then `src[0] - src[1]`.
@@ -1724,7 +1759,8 @@ impl<'a> Lifter<'a> {
         if self.try_horizontal_fp_spec(instruction, "hsubpd", false, true)? {
             return Ok(());
         }
-        self.horizontal_double_arith(instruction, "hsubpd", fsub_x86)
+        let nan = self.generated_nan();
+        self.horizontal_double_arith(instruction, "hsubpd", fsub_x86(nan))
     }
 
     /// HADDPS - horizontal add of adjacent single-precision lane pairs.
@@ -1732,7 +1768,8 @@ impl<'a> Lifter<'a> {
         if self.try_horizontal_fp_spec(instruction, "haddps", true, false)? {
             return Ok(());
         }
-        self.horizontal_single_arith(instruction, "haddps", fadd_x86)
+        let nan = self.generated_nan();
+        self.horizontal_single_arith(instruction, "haddps", fadd_x86(nan))
     }
 
     /// HSUBPS - horizontal subtract of adjacent single-precision lane pairs.
@@ -1740,7 +1777,8 @@ impl<'a> Lifter<'a> {
         if self.try_horizontal_fp_spec(instruction, "hsubps", true, true)? {
             return Ok(());
         }
-        self.horizontal_single_arith(instruction, "hsubps", fsub_x86)
+        let nan = self.generated_nan();
+        self.horizontal_single_arith(instruction, "hsubps", fsub_x86(nan))
     }
 
     /// ADDSUBPS - subtract in the even single-precision lanes, add in the odd
@@ -1763,11 +1801,12 @@ impl<'a> Lifter<'a> {
 
         // Both 64-bit halves hold an even lane below an odd one, so the same
         // sub-then-add pair covers lanes 0/1 and lanes 2/3.
+        let nan = self.generated_nan();
         let half = |s: &mut Self, d: Value, x: Value| {
             let (d0, d1) = s.split_dwords(d);
             let (x0, x1) = s.split_dwords(x);
-            let r0 = s.f32_bits_arith(d0, x0, &fsub_x86);
-            let r1 = s.f32_bits_arith(d1, x1, &fadd_x86);
+            let r0 = s.f32_bits_arith(d0, x0, &fsub_x86(nan));
+            let r1 = s.f32_bits_arith(d1, x1, &fadd_x86(nan));
             s.join_dwords(r0, r1)
         };
         let res_lo = half(self, dst_lo, src_lo);
@@ -1790,8 +1829,9 @@ impl<'a> Lifter<'a> {
         let dst_hi = self.get_xmm_hi(dst_idx);
         let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
 
-        let res_lo = self.f64_bits_arith(dst_lo, src_lo, &fsub_x86);
-        let res_hi = self.f64_bits_arith(dst_hi, src_hi, &fadd_x86);
+        let nan = self.generated_nan();
+        let res_lo = self.f64_bits_arith(dst_lo, src_lo, &fsub_x86(nan));
+        let res_hi = self.f64_bits_arith(dst_hi, src_hi, &fadd_x86(nan));
 
         self.set_xmm_lo(dst_idx, res_lo);
         self.set_xmm_hi(dst_idx, res_hi);
@@ -1831,6 +1871,9 @@ impl<'a> Lifter<'a> {
         who: &str,
         op: impl Fn(&mut FunctionBuilder<'a>, Value, Value) -> Value,
     ) -> crate::Result<()> {
+        if self.try_scalar_fp_vec(instruction, who, true, &op)? {
+            return Ok(());
+        }
         let dst_idx = self.xmm_operand_index(instruction, 0, who)?;
         let dst_lo = self.get_xmm_lo(dst_idx);
         let dst_bits = self.builder.ins().ireduce(types::I32, dst_lo);
@@ -1866,19 +1909,22 @@ impl<'a> Lifter<'a> {
     /// ADDSD - scalar double-precision add of the low 64 bits; the high 64 bits
     /// of the destination are preserved.
     pub(super) fn handle_addsd(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        self.scalar_double_arith(instruction, "addsd", fadd_x86)
+        let nan = self.generated_nan();
+        self.scalar_double_arith(instruction, "addsd", fadd_x86(nan))
     }
 
     /// MULSD - scalar double-precision multiply of the low 64 bits; the high 64
     /// bits of the destination are preserved.
     pub(super) fn handle_mulsd(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        self.scalar_double_arith(instruction, "mulsd", fmul_x86)
+        let nan = self.generated_nan();
+        self.scalar_double_arith(instruction, "mulsd", fmul_x86(nan))
     }
 
     /// DIVSD - scalar double-precision divide of the low 64 bits (`dst / src`);
     /// the high 64 bits of the destination are preserved.
     pub(super) fn handle_divsd(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        self.scalar_double_arith(instruction, "divsd", fdiv_x86)
+        let nan = self.generated_nan();
+        self.scalar_double_arith(instruction, "divsd", fdiv_x86(nan))
     }
 
     /// ADDPD - packed double-precision add of both 64-bit lanes.
@@ -1886,7 +1932,8 @@ impl<'a> Lifter<'a> {
         if self.try_packed_fp_vec(instruction, "addpd", false, PackedFpOp::Add)? {
             return Ok(());
         }
-        self.packed_double_arith(instruction, "addpd", fadd_x86)
+        let nan = self.generated_nan();
+        self.packed_double_arith(instruction, "addpd", fadd_x86(nan))
     }
 
     /// SUBPD - packed double-precision subtract of both 64-bit lanes.
@@ -1894,31 +1941,36 @@ impl<'a> Lifter<'a> {
         if self.try_packed_fp_vec(instruction, "subpd", false, PackedFpOp::Sub)? {
             return Ok(());
         }
-        self.packed_double_arith(instruction, "subpd", fsub_x86)
+        let nan = self.generated_nan();
+        self.packed_double_arith(instruction, "subpd", fsub_x86(nan))
     }
 
     /// ADDSS - scalar single-precision add of the low 32 bits; bits[127:32] of
     /// the destination are preserved.
     pub(super) fn handle_addss(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        self.scalar_single_arith(instruction, "addss", fadd_x86)
+        let nan = self.generated_nan();
+        self.scalar_single_arith(instruction, "addss", fadd_x86(nan))
     }
 
     /// SUBSS - scalar single-precision subtract of the low 32 bits (`dst - src`);
     /// bits[127:32] of the destination are preserved.
     pub(super) fn handle_subss(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        self.scalar_single_arith(instruction, "subss", fsub_x86)
+        let nan = self.generated_nan();
+        self.scalar_single_arith(instruction, "subss", fsub_x86(nan))
     }
 
     /// MULSS - scalar single-precision multiply of the low 32 bits; bits[127:32]
     /// of the destination are preserved.
     pub(super) fn handle_mulss(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        self.scalar_single_arith(instruction, "mulss", fmul_x86)
+        let nan = self.generated_nan();
+        self.scalar_single_arith(instruction, "mulss", fmul_x86(nan))
     }
 
     /// DIVSS - scalar single-precision divide of the low 32 bits (`dst / src`);
     /// bits[127:32] of the destination are preserved.
     pub(super) fn handle_divss(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        self.scalar_single_arith(instruction, "divss", fdiv_x86)
+        let nan = self.generated_nan();
+        self.scalar_single_arith(instruction, "divss", fdiv_x86(nan))
     }
 
     /// MULPS - packed single-precision multiply of all four 32-bit lanes.
@@ -1926,7 +1978,8 @@ impl<'a> Lifter<'a> {
         if self.try_packed_fp_vec(instruction, "mulps", true, PackedFpOp::Mul)? {
             return Ok(());
         }
-        self.packed_single_arith(instruction, "mulps", fmul_x86)
+        let nan = self.generated_nan();
+        self.packed_single_arith(instruction, "mulps", fmul_x86(nan))
     }
 
     /// CVTSI2SS - convert a signed integer to a scalar single-precision float.
@@ -2524,7 +2577,8 @@ impl<'a> Lifter<'a> {
     /// SUBSD - scalar double-precision subtract of the low 64 bits (`dst - src`);
     /// the high 64 bits of the destination are preserved.
     pub(super) fn handle_subsd(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        self.scalar_double_arith(instruction, "subsd", fsub_x86)
+        let nan = self.generated_nan();
+        self.scalar_double_arith(instruction, "subsd", fsub_x86(nan))
     }
 
     /// MULPD - packed double-precision multiply of both 64-bit lanes.
@@ -2532,7 +2586,8 @@ impl<'a> Lifter<'a> {
         if self.try_packed_fp_vec(instruction, "mulpd", false, PackedFpOp::Mul)? {
             return Ok(());
         }
-        self.packed_double_arith(instruction, "mulpd", fmul_x86)
+        let nan = self.generated_nan();
+        self.packed_double_arith(instruction, "mulpd", fmul_x86(nan))
     }
 
     /// DIVPD - packed double-precision divide of both 64-bit lanes.
@@ -2540,7 +2595,8 @@ impl<'a> Lifter<'a> {
         if self.try_packed_fp_vec(instruction, "divpd", false, PackedFpOp::Div)? {
             return Ok(());
         }
-        self.packed_double_arith(instruction, "divpd", fdiv_x86)
+        let nan = self.generated_nan();
+        self.packed_double_arith(instruction, "divpd", fdiv_x86(nan))
     }
 
     /// ADDPS - packed single-precision add of all four 32-bit lanes.
@@ -2548,7 +2604,8 @@ impl<'a> Lifter<'a> {
         if self.try_packed_fp_vec(instruction, "addps", true, PackedFpOp::Add)? {
             return Ok(());
         }
-        self.packed_single_arith(instruction, "addps", fadd_x86)
+        let nan = self.generated_nan();
+        self.packed_single_arith(instruction, "addps", fadd_x86(nan))
     }
 
     /// SUBPS - packed single-precision subtract of all four 32-bit lanes.
@@ -2556,7 +2613,8 @@ impl<'a> Lifter<'a> {
         if self.try_packed_fp_vec(instruction, "subps", true, PackedFpOp::Sub)? {
             return Ok(());
         }
-        self.packed_single_arith(instruction, "subps", fsub_x86)
+        let nan = self.generated_nan();
+        self.packed_single_arith(instruction, "subps", fsub_x86(nan))
     }
 
     /// DIVPS - packed single-precision divide of all four 32-bit lanes.
@@ -2564,7 +2622,8 @@ impl<'a> Lifter<'a> {
         if self.try_packed_fp_vec(instruction, "divps", true, PackedFpOp::Div)? {
             return Ok(());
         }
-        self.packed_single_arith(instruction, "divps", fdiv_x86)
+        let nan = self.generated_nan();
+        self.packed_single_arith(instruction, "divps", fdiv_x86(nan))
     }
 
     /// MINSS / MINSD / MINPS / MINPD, MAXSS / MAXSD / MAXPS / MAXPD.
@@ -2659,7 +2718,8 @@ impl<'a> Lifter<'a> {
             .builder
             .ins()
             .bitcast(types::F64, MemFlagsData::new(), src_bits);
-        let r = fp_sqrt_x86(&mut self.builder, x);
+        let nan = self.generated_nan();
+        let r = fp_sqrt_x86(nan, &mut self.builder, x);
         let bits = self
             .builder
             .ins()
@@ -2677,7 +2737,8 @@ impl<'a> Lifter<'a> {
             .builder
             .ins()
             .bitcast(types::F32, MemFlagsData::new(), src_bits);
-        let r = fp_sqrt_x86(&mut self.builder, x);
+        let nan = self.generated_nan();
+        let r = fp_sqrt_x86(nan, &mut self.builder, x);
         let bits = self
             .builder
             .ins()
@@ -2698,7 +2759,8 @@ impl<'a> Lifter<'a> {
         // argument, reusing the shared bit-level plumbing.
         // The unary op is expressed as a binary one that ignores its second
         // argument, reusing the shared bit-level plumbing.
-        let sqrt = |b: &mut FunctionBuilder<'a>, x: Value, _y: Value| fp_sqrt_x86(b, x);
+        let nan = self.generated_nan();
+        let sqrt = move |b: &mut FunctionBuilder<'a>, x: Value, _y: Value| fp_sqrt_x86(nan, b, x);
         let res_lo = self.f64_bits_arith(src_lo, src_lo, &sqrt);
         let res_hi = self.f64_bits_arith(src_hi, src_hi, &sqrt);
         self.set_xmm_lo(dst_idx, res_lo);
@@ -2714,7 +2776,8 @@ impl<'a> Lifter<'a> {
         }
         let dst_idx = self.xmm_operand_index(instruction, 0, "sqrtps")?;
         let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
-        let sqrt = |b: &mut FunctionBuilder<'a>, x: Value, _y: Value| fp_sqrt_x86(b, x);
+        let nan = self.generated_nan();
+        let sqrt = move |b: &mut FunctionBuilder<'a>, x: Value, _y: Value| fp_sqrt_x86(nan, b, x);
         let res_lo = self.f32_pair_arith(src_lo, src_lo, &sqrt);
         let res_hi = self.f32_pair_arith(src_hi, src_hi, &sqrt);
         self.set_xmm_lo(dst_idx, res_lo);
@@ -3531,9 +3594,12 @@ impl<'a> Lifter<'a> {
     /// Cranelift `sqrt`: a negative lane makes `RSQRT*` *generate* a NaN, and
     /// that NaN must be x86's sign-set floating indefinite rather than the
     /// host's default NaN. The following `fdiv` merely propagates it.
-    fn fp_reciprocal(sqrt: bool) -> impl Fn(&mut FunctionBuilder<'a>, Value, Value) -> Value {
+    fn fp_reciprocal(
+        nan: GeneratedNan,
+        sqrt: bool,
+    ) -> impl Fn(&mut FunctionBuilder<'a>, Value, Value) -> Value {
         move |b, _x, y| {
-            let y = if sqrt { fp_sqrt_x86(b, y) } else { y };
+            let y = if sqrt { fp_sqrt_x86(nan, b, y) } else { y };
             let one = b.ins().f32const(1.0);
             b.ins().fdiv(one, y)
         }
@@ -3550,7 +3616,8 @@ impl<'a> Lifter<'a> {
         if self.try_packed_fp_vec(instruction, who, true, PackedFpOp::Rcp { sqrt })? {
             return Ok(());
         }
-        self.packed_single_arith(instruction, who, Self::fp_reciprocal(sqrt))
+        let nan = self.generated_nan();
+        self.packed_single_arith(instruction, who, Self::fp_reciprocal(nan, sqrt))
     }
 
     /// RCPSS / RSQRTSS - scalar approximate reciprocal (of the square root);
@@ -3561,7 +3628,8 @@ impl<'a> Lifter<'a> {
         sqrt: bool,
     ) -> crate::Result<()> {
         let who = if sqrt { "rsqrtss" } else { "rcpss" };
-        self.scalar_single_arith(instruction, who, Self::fp_reciprocal(sqrt))
+        let nan = self.generated_nan();
+        self.scalar_single_arith(instruction, who, Self::fp_reciprocal(nan, sqrt))
     }
 
     /// MOVSLDUP / MOVSHDUP - duplicate the source's even (`sldup`) or odd

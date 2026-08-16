@@ -758,6 +758,53 @@ pub enum Atomic128Mode {
     Exit,
 }
 
+/// What bit pattern a *generated* NaN gets.
+///
+/// An SSE arithmetic instruction produces a NaN in two quite different ways.
+/// It can **propagate** one an operand already held - quieted, sign and payload
+/// intact - which every host FPU does the same way x86 does, so nothing has to
+/// be emitted for it. Or it can **generate** one out of an invalid operation
+/// (`inf + -inf`, `inf - inf`, `0 * inf`, `0 / 0`, `inf / inf`, `sqrt` of a
+/// negative), and there the ISAs disagree: x86 yields the *floating
+/// indefinite*, whose sign bit is set (`0xFFC0_0000` at single precision),
+/// while the AArch64 default NaN is the otherwise identical `0x7FC0_0000`.
+///
+/// Telling those apart at run time is what costs: the result being a NaN is not
+/// enough, because a propagated NaN must be left alone, so the test is "the
+/// result is NaN *and* the operands were ordered". That is two compares, two
+/// condition materialisations, an `and`, a constant and a select - six or seven
+/// instructions wrapped around arithmetic that is one, on every scalar and
+/// packed FP operation in the program.
+///
+/// This is not the same question as [`Atomic128Mode`], which trades atomicity
+/// for portability. Both modes here lower everywhere; what differs is whether
+/// the answer is x86's or the host's, in a field a guest can only observe by
+/// looking at the bits of a NaN it just generated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GeneratedNan {
+    /// Materialise x86's floating indefinite, whatever the host FPU would have
+    /// produced. Bit-exact against real hardware, and the default: a lifter
+    /// that does not know its guest cannot know the guest will not look.
+    #[default]
+    X86Exact,
+    /// Let the host FPU's own default NaN stand.
+    ///
+    /// Correct for a guest that never observes the bit pattern of a NaN it
+    /// generated - which is most of them, since the value is a NaN either way
+    /// and every comparison, arithmetic and classification of it agrees. What
+    /// diverges is a guest that stores such a NaN and inspects its sign bit, or
+    /// hashes/serialises the raw bits.
+    ///
+    /// Note the divergence is host-dependent by construction: on an x86-64 host
+    /// the FPU's default *is* the floating indefinite, so this mode is
+    /// bit-identical there and only changes anything on a target whose default
+    /// NaN differs (AArch64's, whose sign bit is clear).
+    ///
+    /// Propagated NaNs are unaffected in either mode - this never touches an
+    /// operand's payload.
+    HostDefault,
+}
+
 /// Which addresses a lifted region's entry dispatch offers for re-entry.
 ///
 /// The dispatch is a `Switch` on the incoming PC, and it is the whole reason a
@@ -954,6 +1001,10 @@ pub struct LifterConfig {
     /// How a guest 128-bit compare-and-swap (`CMPXCHG16B`) is lowered. See
     /// [`Atomic128Mode`]; defaults to the portable, non-atomic emulation.
     pub atomic128: Atomic128Mode,
+    /// What bit pattern an SSE instruction's *generated* NaN gets. See
+    /// [`GeneratedNan`]; defaults to [`GeneratedNan::X86Exact`], which is what
+    /// hardware does and costs six or seven instructions per FP operation.
+    pub generated_nan: GeneratedNan,
     /// Produce *inspection* IR for static analysis rather than runnable IR.
     ///
     /// When `true`, the engine omits the machinery that exists purely to support
@@ -1193,6 +1244,7 @@ impl Default for LifterConfig {
             use_vector_xmm: false,
             specialization: Specialization::generic(),
             atomic128: Atomic128Mode::default(),
+            generated_nan: GeneratedNan::default(),
             analysis_mode: false,
             outline_helpers: true,
             emit_source_locs: true,

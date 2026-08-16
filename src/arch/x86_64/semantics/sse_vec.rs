@@ -23,10 +23,11 @@
 //! each hand-rolled mask/shift/OR chain.
 
 use super::sse::{F32_INDEFINITE, F64_INDEFINITE};
+use crate::core::GeneratedNan;
 use crate::lifter::Lifter;
 use cranelift::codegen::ir::ConstantData;
 use cranelift::prelude::*;
-use iced_x86::Instruction;
+use iced_x86::{Instruction, OpKind};
 
 /// Byte index of the `i`-th byte of the *second* `vec_shuffle` operand.
 pub(super) const B: u8 = 16;
@@ -67,6 +68,14 @@ impl<'a> Lifter<'a> {
     /// `tests/fuzz_cross_config.rs` proves the two agree.
     pub(super) fn vec_mode(&self) -> bool {
         self.config.use_vector_xmm
+    }
+
+    /// What bit pattern this lift gives an SSE instruction's *generated* NaN.
+    ///
+    /// Read once per handler and passed into the lane closures, which the
+    /// plumbing hands only a builder - see [`fadd_x86`](super::sse::fadd_x86).
+    pub(super) fn generated_nan(&self) -> GeneratedNan {
+        self.config.generated_nan
     }
 
     /// A 128-bit all-zeros vector.
@@ -236,10 +245,14 @@ impl<'a> Lifter<'a> {
     /// The vector twin of [`fp_sqrt_x86`](super::sse::fp_sqrt_x86): a negative
     /// lane must produce x86's floating indefinite, which is sign-set, rather
     /// than whatever default NaN the host FPU picks. As with the MIN/MAX forms
-    /// the per-lane choice is a `bitselect` on the compare's all-ones mask.
+    /// the per-lane choice is a `bitselect` on the compare's all-ones mask, and
+    /// as there, [`GeneratedNan::HostDefault`] skips the whole thing.
     fn vec_fp_sqrt_x86(&mut self, x: Value) -> Value {
         let fty = self.builder.func.dfg.value_type(x);
         let r = self.builder.ins().sqrt(x);
+        if self.generated_nan() == GeneratedNan::HostDefault {
+            return r;
+        }
 
         let (zero, indefinite) = if fty.lane_type() == types::F32 {
             let z = self.builder.ins().f32const(0.0f32);
@@ -262,8 +275,9 @@ impl<'a> Lifter<'a> {
     /// whose result is a NaN neither operand supplied performed an invalid
     /// operation (`inf + -inf`, `inf - inf`, `0 * inf`, `0 / 0`, `inf / inf`)
     /// and must yield x86's sign-set floating indefinite rather than the host's
-    /// default NaN. Lanes with a NaN operand fall through to the host's
-    /// propagation, which already matches x86.
+    /// default NaN - unless [`GeneratedNan::HostDefault`] says the host's is
+    /// acceptable, in which case nothing is emitted. Lanes with a NaN operand
+    /// fall through to the host's propagation, which already matches x86.
     pub(super) fn vec_fp_arith_x86(
         &mut self,
         a: Value,
@@ -272,6 +286,9 @@ impl<'a> Lifter<'a> {
     ) -> Value {
         let fty = self.builder.func.dfg.value_type(a);
         let r = op(self, a, b);
+        if self.generated_nan() == GeneratedNan::HostDefault {
+            return r;
+        }
 
         let indefinite = if fty.lane_type() == types::F32 {
             self.builder.ins().f32const(F32_INDEFINITE)
@@ -352,6 +369,92 @@ impl<'a> Lifter<'a> {
         let r = self.vec_bitcast(r, types::I64X2);
         self.set_xmm_vec(dst_idx, r);
         Ok(true)
+    }
+
+    /// Emit a *scalar* floating-point op on lane 0, when XMM registers are
+    /// vector-backed.
+    ///
+    /// Returns `false` without emitting anything in scalar mode, leaving the
+    /// caller to fall through to its portable lane expansion.
+    ///
+    /// The portable expansion reaches lane 0 through
+    /// [`get_xmm_lo`](Lifter::get_xmm_lo), which in vector mode is an
+    /// `extractlane` to an *integer* - so `MULSS` arrives at its `fmul` having
+    /// moved the lane into a GPR, masked off the half it does not want, and
+    /// moved it back, and leaves the same way. On aarch64 that is four to six
+    /// instructions around a one-instruction multiply, two of them FP-to-GPR
+    /// transfers, which are among the more expensive moves on the machine.
+    ///
+    /// Nothing about the arithmetic changes here: `op` is the same closure the
+    /// portable path uses, NaN handling included. The only difference is that
+    /// the value never leaves the vector register file - lane 0 of an `F32X4`
+    /// *is* `sN`, so the `extractlane` costs nothing and the `insertlane` that
+    /// puts the result back is the single `mov vD.s[0], vN.s[0]` that the
+    /// instruction's "bits[127:32] are preserved" semantics call for.
+    ///
+    /// `single` selects `F32X4` lanes over `F64X2`. Operand 0 is the
+    /// destination XMM register and operand 1 the `xmm/m32` (or `m64`) source.
+    pub(super) fn try_scalar_fp_vec(
+        &mut self,
+        instruction: &Instruction,
+        who: &str,
+        single: bool,
+        op: &impl Fn(&mut FunctionBuilder<'a>, Value, Value) -> Value,
+    ) -> crate::Result<bool> {
+        if !self.vec_mode() {
+            return Ok(false);
+        }
+        let dst_idx = self.xmm_operand_index(instruction, 0, who)?;
+        let fty = if single { types::F32X4 } else { types::F64X2 };
+
+        let dst = self.get_xmm_vec(dst_idx);
+        let dst = self.vec_bitcast(dst, fty);
+        let a = self.builder.ins().extractlane(dst, 0);
+        let b = self.read_scalar_fp_vec_src(instruction, 1, fty, who)?;
+
+        let r = op(&mut self.builder, a, b);
+
+        // Lanes 1.. are untouched, which is exactly the destination merge every
+        // scalar form specifies: bits[127:32] for single, bits[127:64] for
+        // double.
+        let merged = self.builder.ins().insertlane(dst, r, 0);
+        let merged = self.vec_bitcast(merged, types::I64X2);
+        self.set_xmm_vec(dst_idx, merged);
+        Ok(true)
+    }
+
+    /// Read the scalar source of a [`Lifter::try_scalar_fp_vec`] operation as a
+    /// bare `F32`/`F64`, without routing it through an integer register.
+    ///
+    /// A memory operand is loaded at the *scalar* float type rather than as
+    /// bits, so it lands in the FP register file directly (`ldr s`/`ldr d`) -
+    /// loading it as an integer would reintroduce on the source side exactly
+    /// the transfer this path exists to remove.
+    fn read_scalar_fp_vec_src(
+        &mut self,
+        instruction: &Instruction,
+        op_index: u32,
+        fty: Type,
+        who: &str,
+    ) -> crate::Result<Value> {
+        match self.operand_kind(instruction, op_index) {
+            OpKind::Register => {
+                let idx = self.xmm_operand_index(instruction, op_index, who)?;
+                let v = self.get_xmm_vec(idx);
+                let v = self.vec_bitcast(v, fty);
+                Ok(self.builder.ins().extractlane(v, 0))
+            }
+            OpKind::Memory => {
+                let ptr = self.get_mem_ptr(instruction, op_index)?;
+                Ok(self
+                    .builder
+                    .ins()
+                    .load(fty.lane_type(), MemFlagsData::new(), ptr, 0))
+            }
+            other => Err(crate::MicroliftError::UnsupportedInstruction {
+                mnemonic: format!("{}-scalar-fp-src-op{}-{:?}", who, op_index, other),
+            }),
+        }
     }
 
     /// `ADDSUBPS` / `ADDSUBPD` - subtract in the even lanes, add in the odd

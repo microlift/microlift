@@ -21,7 +21,8 @@ use crate::context::{ExitReason, MemorySegment, RegisterContext};
 use crate::core::specialize::Specialization;
 use crate::core::srcloc::GuestCodeMap;
 use crate::core::{
-    AddressMode, Atomic128Mode, ExecutionMode, LifterConfig, VmResumptionPoints, lift_to_code,
+    AddressMode, Atomic128Mode, ExecutionMode, GeneratedNan, LifterConfig, VmResumptionPoints,
+    lift_to_code,
 };
 use cranelift_codegen::settings::{self, Configurable};
 
@@ -197,6 +198,15 @@ impl<'a> LiftTest<'a> {
     /// host with `has_cmpxchg16b`.
     pub fn atomic128(mut self, mode: Atomic128Mode) -> Self {
         self.config.atomic128 = mode;
+        self
+    }
+
+    /// Select what bit pattern an SSE instruction's *generated* NaN gets
+    /// (`config.generated_nan`). [`GeneratedNan::HostDefault`] diverges from
+    /// hardware only on a host whose default NaN is not x86's floating
+    /// indefinite, so a test asserting on it has to say which host it means.
+    pub fn generated_nan(mut self, mode: GeneratedNan) -> Self {
+        self.config.generated_nan = mode;
         self
     }
 
@@ -725,5 +735,5 @@ pub mod prelude {
     pub use super::{Harness, LiftTest, Opt, RetAddr, RunOutcome, TestError, run_test};
     pub use crate::context::{ExitReason, RegisterContext};
     pub use crate::core::specialize::{Spec, SpecTarget, Specialization};
-    pub use crate::core::{AddressMode, Atomic128Mode, VmResumptionPoints};
+    pub use crate::core::{AddressMode, Atomic128Mode, GeneratedNan, VmResumptionPoints};
 }
