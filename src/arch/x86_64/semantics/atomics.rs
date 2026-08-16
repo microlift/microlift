@@ -13,6 +13,7 @@
 
 use crate::MicroliftError;
 use crate::arch::x86_64::semantics::helpers::size_to_type;
+use crate::core::specialize::Spec;
 use crate::lifter::{Atomic128Mode, Lifter, X86Flag};
 use cranelift::prelude::*;
 use cranelift_codegen::ir::AtomicRmwOp;
@@ -31,9 +32,14 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// PAUSE - spin-wait hint; treated as a NOP.
-    /// TODO: Properly implement this
+    /// PAUSE - spin-wait hint.
+    ///
+    /// The instruction has no architectural effect whatever, so discarding it is
+    /// correct everywhere and is what happens by default.
     pub(super) fn handle_pause(&mut self, _instruction: &Instruction) -> crate::Result<()> {
+        if self.specialized(Spec::SpinLoopHint) {
+            self.builder.ins().spin_hint();
+        }
         Ok(())
     }
 

@@ -139,6 +139,9 @@ pub enum Spec {
     /// it, the dead sites emit a plain `iadd` and the live ones get the short
     /// form. See `arch/x86_64/semantics/arith_spec.rs`.
     IntegerOverflowFlags,
+    /// Emit `PAUSE` instructions as the host's equivalent mechanism via
+    /// the `spin_hint` CLIF opcode.
+    SpinLoopHint,
 }
 
 impl Spec {
@@ -152,6 +155,7 @@ impl Spec {
         Spec::WideningEvenMultiply,
         Spec::RoundedMultiplyHigh,
         Spec::IntegerOverflowFlags,
+        Spec::SpinLoopHint,
     ];
 
     fn bit(self) -> u32 {
@@ -169,6 +173,7 @@ impl Spec {
             Spec::WideningEvenMultiply => "widening-even-multiply",
             Spec::RoundedMultiplyHigh => "rounded-multiply-high",
             Spec::IntegerOverflowFlags => "integer-overflow-flags",
+            Spec::SpinLoopHint => "spin-loop-hint",
         }
     }
 
@@ -185,6 +190,7 @@ impl Spec {
                     | Spec::MultiplyAddUnsignedSigned
                     | Spec::SumOfAbsoluteDifferences
                     | Spec::IntegerOverflowFlags
+                    | Spec::SpinLoopHint
             ),
         }
     }
@@ -193,11 +199,12 @@ impl Spec {
     /// [`LifterConfig::use_vector_xmm`](crate::core::LifterConfig::use_vector_xmm).
     ///
     /// True for every whole-register vector sequence, which is all of them bar
-    /// [`IntegerOverflowFlags`](Spec::IntegerOverflowFlags): that one rewrites
-    /// scalar integer arithmetic and has nothing to do with how XMM registers
-    /// are represented.
+    /// two: [`IntegerOverflowFlags`](Spec::IntegerOverflowFlags) rewrites
+    /// scalar integer arithmetic, and [`SpinLoopHint`](Spec::SpinLoopHint) is a
+    /// single operand-free instruction. Neither has anything to do with how XMM
+    /// registers are represented.
     pub fn requires_vector_xmm(self) -> bool {
-        !matches!(self, Spec::IntegerOverflowFlags)
+        !matches!(self, Spec::IntegerOverflowFlags | Spec::SpinLoopHint)
     }
 }
 

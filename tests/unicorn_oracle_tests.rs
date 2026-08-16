@@ -1707,6 +1707,7 @@ fn specialized_lowerings_agree_with_unicorn() {
         ("pmuludq", &[0x66, 0x0F, 0xF4, 0xC1]),
         ("pmuldq", &[0x66, 0x0F, 0x38, 0x28, 0xC1]),
         ("pmulhrsw", &[0x66, 0x0F, 0x38, 0x0B, 0xC1]),
+        ("pause", &[0xF3, 0x90]),
     ];
 
     let mut all: Vec<(String, Vec<u8>)> = cases
