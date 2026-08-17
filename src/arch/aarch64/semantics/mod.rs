@@ -13,14 +13,14 @@
 //! entry point is reached from `GuestArch::lift_instruction`.
 
 use crate::MicroliftError;
+use crate::arch::aarch64::Aarch64;
 use crate::arch::aarch64::Lifter64;
 use crate::arch::aarch64::decode::A64Instr;
 use crate::arch::aarch64::regs::{Nzcv, ZR};
+use crate::core::GuestArch;
 use crate::core::exit::{ExitReason, TransferKind};
 use cranelift::prelude::*;
 use yaxpeax_arm::armv8::a64::{Opcode, Operand, ShiftStyle, SizeCode};
-use crate::arch::aarch64::Aarch64;
-use crate::core::GuestArch;
 
 /// Decode a register operand into `(reg_number, size, sp_form)`.
 /// `sp_form` is `true` when register 31 denotes SP rather than the zero register.

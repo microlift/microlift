@@ -27,7 +27,10 @@ fn compile_for(bytes: &[u8], spec: Specialization, triple: &str) -> Vec<u8> {
 }
 
 fn occurrences(haystack: &[u8], needle: &[u8]) -> usize {
-    haystack.windows(needle.len()).filter(|w| *w == needle).count()
+    haystack
+        .windows(needle.len())
+        .filter(|w| *w == needle)
+        .count()
 }
 
 /// Emitted IR instruction count, over every block.
@@ -65,7 +68,10 @@ fn each_target_emits_its_own_hint() {
     for &(target, triple, needle) in TARGETS {
         let only = Specialization::for_target(target).only(&[Spec::SpinLoopHint]);
 
-        let off = occurrences(&compile_for(PAUSE_RET, Specialization::generic(), triple), needle);
+        let off = occurrences(
+            &compile_for(PAUSE_RET, Specialization::generic(), triple),
+            needle,
+        );
         let on = occurrences(&compile_for(PAUSE_RET, only, triple), needle);
 
         assert_eq!(

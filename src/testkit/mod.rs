@@ -18,6 +18,7 @@
 use crate::arch::x86_64::X86_64;
 use crate::backend::CraneliftBackend;
 use crate::context::{ExitReason, MemorySegment, RegisterContext};
+use crate::core::optimize::Optimizations;
 use crate::core::specialize::Specialization;
 use crate::core::srcloc::GuestCodeMap;
 use crate::core::{
@@ -207,6 +208,14 @@ impl<'a> LiftTest<'a> {
     /// indefinite, so a test asserting on it has to say which host it means.
     pub fn generated_nan(mut self, mode: GeneratedNan) -> Self {
         self.config.generated_nan = mode;
+        self
+    }
+
+    /// Select which accuracy-trading [`Optimization`](crate::core::optimize::Optimization)s
+    /// are enabled (`config.optimizations`). Defaults to
+    /// [`Optimizations::none`] - nothing enabled.
+    pub fn optimizations(mut self, optimizations: Optimizations) -> Self {
+        self.config.optimizations = optimizations;
         self
     }
 

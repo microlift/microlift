@@ -1,7 +1,9 @@
 use crate::MicroliftError;
+use crate::arch::x86_64::X86_64;
 use crate::arch::x86_64::abi::x86_reg;
 use crate::arch::x86_64::semantics::helpers::size_to_type;
 use crate::context::{ExitReason, TransferKind};
+use crate::core::GuestArch;
 use crate::core::abi::ArgLocation;
 use crate::core::bridge::ImportKind;
 use crate::core::{FastCall, FastCallTarget, fat_to_cl_type};
@@ -9,8 +11,6 @@ use crate::function_traits::FunctionArgumentType;
 use crate::lifter::Lifter;
 use cranelift::prelude::*;
 use iced_x86::{Code, CodeSize, Instruction, OpKind, Register};
-use crate::arch::x86_64::X86_64;
-use crate::core::GuestArch;
 
 impl<'a> Lifter<'a> {
     pub(super) fn handle_jmp(&mut self, instruction: &Instruction) -> crate::Result<()> {
@@ -232,8 +232,7 @@ impl<'a> Lifter<'a> {
                     let rebased_callee = self.runtime_addr(target);
 
                     let ctx_ptr = self.builder.use_var(self.state.context_ptr);
-                    let va_offset =
-                        <X86_64 as GuestArch>::imported_function_va_offset();
+                    let va_offset = <X86_64 as GuestArch>::imported_function_va_offset();
                     self.builder.ins().store(
                         MemFlagsData::trusted(),
                         rebased_callee,

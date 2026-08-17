@@ -386,4 +386,3 @@ fn vector_fast_paths_lower_on_every_target() {
         }
     }
 }
-

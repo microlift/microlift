@@ -182,6 +182,10 @@ name = "generated_nan_tests"
 required-features = ["testkit"]
 
 [[test]]
+name = "optimize_tests"
+required-features = ["testkit"]
+
+[[test]]
 name = "softfloat_outline_tests"
 required-features = ["testkit"]
 

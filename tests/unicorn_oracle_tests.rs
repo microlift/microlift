@@ -1989,14 +1989,26 @@ fn xadd_memory_aliasing_agrees() {
             s.gpr[gpr::RCX] = 2;
         }),
         // xadd [rbx], rbx - the source register is the address base.
-        ("base-is-src", &[0x48, 0x0F, 0xC1, 0x1B, 0xC3], 0, 100, |s| {
-            s.gpr[gpr::RBX] = ARENA_VA;
-        }),
+        (
+            "base-is-src",
+            &[0x48, 0x0F, 0xC1, 0x1B, 0xC3],
+            0,
+            100,
+            |s| {
+                s.gpr[gpr::RBX] = ARENA_VA;
+            },
+        ),
         // xadd [rax+rcx*8], rcx - the source register is the address index.
-        ("index-is-src", &[0x48, 0x0F, 0xC1, 0x0C, 0xC8, 0xC3], 16, 55, |s| {
-            s.gpr[gpr::RAX] = ARENA_VA;
-            s.gpr[gpr::RCX] = 2;
-        }),
+        (
+            "index-is-src",
+            &[0x48, 0x0F, 0xC1, 0x0C, 0xC8, 0xC3],
+            16,
+            55,
+            |s| {
+                s.gpr[gpr::RAX] = ARENA_VA;
+                s.gpr[gpr::RCX] = 2;
+            },
+        ),
     ];
 
     for (label, code, off, seed, setup) in cases {
@@ -2008,17 +2020,13 @@ fn xadd_memory_aliasing_agrees() {
         let out_ml = ml.run(code, CODE_VA, &init, &[], BUDGET);
         assert!(out_ml.is_halted(), "{label}: microlift should halt");
         let ml_state = *out_ml.state();
-        let ml_mem = u64::from_le_bytes(
-            arena.as_mut_slice()[*off..*off + 8].try_into().unwrap(),
-        );
+        let ml_mem = u64::from_le_bytes(arena.as_mut_slice()[*off..*off + 8].try_into().unwrap());
 
         arena.write_at(*off, &seed.to_le_bytes());
         let mut uc = UnicornOracle::new();
         let out_uc = uc.run(code, CODE_VA, &init, &[], BUDGET);
         assert!(out_uc.is_halted(), "{label}: unicorn should halt");
-        let uc_mem = u64::from_le_bytes(
-            arena.as_mut_slice()[*off..*off + 8].try_into().unwrap(),
-        );
+        let uc_mem = u64::from_le_bytes(arena.as_mut_slice()[*off..*off + 8].try_into().unwrap());
 
         let diff = diff_states(&ml_state, out_uc.state(), DiffOptions::default());
         assert!(diff.is_empty(), "{label}: engines diverged: {diff:?}");

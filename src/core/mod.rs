@@ -13,6 +13,7 @@ pub mod bridge;
 pub mod exit;
 pub mod flags;
 pub mod link;
+pub mod optimize;
 pub mod pin;
 pub mod specialize;
 pub mod srcloc;
@@ -26,6 +27,7 @@ use crate::core::bridge::{BridgeImport, ImportKind, ImportRegistry};
 use crate::core::exit::{ExitReason, MemorySegment, TransferKind};
 use crate::core::flags::{FlagEffects, FlagLiveness, FlagSet};
 use crate::core::link::{BlockLinkConfig, BlockLinkOffsets};
+use crate::core::optimize::Optimizations;
 use crate::core::pin::{PinnedAbi, PinnedReg};
 use crate::core::specialize::Specialization;
 use crate::core::srcloc::SourceLocMap;
@@ -1222,6 +1224,9 @@ pub struct LifterConfig {
     /// up. See [`crate::core::link`] for what is emitted.
     /// Off by default.
     pub block_link: Option<BlockLinkConfig>,
+    /// Optimizations for the emitted code. Some optimizations can trade off semantic accuracy
+    /// of not commonly relied upon behavior, such as NAN accuracy.
+    pub optimizations: Optimizations,
 }
 
 // `ImportKind` carries the host address a fast import resolved to, so the map
@@ -1257,6 +1262,7 @@ impl Default for LifterConfig {
             strict_resume: false,
             eliminate_dead_flags: false,
             block_link: None,
+            optimizations: Optimizations::none(),
         }
     }
 }

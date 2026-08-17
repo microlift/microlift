@@ -181,10 +181,9 @@ fn ordinary_arithmetic_is_unchanged() {
         for (a, b) in &pairs {
             let exact = run_lo(MULSS, GeneratedNan::X86Exact, vector, *a, *b);
             let host = run_lo(MULSS, GeneratedNan::HostDefault, vector, *a, *b);
-            // A pair that *did* generate a NaN is allowed to differ; that is
+            // A pair that did generate a NaN is allowed to differ; that is
             // the whole point of the mode. Everything else must not.
-            let generated =
-                f32::from_bits(exact as u32).is_nan() && exact as u32 == F32_INDEFINITE;
+            let generated = f32::from_bits(exact as u32).is_nan() && exact as u32 == F32_INDEFINITE;
             if !generated {
                 assert_eq!(
                     exact, host,

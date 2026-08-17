@@ -183,7 +183,11 @@ impl<'a> Lifter<'a> {
     ///
     /// The inversion is spent on the `brif` destinations rather than on an
     /// extra compare, so `JAE` costs exactly the `CF` read.
-    pub(super) fn handle_jcc(&mut self, instruction: &Instruction, cond: Cond) -> crate::Result<()> {
+    pub(super) fn handle_jcc(
+        &mut self,
+        instruction: &Instruction,
+        cond: Cond,
+    ) -> crate::Result<()> {
         let val = self.eval_cond(cond);
         if cond.base().1 {
             self.handle_conditional_branch_inverted(instruction, val)

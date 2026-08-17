@@ -60,21 +60,21 @@ pub(super) enum PackedFpOp {
 }
 
 impl<'a> Lifter<'a> {
-    /// True when XMM registers are backed by native `I64X2` SSA variables, so
+    /// Get if XMM registers are backed by native `I64X2` SSA variables, so
     /// emitting vector IR costs no lane round-trip.
-    ///
-    /// A fast path guarded by this is a pure performance choice: the scalar
-    /// expansion it skips stays the authority on semantics, and
-    /// `tests/fuzz_cross_config.rs` proves the two agree.
     pub(super) fn vec_mode(&self) -> bool {
         self.config.use_vector_xmm
     }
 
-    /// What bit pattern this lift gives an SSE instruction's *generated* NaN.
-    ///
-    /// Read once per handler and passed into the lane closures, which the
-    /// plumbing hands only a builder - see [`fadd_x86`](super::sse::fadd_x86).
+    /// [`Optimization::UnsafeImpreciseNaN`](crate::core::optimize::Optimization::UnsafeImpreciseNaN)
     pub(super) fn generated_nan(&self) -> GeneratedNan {
+        if self
+            .config
+            .optimizations
+            .allows(crate::core::optimize::Optimization::UnsafeImpreciseNaN)
+        {
+            return GeneratedNan::HostDefault;
+        }
         self.config.generated_nan
     }
 

@@ -21,11 +21,11 @@
 //! declares the exit linkable.
 
 use crate::arch::x86_64::Lifter;
+use crate::arch::x86_64::X86_64;
 use crate::context::ExitReason;
+use crate::core::GuestArch;
 use crate::core::bridge::{BridgeImport, BridgeTarget, RESUME_LINKED, RegMask};
 use cranelift::prelude::*;
-use crate::arch::x86_64::X86_64;
-use crate::core::GuestArch;
 
 impl<'a> Lifter<'a> {
     /// Emit a call to `bridge`, and the two-way branch on its result.
