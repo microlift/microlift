@@ -158,8 +158,10 @@ impl<'a> Lifter<'a> {
     }
 
     /// Transfer control to a popped return address: dispatch into the region if
-    /// it names a known block, otherwise exit - cleanly via the trampoline, or
-    /// as an `UnknownJump`/`Return` for anything else.
+    /// it names a known block, otherwise exit - as an `UnknownJump`/`Return`,
+    /// or cleanly via the trampoline when
+    /// [`LifterConfig::exit_trampoline_address`](crate::core::LifterConfig::exit_trampoline_address)
+    /// named one and the address is it.
     ///
     /// Split out of [`Self::emit_return`] so an import tail `JMP` can perform
     /// exactly the return its callee's `RET` would have, after the stack pointer
@@ -180,23 +182,34 @@ impl<'a> Lifter<'a> {
         self.builder.switch_to_block(external_check_block);
         self.builder.seal_block(external_check_block);
 
-        let trampoline = self
-            .builder
-            .ins()
-            .iconst(types::I64, self.exit_trampoline_address as i64);
-        let is_trampoline = self.builder.ins().icmp(IntCC::Equal, target_ip, trampoline);
+        // The trampoline test - materialize a 64-bit constant, compare, branch -
+        // is paid by every out-of-region RET, so it is only emitted for a host
+        // that declared a sentinel. Without one there is nothing to recognise:
+        // every such return is "keep going at this PC", which is also the
+        // linkable exit. See `LifterConfig::exit_trampoline_address`.
+        let unknown_block = if let Some(trampoline_addr) = self.config.exit_trampoline_address {
+            let trampoline = self
+                .builder
+                .ins()
+                .iconst(types::I64, trampoline_addr as i64);
+            let is_trampoline = self.builder.ins().icmp(IntCC::Equal, target_ip, trampoline);
 
-        let exit_block = self.builder.create_block();
-        let unknown_block = self.builder.create_block();
+            let exit_block = self.builder.create_block();
+            let unknown_block = self.builder.create_block();
 
-        self.builder
-            .ins()
-            .brif(is_trampoline, exit_block, &[], unknown_block, &[]);
+            self.builder
+                .ins()
+                .brif(is_trampoline, exit_block, &[], unknown_block, &[]);
 
-        // Handle Return via Trampoline. Not linkable.
-        self.builder.switch_to_block(exit_block);
-        self.sync_to_context(Some(target_ip), ExitReason::Return)?;
-        self.emit_host_return();
+            // Handle Return via Trampoline. Not linkable.
+            self.builder.switch_to_block(exit_block);
+            self.sync_to_context(Some(target_ip), ExitReason::Return)?;
+            self.emit_host_return();
+
+            unknown_block
+        } else {
+            external_check_block
+        };
 
         // Handle Unknown Jump/Return. Linkable.
         self.builder.switch_to_block(unknown_block);

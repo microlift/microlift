@@ -150,7 +150,15 @@ fn test_execute_emitted_host_function() {
 
     let mut func_ctx = cranelift_frontend::FunctionBuilderContext::new();
     let builder = cranelift_frontend::FunctionBuilder::new(&mut func, &mut func_ctx);
-    let mut lifter = Lifter::new(builder);
+    // The sentinel declared here is what makes the `ret` below a clean `Return`
+    // exit; without one the lifter has no exit trampoline to recognise.
+    let mut lifter = Lifter::with_config(
+        builder,
+        LifterConfig {
+            exit_trampoline_address: Some(0xFFFF_FFFF_FFFF_FFFF),
+            ..LifterConfig::default()
+        },
+    );
 
     // mov rax, 42; ret
     let bytes = [0x48, 0xC7, 0xC0, 0x2A, 0x00, 0x00, 0x00, 0xC3];

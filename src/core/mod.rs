@@ -1023,6 +1023,9 @@ pub struct LifterConfig {
     /// blocks - far more readable for analysis - but it does **not** write guest
     /// state back to the `RegisterContext`, so it is not suitable for execution.
     pub analysis_mode: bool,
+    /// The guest return address that means "leave the region and hand control
+    /// back to the host", or `None` for a host that has no such address.
+    pub exit_trampoline_address: Option<u64>,
     /// Emit large shared code sequences - currently the 80-bit x87 softfloat
     /// kernels - once as helper functions and `call` them, instead of inlining
     /// a copy at every site. On by default: the kernels run to hundreds of IR
@@ -1253,6 +1256,7 @@ impl Default for LifterConfig {
             atomic128: Atomic128Mode::default(),
             generated_nan: GeneratedNan::default(),
             analysis_mode: false,
+            exit_trampoline_address: None,
             outline_helpers: true,
             emit_source_locs: true,
             region_tail_exit: false,
@@ -1449,8 +1453,6 @@ pub struct LiftEngine<'a, A: GuestArch = crate::arch::x86_64::X86_64> {
     /// instruction and a handler asking about "this" instruction would look up
     /// the wrong address.
     live_flags: FlagSet,
-    /// Designated address for controlled VM exit via RET.
-    pub exit_trampoline_address: u64,
     pub syscall_handler_sig: Option<SigRef>,
     /// Fast-call data for registered non-variadic imports, keyed by import VA.
     /// The execution mode decides whether the target is absolute (`Jit`) or
@@ -1626,7 +1628,6 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             // Nothing has been analysed yet, and the IR the engine emits before
             // phase 2 - the entry block's state load - must not be elided.
             live_flags: FlagSet::ALL,
-            exit_trampoline_address: 0xFFFF_FFFF_FFFF_FFFF,
             syscall_handler_sig,
             fast_calls,
             fast_call_by_name,

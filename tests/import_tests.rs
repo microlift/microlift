@@ -33,7 +33,7 @@ unsafe extern "C" fn host_strlen(s: *const u8) -> u64 {
 const LIFT_BASE: u64 = 0x1000;
 /// VA used for the fake "strlen import" stub.
 const IMPORT_VA: u64 = 0x2000;
-/// The exit-trampoline sentinel used by the lifter (always this value).
+/// The exit-trampoline sentinel this file declares in `lift_and_compile`.
 const EXIT_TRAMPOLINE: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 
 /// Builds the x86-64 byte sequence for:
@@ -72,7 +72,12 @@ fn strlen_call_bytes(string_ptr: u64) -> Vec<u8> {
 /// Lift `bytes` with the given config, compile with the JIT backend, and
 /// return the live backend (which keeps the code allocation alive) together
 /// with the raw code pointer.
-fn lift_and_compile(bytes: &[u8], config: LifterConfig) -> (CraneliftBackend, *const u8) {
+fn lift_and_compile(bytes: &[u8], mut config: LifterConfig) -> (CraneliftBackend, *const u8) {
+    // Every test here ends its region with a `RET` to the sentinel
+    // `make_ctx_and_stack` pushed, so the sentinel is declared here rather than
+    // in each caller's config literal.
+    config.exit_trampoline_address = Some(EXIT_TRAMPOLINE);
+
     let mut func = Function::with_name_signature(
         UserFuncName::user(0, 0),
         Signature::new(get_host_calling_conv()),
@@ -228,6 +233,9 @@ fn test_runtime_assisted_fast_call_strlen() {
 
     let mut config = LifterConfig {
         execution_mode: ExecutionMode::RuntimeAssisted,
+        // This test compiles the function itself rather than going through
+        // `lift_and_compile`, so it declares the sentinel too.
+        exit_trampoline_address: Some(EXIT_TRAMPOLINE),
         ..LifterConfig::default()
     };
     config.register_fast_import(
@@ -344,6 +352,9 @@ fn test_runtime_assisted_fast_call_two_imports() {
 
     let mut config = LifterConfig {
         execution_mode: ExecutionMode::RuntimeAssisted,
+        // This test compiles the function itself rather than going through
+        // `lift_and_compile`, so it declares the sentinel too.
+        exit_trampoline_address: Some(EXIT_TRAMPOLINE),
         ..LifterConfig::default()
     };
     config.register_fast_import(

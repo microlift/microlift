@@ -21,6 +21,10 @@ use microlift::os::get_host_calling_conv;
 
 const LIFT_BASE: u64 = 0x1000;
 
+/// The sentinel return address this file's harness pushes; a `RET` to it exits
+/// with `ExitReason::Return` because the config below declares it.
+const EXIT_TRAMPOLINE: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+
 /// Lift + JIT `bytes` at LIFT_BASE, run against `ctx`, and return the mutated
 /// context. A fresh stack is installed with the exit trampoline pre-pushed.
 fn run(bytes: &[u8], mut ctx: RegisterContext) -> RegisterContext {
@@ -35,7 +39,13 @@ fn run(bytes: &[u8], mut ctx: RegisterContext) -> RegisterContext {
     func.signature.params.push(AbiParam::new(types::I64));
     let mut func_ctx = cranelift_frontend::FunctionBuilderContext::new();
     let builder = cranelift_frontend::FunctionBuilder::new(&mut func, &mut func_ctx);
-    let mut lifter = Lifter::new(builder);
+    let mut lifter = Lifter::with_config(
+        builder,
+        LifterConfig {
+            exit_trampoline_address: Some(EXIT_TRAMPOLINE),
+            ..LifterConfig::default()
+        },
+    );
 
     let mut stack = [0u64; 1024];
     let stack_top = stack.as_mut_ptr() as u64 + 8192;
@@ -43,9 +53,8 @@ fn run(bytes: &[u8], mut ctx: RegisterContext) -> RegisterContext {
     if ctx.image_base == 0 {
         ctx.image_base = LIFT_BASE;
     }
-    let exit_trampoline = lifter.exit_trampoline_address;
     unsafe {
-        *(ctx.rsp as *mut u64) = exit_trampoline;
+        *(ctx.rsp as *mut u64) = EXIT_TRAMPOLINE;
     }
 
     lifter.lift(bytes, LIFT_BASE).expect("lifting failed");

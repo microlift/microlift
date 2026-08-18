@@ -1,5 +1,6 @@
 use cranelift_codegen::isa::CallConv;
 use microlift::core::{ExecutionMode, LifterConfig};
+use microlift::testkit::EXIT_TRAMPOLINE;
 use microlift::testkit::prelude::*;
 
 fn run_stack_test(bytes: &[u8], ctx: RegisterContext) -> RegisterContext {
@@ -11,7 +12,14 @@ fn run_stack_test_with_config(
     ctx: RegisterContext,
     config: LifterConfig,
 ) -> RegisterContext {
-    LiftTest::new(bytes).config(config).ctx(ctx).run().ctx
+    // A whole config replaces the harness default, so re-declare the sentinel
+    // the harness pushes - these programs end in a `RET` to it.
+    LiftTest::new(bytes)
+        .config(config)
+        .exit_trampoline(Some(EXIT_TRAMPOLINE))
+        .ctx(ctx)
+        .run()
+        .ctx
 }
 
 unsafe extern "C" fn test_syscall_handler(ctx: *mut RegisterContext) {

@@ -214,6 +214,10 @@ name = "spin_hint_tests"
 required-features = ["testkit"]
 
 [[test]]
+name = "exit_trampoline_tests"
+required-features = ["testkit"]
+
+[[test]]
 name = "block_link_tests"
 required-features = ["testkit"]
 

@@ -19,6 +19,7 @@
 use microlift::arch::x86_64::X86_64;
 use microlift::core::exit::TransferKind;
 use microlift::core::{ExecutionMode, LifterConfig, lift_to_code};
+use microlift::testkit::EXIT_TRAMPOLINE;
 use microlift::testkit::prelude::*;
 
 const BASE: u64 = 0x1000;
@@ -52,9 +53,13 @@ fn assert_exit_resumes(exit_insn: &[u8], expect: ExitReason, rip: ExitRip) {
 
     // `interpreter_fallback` so an instruction with no semantics becomes the
     // resumable fallback exit rather than a hard lift error; every other case
-    // here is unaffected by it.
+    // here is unaffected by it. The trampoline sentinel is the harness default,
+    // but a whole config passed to `.config()` replaces it, and the closing
+    // `RET` has to exit with `Return` for the resumed-region check to mean
+    // anything.
     let config = LifterConfig {
         interpreter_fallback: true,
+        exit_trampoline_address: Some(EXIT_TRAMPOLINE),
         ..Default::default()
     };
 

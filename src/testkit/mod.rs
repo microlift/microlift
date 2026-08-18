@@ -119,11 +119,17 @@ pub struct LiftTest<'a> {
 impl<'a> LiftTest<'a> {
     /// Start describing a test that lifts `bytes` at [`DEFAULT_LIFT_BASE`].
     pub fn new(bytes: &'a [u8]) -> Self {
+        // The harness's whole exit protocol is the sentinel at `[rsp]`, so the
+        // test config declares it even though the library default is `None`.
+        let config = LifterConfig {
+            exit_trampoline_address: Some(EXIT_TRAMPOLINE),
+            ..LifterConfig::default()
+        };
         Self {
             bytes,
             ip: DEFAULT_LIFT_BASE,
             image_base: DEFAULT_LIFT_BASE,
-            config: LifterConfig::default(),
+            config,
             opt: Opt::None,
             stack_words: DEFAULT_STACK_WORDS,
             ret_addr: RetAddr::Trampoline,
@@ -149,8 +155,23 @@ impl<'a> LiftTest<'a> {
     }
 
     /// Replace the whole [`LifterConfig`].
+    ///
+    /// Note this also drops the harness's default
+    /// [`LifterConfig::exit_trampoline_address`] (`Some(EXIT_TRAMPOLINE)`),
+    /// since a supplied config is taken as-is - set it on the config, or call
+    /// [`exit_trampoline`](Self::exit_trampoline) afterwards, for a test whose
+    /// program ends in a `RET` to the sentinel.
     pub fn config(mut self, config: LifterConfig) -> Self {
         self.config = config;
+        self
+    }
+
+    /// Set the sentinel return address that makes a `RET` exit with
+    /// [`ExitReason::Return`] (`config.exit_trampoline_address`). Defaults to
+    /// `Some(EXIT_TRAMPOLINE)`; pass `None` to lift the way the library does by
+    /// default, where such a `RET` is an `UnknownJump` instead.
+    pub fn exit_trampoline(mut self, addr: Option<u64>) -> Self {
+        self.config.exit_trampoline_address = addr;
         self
     }
 

@@ -368,6 +368,9 @@ fn imports_and_helpers_share_one_index_space() {
 
     let mut config = LifterConfig {
         execution_mode: ExecutionMode::RuntimeAssisted,
+        // Declared so the closing `ret` to the sentinel pushed below is a clean
+        // `Return` exit rather than an `UnknownJump`.
+        exit_trampoline_address: Some(0xFFFF_FFFF_FFFF_FFFF),
         ..LifterConfig::default()
     };
     config.register_fast_import(
