@@ -1,32 +1,24 @@
 //! Block linking: letting a translated region resolve its own successor.
 //!
-//! The lifted code performs **no validation** beyond the address compare: a
-//! matching [`BlockLinkEntry`] is taken to name executable code that may be
-//! entered at that guest PC. So the host must guarantee, for every entry it
-//! publishes:
+//! The lifted code performs **no validation** beyond the address compare, so for
+//! every [`BlockLinkEntry`] it publishes the host must guarantee:
 //!
-//! - `code` is the entry point of a compiled translation that *can be entered
-//!   at* `guest_pc` (microlift's [`LiftedCode::resume_points`] is the exact
-//!   set), and `image_base` is the value that translation wants - the lift base
-//!   of the region, reconciled as `pc = image_base + (ip - lift_base)`.
-//! - `code` stays mapped for as long as the entry is reachable. Overwriting the
-//!   entry is the only way to retract it, and nothing here is atomic: a table
-//!   must not be written while another thread's guest code can read it. One
-//!   table per guest thread is the intended shape.
-//! - The table is `entries` rows long and at least 8-byte aligned, which a
-//!   `[BlockLinkEntry]` is by construction - the probe's loads are `notrap` and
-//!   `aligned`, so a misaligned table is undefined rather than slow.
+//! - `code` is a compiled translation that *can be entered at* `guest_pc`
+//!   ([`LiftedCode::resume_points`] is the exact set), with the `image_base` that
+//!   translation wants (`pc = image_base + (ip - lift_base)`).
+//! - `code` stays mapped while the entry is reachable. Overwriting it is the only
+//!   way to retract it, and nothing here is atomic - one table per guest thread
+//!   is the intended shape.
+//! - The table is `entries` rows long and at least 8-byte aligned; the probe's
+//!   loads are `notrap`/`aligned`, so a misaligned table is undefined.
 //!
-//! An entry is otherwise free to be stale in the one way that does not matter:
-//! naming an older translation that also covers the PC. Two translations of
-//! the same address are interchangeable, which is what makes a direct-mapped
-//! table with no invalidation sound.
+//! An entry may be stale in the one way that does not matter: naming an older
+//! translation that also covers the PC. Two translations of the same address are
+//! interchangeable, which is what makes a direct-mapped table with no
+//! invalidation sound.
 //!
-//! What the region *does* with a match is [`LinkDispatch`]: hand the row to the
-//! host ([`LinkDispatch::HostResume`], the shape this module was built in), or
-//! branch to it with a pinned register file ([`LinkDispatch::Pinned`], see
-//! [`crate::core::pin`]). Everything above holds identically for both - they
-//! differ only after the address compare.
+//! [`LinkDispatch`] decides what a region does with a match; everything above
+//! holds for both shapes.
 //!
 //! [`RegisterContext`]: crate::arch::x86_64::context::RegisterContext
 //! [`LifterConfig::block_link`]: crate::core::LifterConfig::block_link
@@ -38,9 +30,8 @@ use crate::core::pin::PinnedAbi;
 /// at `code`, and it wants `image_base`"*.
 ///
 /// `#[repr(C)]` and exactly 32 bytes because lifted code indexes it with a
-/// shift: the layout is part of the ABI between a translation and its host, not
-/// an implementation detail. The trailing word is padding to that power of two
-/// and is never read by lifted code.
+/// shift - the layout is ABI, not an implementation detail. The trailing word
+/// is padding and is never read.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BlockLinkEntry {
@@ -71,12 +62,11 @@ pub const IMAGE_BASE_OFFSET: i32 = 16;
 
 /// The shape of the host's link table, as the lifter must know it.
 ///
-/// Both fields are baked into the emitted probe, so a host that changes either
-/// one has to discard the translations lifted under the old value. Keeping the
-/// table's geometry here - rather than letting each side pick its own - is what
-/// makes [`BlockLinkConfig::slot`] the single definition of where a PC lives:
-/// the host fills the row that lifted code will read, by construction rather
-/// than by agreement.
+/// Both fields are baked into the emitted probe, so changing either means
+/// discarding the translations lifted under the old value. Keeping the
+/// geometry here makes [`BlockLinkConfig::slot`] the single definition of
+/// where a PC lives, so the host fills the row lifted code reads by
+/// construction rather than by agreement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockLinkConfig {
     /// How many rows the table has. Must be a power of two, so the index is a
@@ -84,9 +74,9 @@ pub struct BlockLinkConfig {
     pub entries: u32,
     /// How far to shift a guest PC right before masking.
     ///
-    /// The low bits of a code address are the least distinguishing ones it has -
-    /// functions are aligned - so dropping them spreads a working set over the
-    /// table instead of leaving most of it empty. Four is the usual answer.
+    /// The low bits of a code address are its least distinguishing (functions are
+    /// aligned), so dropping them spreads a working set over the table. Four is
+    /// the usual answer.
     pub shift: u32,
     /// What the probe does once it has found a row. See [`LinkDispatch`].
     pub dispatch: LinkDispatch,
@@ -95,29 +85,24 @@ pub struct BlockLinkConfig {
 /// What a region does with the successor it resolved: hand it to the host, or
 /// branch to it.
 ///
-/// **This is the boundary between the two shapes of block linking**, and the
-/// only thing that distinguishes them at the seam. Both use the same table, the
-/// same geometry and the same probe up to the address compare; they differ in
-/// the three instructions after it, and in what that costs the region around
-/// them.
+/// **The boundary between the two shapes of block linking.** Both use the same
+/// table, geometry and probe up to the address compare, and differ only in the
+/// three instructions after it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkDispatch {
     /// Publish the matching row in [`BlockLinkOffsets::hit`] and return.
     ///
     /// The host reads the row and calls the code it names, so the register file
-    /// still goes out to the context and comes back on every region entry - what
-    /// is deleted is the host's *decision*, not its spill. A region under this
-    /// mode is an ordinary `extern "C" fn(*mut RegisterContext)` and nothing
-    /// about how it is entered changes.
+    /// still goes out to the context and back on every region entry - what is
+    /// deleted is the host's *decision*, not its spill. A region under this mode
+    /// is an ordinary `extern "C" fn(*mut RegisterContext)`.
     HostResume,
     /// Tail-call the code the row names, carrying the pinned registers with it.
     ///
-    /// The host does not see the link at all: the successor is entered by a
-    /// `return_call_indirect` from inside the region, with the guest state in
-    /// [`PinnedAbi`] still in machine registers. The fill and spill are paid
-    /// once per *chain* - in the entry thunk - instead of once per region, which
-    /// is the whole point of the exercise. See [`crate::core::pin`] for the ABI
-    /// this implies and the obligations it puts on the host.
+    /// The host does not see the link: the successor is entered by a
+    /// `return_call_indirect` with the guest state in [`PinnedAbi`] still in
+    /// machine registers, so the fill and spill are paid once per *chain* instead
+    /// of once per region. See [`crate::core::pin`].
     ///
     /// Inert, falling back to [`HostResume`](Self::HostResume), when the ABI is
     /// empty or the guest frontend cannot type its slots.
@@ -129,8 +114,7 @@ impl BlockLinkConfig {
     ///
     /// # Panics
     ///
-    /// If `entries` is not a power of two. This is a programming error rather
-    /// than a run-time condition: the lifter emits a mask, and a mask for a
+    /// If `entries` is not a power of two: the lifter emits a mask, which for a
     /// non-power-of-two size would silently read outside the table.
     pub fn new(entries: u32) -> Self {
         assert!(
@@ -155,11 +139,10 @@ impl BlockLinkConfig {
         self
     }
 
-    /// The pinned ABI this config asks for, if it asks for one at all.
+    /// The pinned ABI this config asks for, if any.
     ///
     /// Says nothing about whether the *guest* can supply it - that is
-    /// [`crate::core::pinned_abi_for`], which is the question every part of the
-    /// engine actually asks.
+    /// [`crate::core::pinned_abi_for`], the question the engine actually asks.
     pub fn pinned_abi(&self) -> Option<PinnedAbi> {
         match self.dispatch {
             LinkDispatch::HostResume => None,
@@ -182,9 +165,7 @@ impl BlockLinkConfig {
 /// Where a guest's `RegisterContext` keeps the two fields block linking needs.
 ///
 /// Returned by [`GuestArch::block_link_offsets`](crate::core::GuestArch::block_link_offsets);
-/// a guest that has not made room for them returns `None` and never links,
-/// which is why every other part of this is written without reference to a
-/// particular guest's context layout.
+/// a guest that has not made room for them returns `None` and never links.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockLinkOffsets {
     /// Byte offset of the pointer to the host's [`BlockLinkEntry`] table. Read
@@ -194,10 +175,9 @@ pub struct BlockLinkOffsets {
     /// Byte offset of the word the probe writes the matching entry's **address**
     /// into. Zero means "no link; service this exit yourself".
     ///
-    /// The host clears it before entering, rather than the probe clearing it on
-    /// a miss: that puts the store on the path taken once per entry instead of
-    /// once per exit, and makes an exit with no probe at all (a syscall, an
-    /// import call) report "no link" without having to know that linking exists.
+    /// The host clears it before entering rather than the probe clearing it on a
+    /// miss: that puts the store on the once-per-entry path, and lets an exit with
+    /// no probe at all report "no link" without knowing linking exists.
     pub hit: i32,
 }
 

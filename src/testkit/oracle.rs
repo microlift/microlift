@@ -220,14 +220,12 @@ pub struct MicroliftOracle {
     ///
     /// Defaults off, matching [`LifterConfig`](crate::core::LifterConfig).
     pub vector_xmm: bool,
-    /// Target-directed instruction specializations to apply
-    /// (`config.specialization`).
+    /// Target-directed instruction specializations to apply.
     ///
-    /// Defaults to [`Specialization::generic`]. Setting it points the oracle at
-    /// the specialized lowerings, which is how those get differential coverage
-    /// against real hardware semantics rather than only against microlift's own
-    /// portable path. The vector specializations additionally need
-    /// [`vector_xmm`](Self::vector_xmm), and
+    /// Defaults to [`Specialization::generic`]. Setting it points the oracle at the
+    /// specialized lowerings, which is how those get differential coverage against
+    /// real hardware rather than only against microlift's own portable path. The
+    /// vector ones additionally need [`vector_xmm`](Self::vector_xmm), and
     /// [`Spec::IntegerOverflowFlags`](crate::core::specialize::Spec::IntegerOverflowFlags)
     /// needs [`eliminate_dead_flags`](Self::eliminate_dead_flags);
     /// [`specialized`](Self::specialized) sets both.
@@ -246,15 +244,12 @@ impl MicroliftOracle {
         }
     }
 
-    /// Lift with `spec` applied, and with everything the specializations need
-    /// to be reachable at all: vector-backed XMM registers, and the dead-flag
-    /// liveness pass.
+    /// Lift with `spec` applied, and with everything the specializations need to be
+    /// reachable: vector-backed XMM registers and the dead-flag liveness pass.
     ///
-    /// Both prerequisites are turned on together rather than per-`Spec` so that
-    /// a caller enabling a whole target's set gets a lift where every member of
-    /// it can fire. Neither changes an architectural result, which is what
-    /// makes that safe to do behind one method - and both are separately proven
-    /// not to (`specialize_tests`, `dead_flag_tests`).
+    /// Both are turned on together rather than per-`Spec` so a caller enabling a
+    /// whole target's set gets a lift where every member can fire. Neither changes
+    /// an architectural result, and both are separately proven not to.
     pub fn specialized(mut self, spec: Specialization) -> Self {
         self.vector_xmm = true;
         self.eliminate_dead_flags = true;
@@ -389,13 +384,12 @@ pub fn differential<A: CpuOracle, B: CpuOracle>(
     Some(diff_states(oa.state(), ob.state(), opts))
 }
 
-/// A host memory buffer mapped at a fixed virtual address so that
-/// *guest VA == host VA* - the reconciliation primitive that lets Microlift's
-/// pointer-is-the-host-address JIT be diffed against an external emulator that
-/// maps the same VA into its own space.
+/// A host memory buffer mapped at a fixed virtual address so that *guest VA ==
+/// host VA* - the reconciliation primitive that lets microlift's
+/// pointer-is-the-host-address JIT be diffed against an external emulator.
 ///
 /// Unix only, and it never displaces an existing mapping - see
-/// [`IdentityArena::map`], which is where the interesting part is.
+/// [`IdentityArena::map`].
 #[cfg(unix)]
 pub struct IdentityArena {
     ptr: *mut u8,
@@ -405,28 +399,21 @@ pub struct IdentityArena {
 #[cfg(unix)]
 impl IdentityArena {
     /// Map `len` bytes read/write at exactly `va`. `va` and `len` should be page
-    /// aligned and in a normally-free range (e.g. `0x1_0000_0000`). Returns
-    /// `None` if the mapping could not be established there, which callers are
-    /// expected to treat as "skip this test" rather than as a failure.
+    /// aligned and in a normally-free range. `None` if the mapping could not be
+    /// established there, which callers treat as "skip this test".
     ///
-    /// **Never `MAP_FIXED`.** `MAP_FIXED` does not fail on a collision, it
-    /// *replaces* the mapping that was there - and in a test binary the thing
-    /// that was there is another thread's JIT code or heap, chosen by the
-    /// kernel precisely because this range was free a moment ago. That corrupts
-    /// the other thread, and worse, survives being noticed: the owner's own
-    /// `munmap` then tears down what is now *this* arena, and the fault lands
-    /// here, in a test that did nothing wrong, at exactly `va`. It reproduced
-    /// as an intermittent SIGSEGV in `unicorn_oracle_tests` under `--release`
-    /// with no failing test - the parallel harness is what made it likely
-    /// enough to see, not what made it possible.
+    /// **Never `MAP_FIXED`.** It does not fail on a collision, it *replaces* the
+    /// mapping that was there - which in a test binary is another thread's JIT code
+    /// or heap, placed there precisely because the range was free a moment ago. That
+    /// corrupts the other thread and survives being noticed: the owner's `munmap`
+    /// then tears down what is now *this* arena, and the fault lands here, at
+    /// exactly `va`, in a test that did nothing wrong. It reproduced as an
+    /// intermittent SIGSEGV in `unicorn_oracle_tests` under `--release`.
     ///
-    /// Linux has `MAP_FIXED_NOREPLACE`, which is the flag `MAP_FIXED` is
-    /// mistaken for: same exact placement, but `EEXIST` instead of a silent
-    /// replacement. Everywhere else this passes `va` as a plain **hint** with
-    /// no fixed flag at all - the kernel places the mapping at `va` when that
-    /// range is free and somewhere else when it is not, and the exact-address
-    /// check below turns "somewhere else" into `None`. Both spellings are
-    /// therefore atomic with respect to other threads; neither can clobber.
+    /// Linux has `MAP_FIXED_NOREPLACE`: same exact placement, `EEXIST` instead of a
+    /// silent replacement. Everywhere else `va` is a plain **hint** with no fixed
+    /// flag, and the exact-address check below turns "somewhere else" into `None`.
+    /// Both spellings are atomic with respect to other threads.
     pub fn map(va: u64, len: usize) -> Option<Self> {
         #[cfg(target_os = "linux")]
         let fixed = libc_flags::MAP_FIXED_NOREPLACE;
@@ -667,16 +654,14 @@ pub mod unicorn {
     }
 
     impl UnicornOracle {
-        /// The engine-side half of the [`ImportTable`] trampoline: for each
-        /// trapped VA, make sure the address is fetchable and break out of
-        /// emulation the moment control reaches it.
+        /// The engine-side half of the [`ImportTable`] trampoline: for each trapped VA,
+        /// make the address fetchable and break out of emulation the moment control
+        /// reaches it.
         ///
-        /// The returned cell carries the VA the run stopped at (set by the hook,
-        /// read by [`UnicornOracle::run_impl`]'s service loop). Breaking out -
-        /// rather than redirecting `RIP` from inside the hook - keeps the
-        /// trampoline independent of how Unicorn sequences a code hook against
-        /// the instruction it guards: the service loop simply restarts
-        /// emulation at the address it chose.
+        /// The returned cell carries the VA the run stopped at. Breaking out - rather
+        /// than redirecting `RIP` from inside the hook - keeps the trampoline
+        /// independent of how Unicorn sequences a code hook against the instruction it
+        /// guards: the service loop simply restarts emulation at the address it chose.
         fn install_import_stubs(
             uc: &mut Unicorn<'_, ()>,
             vas: &[u64],
@@ -902,13 +887,11 @@ pub mod unicorn {
 
     /// [`differential_unicorn`] with microlift lifting under `spec`.
     ///
-    /// This is the check that the target-specialized lowerings agree with the
-    /// *hardware*, not merely with microlift's own portable expansion. Both are
-    /// worth having and they prove different things:
-    /// `tests/specialize_tests.rs` proves specialized == portable for every
-    /// instruction and every target, and this proves portable == hardware. It
-    /// is the second that would catch a case where both of microlift's paths
-    /// are wrong the same way.
+    /// The check that the target-specialized lowerings agree with the *hardware*,
+    /// not merely with microlift's own portable expansion. `tests/specialize_tests.rs`
+    /// proves specialized == portable; this proves portable == hardware, and it is
+    /// the second that would catch both of microlift's paths being wrong the same
+    /// way.
     pub fn differential_unicorn_spec(
         code: &[u8],
         code_va: u64,

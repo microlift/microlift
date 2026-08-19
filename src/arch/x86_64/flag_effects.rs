@@ -1,45 +1,22 @@
 //! What each x86-64 instruction's *lift* does to the condition flags.
 //!
 //! The classification behind [`LifterConfig::eliminate_dead_flags`]. Read
-//! [`crate::core::flags`] first for what the analysis does with this, and
-//! [`FlagEffects`] for the contract - the two directions are asymmetric and
-//! getting one wrong is a wrong answer, not an error.
+//! [`crate::core::flags`] for what the analysis does with this, and
+//! [`FlagEffects`] for the contract - the two directions are asymmetric.
 //!
-//! ## This table describes `semantics/`, not the Intel manual
+//! **This table describes `semantics/`, not the Intel manual**, which is why it
+//! is hand-written rather than a call to iced's `rflags_written()`: AF is left
+//! *unchanged* after a logical op where the manual says undefined, the `IMUL`
+//! handlers assign only CF and OF, and `update_flags_shift` *reads* all five of
+//! CF/PF/ZF/SF/OF where the manual says a shift reads nothing.
 //!
-//! Which is the whole reason it is a hand-written table and not a call to
-//! iced's `rflags_written()`. Three places where the lift and the architecture
-//! disagree, each of which would be a bug if the architecture were believed:
-//!
-//! - **AF after a logical op.** The manual says undefined; `update_flags_logical`
-//!   leaves it *unchanged*, so a later reader observes whatever set it last.
-//!   `AND` therefore does not claim to write AF, and an earlier `ADD`'s AF stays
-//!   live across it.
-//! - **The undefined flags of `IMUL`/`MUL`.** Same shape: the handlers assign CF
-//!   and OF and nothing else, so that is all they claim.
-//! - **The flags a shift *reads*.** The manual says `SHL` reads nothing.
-//!   `update_flags_shift` loads all five of CF/PF/ZF/SF/OF, because a shift by a
-//!   masked count of zero must leave them as they were and the handler selects
-//!   between old and new. Classifying a shift as reading nothing would let the
-//!   value it selects be elided.
-//!
-//! ## Absence is the safe answer
-//!
-//! Every mnemonic not named below classifies as [`FlagEffects::CONSERVATIVE`] -
-//! reads everything, writes nothing - which keeps every earlier flag write
-//! alive across it. That is not a gap to be closed carelessly; it is what makes
-//! the whole thing safe without the table knowing which instructions microlift
-//! implements. An instruction that lifts to an `UnimplementedInstruction` exit
-//! syncs the entire context to the host, and the only reason that sync sees
-//! correct flags is that nobody classified the instruction, so nothing before it
-//! was elided. **A mnemonic belongs here only once someone has read its
-//! handler.**
-//!
-//! Three whole-instruction conditions short-circuit to conservative before the
-//! mnemonic is even consulted, because each of them routes to a different
-//! handler than the one this table was audited against: a `LOCK` prefix (which
-//! goes to `handle_locked_instruction`), an MMX register operand (which goes
-//! straight to the unimplemented exit), and a `REP`/`REPNE` prefix.
+//! **Absence is the safe answer.** An unnamed mnemonic classifies as
+//! [`FlagEffects::CONSERVATIVE`], which is what makes the table safe without
+//! knowing which instructions microlift implements. **A mnemonic belongs here
+//! only once someone has read its handler.** A `LOCK` prefix, an MMX operand and
+//! a `REP`/`REPNE` prefix short-circuit to conservative before the mnemonic is
+//! consulted, each routing to a different handler than this table was audited
+//! against.
 //!
 //! [`LifterConfig::eliminate_dead_flags`]: crate::core::LifterConfig::eliminate_dead_flags
 
@@ -148,26 +125,21 @@ pub fn flag_effects(i: &Instruction) -> Option<FlagEffects> {
         },
         Mnemonic::Std | Mnemonic::Cld => FlagEffects::writing(DF),
 
-        // A `Jcc`, `SETcc` or `CMOVcc` reads exactly the flags of its condition
-        // and writes none, and *which* flags is per-condition - so iced answers
-        // it rather than sixty match arms. Safe to trust here in a way it is not
-        // for a producer: this is the `reads` direction, where the requirement
-        // is a superset, and iced's read set is the architectural one the
-        // handlers evaluate.
+        // A `Jcc`, `SETcc` or `CMOVcc` reads exactly the flags of its condition and
+        // writes none, and *which* flags is per-condition - so iced answers it rather
+        // than sixty match arms. Safe here in a way it is not for a producer: this is
+        // the `reads` direction, where the requirement is a superset.
         //
-        // The conditional branches are also the reason the whole optimisation
-        // pays: `cmp; je` wants ZF, which leaves the other five of the `CMP`'s
-        // flags with no reader at all.
+        // These are also why the whole optimisation pays: `cmp; je` wants ZF, leaving
+        // the other five of the `CMP`'s flags with no reader at all.
         m if is_condition_consumer(m) => FlagEffects::reading(from_rflags(i.rflags_read())),
 
-        // Checked last so that any mnemonic named above wins: the two sets are
-        // disjoint by construction (`the_two_halves_of_the_table_are_disjoint`
-        // asserts it), and the ordering means a future overlap is resolved in
-        // favour of the hand-written entry rather than silently against it.
+        // Checked last so any mnemonic named above wins. The two sets are disjoint by
+        // construction (`the_two_halves_of_the_table_are_disjoint` asserts it), and the
+        // ordering resolves a future overlap in favour of the hand-written entry.
         //
-        // Transparency is what makes the analysis able to see *through* a
-        // stretch of code. Without it, liveness stops at the first `MOV` and a
-        // `cmp; mov; mov; jne` - which is most compiled code - keeps every flag.
+        // Transparency is what lets liveness see *through* a stretch of code; without
+        // it, it stops at the first `MOV` and `cmp; mov; mov; jne` keeps every flag.
         m if is_flag_free(m) => FlagEffects::TRANSPARENT,
 
         // Everything else, including every instruction that lifts to a VM exit
@@ -181,30 +153,26 @@ pub fn flag_effects(i: &Instruction) -> Option<FlagEffects> {
 /// Mnemonics whose lift provably touches no flag and never syncs to the host.
 ///
 /// **Generated, not written.** `tools/derive-flag-free.py` re-derives it from
-/// `semantics/` and prints the list; the procedure is:
+/// `semantics/`:
 ///
-/// 1. Take every mnemonic `semantics::handle_instruction` dispatches, and the
-///    handler it dispatches to.
+/// 1. Take every mnemonic `handle_instruction` dispatches and its handler.
 /// 2. Mark a function *tainted* if its body mentions `set_flag`, `state.flags`,
 ///    `flag_needed`, `sync_to_context`, `write_exit_reason`, `write_exit_code`,
 ///    `resumes_at`, or `handle_unimplemented`.
-/// 3. Propagate the taint to a fixpoint through **any mention** of another
-///    function's name - not just `self.f(` calls. That over-approximation is
-///    the point: `MOVSB` reads DF through `Self::emit_movs` passed as a value,
-///    and a call-shaped search alone declares it flag-free, which is a
-///    miscompile. It is excluded here because of this rule.
+/// 3. Propagate to a fixpoint through **any mention** of another function's
+///    name, not just `self.f(` calls. That over-approximation is the point:
+///    `MOVSB` reaches DF through `Self::emit_movs` passed as a value, and a
+///    call-shaped search alone would declare it flag-free - a miscompile.
 /// 4. Keep the mnemonics whose handler is untainted.
 ///
-/// Both halves of the taint matter. A handler that touches a flag obviously
-/// cannot be transparent; a handler that **syncs to the host** cannot either,
-/// because the sync publishes every flag and an elided write would publish a
-/// stale one. That second rule is what keeps `CPUID`, `SYSCALL`, `DIV` and the
-/// rest of the exiting instructions out.
+/// Both halves of the taint matter: a handler that touches a flag obviously
+/// cannot be transparent, and one that **syncs to the host** cannot either,
+/// since the sync publishes every flag and an elided write would publish a
+/// stale one. That is what keeps `CPUID`, `SYSCALL`, `DIV` and the rest out.
 ///
 /// Re-run the script after touching `semantics/`. It is an allowlist, so the
-/// dangerous direction - a handler that gains a `set_flag` and stays on this
-/// list - is the one to re-derive for; a mnemonic that merely stops being
-/// listed costs speed alone.
+/// dangerous direction is a handler that gains a `set_flag` and stays listed; a
+/// mnemonic that merely stops being listed costs speed alone.
 fn is_flag_free(m: Mnemonic) -> bool {
     matches!(
         m,
@@ -525,10 +493,8 @@ fn is_flag_free(m: Mnemonic) -> bool {
 /// interaction is evaluating a condition.
 ///
 /// `JRCXZ`, `LOOP`, `LOOPE` and `LOOPNE` are deliberately absent even though
-/// they branch: `JRCXZ` and `LOOP` test a register rather than a flag, and the
-/// `LOOPcc` pair read ZF, all of which iced reports correctly - but their
-/// handlers also decrement `RCX`, so they are left to classify conservatively
-/// until someone has read them.
+/// they branch: their handlers also decrement `RCX`, so they classify
+/// conservatively until someone has read them.
 fn is_condition_consumer(m: Mnemonic) -> bool {
     use Mnemonic::*;
     matches!(

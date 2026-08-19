@@ -1,19 +1,12 @@
 //! Guest-architecture abstraction.
 //!
-//! Microlift lifts a *guest* instruction set into Cranelift IR. The lift engine
-//! itself (block discovery, resumable dispatch, import fast-calls, context
-//! sync, exit handling) is guest-agnostic and lives in [`crate::core`]. Each
-//! supported guest architecture plugs into that engine by providing:
+//! The lift engine itself is guest-agnostic and lives in [`crate::core`]. Each
+//! guest plugs into it by providing a decoder, static control-flow facts per
+//! instruction, an SSA register file, and per-mnemonic semantics.
 //!
-//! - a decoder that turns bytes into a list of instructions,
-//! - static control-flow facts per instruction (for block-leader discovery),
-//! - a register file (SSA variables mapped to guest registers/flags), and
-//! - instruction semantics (per-mnemonic IR emission).
-//!
-//! The central trait tying these together is `GuestArch`. It is defined
-//! alongside the generic `Lifter` in [`crate::core`] because its methods take
-//! `&mut Lifter<'_, Self>`. This module hosts the arch-neutral value types the
-//! trait and engine exchange.
+//! The trait tying those together is `GuestArch`, defined alongside the generic
+//! `Lifter` in [`crate::core`] because its methods take `&mut Lifter<'_, Self>`.
+//! This module hosts the arch-neutral value types they exchange.
 
 pub mod aarch64;
 pub mod x86_64;

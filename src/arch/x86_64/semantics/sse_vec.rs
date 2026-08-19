@@ -1,26 +1,21 @@
 //! Native-vector fast paths for the SSE handlers.
 //!
 //! Every handler in [`sse`](super::sse) and [`sse_int`](super::sse_int) has a
-//! portable scalar expansion that works on the `(lo, hi)` 64-bit half pair.
-//! That expansion is required when XMM registers are backed by two `I64` SSA
-//! variables (the default, and the only option for AOT targets without SIMD),
-//! but it is *also* what ran under `use_vector_xmm` for every handler that had
-//! no explicit fast path - paying two `extractlane`s, a scalar lane expansion
-//! that can run to hundreds of IR instructions, and two `insertlane`s, all to
-//! express something the host does in one SIMD instruction.
+//! portable scalar expansion over the `(lo, hi)` 64-bit half pair, required when
+//! XMM registers are backed by two `I64` SSA variables. Under `use_vector_xmm`
+//! that expansion costs two `extractlane`s, a lane expansion that can run to
+//! hundreds of IR instructions, and two `insertlane`s, to express what the host
+//! does in one SIMD instruction.
 //!
-//! This module holds the shared plumbing those fast paths are built from. The
-//! handlers call [`Lifter::vec_mode`] and, when it holds, emit a native
-//! `I64X2`-typed sequence instead.
+//! This module is the shared plumbing the fast paths are built from: handlers
+//! call [`Lifter::vec_mode`] and, when it holds, emit a native `I64X2` sequence.
 //!
-//! The single most valuable primitive here is [`Lifter::vec_shuffle`]: a large
-//! part of the SSE surface (`PSHUFD`, `SHUFPS`, `SHUFPD`, the whole `PUNPCK*` /
-//! `UNPCKP*` family, `PSHUFLW` / `PSHUFHW`, `PSLLDQ` / `PSRLDQ`, `PALIGNR`,
-//! `MOVSLDUP` / `MOVSHDUP`, `MOVDDUP`, `MOVHLPS` / `MOVLHPS` and the
-//! register-to-register `MOVSS` / `MOVSD` merges) is nothing but a *lift-time
-//! constant* permutation of the 32 bytes of two 128-bit inputs, which is
-//! exactly Cranelift's `shuffle`. One mask builder per instruction replaces
-//! each hand-rolled mask/shift/OR chain.
+//! The most valuable primitive is [`Lifter::vec_shuffle`]. A large part of the
+//! SSE surface (`PSHUFD`, `SHUFPS`, `SHUFPD`, `PUNPCK*`/`UNPCKP*`,
+//! `PSHUFLW`/`PSHUFHW`, `PSLLDQ`/`PSRLDQ`, `PALIGNR`, `MOVSLDUP`/`MOVSHDUP`,
+//! `MOVDDUP`, `MOVHLPS`/`MOVLHPS` and the register-to-register `MOVSS`/`MOVSD`
+//! merges) is nothing but a *lift-time constant* permutation of the 32 bytes of
+//! two 128-bit inputs, which is exactly Cranelift's `shuffle`.
 
 use super::sse::{F32_INDEFINITE, F64_INDEFINITE};
 use crate::core::GeneratedNan;
@@ -113,14 +108,12 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// Multiply the eight 16-bit lanes of `a` and `b` into two `I32X4` vectors
-    /// of exact 32-bit products - the low four lanes, then the high four.
+    /// Multiply the eight 16-bit lanes of `a` and `b` into two `I32X4` vectors of
+    /// exact 32-bit products - the low four lanes, then the high four.
     ///
-    /// This is the portable substrate the 16-bit multiply-high forms are built
-    /// on. Cranelift *does* have single ops for some of them (`smulhi`,
-    /// `umulhi`, `x86_pmulhrsw`), but none of those lower on aarch64, and
-    /// microlift targets whatever host or AOT triple it is pointed at - so the
-    /// expansion has to use ops every backend implements.
+    /// The portable substrate the 16-bit multiply-high forms are built on.
+    /// Cranelift has single ops for some of them (`smulhi`, `umulhi`,
+    /// `x86_pmulhrsw`), but none lower on aarch64.
     fn vec_mul_word_widen(&mut self, a: Value, b: Value, signed: bool) -> (Value, Value) {
         let a = self.vec_bitcast(a, types::I16X8);
         let b = self.vec_bitcast(b, types::I16X8);
@@ -147,8 +140,7 @@ impl<'a> Lifter<'a> {
     }
 
     /// Narrow two `I32X4` vectors to one `I16X8` by keeping the 16 bits of each
-    /// dword lane starting at byte `byte_off` (0 for the low half, 2 for the
-    /// high), discarding the rest.
+    /// dword lane starting at byte `byte_off` (0 for the low half, 2 for the high).
     ///
     /// Unlike `snarrow`/`unarrow` this truncates rather than saturates, which is
     /// what the multiply forms want.
@@ -188,12 +180,10 @@ impl<'a> Lifter<'a> {
 
     /// Lane-wise floating-point compare yielding an all-ones/all-zeros mask.
     ///
-    /// aarch64 has no vector-float lowering for the
-    /// `UnorderedOrGreaterThan{,OrEqual}` conditions (x86's `NLE` and `NLT`
-    /// predicates), so those are emitted as the bitwise complement of the
-    /// ordered compare each one negates. `NLT` *is* "not `<`" and `NLE` "not
-    /// `<=`", unordered operands included, so the rewrite is exact; it costs one
-    /// `bnot` on backends that could have taken the condition directly.
+    /// aarch64 has no vector-float lowering for `UnorderedOrGreaterThan{,OrEqual}`
+    /// (x86's `NLE`/`NLT`), so those are emitted as the bitwise complement of the
+    /// ordered compare each negates. `NLT` *is* "not `<`" including unordered
+    /// operands, so the rewrite is exact; it costs one `bnot` elsewhere.
     pub(super) fn vec_fcmp(&mut self, cc: FloatCC, a: Value, b: Value) -> Value {
         let (cc, invert) = match cc {
             FloatCC::UnorderedOrGreaterThanOrEqual => (FloatCC::LessThan, true),
@@ -212,9 +202,8 @@ impl<'a> Lifter<'a> {
     /// out-of-range behaviour.
     ///
     /// The vector twin of [`Lifter::fp_to_sint_x86`](super::sse): saturation
-    /// already gives `INT_MIN` on the too-negative side, so only the "NaN or too
-    /// positive" side needs patching back from `fcvt_to_sint_sat`'s
-    /// `0`/`INT_MAX` to the integer indefinite value.
+    /// already gives `INT_MIN` on the too-negative side, so only "NaN or too
+    /// positive" needs patching back to the integer indefinite.
     pub(super) fn vec_fp_to_sint_x86(&mut self, x: Value, ity: Type, truncate: bool) -> Value {
         let fty = self.builder.func.dfg.value_type(x);
         let x = if truncate {
@@ -242,11 +231,10 @@ impl<'a> Lifter<'a> {
 
     /// Lane-wise square root with x86's NaN behaviour.
     ///
-    /// The vector twin of [`fp_sqrt_x86`](super::sse::fp_sqrt_x86): a negative
-    /// lane must produce x86's floating indefinite, which is sign-set, rather
-    /// than whatever default NaN the host FPU picks. As with the MIN/MAX forms
-    /// the per-lane choice is a `bitselect` on the compare's all-ones mask, and
-    /// as there, [`GeneratedNan::HostDefault`] skips the whole thing.
+    /// The vector twin of [`fp_sqrt_x86`](super::sse::fp_sqrt_x86): a negative lane
+    /// must produce x86's sign-set floating indefinite rather than the host's
+    /// default NaN. The per-lane choice is a `bitselect` on the compare mask, and
+    /// [`GeneratedNan::HostDefault`] skips the whole thing.
     fn vec_fp_sqrt_x86(&mut self, x: Value) -> Value {
         let fty = self.builder.func.dfg.value_type(x);
         let r = self.builder.ins().sqrt(x);
@@ -271,13 +259,11 @@ impl<'a> Lifter<'a> {
 
     /// Lane-wise arithmetic with x86's generated-NaN bits.
     ///
-    /// The vector twin of [`fp_arith_x86`](super::sse::fp_arith_x86): a lane
-    /// whose result is a NaN neither operand supplied performed an invalid
-    /// operation (`inf + -inf`, `inf - inf`, `0 * inf`, `0 / 0`, `inf / inf`)
-    /// and must yield x86's sign-set floating indefinite rather than the host's
-    /// default NaN - unless [`GeneratedNan::HostDefault`] says the host's is
-    /// acceptable, in which case nothing is emitted. Lanes with a NaN operand
-    /// fall through to the host's propagation, which already matches x86.
+    /// The vector twin of [`fp_arith_x86`](super::sse::fp_arith_x86): a lane whose
+    /// result is a NaN neither operand supplied performed an invalid operation and
+    /// must yield x86's sign-set floating indefinite, unless
+    /// [`GeneratedNan::HostDefault`] says the host's is acceptable. Lanes with a
+    /// NaN operand fall through to the host's propagation, which matches x86.
     pub(super) fn vec_fp_arith_x86(
         &mut self,
         a: Value,
@@ -305,14 +291,11 @@ impl<'a> Lifter<'a> {
     }
 
     /// Emit a packed floating-point op over whole 128-bit vectors, when XMM
-    /// registers are vector-backed.
+    /// registers are vector-backed. Returns `false` without emitting anything in
+    /// scalar mode, leaving the caller to fall through to its lane expansion.
     ///
-    /// Returns `false` without emitting anything in scalar mode, leaving the
-    /// caller to fall through to its portable lane expansion.
-    ///
-    /// `single` selects `F32X4` lanes over `F64X2`. Operand 0 is the
-    /// destination XMM register and operand 1 the `xmm/m128` source, the shape
-    /// every packed form here shares.
+    /// `single` selects `F32X4` lanes over `F64X2`. Operand 0 is the destination
+    /// XMM register, operand 1 the `xmm/m128` source.
     pub(super) fn try_packed_fp_vec(
         &mut self,
         instruction: &Instruction,
@@ -372,28 +355,22 @@ impl<'a> Lifter<'a> {
     }
 
     /// Emit a *scalar* floating-point op on lane 0, when XMM registers are
-    /// vector-backed.
-    ///
-    /// Returns `false` without emitting anything in scalar mode, leaving the
-    /// caller to fall through to its portable lane expansion.
+    /// vector-backed. Returns `false` without emitting anything in scalar mode.
     ///
     /// The portable expansion reaches lane 0 through
     /// [`get_xmm_lo`](Lifter::get_xmm_lo), which in vector mode is an
-    /// `extractlane` to an *integer* - so `MULSS` arrives at its `fmul` having
-    /// moved the lane into a GPR, masked off the half it does not want, and
-    /// moved it back, and leaves the same way. On aarch64 that is four to six
-    /// instructions around a one-instruction multiply, two of them FP-to-GPR
-    /// transfers, which are among the more expensive moves on the machine.
+    /// `extractlane` to an *integer* - so `MULSS` arrives at its `fmul` having moved
+    /// the lane into a GPR, masked, and moved it back, and leaves the same way. On
+    /// aarch64 that is four to six instructions around a one-instruction multiply,
+    /// two of them expensive FP-to-GPR transfers.
     ///
-    /// Nothing about the arithmetic changes here: `op` is the same closure the
-    /// portable path uses, NaN handling included. The only difference is that
-    /// the value never leaves the vector register file - lane 0 of an `F32X4`
-    /// *is* `sN`, so the `extractlane` costs nothing and the `insertlane` that
-    /// puts the result back is the single `mov vD.s[0], vN.s[0]` that the
-    /// instruction's "bits[127:32] are preserved" semantics call for.
+    /// The arithmetic is unchanged - `op` is the same closure, NaN handling
+    /// included. The difference is that the value never leaves the vector register
+    /// file: lane 0 of an `F32X4` *is* `sN`, so the `extractlane` costs nothing and
+    /// the `insertlane` is the single `mov vD.s[0], vN.s[0]` the "bits[127:32] are
+    /// preserved" semantics call for.
     ///
-    /// `single` selects `F32X4` lanes over `F64X2`. Operand 0 is the
-    /// destination XMM register and operand 1 the `xmm/m32` (or `m64`) source.
+    /// `single` selects `F32X4` lanes over `F64X2`.
     pub(super) fn try_scalar_fp_vec(
         &mut self,
         instruction: &Instruction,
@@ -426,10 +403,9 @@ impl<'a> Lifter<'a> {
     /// Read the scalar source of a [`Lifter::try_scalar_fp_vec`] operation as a
     /// bare `F32`/`F64`, without routing it through an integer register.
     ///
-    /// A memory operand is loaded at the *scalar* float type rather than as
-    /// bits, so it lands in the FP register file directly (`ldr s`/`ldr d`) -
-    /// loading it as an integer would reintroduce on the source side exactly
-    /// the transfer this path exists to remove.
+    /// A memory operand is loaded at the *scalar* float type rather than as bits, so
+    /// it lands in the FP register file directly (`ldr s`/`ldr d`) - loading it as
+    /// an integer would reintroduce the transfer this path exists to remove.
     fn read_scalar_fp_vec_src(
         &mut self,
         instruction: &Instruction,
@@ -457,17 +433,13 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// `ADDSUBPS` / `ADDSUBPD` - subtract in the even lanes, add in the odd
-    /// ones - over whole 128-bit vectors, when XMM registers are vector-backed.
+    /// `ADDSUBPS`/`ADDSUBPD` over whole 128-bit vectors, when XMM registers are
+    /// vector-backed. Returns `false` without emitting anything in scalar mode.
     ///
-    /// Returns `false` without emitting anything in scalar mode, leaving the
-    /// caller to fall through to its portable lane expansion.
-    ///
-    /// Both results are computed and then blended by a lift-time constant
-    /// shuffle. The cheaper-looking alternative - flip the sign of the even
-    /// source lanes and issue a single `fadd` - is *not* equivalent: an even
-    /// lane whose source is a NaN would propagate that NaN with its sign bit
-    /// flipped, where the real subtract propagates it unchanged.
+    /// Both results are computed and blended by a lift-time constant shuffle. The
+    /// cheaper-looking alternative - flip the sign of the even source lanes and
+    /// issue one `fadd` - is *not* equivalent: an even lane whose source is a NaN
+    /// would propagate it with the sign bit flipped.
     pub(super) fn try_addsub_vec(
         &mut self,
         instruction: &Instruction,
@@ -503,10 +475,9 @@ impl<'a> Lifter<'a> {
 
     /// Build a 16-byte shuffle mask from a lane-level selector.
     ///
-    /// `bits` is the lane width; `pick(j)` returns the source lane of result
-    /// lane `j`, numbered across both operands (`0..128/bits` in the first,
-    /// then the same range again in the second). This keeps every caller
-    /// working in the lane units its mnemonic is defined in rather than bytes.
+    /// `bits` is the lane width; `pick(j)` returns the source lane of result lane
+    /// `j`, numbered across both operands. This keeps callers working in the lane
+    /// units their mnemonic is defined in rather than in bytes.
     pub(super) fn lane_shuffle_mask(bits: u32, mut pick: impl FnMut(u32) -> u32) -> [u8; 16] {
         let stride = bits / 8;
         let lanes = 128 / bits;

@@ -1,35 +1,21 @@
-//! Software x87 80-bit extended-precision floating point, emitted as pure
-//! Cranelift IR.
+//! Software x87 80-bit extended-precision floating point, as pure Cranelift IR.
 //!
-//! Each operation is a free `emit_*` function that builds its body into a given
-//! [`FunctionBuilder`], taking and returning values in the lifter's raw 80-bit
-//! representation: a `(mant: i64, se: i32)` pair, where `mant` is the 64-bit
-//! significand (explicit integer bit at position 63 for normal values) and `se`
-//! holds the sign at bit 15 and the 15-bit biased exponent (bias 16383) in the
-//! low bits.
+//! Each operation is a free `emit_*` function building into a given
+//! [`FunctionBuilder`], taking and returning the raw 80-bit representation: a
+//! `(mant: i64, se: i32)` pair, where `mant` is the significand (explicit integer
+//! bit at 63) and `se` holds the sign at bit 15 and the 15-bit biased exponent
+//! (bias 16383) below it.
 //!
-//! Writing them as free IR-builders (rather than `Lifter` methods) means the
-//! same body serves two emission strategies without changing the logic:
-//! *inline* at each x87 site, or emitted once into a co-located helper function
-//! that every site `call`s. [`F80Kernel`] names the outlinable kernels and
-//! builds those helper bodies; the engine's outlined-helper table
-//! ([`crate::core::LiftEngine::outlined_helper`]) declares and de-duplicates
-//! them. Outlining is the default - these kernels are hundreds of IR
-//! instructions each (the divide and square root contain 128-bit
-//! shift/subtract loops), so inlining them at every `FMUL`/`FDIV` in a region
-//! bloats the emitted code far past what the instruction cache tolerates.
+//! Free builders rather than `Lifter` methods so one body serves both emission
+//! strategies: inline at each site, or emitted once into a helper every site
+//! `call`s ([`F80Kernel`]). Outlining is the default - the kernels run to
+//! hundreds of IR instructions each.
 //!
-//! Scope and known approximations:
-//!  - Handles normal values, zero, infinity and NaN correctly for `+ - * /` and
-//!    the ordering compare, with round-to-nearest-even.
-//!  - Subnormal *results* are flushed to zero (underflow), and subnormal
-//!    *inputs* are treated via their stored significand without renormalisation.
-//!    x87 `long double` from a compiler rarely produces these; full subnormal
-//!    support is a later refinement.
-//!  - NaN results use the canonical x87 QNaN indefinite rather than propagating
-//!    input payloads bit-for-bit.
-//!  - The transcendental kernel ([`emit_f80_cos`]) is correctly *reduced* but
-//!    not correctly *rounded*: see its own accuracy note.
+//! Approximations: subnormal *results* flush to zero and subnormal *inputs* are
+//! used as stored; NaN results are the canonical x87 QNaN indefinite rather than
+//! propagating input payloads; and [`emit_f80_trig`] is correctly *reduced* but
+//! not correctly *rounded* (see its own accuracy note). Everything else is
+//! correct for `+ - * /` and the ordering compare, round-to-nearest-even.
 
 use cranelift::prelude::*;
 use cranelift_codegen::isa::CallConv;
@@ -849,12 +835,10 @@ pub fn emit_f80_cmp(
 
 /// `floor((2/pi) * 2^256)`, least-significant limb first.
 ///
-/// Argument reduction is Payne-Hanek: the quadrant and the reduced argument
-/// both come out of the bits of `|x| * 2/pi`, which needs `2/pi` to far more
-/// precision than 80 bits. 256 bits is sized for the whole `FCOS` domain -
-/// `|x| < 2^63` puts the worst-case cancellation (an argument sitting almost
-/// exactly on a multiple of `pi/2`) around 2^-70, leaving well over 64 good
-/// bits in the remainder.
+/// Argument reduction is Payne-Hanek: the quadrant and the reduced argument both
+/// come out of the bits of `|x| * 2/pi`, which needs `2/pi` to far more than 80
+/// bits. 256 is sized for the whole domain - `|x| < 2^63` puts the worst-case
+/// cancellation around 2^-70, leaving well over 64 good bits.
 const TWO_OVER_PI_Q256: [u64; 4] = [
     0xFE51_63AB_DEBB_C561,
     0xDB62_9599_3C43_9041,
@@ -868,9 +852,8 @@ const PI_OVER_2_Q127: (u64, u64) = (0xC90F_DAA2_2168_C234, 0xC4C6_628B_80DC_1CD1
 /// Taylor coefficients of `cos` in `u = r^2`: `(-1)^k / (2k)!`, as Q126
 /// two's-complement `(high, low)` halves.
 ///
-/// Twelve terms take the truncation error below 2^-87 over the whole reduced
-/// range `|r| <= pi/4` (`u <= 0.618`), which is far under the Q126 accumulator's
-/// own rounding noise.
+/// Twelve terms put the truncation error below 2^-87 over `|r| <= pi/4`, far
+/// under the Q126 accumulator's own rounding noise.
 const COS_COEFFS_Q126: [(u64, u64); TRIG_POLY_TERMS] = [
     (0x4000_0000_0000_0000, 0x0000_0000_0000_0000),
     (0xE000_0000_0000_0000, 0x0000_0000_0000_0000),
@@ -990,15 +973,14 @@ fn mulhi_su(b: &mut FunctionBuilder, a: Value, y: Value) -> Value {
     b.ins().isub(hi, corr)
 }
 
-/// Reduce `|x|` (given as its raw significand and biased exponent) modulo
-/// `pi/2`.
+/// Reduce `|x|` (as its raw significand and biased exponent) modulo `pi/2`.
 ///
-/// Returns `(n, r_sig, r_exp, r_sign)`: the nearest quadrant index `n =
-/// round(|x| / (pi/2))` as an `I64`, and the remainder `r = |x| - n*(pi/2)`,
-/// `|r| <= pi/4`, as a normalised significand + biased exponent + sign bit.
+/// Returns `(n, r_sig, r_exp, r_sign)`: the nearest quadrant index
+/// `n = round(|x| / (pi/2))`, and the remainder `r = |x| - n*(pi/2)` with
+/// `|r| <= pi/4`, as a normalised significand, biased exponent and sign bit.
 ///
-/// The caller must have established `|x| < 2^63` and that `x` is finite; that
-/// bound is exactly what makes the fixed 256-bit `2/pi` window enough.
+/// The caller must have established that `x` is finite and `|x| < 2^63`, which
+/// is exactly what makes the fixed 256-bit `2/pi` window enough.
 fn emit_trig_reduce(b: &mut FunctionBuilder, m: Value, e: Value) -> (Value, Value, Value, Value) {
     let i128 = types::I128;
     let i32t = types::I32;
@@ -1178,37 +1160,32 @@ pub const TRIG_PHASE_COS: i64 = 0;
 pub const TRIG_PHASE_SIN: i64 = 1;
 
 /// Emit `cos(a)` or `sin(a)` for a raw 80-bit value, selected by `phase`
-/// ([`TRIG_PHASE_COS`] / [`TRIG_PHASE_SIN`], an `I32`).
+/// ([`TRIG_PHASE_COS`]/[`TRIG_PHASE_SIN`], an `I32`).
 ///
-/// `phase` is a *runtime* value rather than a Rust-level flag on purpose: the
-/// quadrant selection it feeds is already a chain of `select`s, so both
-/// functions come out of one shared body - one outlined helper serving `FSIN`,
-/// `FCOS`, `FSINCOS` and `FPTAN` instead of near-identical copies.
+/// `phase` is a *runtime* value on purpose: the quadrant selection it feeds is
+/// already a chain of `select`s, so one outlined helper serves `FSIN`, `FCOS`,
+/// `FSINCOS` and `FPTAN`.
 ///
-/// The caller is responsible for the x87 out-of-range protocol: this assumes
-/// `|a| < 2^63` (the domain on which these instructions compute at all) and
+/// The caller owns the x87 out-of-range protocol; this assumes `|a| < 2^63` and
 /// returns the QNaN indefinite for a NaN or infinite input.
 ///
 /// Shape: Payne-Hanek reduction against a 256-bit `2/pi` gives the quadrant and
 /// a remainder `|r| <= pi/4`; a twelve-term Horner evaluation in `u = r^2` gives
-/// `cos(r)` or `sin(r)/r`, selected per coefficient by the quadrant so the two
-/// series share one evaluation. The polynomial runs in 128-bit fixed point (Q126
-/// accumulator, Q127 argument) rather than through the 80-bit kernels: the
-/// series value is always near 1, so absolute precision there *is* relative
-/// precision, at a fraction of the IR. The `sin` case then multiplies by the
-/// *normalised* `r` rather than a fixed-point one, so an argument that lands
-/// almost exactly on a multiple of `pi/2` keeps its relative accuracy.
+/// `cos(r)` or `sin(r)/r`, selected per coefficient by the quadrant so both
+/// series share one evaluation. The polynomial runs in 128-bit fixed point
+/// rather than through the 80-bit kernels: the series value is near 1, so
+/// absolute precision there *is* relative precision, at a fraction of the IR.
+/// The `sin` case multiplies by the *normalised* `r`, which is what preserves
+/// relative accuracy for an argument landing almost exactly on a multiple of
+/// `pi/2`.
 ///
 /// Accuracy: faithful to the 64-bit significand. Against the 90-digit reference
 /// tables in `fpu_tests::test_fcos_full_80_bit_precision` and its `fsin`
 /// sibling, every case is correctly rounded but one, which is 1 ulp out - so the
 /// tests bound the error at 1 ulp rather than asserting correct rounding, which
-/// nothing here proves (the Q126 accumulator is not bounded against a hard
-/// case). That includes the arguments that sit on the 80-bit `pi/2` and `pi`,
-/// where the true result is ~3.4e-20 and survives only because of the
-/// reduction's spare bits. Real x87 hardware reduces against a 66-bit `pi` and
-/// is far *less* accurate than this for large arguments, so no bit-exact
-/// agreement with it is possible or attempted.
+/// nothing here proves. Real x87 hardware reduces against a 66-bit `pi` and is
+/// far *less* accurate for large arguments, so bit-exact agreement with it is
+/// neither possible nor attempted.
 pub fn emit_f80_trig(
     b: &mut FunctionBuilder,
     am: Value,
@@ -1340,16 +1317,13 @@ pub fn emit_f80_trig(
 /// One 80-bit softfloat kernel, identified so it can be emitted **once** into a
 /// shared helper function and `call`ed from every x87 site that needs it.
 ///
-/// The helper body is exactly the corresponding `emit_f80_*` above, wrapped in
-/// a function whose parameters and results are the same raw `(mant: i64,
-/// se: i32)` pairs those builders already take and return - so inline and
-/// outlined emission are bit-identical by construction, not by parallel
-/// maintenance.
+/// The helper body is exactly the corresponding `emit_f80_*`, wrapped in a
+/// function whose parameters and results are the same raw `(mant, se)` pairs -
+/// so inline and outlined emission are bit-identical by construction.
 ///
-/// Note `Sub` is its own kernel rather than a call into `Add` with a flipped
-/// sign: the sign flip is one `bxor`, so a separate `Subr` call site would pay
-/// a second call for nothing. `FSUBR`/`FDIVR` reuse the `Sub`/`Div` helpers
-/// with their arguments swapped at the call site.
+/// `Sub` is its own kernel rather than a call into `Add` with a flipped sign:
+/// the flip is one `bxor`, so routing through `Add` would pay a second call for
+/// nothing. `FSUBR`/`FDIVR` reuse `Sub`/`Div` with swapped arguments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum F80Kernel {
     Add,
@@ -1401,11 +1375,8 @@ impl F80Kernel {
     }
 
     /// The helper's signature: one `(I64 mant, I32 se)` pair per operand, and
-    /// either an 80-bit result pair or - for [`F80Kernel::Cmp`] - the three
-    /// `I8` predicates.
-    ///
-    /// `call_conv` should match the calling function's, so a call needs no
-    /// convention bridging.
+    /// either an 80-bit result pair or - for [`F80Kernel::Cmp`] - three `I8`
+    /// predicates. `call_conv` should match the calling function's.
     pub fn signature(self, call_conv: CallConv) -> Signature {
         let mut sig = Signature::new(call_conv);
         for _ in 0..self.operand_count() {
@@ -1430,14 +1401,12 @@ impl F80Kernel {
         sig
     }
 
-    /// Emit the kernel's body into `b`, whose function must already have been
-    /// given [`signature`](Self::signature). Creates the entry block, runs the
-    /// matching `emit_f80_*` builder over the parameters, and returns its
-    /// results.
+    /// Emit the kernel's body into `b`, whose function must already have been given
+    /// [`signature`](Self::signature).
     ///
-    /// The `emit_f80_*` builders create and seal their own internal blocks (the
-    /// division and square-root loops), and leave the builder positioned in the
-    /// block holding the result, which is where the `return` lands.
+    /// The `emit_f80_*` builders create and seal their own internal blocks and leave
+    /// the builder positioned in the block holding the result, which is where the
+    /// `return` lands.
     pub fn build_body(self, b: &mut FunctionBuilder) {
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);

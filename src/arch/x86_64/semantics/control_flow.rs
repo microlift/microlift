@@ -17,10 +17,9 @@ impl<'a> Lifter<'a> {
         match instruction.op0_kind() {
             OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
                 let target = instruction.near_branch_target();
-                // A `JMP` to a known import is a tail call: the guest's stub
-                // jumps straight into the imported function, which then returns
-                // to *our* caller. Handle it here rather than exiting to a host
-                // that has to re-recognise the stub before every region entry.
+                // A `JMP` to a known import is a tail call: the stub jumps straight into the
+                // imported function, which returns to *our* caller. Handled here rather than
+                // exiting to a host that must re-recognise the stub before every entry.
                 if !self.config.analysis_mode
                     && self.is_import(target)
                     && self.emit_import_tail_jump(target)?
@@ -32,12 +31,10 @@ impl<'a> Lifter<'a> {
                 self.block_terminated = true;
             }
             OpKind::Register => {
-                // Indirect jump via register - emit a runtime dispatch switch
                 let target_val = self.get_reg_val(instruction.op0_register())?;
                 self.emit_runtime_indirect_jump(target_val)?;
             }
             OpKind::Memory => {
-                // Indirect jump via memory - load the target then dispatch
                 let ptr = self.get_mem_ptr(instruction, 0)?;
                 let target_val = self
                     .builder
@@ -57,8 +54,7 @@ impl<'a> Lifter<'a> {
     /// Emit a switch-based indirect jump dispatch for a runtime target value.
     /// Jumps to any known block whose offset matches; otherwise exits the VM.
     pub fn emit_runtime_indirect_jump(&mut self, target_val: Value) -> crate::Result<()> {
-        // Convert the run-time target address back into lift-time VA space,
-        // which is what the block map is keyed on.
+        // Back into lift-time VA space, which is what the block map is keyed on.
         let target_offset = self.to_lift_va(target_val);
 
         let mut switch = cranelift_frontend::Switch::new();
@@ -120,9 +116,8 @@ impl<'a> Lifter<'a> {
         pop_cs: bool,
     ) -> crate::Result<()> {
         if self.config.analysis_mode {
-            // Inspection IR: a return terminates the function. The runtime stack
-            // pop + dispatch switch + trampoline check are execution-only
-            // machinery that only obscure the control-flow view.
+            // Inspection IR: a return terminates the function. The stack pop, dispatch
+            // switch and trampoline check are execution-only machinery.
             self.emit_host_return();
             self.block_terminated = true;
             return Ok(());
@@ -167,7 +162,6 @@ impl<'a> Lifter<'a> {
     /// exactly the return its callee's `RET` would have, after the stack pointer
     /// has already been adjusted.
     fn emit_return_dispatch(&mut self, target_ip: Value) -> crate::Result<()> {
-        // Internal Dispatch via Switch
         let mut switch = cranelift_frontend::Switch::new();
         let target_offset = self.to_lift_va(target_ip);
 
@@ -178,15 +172,13 @@ impl<'a> Lifter<'a> {
         let external_check_block = self.builder.create_block();
         switch.emit(&mut self.builder, target_offset, external_check_block);
 
-        // Handle Return via Trampoline or Unknown
         self.builder.switch_to_block(external_check_block);
         self.builder.seal_block(external_check_block);
 
-        // The trampoline test - materialize a 64-bit constant, compare, branch -
-        // is paid by every out-of-region RET, so it is only emitted for a host
-        // that declared a sentinel. Without one there is nothing to recognise:
-        // every such return is "keep going at this PC", which is also the
-        // linkable exit. See `LifterConfig::exit_trampoline_address`.
+        // The trampoline test - constant, compare, branch - is paid by every
+        // out-of-region RET, so it is only emitted for a host that declared a
+        // sentinel. Without one, every such return is "keep going at this PC",
+        // which is also the linkable exit.
         let unknown_block = if let Some(trampoline_addr) = self.config.exit_trampoline_address {
             let trampoline = self
                 .builder
@@ -234,11 +226,9 @@ impl<'a> Lifter<'a> {
                     return self.emit_import_call(target);
                 }
 
-                // Out-of-region direct call. Emit UnknownJump + DirectCall so
-                // the runtime can distinguish this from a real ImportedFunctionCall
-                // (a registered import whose callee is always a native function).
-                // For DirectCall the callee may itself be a virtualized function,
-                // which the runtime will have to account for appropriately.
+                // Out-of-region direct call. `UnknownJump` + `DirectCall` so the runtime can
+                // distinguish it from a real `ImportedFunctionCall`, whose callee is always
+                // native - a `DirectCall` callee may itself be virtualized.
                 if !self.in_region(target) {
                     self.get_block(self.current_ip);
 
@@ -265,11 +255,9 @@ impl<'a> Lifter<'a> {
 
                     self.sync_to_context(None, ExitReason::UnknownJump)?;
                     self.write_exit_code(TransferKind::DirectCall as u32);
-                    // Linkable: the return address is already pushed and `rip`
-                    // is the callee, so the host has nothing left to do but
-                    // enter it. `Some(rebased_callee)` rather than `None`
-                    // because `current_ip` here is the *return* address, and it
-                    // is the callee that was synced.
+                    // Linkable: the return address is pushed and `rip` is the callee, so the
+                    // host has nothing left to do but enter it. `Some(rebased_callee)` because
+                    // `current_ip` here is the *return* address.
                     self.emit_exit(Some(rebased_callee));
                     self.block_terminated = true;
                     return Ok(());
@@ -333,9 +321,8 @@ impl<'a> Lifter<'a> {
                 self.builder.ins().call(fref, &[]);
             }
             OpKind::Register => {
-                // Indirect call: no statically-known callee, so no external
-                // function is declared (and no `analysis_call_targets` entry);
-                // `call_indirect` carries the runtime target value directly.
+                // Indirect call: no statically-known callee, so no external function is
+                // declared; `call_indirect` carries the runtime target directly.
                 let target_val = self.get_reg_val(instruction.op0_register())?;
                 let sig = self.analysis_call_sig();
                 self.builder.ins().call_indirect(sig, target_val, &[]);
@@ -462,11 +449,9 @@ impl<'a> Lifter<'a> {
     fn emit_indirect_call_exit(&mut self, target_val: Value) -> crate::Result<()> {
         self.get_block(self.current_ip);
 
-        // With an indirect-call bridge installed the runtime does its own
-        // dispatch on the host side and usually handles the call inline, so
-        // every `dlsym`ed function pointer, `call *%r12` and TLS bootstrap costs
-        // a call rather than a VM exit. The bridge still returns non-zero to
-        // demand the exit below when the target turns out to be guest code.
+        // With an indirect-call bridge the runtime dispatches host-side and usually
+        // handles the call inline, so a `dlsym`ed pointer or `call *%r12` costs a
+        // call rather than a VM exit. It still returns non-zero for guest code.
         if let Some(bridge) = self.config.indirect_call_bridge.clone() {
             return self.emit_bridge_call(&bridge, target_val, None, ExitReason::IndirectCall);
         }
@@ -524,10 +509,9 @@ impl<'a> Lifter<'a> {
             call_args.push(self.load_fast_call_arg(ty, loc)?);
         }
 
-        // Host code is about to run with this region's state still in
-        // registers. Anything pinned has to be in the context for the duration:
-        // a host import may look at the guest's stack, or call back into guest
-        // code below the live frame. See [`LiftEngine::publish_pinned`].
+        // Host code is about to run with this region's state in registers, so
+        // anything pinned must be in the context for the duration - a host import
+        // may read the guest stack, or call back into guest code below the frame.
         self.publish_pinned()?;
 
         let call = match target {

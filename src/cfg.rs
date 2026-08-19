@@ -1,20 +1,14 @@
 //! Guest-agnostic control-flow graph discovery.
 //!
-//! Phase 1 of [`crate::core::LiftEngine::lift`] already discovers basic-block
-//! leaders from static control-flow facts, but that work is private to the lift
-//! and tied to IR generation. Static-analysis consumers frequently want the CFG
-//! *without* lifting to IR - for rendering, reachability, loop detection, and so
-//! on.
-//!
-//! [`discover_cfg`] exposes that structure directly: it decodes a byte region
-//! and partitions it into [`BasicBlock`]s connected by [`Edge`]s, reusing the
-//! same [`GuestArch`] decode + [`ControlFlow`](crate::arch::ControlFlow)
+//! Phase 1 of [`crate::core::LiftEngine::lift`] already discovers block leaders,
+//! but that work is private to the lift and tied to IR generation.
+//! [`discover_cfg`] exposes the structure directly: it decodes a byte region and
+//! partitions it into [`BasicBlock`]s connected by [`Edge`]s, reusing the same
+//! [`GuestArch`] decode and [`ControlFlow`](crate::arch::ControlFlow)
 //! classification the lifter relies on, so the two stay consistent.
 //!
-//! This is a *linear-sweep* CFG: every 1-/4-byte position in the region is
-//! decoded from `base`. Bytes that are really embedded data will be decoded as
-//! instructions; a recursive-descent variant that only follows reachable code
-//! is future work.
+//! This is a *linear-sweep* CFG: bytes that are really embedded data will be
+//! decoded as instructions. A recursive-descent variant is future work.
 
 use crate::arch::{ControlFlow, ControlFlowKind};
 use crate::context::MemorySegment;
@@ -298,19 +292,15 @@ pub fn discover_cfg<A: GuestArch>(bytes: &[u8], base: u64) -> Cfg {
 }
 
 /// Recursive-descent decode: starting from `entries`, decode only the
-/// instructions reachable by following static control flow, and return them
-/// sorted by address.
+/// instructions reachable by following static control flow, sorted by address.
 ///
-/// Pass `&[base]` to start at the region entry. Unlike the linear sweep used by
-/// [`discover_cfg`] and `decode_region`, this never decodes embedded data (jump
-/// tables, literal pools, inter-function padding) as code - at the cost of
-/// missing code reachable only through indirect transfers, whose targets are
-/// not statically known. In-region direct `CALL`/`JMP`/branch targets *are*
-/// followed, so callees within the region are discovered.
+/// Pass `&[base]` to start at the region entry. Unlike the linear sweep, this
+/// never decodes embedded data as code - at the cost of missing code reachable
+/// only through indirect transfers. In-region direct `CALL`/`JMP`/branch targets
+/// *are* followed.
 ///
 /// Each address is decoded at most once. Out-of-range entries and targets are
-/// ignored. Invalid encodings are retained (so a genuine bad byte is visible)
-/// but not followed.
+/// ignored. Invalid encodings are retained but not followed.
 pub fn decode_reachable<A: GuestArch>(bytes: &[u8], base: u64, entries: &[u64]) -> Vec<A::Instr> {
     let end = base + bytes.len() as u64;
     let mut decoded: BTreeMap<u64, A::Instr> = BTreeMap::new();
@@ -364,13 +354,11 @@ pub fn decode_reachable<A: GuestArch>(bytes: &[u8], base: u64, entries: &[u64]) 
 
 /// Statically-resolved control-transfer destinations harvested from a region.
 ///
-/// These are the targets that fall out of decode alone - direct `CALL`/`JMP`
-/// and conditional-branch destinations - with no value analysis. Indirect
-/// transfers (through a register or memory operand) contribute nothing here.
+/// The targets that fall out of decode alone - direct `CALL`/`JMP` and
+/// conditional-branch destinations - with no value analysis.
 ///
-/// Targets may point *outside* the scanned region (a call into another
-/// function/section is common); callers that only care about in-region targets
-/// should filter with their own bounds (or [`Cfg::in_region`]).
+/// Targets may point *outside* the scanned region; callers that care should
+/// filter with their own bounds (or [`Cfg::in_region`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Targets {
@@ -384,16 +372,13 @@ pub struct Targets {
 
 /// Collect every statically-known call and branch destination in a region.
 ///
-/// This is the function-start-discovery primitive: a linear sweep that
-/// classifies each instruction's control flow and accumulates the resolved
-/// direct-`CALL` targets (almost always function entries) and direct-branch
-/// targets. It reuses the same [`GuestArch`] decode + control-flow
-/// classification as [`discover_cfg`], so an analysis framework no longer has to
-/// re-implement the sweep just to harvest call targets.
+/// The function-start-discovery primitive: a linear sweep that classifies each
+/// instruction's control flow and accumulates the resolved direct-`CALL` targets
+/// (almost always function entries) and direct-branch targets, reusing the same
+/// decode and classification as [`discover_cfg`].
 ///
-/// Indirect calls/branches are invisible to this pass (their targets are not
-/// statically known); resolving those is the job of value-set analysis
-/// ([`crate::vsa`]).
+/// Indirect calls and branches are invisible here; resolving those is the job of
+/// value-set analysis ([`crate::vsa`]).
 pub fn static_targets<A: GuestArch>(bytes: &[u8], base: u64) -> Targets {
     let mut targets = Targets::default();
     for instr in A::decode_region(bytes, base) {
@@ -413,14 +398,14 @@ pub fn static_targets<A: GuestArch>(bytes: &[u8], base: u64) -> Targets {
     targets
 }
 
-/// Indirect control-transfer targets recovered by value-set analysis ([`crate::vsa`]),
-/// keyed by the address of the indirect `JMP`/`CALL` they were resolved at.
+/// Indirect control-transfer targets recovered by value-set analysis
+/// ([`crate::vsa`]), keyed by the address of the `JMP`/`CALL` they were resolved
+/// at.
 ///
-/// Where [`static_targets`] sees only direct transfers, this resolves the ones
-/// that go through a register or memory operand - jump tables, vtable/function-
-/// pointer calls, import thunks - to the extent VSA can narrow them to a finite
-/// set. Architectures without a value-set analyzer (everything but x86-64 today)
-/// yield an empty result.
+/// Where [`static_targets`] sees only direct transfers, this resolves jump
+/// tables, vtable and function-pointer calls, and import thunks, to the extent
+/// VSA can narrow them to a finite set. Architectures without a value-set
+/// analyzer yield an empty result.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ResolvedTargets {

@@ -3,15 +3,12 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum Optimization {
-    /// Skip the fixup that gives an SSE instruction's generated NaN (as
-    /// opposed to one it merely propagates from an operand) a specific,
-    /// guest-accurate bit pattern.
+    /// Skip the fixup that gives an SSE instruction's *generated* NaN (as opposed
+    /// to one it propagates from an operand) a guest-accurate bit pattern.
     ///
-    /// Safe only for a guest that never inspects the sign or payload bits of
-    /// a NaN it just generated (as opposed to one it loaded or was handed) -
-    /// which is most guest code, since every arithmetic operation,
-    /// comparison and classification of a NaN agrees regardless of its bit
-    /// pattern.
+    /// Safe only for a guest that never inspects the sign or payload bits of a NaN
+    /// it just generated - which is most guest code, since every operation on a NaN
+    /// agrees regardless of its bit pattern.
     UnsafeImpreciseNaN,
 }
 

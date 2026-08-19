@@ -67,9 +67,7 @@ fn run(bytes: &[u8], mut ctx: RegisterContext) -> RegisterContext {
     ctx
 }
 
-// ---------------------------------------------------------------------------
 // 1. Indirect JMP classification
-// ---------------------------------------------------------------------------
 
 #[test]
 fn indirect_jmp_reg_is_not_a_static_branch_target() {
@@ -100,9 +98,7 @@ fn direct_jmp_still_reports_its_target() {
     assert!(t.branches.contains(&0x1007), "branches: {:?}", t.branches);
 }
 
-// ---------------------------------------------------------------------------
 // 2. RCL
-// ---------------------------------------------------------------------------
 
 #[test]
 fn rcl_rax_by_1_through_carry() {
@@ -139,9 +135,7 @@ fn rcl_matches_rcr_roundtrip() {
     assert_eq!(out.rax, 0x0123_4567_89AB_CDEF, "rcl;rcr should round-trip");
 }
 
-// ---------------------------------------------------------------------------
 // 3. BSF / BSR with a zero source preserve the full destination
-// ---------------------------------------------------------------------------
 
 #[test]
 fn bsf_zero_source_preserves_upper_dword() {
@@ -182,9 +176,7 @@ fn bsf_nonzero_source_zero_extends_result() {
     assert_eq!(out.zf, 0, "zf");
 }
 
-// ---------------------------------------------------------------------------
 // 4. LOCK NOT / LOCK NEG
-// ---------------------------------------------------------------------------
 
 #[test]
 fn lock_not_qword_mem() {
@@ -221,9 +213,7 @@ fn lock_neg_of_zero_clears_carry() {
     assert_eq!(out.zf, 1, "zf");
 }
 
-// ---------------------------------------------------------------------------
 // 5. String-op address size
-// ---------------------------------------------------------------------------
 
 #[test]
 fn rep_movsb_64bit_addr_size_still_works() {

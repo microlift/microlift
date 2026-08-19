@@ -12,14 +12,12 @@ use object::{Object, ObjectSection};
 use std::sync::Arc;
 use target_lexicon::Triple;
 
-/// Metadata for a single external function that the lifted IR references via
-/// `ExternalName::user(0, i)`. Produced by `Lifter::aot_imports()`.
+/// Metadata for one external function the lifted IR references via
+/// `ExternalName::user(0, i)`, produced by `Lifter::aot_imports()`.
 ///
-/// The tuple is `(symbol_name, host_fn_ptr, signature)`:
-/// - `symbol_name` - the C symbol the relocation or JIT lookup will resolve.
-/// - `host_fn_ptr` - the in-process address; used by JIT backends to register
-///   the symbol; AOT backends only need the name and signature.
-/// - `signature` - the Cranelift calling-convention signature for the function.
+/// `(symbol_name, host_fn_ptr, signature)`: the C symbol a relocation or JIT
+/// lookup resolves, the in-process address JIT backends register it at (AOT
+/// backends need only the name and signature), and its Cranelift signature.
 pub type AotImport = (&'static str, *const u8, Signature);
 
 /// A helper that has been declared but not yet compiled - see
@@ -29,19 +27,17 @@ type PendingHelper = (cranelift_module::FuncId, Function);
 /// Declare the ordered namespace-0 external functions a [`LiftedCode`]
 /// references, *before* the lifted function itself is declared.
 ///
-/// The IR reaches both kinds through `ExternalName::user(0, i)` over one dense
-/// index space: imports occupy `0..imports.len()`, helpers continue from there.
-/// Module `FuncId`s are handed out in declaration order, so declaring them here
-/// in that same order is what makes `FuncId(i) == i` hold.
+/// The IR reaches both kinds through one dense index space: imports occupy
+/// `0..imports.len()`, helpers continue from there. Module `FuncId`s are handed
+/// out in declaration order, which is what makes `FuncId(i) == i` hold.
 ///
 /// Helper *bodies* are not compiled here - the returned list goes to
-/// [`define_helpers`] after the lifted function has been defined, which keeps
-/// `lifted_func` first in the emitted `.text` (what
-/// [`ArtifactBackend::compile_to_raw`] hands back as raw code).
+/// [`define_helpers`] after the lifted function is defined, keeping
+/// `lifted_func` first in the emitted `.text`.
 ///
 /// The module must be fresh: helper symbols are per-body, so compiling two
-/// lifted regions into one module would redefine them (and shift the index
-/// space out from under the second region's IR).
+/// regions into one module would redefine them and shift the index space out
+/// from under the second region's IR.
 fn declare_externals<M: Module>(
     module: &mut M,
     imports: &[AotImport],
@@ -64,13 +60,12 @@ fn declare_externals<M: Module>(
         .collect()
 }
 
-/// Extract the guest-instruction map for a function that was just compiled into
-/// `ctx`, decoding the surviving `SourceLoc`s with the lift's `source_map`.
+/// Extract the guest-instruction map for a function just compiled into `ctx`,
+/// decoding the surviving `SourceLoc`s with the lift's `source_map`.
 ///
-/// Empty when the function was lifted with
+/// Empty when the lift ran with
 /// [`LifterConfig::emit_source_locs`](crate::core::LifterConfig::emit_source_locs)
-/// off (nothing to decode), and - defensively - when the module reported no
-/// compiled code at all.
+/// off, and - defensively - when the module reported no compiled code.
 fn guest_code_map(ctx: &cranelift_codegen::Context, source_map: SourceLocMap) -> GuestCodeMap {
     ctx.compiled_code()
         .map(|compiled| GuestCodeMap::from_compiled(compiled, source_map))
@@ -92,19 +87,15 @@ fn define_helpers<M: Module>(module: &mut M, pending: Vec<PendingHelper>) -> Res
 /// that calls it - returning the `FuncId` the *host* enters through and the
 /// body's guest-instruction map.
 ///
-/// Two shapes, and the difference is which function the host may call:
-///
-/// - No thunk: The body is `extern "C" fn(*mut RegisterContext)` and is
-///   itself the entry, exported as `lifted_func` exactly as it always was.
-/// - Thunk: ([`crate::core::pin`]) The body carries the `tail` calling
-///   convention and a signature no host can call, so it is defined as a local
-///   `lifted_body` and `lifted_func` is the thunk. The body is declared *after*
-///   the helpers, continuing the same namespace-0 index space, which is the
-///   index the thunk's call was built against.
+/// - No thunk: the body is `extern "C" fn(*mut RegisterContext)` and is itself
+///   the entry, exported as `lifted_func`.
+/// - Thunk ([`crate::core::pin`]): the body carries the `tail` convention and a
+///   signature no host can call, so it is defined as a local `lifted_body` and
+///   `lifted_func` is the thunk. The body is declared *after* the helpers,
+///   continuing the namespace-0 index space the thunk's call was built against.
 ///
 /// The body is **defined first** either way, so the map's offsets keep indexing
-/// from the start of the emitted `.text` (what
-/// [`ArtifactBackend::compile_lifted_to_raw`] hands back).
+/// from the start of the emitted `.text`.
 fn define_region<M: Module>(
     module: &mut M,
     func: Function,
@@ -169,18 +160,16 @@ struct DefinedRegion {
 
 /// The two ways into a compiled region, as addresses.
 ///
-/// They are the same address for an ordinary region, and different ones for a
-/// pinned region ([`crate::core::pin`]) - which is the whole reason this type
-/// exists, because using one where the other belongs is a wrong-code bug that
-/// nothing checks:
+/// The same address for an ordinary region and two different ones for a pinned
+/// region ([`crate::core::pin`]) - which is why this type exists, since using
+/// one where the other belongs is a wrong-code bug nothing checks:
 ///
 /// - [`entry`](Self::entry) is what a **host** calls. Always
 ///   `extern "C" fn(*mut RegisterContext)`.
 /// - [`link_target`](Self::link_target) is what a host publishes in a
 ///   [`BlockLinkEntry::code`](crate::core::link::BlockLinkEntry::code). Under a
-///   pinned ABI that is the region *body*, which is entered by a tail call with
-///   the guest registers already in place and cannot be called from Rust; the
-///   thunk in front of it would take those registers for its own ABI's.
+///   pinned ABI that is the region *body*, entered by a tail call with the guest
+///   registers already in place, and not callable from Rust.
 #[derive(Debug, Clone, Copy)]
 pub struct CompiledRegion {
     /// Entry point for a host call.
@@ -203,14 +192,12 @@ impl CraneliftBackend {
 
     /// Build a `TargetIsa` for the host with the shared `flags`.
     ///
-    /// `isa_settings` is a list of ISA-specific `(name, value)` pairs applied to
-    /// the ISA builder before it is finished - e.g. the x86 target-feature knobs
-    /// (`has_avx`, `has_sse41`, ...) used to raise the recompiled code above the
-    /// baseline `x86-64` microarchitecture level. This is the JIT counterpart of
-    /// `ArtifactBackend::get_isa`; note the builder starts from the *detected*
-    /// host features, so these pairs override that detection rather than adding
-    /// to a bare baseline. Each name must be valid for the host architecture or
-    /// an error is returned.
+    /// `isa_settings` is a list of ISA-specific `(name, value)` pairs applied to the
+    /// builder before it is finished - e.g. the x86 target-feature knobs (`has_avx`,
+    /// `has_sse41`) that raise the recompiled code above the baseline `x86-64`
+    /// level. The builder starts from the *detected* host features, so these
+    /// override that detection rather than adding to a bare baseline. Each name must
+    /// be valid for the host architecture or an error is returned.
     fn native_isa(
         flags: settings::Flags,
         isa_settings: &[(&str, &str)],
@@ -241,15 +228,14 @@ impl CraneliftBackend {
     }
 
     /// JIT-compile a full [`LiftedCode`] - the lifted region plus any outlined
-    /// helper functions it calls (the x87 softfloat kernels).
+    /// helper functions it calls.
     ///
-    /// This is the entry point for `Jit`-mode output, and the one to use when
-    /// the region may contain x87 code; [`compile`](Self::compile) takes a bare
-    /// `Function` and so cannot carry helper bodies.
+    /// The entry point for `Jit`-mode output, and the one to use when the region
+    /// may contain x87 code; [`compile`](Self::compile) takes a bare `Function` and
+    /// cannot carry helper bodies.
     ///
-    /// `code.imports` must be empty: a `RuntimeAssisted` region's imports need
-    /// their symbol addresses registered when the module is *built*, which this
-    /// backend's module already was - use
+    /// `code.imports` must be empty: a `RuntimeAssisted` region's imports need their
+    /// symbol addresses registered when the module is *built* - use
     /// [`compile_lifted_with_fast_imports`](Self::compile_lifted_with_fast_imports).
     pub fn compile_lifted(&mut self, code: LiftedCode) -> Result<*const u8> {
         Ok(self.compile_lifted_with_map(code)?.0)
@@ -258,10 +244,9 @@ impl CraneliftBackend {
     /// [`compile_lifted`](Self::compile_lifted), additionally returning the
     /// host-code -> guest-instruction map for the compiled region.
     ///
-    /// The map's offsets are relative to the returned function pointer, so
+    /// Offsets are relative to the returned function pointer, so
     /// [`GuestCodeMap::lookup_host_addr`] turns a host `RIP` sampled inside this
-    /// region - from a signal handler, a profiler, a debugger - into the guest
-    /// address it is executing. It is empty unless the lift ran with
+    /// region into the guest address it is executing. Empty unless the lift ran with
     /// [`LifterConfig::emit_source_locs`](crate::core::LifterConfig::emit_source_locs)
     /// on (the default).
     pub fn compile_lifted_with_map(
@@ -325,13 +310,12 @@ impl CraneliftBackend {
     }
 
     /// JIT-compile a `RuntimeAssisted`-mode function that uses relocatable
-    /// fast-call imports (i.e. `call(func_ref, ...)` instructions backed by
-    /// `ExternalName::user(0, i)` references).
+    /// fast-call imports.
     ///
-    /// `imports` must be the slice returned by `Lifter::aot_imports()` -
-    /// element `i` must correspond to `ExternalName::user(0, i)` in the IR.
-    /// Imports are declared first so each receives `FuncId(i)`, which the
-    /// JIT linker maps to the registered symbol address at finalization time.
+    /// `imports` must be the slice returned by `Lifter::aot_imports()` - element `i`
+    /// must correspond to `ExternalName::user(0, i)` in the IR. Imports are declared
+    /// first so each receives `FuncId(i)`, which the JIT linker maps to the
+    /// registered symbol address at finalization.
     ///
     /// `isa_settings` carries host ISA feature overrides, as in `with_flags`.
     pub fn compile_with_fast_imports(
@@ -405,11 +389,9 @@ pub struct ArtifactBackend;
 impl ArtifactBackend {
     /// Build a `TargetIsa` for `triple` with the shared `flags`.
     ///
-    /// `isa_settings` is a list of ISA-specific `(name, value)` pairs applied to
-    /// the ISA builder before it is finished - e.g. the x86 target-feature knobs
-    /// (`has_avx`, `has_sse41`, ...) used to raise the recompiled code above the
-    /// baseline `x86-64` microarchitecture level. Each name must be valid for the
-    /// resolved architecture or an error is returned.
+    /// `isa_settings` is a list of ISA-specific `(name, value)` pairs applied to the
+    /// builder before it is finished - e.g. the x86 target-feature knobs. Each name
+    /// must be valid for the resolved architecture or an error is returned.
     fn get_isa(
         triple: Option<&str>,
         flags: Option<settings::Flags>,
@@ -448,12 +430,9 @@ impl ArtifactBackend {
     /// Compile a `RuntimeAssisted`-mode function to a relocatable object file,
     /// emitting named external relocations for fast-call imports.
     ///
-    /// `imports` must be the slice returned by `Lifter::aot_imports()` -
-    /// element `i` corresponds to `ExternalName::user(0, i)` in the IR and
-    /// will be declared as an imported symbol before `lifted_func`.
-    /// Declaring them first ensures `FuncId(i) == i`, so the object module
-    /// can resolve `ExternalName::user(0, i)` to the correct symbol name when
-    /// emitting relocations.
+    /// `imports` must be the slice returned by `Lifter::aot_imports()` - element `i`
+    /// corresponds to `ExternalName::user(0, i)` and is declared as an imported
+    /// symbol before `lifted_func`, which is what makes `FuncId(i) == i` hold.
     pub fn compile_to_object_with_fast_imports(
         func: Function,
         imports: &[AotImport],
@@ -492,11 +471,9 @@ impl ArtifactBackend {
     /// [`compile_lifted_to_object`](Self::compile_lifted_to_object), additionally
     /// returning the host-code -> guest-instruction map for `lifted_func`.
     ///
-    /// Offsets are relative to the start of `lifted_func`, not to the start of
-    /// the object's `.text` - look the symbol's address up in the object (or
-    /// note that `lifted_func` is defined first, so it sits at offset 0 of the
-    /// `.text` that [`compile_lifted_to_raw`](Self::compile_lifted_to_raw)
-    /// extracts).
+    /// Offsets are relative to the start of `lifted_func`, not the object's
+    /// `.text` - though `lifted_func` is defined first, so it sits at offset 0 of
+    /// what [`compile_lifted_to_raw`](Self::compile_lifted_to_raw) extracts.
     pub fn compile_lifted_to_object_with_map(
         code: LiftedCode,
         triple: Option<&str>,
@@ -566,11 +543,11 @@ impl ArtifactBackend {
 
     /// [`compile_to_raw`](Self::compile_to_raw) for a full [`LiftedCode`].
     ///
-    /// Note the extracted `.text` holds the outlined helper bodies as well as
-    /// the lifted function, and the object's symbol table - which says where
-    /// each begins - is what raw extraction throws away. Prefer
-    /// [`compile_lifted_to_object`](Self::compile_lifted_to_object) when the
-    /// region has helpers.
+    /// The extracted `.text` holds the outlined helper bodies as well as the lifted
+    /// function, and raw extraction throws away the symbol table that says where
+    /// each begins. Prefer
+    /// [`compile_lifted_to_object`](Self::compile_lifted_to_object) when the region
+    /// has helpers.
     pub fn compile_lifted_to_raw(
         code: LiftedCode,
         triple: Option<&str>,
@@ -582,10 +559,9 @@ impl ArtifactBackend {
     /// [`compile_lifted_to_raw`](Self::compile_lifted_to_raw), additionally
     /// returning the host-code -> guest-instruction map.
     ///
-    /// `lifted_func` is defined before the helpers, so its code starts at offset
-    /// 0 of the extracted `.text` and the map's offsets index the returned bytes
-    /// directly - which is what makes an annotated disassembly possible; see
-    /// [`disassemble_annotated`](Self::disassemble_annotated).
+    /// `lifted_func` is defined before the helpers, so its code starts at offset 0
+    /// of the extracted `.text` and the map's offsets index the returned bytes
+    /// directly.
     pub fn compile_lifted_to_raw_with_map(
         code: LiftedCode,
         triple: Option<&str>,
@@ -667,17 +643,12 @@ impl ArtifactBackend {
     /// Disassemble compiled code, interleaving a header line each time the guest
     /// instruction responsible for it changes.
     ///
-    /// This is the payoff of source locations for a human reading output: the
-    /// lifted code for one guest instruction is not contiguous, not in guest
-    /// order, and heavily interleaved by scheduling, so a bare disassembly of a
-    /// lifted region is very hard to relate back to the guest program. Host
-    /// instructions with no guest origin (prologue, dispatch switch) are grouped
-    /// under a `[no source]` header.
+    /// The lifted code for one guest instruction is not contiguous, not in guest
+    /// order, and heavily interleaved by scheduling, so a bare disassembly is very
+    /// hard to relate back to the guest program. Host instructions with no guest
+    /// origin are grouped under a `[no source]` header.
     ///
-    /// `bytes` must start at the beginning of the function the map came from -
-    /// i.e. the output of
-    /// [`compile_lifted_to_raw_with_map`](Self::compile_lifted_to_raw_with_map),
-    /// whose `lifted_func` sits at offset 0.
+    /// `bytes` must start at the beginning of the function the map came from.
     #[cfg(feature = "disasm")]
     pub fn disassemble_annotated(
         bytes: &[u8],

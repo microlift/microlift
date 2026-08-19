@@ -41,11 +41,9 @@ impl<'a> Lifter<'a> {
             return self.handle_locked_instruction(instruction);
         }
 
-        // Most SSE integer opcodes have an MMX encoding (the same mnemonic
-        // without the 0x66 prefix) that operates on MM0..MM7 - an aliased view
-        // of the x87 stack this frontend does not model. Exit to the host
-        // rather than failing the whole lift on an operand the handlers cannot
-        // resolve to an XMM register.
+        // Most SSE integer opcodes have an MMX encoding operating on MM0..MM7, an
+        // aliased view of the x87 stack this frontend does not model. Exit to the host
+        // rather than failing the lift on an operand no handler can resolve.
         if uses_mmx_register(instruction) {
             return self.handle_unimplemented_instruction(instruction);
         }
@@ -75,10 +73,8 @@ impl<'a> Lifter<'a> {
                 self.handle_mfence(instruction)
             }
             Mnemonic::Pause => self.handle_pause(instruction),
-            // Cache maintenance. The guest shares the host's coherent view of
-            // memory (guest VA == host VA, no emulated cache), so a flush or a
-            // writeback has nothing to do; ordering still comes from the fences
-            // that surround them.
+            // Cache maintenance. The guest shares the host's coherent view of memory,
+            // so a flush has nothing to do; ordering comes from the surrounding fences.
             Mnemonic::Clflush | Mnemonic::Clflushopt | Mnemonic::Clwb => {
                 self.handle_nop(instruction)
             }
@@ -246,9 +242,8 @@ impl<'a> Lifter<'a> {
             Mnemonic::Cmpps => self.handle_cmpps(instruction),
             Mnemonic::Cmppd => self.handle_cmppd(instruction),
             Mnemonic::Cmpss => self.handle_cmpss(instruction),
-            // CMPSD is shared between the string compare (memory-string
-            // operands) and SSE2 scalar-double compare (XMM destination), the
-            // same collision MOVSD has below.
+            // CMPSD is shared between the string compare and the SSE2 scalar-double
+            // compare, the same collision MOVSD has below.
             Mnemonic::Cmpsd if matches!(instruction.op0_kind(), OpKind::Register) => {
                 self.handle_cmpsd_sse(instruction)
             }
@@ -342,11 +337,9 @@ impl<'a> Lifter<'a> {
                 PackedWidth::Qword,
             ),
 
-            // SSE4.2 - the packed string compares. All four share one handler;
-            // which of them it is decides only where the operand lengths come
-            // from and where the result goes (see `sse_str::PcmpstrForm`).
-            // The `REX.W` spellings are separate mnemonics in iced, not a flag
-            // on the base one.
+            // SSE4.2 packed string compares. All four share one handler; which it is
+            // decides only where the lengths come from and where the result goes. The
+            // `REX.W` spellings are separate mnemonics in iced.
             Mnemonic::Pcmpistri
             | Mnemonic::Pcmpistrm
             | Mnemonic::Pcmpestri
@@ -354,9 +347,8 @@ impl<'a> Lifter<'a> {
             | Mnemonic::Pcmpestri64
             | Mnemonic::Pcmpestrm64 => match PcmpstrForm::of(instruction) {
                 Some(form) => self.handle_pcmpstr(instruction, form),
-                // The mnemonic is one of the four but the encoding is not - a
-                // VEX spelling this frontend does not decode into these
-                // handlers. Exit rather than lift it wrongly.
+                // The mnemonic is one of the four but the encoding is a VEX spelling this
+                // frontend does not decode. Exit rather than lift it wrongly.
                 None => self.handle_unimplemented_instruction(instruction),
             },
 
@@ -564,9 +556,8 @@ impl<'a> Lifter<'a> {
             // String Operations
             Mnemonic::Movsb => self.handle_movsb(instruction),
             Mnemonic::Movsw => self.handle_movsw(instruction),
-            // MOVSD is shared between the string op (no register operands) and
-            // SSE2 scalar-double (XMM register operands). Disambiguate by
-            // checking whether op0 is a memory-string kind.
+            // MOVSD is shared between the string op and SSE2 scalar-double.
+            // Disambiguate on whether op0 is a memory-string kind.
             Mnemonic::Movsd => {
                 if matches!(
                     instruction.op0_kind(),
@@ -793,9 +784,8 @@ impl<'a> Lifter<'a> {
             Mnemonic::Fdecstp => self.handle_fdecstp(instruction),
             Mnemonic::Ffree => self.handle_ffree(instruction),
             Mnemonic::Emms => self.handle_emms(instruction),
-            // `FNOP` does nothing; `WAIT`/`FWAIT` has nothing to wait for (see
-            // `handle_fpu_nop`) and is also the `9B` prefix byte iced splits
-            // off the `FSTENV`/`FCLEX`/`FINIT` spellings.
+            // `FNOP` does nothing; `WAIT`/`FWAIT` has nothing to wait for, and is the
+            // `9B` prefix byte iced splits off `FSTENV`/`FCLEX`/`FINIT`.
             Mnemonic::Fnop | Mnemonic::Wait => self.handle_fpu_nop(instruction),
             Mnemonic::Fnstenv => self.handle_fnstenv(instruction),
             Mnemonic::Fldenv => self.handle_fldenv(instruction),

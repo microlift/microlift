@@ -1,24 +1,23 @@
 //! Emission for runtime-supplied bridges (see [`crate::core::bridge`]).
 //!
 //! One emitter serves all three bridge sites - a registered import call, an
-//! import reached by tail `JMP`, and a runtime-resolved indirect call - because
+//! import reached by tail `JMP`, and a runtime-resolved indirect call - since
 //! they share one contract:
 //!
 //! ```text
 //! extern "C" fn(ctx: *mut RegisterContext, extra: u64) -> u32
 //! ```
 //!
-//! `extra` is the import VA at an import site and the resolved callee address at
-//! an indirect-call site; either way it is also parked in
-//! `imported_function_va` before the call, so a bridge that ignores its second
-//! argument (or a crash inside one) still finds the callee in the context.
+//! `extra` is the import VA at an import site and the resolved callee at an
+//! indirect-call site; either way it is also parked in `imported_function_va`
+//! before the call, so a bridge that ignores its second argument still finds
+//! the callee in the context.
 //!
-//! The return value is the whole protocol: **0** means handled, and the lifted
-//! code falls through inline with the declared clobbers reloaded; **non-zero**
-//! means return to the host immediately, with `exit_reason`/`exit_code` left
-//! exactly as the bridge wrote them - except
-//! [`RESUME_LINKED`](crate::core::bridge::RESUME_LINKED), which additionally
-//! declares the exit linkable.
+//! The return value is the protocol: **0** means handled and the lifted code
+//! falls through inline with the declared clobbers reloaded; **non-zero** means
+//! return to the host immediately, with `exit_reason`/`exit_code` as the bridge
+//! wrote them - except [`RESUME_LINKED`](crate::core::bridge::RESUME_LINKED),
+//! which additionally declares the exit linkable.
 
 use crate::arch::x86_64::Lifter;
 use crate::arch::x86_64::X86_64;
@@ -102,16 +101,13 @@ impl<'a> Lifter<'a> {
     /// Terminate the bridge's exiting path, linking when it asked to.
     ///
     /// The PC is **loaded back out of the context** rather than reused from the
-    /// value published before the call, because moving it is exactly what a
-    /// bridge that returns [`RESUME_LINKED`] does: an `objc_msgSend` standing in
-    /// for the send, a `longjmp`, an indirect call that turned out to target
-    /// guest code. The value published before the call is the resume point that
-    /// would have applied had the bridge handled it, which is the wrong address
-    /// to link on.
+    /// value published before the call, because moving it is exactly what a bridge
+    /// returning [`RESUME_LINKED`] does. The published value is the resume point
+    /// that would have applied had the bridge handled it, which is the wrong
+    /// address to link on.
     ///
-    /// With linking off - or on a guest with nowhere to put the answer - this
-    /// collapses to the bare `return_` it has always been, and the comparison
-    /// against `RESUME_LINKED` is not emitted at all.
+    /// With linking off this collapses to the bare `return_` it has always been,
+    /// and the comparison against `RESUME_LINKED` is not emitted at all.
     fn emit_bridge_exit(&mut self, handled: Value) -> crate::Result<()> {
         if self.block_link_active() {
             let link_block = self.builder.create_block();

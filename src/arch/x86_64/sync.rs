@@ -20,12 +20,11 @@ impl<'a> Lifter<'a> {
     /// Store exactly the registers in `mask` into the `RegisterContext`, and
     /// nothing else - no PC, no `exit_reason`, no `exit_code`.
     ///
-    /// This is the write half of a [`BridgeEffects`](crate::core::bridge::BridgeEffects)
-    /// mask. Read its doc comment before using this anywhere new: it is sound
-    /// *because* the mask is declared by the callee and applied at a single call
-    /// site, not inferred from emission order the way the removed-in-spirit
-    /// [`Self::sync_to_context_selective`] does it. Do not try to derive a mask
-    /// from `state.dirty_*`.
+    /// The write half of a [`BridgeEffects`](crate::core::bridge::BridgeEffects)
+    /// mask, sound *because* the mask is declared by the callee and applied at a
+    /// single call site - not inferred from emission order the way
+    /// [`Self::sync_to_context_selective`] does. Do not derive a mask from
+    /// `state.dirty_*`.
     pub fn sync_regs_masked(&mut self, mask: RegMask) -> crate::Result<()> {
         if self.config.analysis_mode || mask.is_empty() {
             return Ok(());
@@ -104,13 +103,13 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Reload exactly the registers in `mask` from the `RegisterContext` back
-    /// into their SSA variables. The read half of a
+    /// Reload exactly the registers in `mask` from the `RegisterContext` into their
+    /// SSA variables. The read half of a
     /// [`BridgeEffects`](crate::core::bridge::BridgeEffects) mask; registers
-    /// outside `mask` keep the SSA values they had before the call.
+    /// outside `mask` keep the values they had before the call.
     ///
-    /// `image_base` is deliberately not reloaded: it is fixed for the lifetime
-    /// of a region and a bridge has no business changing it.
+    /// `image_base` is deliberately not reloaded: it is fixed for the lifetime of a
+    /// region.
     pub fn load_regs_masked(&mut self, mask: RegMask) -> crate::Result<()> {
         if self.config.analysis_mode || mask.is_empty() {
             return Ok(());
@@ -195,13 +194,12 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Whether `reg` is carried out of the region in a machine register rather
-    /// than through the `RegisterContext`, and so must be skipped by the full
-    /// sync and the entry load.
+    /// Whether `reg` is carried out of the region in a machine register rather than
+    /// through the `RegisterContext`, and so must be skipped by the full sync and
+    /// the entry load.
     ///
-    /// Not by the masked ones: those serve a call the host makes while this
-    /// region is still running, and the host reads the context then. See
-    /// [`crate::core::pin`].
+    /// Not by the masked ones: those serve a call the host makes while this region
+    /// is still running, and the host reads the context then.
     fn pinned_gpr(&self, reg: Register) -> bool {
         match crate::arch::x86_64::regs::gpr_index(reg) {
             Some(i) => self.is_pinned(PinnedReg::gpr(i as u16)),
@@ -218,10 +216,9 @@ impl<'a> Lifter<'a> {
     /// Full sync - writes all GPRs, flags, XMMs and segment bases back to the
     /// `RegisterContext`. Used on context reload paths and unvisited exit stubs.
     ///
-    /// Except the pinned ones ([`crate::core::pin`]): those leave the region
-    /// in registers, and the entry thunk stores them once the chain ends. A
-    /// store here would be the very cost pinning exists to delete, and would
-    /// also be stale by the time anything read it.
+    /// Except the pinned ones ([`crate::core::pin`]), which leave the region in
+    /// registers for the entry thunk to store once the chain ends. A store here
+    /// would be the very cost pinning exists to delete.
     pub fn sync_to_context(&mut self, pc: Option<Value>, reason: ExitReason) -> crate::Result<()> {
         // Analysis mode produces inspection IR with no context write-back.
         if self.config.analysis_mode {
@@ -309,30 +306,24 @@ impl<'a> Lifter<'a> {
     /// Selective sync - only writes registers/flags/xmms marked dirty since the
     /// last `load_state_from_context`.
     ///
-    /// DANGEROUS - DO NOT USE. Retained for reference only; all VM-exit paths
-    /// now use the full [`Self::sync_to_context`] instead.
+    /// DANGEROUS - DO NOT USE. Retained for reference only; every VM-exit path uses
+    /// the full [`Self::sync_to_context`].
     ///
-    /// The dirty set (`state.dirty_gprs` etc.) is a single, global, cumulative
-    /// set that is only ever cleared by `load_state_from_context` (once at
-    /// region entry). It is populated as a side effect of instruction emission,
-    /// which happens in block-address order. So at the point a selective sync is
-    /// *emitted*, the dirty set reflects the registers written by instructions
-    /// emitted *before it in address order* - NOT the registers actually written
-    /// along the runtime control-flow paths that reach this exit.
+    /// The dirty set is global and cumulative, cleared only by
+    /// `load_state_from_context` at region entry, and populated as a side effect of
+    /// instruction emission - which happens in block-address order. So at the point
+    /// a selective sync is *emitted*, it reflects the registers written by
+    /// instructions emitted before it *in address order*, not the ones written
+    /// along the runtime paths that reach this exit.
     ///
-    /// That is unsound for any non-linear CFG. Concretely: a register written in
-    /// a higher-addressed block (emitted later) that reaches a lower-addressed
-    /// VM-exit via a backward edge (i.e. a loop) is missing from the dirty set
-    /// when the exit is emitted. Its store is omitted, the update never reaches
-    /// the `RegisterContext`, and on resume `load_state_from_context` reloads the
-    /// stale pre-loop value - silently corrupting a live register across the
-    /// exit. (Observed as an out-of-bounds `std::string::substr` in a guest
-    /// environ-parsing loop: a loop-carried index reverted to a stale value
-    /// across a slow import-call exit.)
+    /// That is unsound for any non-linear CFG: a register written in a
+    /// higher-addressed block that reaches a lower-addressed exit via a backward
+    /// edge is missing from the dirty set, its store is omitted, and on resume the
+    /// stale pre-loop value is reloaded. (Observed as an out-of-bounds
+    /// `std::string::substr` in a guest environ-parsing loop.)
     ///
-    /// A correct selective sync would need real CFG dataflow (reaching-defs /
-    /// liveness over the block graph), not an emission-order side effect. Until
-    /// that exists, always use the full sync.
+    /// A correct version would need real CFG dataflow, not an emission-order side
+    /// effect.
     #[allow(dead_code)]
     pub fn sync_to_context_selective(
         &mut self,

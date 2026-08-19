@@ -1,15 +1,10 @@
-//! Atomic instruction semantics.
+//! Atomic instruction semantics: the fences, `PAUSE`, the `CMPXCHG` family and
+//! the LOCK-prefixed arithmetic and bit operations.
 //!
-//! Covers:
-//! - Memory fence instructions: MFENCE, SFENCE, LFENCE, SERIALIZE
-//! - PAUSE (spin-wait hint)
-//! - CMPXCHG / CMPXCHG8B / CMPXCHG16B
-//! - LOCK-prefixed arithmetic and bit operations
-//!
-//! Everything up to 64 bits maps onto Cranelift's `atomic_cas` / `atomic_rmw`,
-//! so the LOCK prefix costs nothing extra and the handler is shared with the
+//! Everything up to 64 bits maps onto Cranelift's `atomic_cas`/`atomic_rmw`, so
+//! the LOCK prefix costs nothing extra and the handler is shared with the
 //! unlocked form. `CMPXCHG16B` is the exception: only the x64 backend can
-//! express a 128-bit CAS, so its lowering is a [`Atomic128Mode`] choice.
+//! express a 128-bit CAS, so its lowering is an [`Atomic128Mode`] choice.
 
 use crate::MicroliftError;
 use crate::arch::x86_64::semantics::helpers::size_to_type;
@@ -45,13 +40,12 @@ impl<'a> Lifter<'a> {
 
     /// CMPXCHG dst, src
     ///
-    /// Compares AL/AX/EAX/RAX with `dst`. If equal: ZF=1, dst <- src.
-    /// Otherwise: ZF=0, accumulator <- dst. All comparison flags (CF/OF/SF/ZF)
-    /// are updated as if CMP acc, dst had been executed.
+    /// Compares AL/AX/EAX/RAX with `dst`. Equal: ZF=1, dst <- src. Otherwise:
+    /// ZF=0, accumulator <- dst. All comparison flags are updated as if
+    /// `CMP acc, dst` had run.
     ///
-    /// When `dst` is a memory operand, Cranelift's `atomic_cas` is used so
-    /// that the compare-and-swap is truly atomic (matching x86 LOCK CMPXCHG
-    /// semantics). The LOCK prefix is therefore handled transparently here.
+    /// A memory `dst` goes through Cranelift's `atomic_cas`, so the LOCK prefix is
+    /// handled transparently here.
     pub(super) fn handle_cmpxchg(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let size = self.operand_size(instruction, 0)?;
         let ty = size_to_type(size);
@@ -162,20 +156,17 @@ impl<'a> Lifter<'a> {
 
     /// CMPXCHG16B [mem]
     ///
-    /// Atomically compares RDX:RAX with the 128-bit value at [mem].
-    /// If equal: ZF=1, [mem] <- RCX:RBX.
-    /// Otherwise: ZF=0, RDX:RAX <- [mem].
+    /// Atomically compares RDX:RAX with the 128-bit value at [mem]. Equal: ZF=1,
+    /// [mem] <- RCX:RBX. Otherwise: ZF=0, RDX:RAX <- [mem].
     ///
-    /// Only ZF is affected - CF/PF/AF/SF/OF are untouched, unlike `CMPXCHG`,
-    /// which updates all of them as if a `CMP` had run.
+    /// Only ZF is affected, unlike `CMPXCHG` which updates all of them.
     ///
-    /// The guest's memory operand must be 16-byte aligned or the real CPU
-    /// raises `#GP`; this lifter does not model alignment faults, so a
-    /// misaligned operand is simply performed.
+    /// A real CPU raises `#GP` for a misaligned operand; this lifter models no
+    /// alignment faults, so a misaligned operand is simply performed.
     ///
-    /// How the 128-bit RMW is realized is a [`Atomic128Mode`] decision, because
-    /// only the x64 Cranelift backend can express one. See that enum for the
-    /// trade-offs; the default is a portable but non-atomic load/compare/store.
+    /// How the 128-bit RMW is realized is an [`Atomic128Mode`] decision, since only
+    /// the x64 backend can express one. The default is a portable but non-atomic
+    /// load/compare/store.
     pub(super) fn handle_cmpxchg16b(&mut self, instruction: &Instruction) -> crate::Result<()> {
         if instruction.op0_kind() != OpKind::Memory {
             return Err(MicroliftError::UnsupportedInstruction {
@@ -303,15 +294,13 @@ impl<'a> Lifter<'a> {
 
     /// LOCK ADC / LOCK SBB [mem], src
     ///
-    /// Neither has an atomic-RMW opcode - the operation depends on the incoming
-    /// CF as well as on the memory value - so both lower to the same
-    /// compare-and-swap retry loop `LOCK NEG` uses: observe the value, compute
-    /// `dst ± src ± CF`, `atomic_cas` it back, and retry with the fresh value if
-    /// another thread got there first.
+    /// Neither has an atomic-RMW opcode - the operation depends on the incoming CF
+    /// as well as the memory value - so both lower to the compare-and-swap retry
+    /// loop `LOCK NEG` uses.
     ///
     /// The incoming CF is loop-invariant and read once in the entry block, which
-    /// dominates the loop, so a retry re-uses it rather than the CF a previous
-    /// iteration would have computed - matching the single-execution semantics.
+    /// dominates the loop, so a retry reuses it rather than the CF a previous
+    /// iteration computed - matching the single-execution semantics.
     fn handle_lock_adc_sbb(
         &mut self,
         instruction: &Instruction,
@@ -486,11 +475,10 @@ impl<'a> Lifter<'a> {
 
     /// LOCK NEG [mem]: atomically negate memory.
     ///
-    /// `NEG` has no direct atomic-RMW opcode, so it is lowered as a
-    /// compare-and-swap retry loop: load the current value, compute `0 - value`,
-    /// and `atomic_cas` it back; on contention (the observed value changed) the
-    /// loop retries with the fresh value. The flag update uses the value that
-    /// was actually swapped, matching `NEG`'s "flags as if `0 - dst`" semantics.
+    /// `NEG` has no atomic-RMW opcode, so it is a compare-and-swap retry loop:
+    /// load, compute `0 - value`, `atomic_cas` back, retry on contention. The flag
+    /// update uses the value actually swapped, matching `NEG`'s "flags as if
+    /// `0 - dst`" semantics.
     fn handle_lock_neg(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let size = self.operand_size(instruction, 0)?;
         let ty = size_to_type(size);

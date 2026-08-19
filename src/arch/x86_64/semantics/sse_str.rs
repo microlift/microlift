@@ -1,30 +1,20 @@
 //! SSE4.2 packed string compare - `PCMPISTRI`, `PCMPISTRM`, `PCMPESTRI`,
 //! `PCMPESTRM`.
 //!
-//! Four instructions and one operation. Each compares two 128-bit vectors of
-//! byte or word *elements* under one of four aggregation rules, folds the
-//! per-element answers into a bitmask, and reports it as either an index (the
-//! `...I` forms, into `ECX`) or a mask (the `...M` forms, into `XMM0`) - plus
-//! the same five flags in every case. The two families differ only in where the
-//! operand *lengths* come from: the implicit (`...ISTR...`) forms scan for the
-//! first null element, the explicit (`...ESTR...`) forms take them from
-//! `EAX`/`EDX` (`RAX`/`RDX` under `REX.W`).
+//! Four instructions, one operation: compare two 128-bit vectors of byte or word
+//! *elements* under one of four aggregation rules, fold the answers into a
+//! bitmask, and report it as an index (`...I`, into `ECX`) or a mask (`...M`,
+//! into `XMM0`), plus five flags. The families differ only in where the operand
+//! lengths come from: implicit forms scan for the first null, explicit forms take
+//! them from `EAX`/`EDX`.
 //!
-//! ## The `imm8` is a lift-time constant, and that is the whole design
+//! The control byte has no register form, so all four of its decisions are known
+//! at lift time and none becomes a runtime branch.
 //!
-//! There is no register-operand form of the control byte, so every one of its
-//! four decisions - element width and signedness, aggregation rule, polarity,
-//! index-vs-mask output - is known while lifting. None of them becomes a
-//! runtime branch or select: the handler *is* the interpreter for `imm8`, and
-//! what it emits is straight-line code for exactly the one variant in front of
-//! it. Only the element data and the two lengths stay dynamic.
+//! ## Validity
 //!
-//! ## Validity, and why it is not an optimisation
-//!
-//! The aggregation is defined over all 8 or 16 element positions of both
-//! operands, including the ones past the operand's length. Those positions do
-//! not compare - they take a *forced* value, and which value depends on the
-//! aggregation rule and on which side is out of range. The table is the one in
+//! The aggregation covers all 8 or 16 element positions of both operands,
+//! including those past the operand's length. Those take a *forced* value, per
 //! the SDM's `PCMPxSTRx` operation section:
 //!
 //! | `xmm1[i]` | `xmm2[j]` | equal any | ranges | equal each | equal ordered |
@@ -34,38 +24,21 @@
 //! | valid   | invalid | false | false | false | false |
 //! | valid   | valid   | compare | compare | compare | compare |
 //!
-//! The two `true`s in the "equal ordered" column are what make a substring
-//! search report a match that runs off the end of the needle, and the `true` in
-//! "equal each" is what makes two exhausted strings compare equal. Neither is a
-//! don't-care: a lift that treated invalid positions as merely "not matching"
-//! computes the wrong answer for `strcmp` and `strstr`, which is most of what
-//! these instructions are used for.
+//! Those `true`s are not don't-cares: they are what let a substring search match
+//! a needle running off the end, and two exhausted strings compare equal.
+//! Treating invalid positions as merely "not matching" gives the wrong answer for
+//! `strcmp` and `strstr`.
 //!
-//! "Invalid" also covers a position that does not exist. In the equal-ordered
-//! aggregation, needle element `i` is paired with haystack element `j + i`,
-//! which for a late `j` runs past the end of the register - and that pairing
-//! takes the same forced value as one past the operand's length, rather than
-//! being skipped. The difference is observable: `PCMPESTRM` with a two-element
-//! first operand and a full second one reports `0x7FFF`, not `0xFFFF`, because
-//! a two-element needle cannot start at the last element. The tables above were
-//! checked against hardware through the Unicorn oracle; where the operation
-//! section admits a second reading, the hardware is what this implements.
+//! "Invalid" also covers a position that does not exist: in equal-ordered, needle
+//! element `i` pairs with haystack element `j + i`, which for a late `j` runs past
+//! the end of the register and takes the same forced value rather than being
+//! skipped. Observably, `PCMPESTRM` with a two-element first operand and a full
+//! second reports `0x7FFF`, not `0xFFFF`. The table was checked against hardware
+//! through the Unicorn oracle.
 //!
-//! ## Why the aggregation is outlined
-//!
-//! "Equal any" and "equal ordered" compare every element of one operand against
-//! every element of the other: 256 comparisons at byte width, each a handful of
-//! IR instructions on top of the 32 lane extractions. That is softfloat-kernel
-//! territory ([`softfloat`](super::softfloat)), so it uses the same mechanism -
-//! except that the body depends on the control byte, so there is one helper per
-//! distinct *aggregation-relevant* nibble rather than one per instruction.
-//!
-//! Only `imm8[3:0]` reaches the helper. Polarity (`imm8[5:4]`) is a mask over
-//! the result and output select (`imm8[6]`) picks between two ways of reporting
-//! it, and both are a few instructions at the call site - keeping them out of
-//! the body is what holds the helper count at 16 rather than 128, and lets one
-//! `PCMPISTRI` and one `PCMPESTRM` with the same element format and rule share
-//! a body.
+//! The two exhaustive aggregations are **outlined**, one helper per
+//! aggregation-relevant nibble (`imm8[3:0]`) rather than per instruction; polarity
+//! and output select stay at the call site, which holds the helper count at 16.
 
 use crate::arch::x86_64::regs::X86Flag;
 use crate::lifter::Lifter;
@@ -128,10 +101,9 @@ fn signed(ctl: u8) -> bool {
 /// The 16 helper symbols, indexed by `imm8[3:0]`.
 ///
 /// Spelled out rather than formatted because
-/// [`outlined_helper`](crate::core::LiftEngine::outlined_helper) keys and
-/// de-duplicates on a `&'static str`, and because the nibble is exactly what
-/// distinguishes two bodies - a name that did not encode it would silently
-/// share one body between two different aggregations.
+/// [`outlined_helper`](crate::core::LiftEngine::outlined_helper) de-duplicates
+/// on a `&'static str`, and the nibble is exactly what distinguishes two
+/// bodies - a name that did not encode it would silently share one.
 const AGG_SYMBOLS: [&str; 16] = [
     "__microlift_pcmpstr_agg_0",
     "__microlift_pcmpstr_agg_1",
@@ -251,9 +223,9 @@ fn pack_bits(b: &mut FunctionBuilder, bits: &[Value]) -> Value {
 /// Emit the aggregation for control nibble `ctl`, producing `IntRes1` as an
 /// `I32` with one bit per element position of the *second* operand.
 ///
-/// `len1` / `len2` are element counts in `0..=n`, already saturated by the
-/// caller; everything at or above them is an invalid position and takes the
-/// forced value from the module's table rather than a comparison.
+/// `len1`/`len2` are element counts in `0..=n`, already saturated by the
+/// caller; everything at or above them is invalid and takes the forced value
+/// from the module's table.
 pub fn emit_pcmpstr_agg(
     b: &mut FunctionBuilder,
     ctl: u8,
@@ -330,19 +302,14 @@ pub fn emit_pcmpstr_agg(
             .collect(),
 
         // Equal ordered: substring search. Bit j asks whether the first operand
-        // occurs in the second starting at j. Running off the *needle* (an
-        // invalid `a[i]`) forces true, so a short needle still matches; running
-        // off the *haystack* forces false, so a match may not extend past the
-        // end of the string being searched.
+        // occurs in the second starting at j. Running off the *needle* forces true,
+        // so a short needle still matches; running off the *haystack* forces false.
         //
-        // The pairing runs over all `n` positions of the needle, not the
-        // `n - j` that stay inside the register: a needle element whose
-        // haystack position would be element `n` or beyond is compared against
-        // an out-of-range - hence invalid - element, and so forces false unless
-        // the needle has run out first. Stopping the loop at the register edge
-        // instead would report a match for a needle that demonstrably does not
-        // fit, which is the one place the natural reading of the operation
-        // section is wrong.
+        // The pairing runs over all `n` needle positions, not the `n - j` that stay
+        // inside the register: a needle element whose haystack position would be
+        // element `n` or beyond compares against an invalid element and forces false
+        // unless the needle ran out first. Stopping at the register edge would report
+        // a match for a needle that demonstrably does not fit.
         _ => (0..n)
             .map(|j| {
                 let mut all = b.ins().iconst(types::I8, 1);
@@ -440,12 +407,10 @@ impl<'a> Lifter<'a> {
         self.builder.inst_results(call)[0]
     }
 
-    /// The implicit-length rule: the number of elements before the first null
-    /// one, or all `n` if there is none.
+    /// The implicit-length rule: the number of elements before the first null one,
+    /// or all `n` if there is none.
     ///
-    /// Built as a fold from the top so that the *lowest* null wins, which is the
-    /// C string rule - a later null past the terminator must not extend the
-    /// length.
+    /// Folded from the top so the *lowest* null wins, which is the C string rule.
     fn implicit_len(&mut self, lo: Value, hi: Value, bits: u32) -> Value {
         let lanes = self.xmm_lanes(lo, hi, bits, false);
         let n = lanes.len();
@@ -460,10 +425,10 @@ impl<'a> Lifter<'a> {
 
     /// The explicit-length rule: `|reg|`, saturated to `n`.
     ///
-    /// The comparison against `n` is *unsigned* on purpose. `iabs` of the most
-    /// negative value is itself, and reading that as unsigned makes it larger
-    /// than `n` - so the one input whose absolute value does not exist
-    /// saturates, rather than passing through as a huge negative length.
+    /// The comparison against `n` is *unsigned* on purpose: `iabs` of the most
+    /// negative value is itself, and reading that as unsigned makes it larger than
+    /// `n`, so the one input whose absolute value does not exist saturates instead
+    /// of passing through as a huge negative length.
     fn explicit_len(&mut self, reg: Register, n: usize) -> crate::Result<Value> {
         let v = self.get_reg_val(reg)?;
         let wide = if self.builder.func.dfg.value_type(v) == types::I64 {
@@ -506,10 +471,9 @@ impl<'a> Lifter<'a> {
 
     /// The five flags every `PCMPxSTRx` defines, plus the two it clears.
     ///
-    /// `ZF` and `SF` report *operand exhaustion* rather than anything about the
-    /// comparison: each is set when the corresponding operand held fewer than a
-    /// full register of elements, which for the implicit forms means it
-    /// contained a null.
+    /// `ZF` and `SF` report *operand exhaustion*, not anything about the
+    /// comparison: each is set when its operand held fewer than a full register of
+    /// elements, which for the implicit forms means it contained a null.
     fn pcmpstr_flags(
         &mut self,
         int_res2: Value,

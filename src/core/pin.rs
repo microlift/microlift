@@ -1,74 +1,25 @@
 //! Pinned register files: keeping guest state in host registers across a link.
 //!
-//! [`crate::core::link`] lets a region resolve its own successor. This module is
-//! what lets it *branch* to that successor instead of handing a code address
-//! back to the host - and, in doing so, carry part of the guest register file
-//! along in machine registers rather than through the
-//! [`RegisterContext`](crate::arch::x86_64::context::RegisterContext).
+//! [`crate::core::link`] lets a region resolve its own successor; this lets it
+//! *branch* there, carrying part of the guest register file in machine registers
+//! rather than through the `RegisterContext`.
 //!
-//! # The mechanism, and why it is the signature
+//! **The pinned file is the signature.** A pinned region is compiled with
+//! [`CallConv::Tail`](cranelift_codegen::isa::CallConv::Tail) as
+//! `tail (ctx, slot0, ...) -> (ctx, slot0, ...)`. The results being the
+//! parameters is load-bearing: the tail convention assigns both from the same
+//! register sequence, so every slot stays where it is and a link lowers to a
+//! branch.
 //!
-//! Cranelift allocates registers per function, so two translations do not agree
-//! on where the guest's registers live. The one portable way to make them agree
-//! is to say so in the ABI: a pinned region is compiled with
-//! [`CallConv::Tail`](cranelift_codegen::isa::CallConv::Tail) and the signature
+//! The host declares the ordered [`PinnedAbi`], and owes two things: every region
+//! reachable through one link table must be lifted under the **same** ABI, slot
+//! for slot (nothing checks it at run time); and slots are scarce, with overflow
+//! past [`RegisterBudget`] silent for arguments ([`PinnedAbi::check_budget`]).
 //!
-//! ```text
-//! tail (ctx, slot0, slot1, ...) -> (ctx, slot0, slot1, ...)
-//! ```
-//!
-//! so a link is a real `return_call_indirect` and the pinned slots are already
-//! in the registers the callee expects. There is no separate "pin these
-//! registers" facility to reach for: Cranelift's `enable_pinned_reg` pins
-//! exactly one, which is not a register *file*.
-//!
-//! **The context pointer is returned as well as passed, and that is
-//! load-bearing.** Under the tail convention arguments and results are assigned
-//! from the same register sequence, so a signature whose results are its
-//! parameters puts every slot in the register it already occupies: forwarding
-//! state costs nothing and a link lowers to a branch. Drop `ctx` from the
-//! results and every slot shifts by one register, which is a move per slot per
-//! link, in both directions.
-//!
-//! # What the host decides, and what it must not get wrong
-//!
-//! Microlift has no opinion about which registers are worth pinning - that is a
-//! property of the guest program, and the answer for a game is not the answer
-//! for a compiler. The host declares an ordered [`PinnedAbi`] and everything
-//! else follows from it.
-//!
-//! Two obligations come with that:
-//!
-//! - **Every region reachable through one link table must be lifted under the
-//!   same `PinnedAbi`,** slot for slot and in the same order. It is the ABI of a
-//!   branch between two independently compiled functions; nothing checks it at
-//!   run time and a mismatch is a wrong-code bug, not a fault. Changing it means
-//!   discarding every translation lifted under the old one - the same rule
-//!   [`BlockLinkConfig`](crate::core::link::BlockLinkConfig) already carries for
-//!   its geometry, for the same reason.
-//! - **Slots are scarce, and overflowing them is silent for arguments.** See
-//!   [`RegisterBudget`]: past the budget Cranelift assigns stack locations, and
-//!   a "pinned" register that lives in a stack slot is strictly worse than one
-//!   that lives in the context. [`PinnedAbi::check_budget`] is how a host asks
-//!   before it finds out.
-//!
-//! # Where the boundary is
-//!
-//! A pinned slot changes exactly three things, and deliberately nothing else:
-//!
-//! 1. **Entry.** Its value arrives as a function parameter instead of a load
-//!    from the context.
-//! 2. **Exit to the host.** Its value is returned instead of stored; the entry
-//!    thunk ([`LiftedCode::entry_thunk`](crate::core::LiftedCode::entry_thunk))
-//!    performs the store, once per *chain* rather than once per region.
-//! 3. **A taken link.** Its value is an argument to the tail call.
-//!
-//! Everything in between - a bridge call's [`RegMask`](crate::core::bridge::RegMask)
-//! sync, an import's argument marshalling, a guest instruction reading the
-//! register - is untouched, because those all happen while the region is
-//! running and the context is what the host reads *then*. The rule that keeps
-//! this straight: **the full [`GuestArch::sync_to_context`] skips pinned slots,
-//! and the masked syncs never do.**
+//! A pinned slot changes exactly three things - it arrives as a parameter at
+//! entry, is returned rather than stored on exit to the host, and is an argument
+//! to a taken link. Hence: **the full [`GuestArch::sync_to_context`] skips pinned
+//! slots, and the masked syncs never do.**
 //!
 //! [`GuestArch::sync_to_context`]: crate::core::GuestArch::sync_to_context
 
@@ -78,17 +29,14 @@ use target_lexicon::Architecture;
 
 /// The most slots a [`PinnedAbi`] can hold.
 ///
-/// Comfortably above every target's [`RegisterBudget`], so the cap is never the
-/// thing a host runs into first - it exists so the ABI is a `Copy` value that
-/// can live inside a [`LifterConfig`](crate::core::LifterConfig) cloned once per
-/// region.
+/// Comfortably above every target's [`RegisterBudget`]; it exists so the ABI is
+/// a `Copy` value that can live in a `LifterConfig` cloned once per region.
 pub const MAX_PINNED_SLOTS: usize = 16;
 
 /// Which of a guest's register banks a slot names.
 ///
-/// Deliberately only two: this is the granularity every guest frontend can be
-/// expected to answer for, and the granularity a machine ABI actually
-/// distinguishes.
+/// Only two: the granularity every guest frontend can answer for, and the one
+/// a machine ABI actually distinguishes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RegClass {
     /// An integer/pointer register - x86-64's `RAX`..`R15`, aarch64's `X0`..`X30`.
@@ -99,12 +47,10 @@ pub enum RegClass {
 
 /// One guest register, in the guest's own architectural numbering.
 ///
-/// The engine never interprets `index`; it hands the pair straight back to the
-/// frontend ([`GuestArch::pinned_slot_var`](crate::core::GuestArch::pinned_slot_var)),
-/// which is what keeps this file free of any particular guest's register names.
-/// For x86-64 the numbering is [`GPR_ORDER`](crate::arch::x86_64::regs::GPR_ORDER)
-/// for [`RegClass::Gpr`] and the XMM number for [`RegClass::Vector`]; the named
-/// constants in [`crate::arch::x86_64::pin`] are the readable spelling.
+/// The engine never interprets `index`; it hands the pair back to the frontend
+/// ([`GuestArch::pinned_slot_var`](crate::core::GuestArch::pinned_slot_var)).
+/// For x86-64 that is [`GPR_ORDER`](crate::arch::x86_64::regs::GPR_ORDER) or
+/// the XMM number; [`crate::arch::x86_64::pin`] is the readable spelling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PinnedReg {
     /// Which bank the register is in.
@@ -135,12 +81,10 @@ impl PinnedReg {
 ///
 /// Order is significant - it is the parameter order of every region compiled
 /// under it - so this is a sequence, not a set. Duplicates are refused at
-/// construction because a register occupying two slots has two values on entry
-/// and no defined answer for which one wins.
+/// construction: a register in two slots has two values on entry.
 ///
-/// `Copy`, and sized rather than heap-allocated, because a
-/// [`LifterConfig`](crate::core::LifterConfig) is cloned once per region and
-/// anything in it is paid for at that rate.
+/// `Copy` and sized rather than heap-allocated, because a `LifterConfig` is
+/// cloned once per region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PinnedAbi {
     slots: [PinnedReg; MAX_PINNED_SLOTS],
@@ -168,10 +112,9 @@ impl PinnedAbi {
     ///
     /// # Panics
     ///
-    /// If `reg` is already pinned, or the ABI is full ([`MAX_PINNED_SLOTS`]).
-    /// Both are programming errors in a declaration written once at start-up,
-    /// not run-time conditions - and a silently dropped slot would be a
-    /// wrong-code bug in every region compiled afterwards.
+    /// If `reg` is already pinned, or the ABI is full ([`MAX_PINNED_SLOTS`]). Both
+    /// are programming errors in a declaration written once at start-up, and a
+    /// silently dropped slot would be a wrong-code bug in every region after it.
     #[must_use]
     pub fn with(mut self, reg: PinnedReg) -> Self {
         assert!(
@@ -261,12 +204,10 @@ impl PinnedAbi {
 /// What one target can pass in registers under the tail calling convention,
 /// counting the context pointer.
 ///
-/// **This mirrors Cranelift's own `compute_arg_locs` and is a lint, not a
-/// contract.** The authority is the backend; this is here so a host can ask the
-/// question at start-up instead of discovering the answer as a mysterious stack
-/// access in a profile. The one direction that is not silent is results: too
-/// many of those is a hard compile error out of Cranelift ("Too many return
-/// values to fit in registers"), which is the backstop under this lint.
+/// **A lint, not a contract** - it mirrors Cranelift's own `compute_arg_locs`
+/// so a host can ask at start-up rather than find a mysterious stack access in
+/// a profile; the authority is the backend. Too many *results* is the one case
+/// that is not silent: Cranelift errors outright.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RegisterBudget {
     /// Integer values passable in registers, *including* the context pointer.
@@ -339,9 +280,8 @@ impl std::error::Error for BudgetError {}
 /// Build the signature every region under `abi` carries: the context pointer
 /// followed by one parameter per slot, returning exactly the same list.
 ///
-/// `slot_types` gives the Cranelift type of each slot in order; a frontend that
-/// cannot type a slot has already disabled pinning by then (see
-/// [`crate::core::pinned_abi_for`]), so this takes them resolved.
+/// A frontend that cannot type a slot has already disabled pinning (see
+/// [`crate::core::pinned_abi_for`]), so `slot_types` arrives resolved.
 pub(crate) fn pinned_signature(slot_types: &[Type]) -> Signature {
     let mut sig = Signature::new(CallConv::Tail);
     sig.params.push(AbiParam::new(types::I64));

@@ -3,9 +3,7 @@
 /// cbw/cwde/cdqe/cwd/cdq/cqo, sar, rol, shld/shrd, bt.
 use microlift::testkit::prelude::*;
 
-// ---------------------------------------------------------------------------
 // NEG
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_neg() {
@@ -35,9 +33,7 @@ fn test_neg() {
     assert_eq!(ctx.zf, 1);
 }
 
-// ---------------------------------------------------------------------------
 // IMUL
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_imul_two_operand() {
@@ -123,9 +119,7 @@ fn test_imul_one_operand_overflow() {
     assert_eq!(ctx.cf, 1);
 }
 
-// ---------------------------------------------------------------------------
 // MUL
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_mul() {
@@ -214,9 +208,7 @@ fn test_mul_overflow() {
     assert_eq!(ctx.cf, 1);
 }
 
-// ---------------------------------------------------------------------------
 // IDIV / DIV
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_idiv() {
@@ -269,9 +261,7 @@ fn test_div() {
     assert_eq!(ctx.rdx, 1);
 }
 
-// ---------------------------------------------------------------------------
 // Sign-extension conversions
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_cbw() {
@@ -419,9 +409,7 @@ fn test_cqo() {
     assert_eq!(ctx.rdx, 0);
 }
 
-// ---------------------------------------------------------------------------
 // SAR (arithmetic right shift)
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_sar_positive() {
@@ -466,9 +454,7 @@ fn test_sar_by_cl() {
     assert_eq!(ctx.rax, 8);
 }
 
-// ---------------------------------------------------------------------------
 // ROL (rotate left)
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_rol_msb_rotates_to_lsb() {
@@ -499,9 +485,7 @@ fn test_rol_preserves_value_at_full_rotation() {
     assert_eq!(ctx.rax, 0xF0F0F0F0F0F0F0F0u64);
 }
 
-// ---------------------------------------------------------------------------
 // SHLD / SHRD (double-precision shift)
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_shld() {
@@ -567,9 +551,7 @@ fn test_shrd_simple() {
     assert_eq!(ctx.rax, 1);
 }
 
-// ---------------------------------------------------------------------------
 // BT (bit test, read-only)
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_bt_immediate() {
@@ -769,13 +751,11 @@ fn test_sbb_result_zero() {
     assert_eq!(ctx.zf, 1);
 }
 
-// ---------------------------------------------------------------------------
 // Regression: shift by masked-zero count must NOT touch flags.
 // Per x86: when the masked shift count is 0, CF/ZF/SF/OF are all unchanged.
 // Earlier the lifter computed CF as `(val >> bit_width) & 1` for SHL and
 // `(val >> -1) & 1` for SHR/SAR - both Cranelift-masked-to-0/63 - silently
 // corrupting CF for any subsequent JC/JNC.
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_shl_by_zero_preserves_flags() {
@@ -903,11 +883,9 @@ fn test_shl_by_zero_does_not_pick_lsb_into_cf() {
     assert_eq!(ctx.cf, 0, "SHL by 0 must not move val's LSB into CF");
 }
 
-// ---------------------------------------------------------------------------
 // Regression: 8-bit DIV/IDIV must use AX (not AL) as the dividend.
 // x86 8-bit divide: AL = AX / r/m8, AH = AX % r/m8 - AH (high byte of AX)
 // must contribute to the dividend.
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_div_8bit_uses_ax_as_dividend() {

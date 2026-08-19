@@ -1,20 +1,15 @@
 //! SSE / SSE2 / XMM instruction semantics.
 //!
-//! XMM registers have two interchangeable backing representations,
-//! selected by [`crate::lifter::LifterConfig::use_vector_xmm`]:
-//!  - scalar (default): two `I64` SSA variables per register (lo + hi).
-//!    Portable to AOT targets without vector lowering (e.g. RISC-V64).
-//!  - vector: a single native `I64X2` SSA variable per register, which
-//!    lowers directly to host XMM registers on x86-64.
+//! XMM registers have two backing representations, selected by
+//! [`crate::lifter::LifterConfig::use_vector_xmm`]: scalar (default) is two
+//! `I64` SSA variables per register, portable to AOT targets without vector
+//! lowering; vector is one native `I64X2`.
 //!
-//! The scalar expansion is the authority on semantics and always works.
-//! When the vector representation is enabled, most handlers take a native
-//! fast path instead - see [`sse_vec`](super::sse_vec) for the shared
-//! plumbing and `tests/sse_vec_equiv_tests.rs` for the equivalence proof.
-//! Handlers with no fast path (and every handler in scalar mode) reach
-//! lo/hi lane access via [`crate::lifter::Lifter::get_xmm_lo`] /
-//! [`crate::lifter::Lifter::get_xmm_hi`], which transparently handle both
-//! representations.
+//! The scalar expansion is the authority on semantics and always works; with
+//! the vector representation most handlers take a native fast path instead -
+//! see [`sse_vec`](super::sse_vec) and `tests/sse_vec_equiv_tests.rs`. Lane
+//! access goes through [`crate::lifter::Lifter::get_xmm_lo`]/`get_xmm_hi`,
+//! which handle both representations.
 
 use crate::MicroliftError;
 use crate::arch::x86_64::context::{MXCSR_MASK, RegisterContext};
@@ -37,25 +32,19 @@ pub(super) const F64_INDEFINITE: Ieee64 = Ieee64::with_bits(0xFFF8_0000_0000_000
 
 /// Square root of one `F32` or `F64` with x86's NaN behaviour.
 ///
-/// For a negative operand the result is a NaN the instruction *generates*
-/// rather than propagates, and the two ISAs disagree on its sign: x86 yields
-/// the floating indefinite (see [`F32_INDEFINITE`]) while the AArch64 default
-/// NaN is positive. A bare Cranelift `sqrt` lets the *host* FPU pick, so lifted
-/// code produces the wrong bits on a non-x86 host; the indefinite is
-/// materialised explicitly instead.
+/// A negative operand *generates* a NaN rather than propagating one, and the
+/// ISAs disagree on its sign: x86 yields the floating indefinite (see
+/// [`F32_INDEFINITE`]) where AArch64's default NaN is positive. A bare
+/// Cranelift `sqrt` lets the host FPU pick, so the indefinite is materialised
+/// explicitly.
 ///
-/// Only the strict `x < 0` case is patched, which is exactly the input set that
-/// generates a NaN: `-0.0` still gives `-0.0`, and a NaN operand falls through
-/// to `sqrt`, which propagates it - quieting a signalling NaN - with its sign
-/// and payload intact, as x86 does.
+/// Only the strict `x < 0` case is patched, which is exactly the NaN-generating
+/// input set: `-0.0` still gives `-0.0`, and a NaN operand falls through to
+/// `sqrt`, which propagates it with sign and payload intact as x86 does.
+/// [`GeneratedNan::HostDefault`] skips the patch entirely.
 ///
-/// Under [`GeneratedNan::HostDefault`] the patch is skipped entirely and the
-/// host FPU's own default NaN stands - see that mode for what a guest has to do
-/// to notice.
-///
-/// A free function rather than a [`Lifter`] method so it can be passed directly
-/// as the `op` closure of the packed lane plumbing, which is handed only the
-/// builder.
+/// A free function rather than a [`Lifter`] method so it can be passed as the
+/// `op` closure of the packed lane plumbing, which is handed only the builder.
 pub(super) fn fp_sqrt_x86(nan: GeneratedNan, b: &mut FunctionBuilder, x: Value) -> Value {
     let r = b.ins().sqrt(x);
     if nan == GeneratedNan::HostDefault {
@@ -72,21 +61,16 @@ pub(super) fn fp_sqrt_x86(nan: GeneratedNan, b: &mut FunctionBuilder, x: Value) 
 
 /// One `F32`/`F64` arithmetic lane with x86's *generated*-NaN bits.
 ///
-/// The companion of [`fp_sqrt_x86`] for the binary operations: `inf + -inf`,
-/// `inf - inf`, `0 * inf`, `0 / 0` and `inf / inf` are *invalid operations*,
-/// and the NaN they produce is one the instruction generates rather than
-/// propagates - so it must be x86's sign-set floating indefinite, not whatever
-/// default NaN the host FPU picks (AArch64's is positive).
+/// The binary companion of [`fp_sqrt_x86`]: `inf + -inf`, `inf - inf`,
+/// `0 * inf`, `0 / 0` and `inf / inf` are invalid operations whose NaN the
+/// instruction generates rather than propagates, so it must be x86's sign-set
+/// floating indefinite rather than the host's default.
 ///
-/// The condition is stated once for all four operations rather than enumerated
-/// per operation: a NaN result that neither operand supplied *is* the invalid
-/// case, and it is exactly the set above. When an operand is already a NaN the
-/// host propagates it correctly - quieted, sign and payload intact, as x86
-/// does - so `Ordered(x, y)` leaves that path untouched.
-///
-/// All of which is what [`GeneratedNan::HostDefault`] buys out of: the
-/// propagating path was already free, so the whole sequence exists for the
-/// generated case alone and that mode drops it.
+/// The condition is stated once for all four operations rather than enumerated:
+/// a NaN result neither operand supplied *is* the invalid case, and is exactly
+/// that set. An operand that is already a NaN is propagated correctly by the
+/// host, so `Ordered(x, y)` leaves that path untouched - which is what
+/// [`GeneratedNan::HostDefault`] buys out of.
 pub(super) fn fp_arith_x86(
     nan: GeneratedNan,
     b: &mut FunctionBuilder,
@@ -112,10 +96,8 @@ pub(super) fn fp_arith_x86(
 /// [`fp_arith_x86`] over `FADD`, as the lane closure the packed and scalar
 /// plumbing expects, with `nan` bound in.
 ///
-/// Curried rather than a plain function because that plumbing hands its `op`
-/// only the builder, and the generated-NaN policy is a property of the *lift*.
-/// Every caller therefore reads [`Lifter::generated_nan`] once and passes the
-/// result of one of these four.
+/// Curried because that plumbing hands its `op` only the builder, while the
+/// generated-NaN policy is a property of the lift.
 pub(super) fn fadd_x86<'a>(
     nan: GeneratedNan,
 ) -> impl Fn(&mut FunctionBuilder<'a>, Value, Value) -> Value + Copy {
@@ -158,15 +140,11 @@ pub(super) enum RoundMode {
 
 /// Decode `imm8[2:0]` of a `ROUND*` instruction.
 ///
-/// Bit 2 means "ignore bits[1:0] and use MXCSR's current rounding mode". The
-/// register itself exists ([`crate::context::RegisterContext::mxcsr`], written
-/// by `LDMXCSR`), but no arithmetic consults it: every SSE operation here
-/// rounds nearest-even, so that is what bit 2 resolves to. A guest that changed
-/// `MXCSR.RC` and then rounded would differ - the standing gap recorded on the
-/// `mxcsr` field, not papered over here.
-///
-/// Bit 3 suppresses the precision exception, which is unobservable here: no
-/// floating-point exception is raised in the first place.
+/// Bit 2 means "use MXCSR's current rounding mode". The register exists
+/// ([`crate::context::RegisterContext::mxcsr`]) but no arithmetic consults it:
+/// every SSE operation here rounds nearest-even, so that is what bit 2
+/// resolves to. Bit 3 suppresses the precision exception, unobservable here
+/// since no FP exception is raised in the first place.
 pub(super) fn round_mode(imm: u8) -> RoundMode {
     if imm & 0b100 != 0 {
         return RoundMode::Nearest;
@@ -465,11 +443,9 @@ impl<'a> Lifter<'a> {
 
     /// Load a 128-bit XMM source operand as a native `I64X2` value.
     ///
-    /// - XMM register source: direct vec read (or assembled from lo/hi
-    ///   in scalar mode).
-    /// - GPR source (e.g. MOVQ xmm, r64): zero-extends 64-bit value
-    ///   into lane 0; lane 1 = 0.
-    /// - Memory source: single 128-bit unaligned load.
+    /// - XMM register: direct vec read (or assembled from lo/hi in scalar mode).
+    /// - GPR (e.g. `MOVQ xmm, r64`): zero-extended into lane 0, lane 1 = 0.
+    /// - Memory: one 128-bit unaligned load.
     pub(super) fn read_xmm_src_vec(
         &mut self,
         instruction: &Instruction,
@@ -795,10 +771,10 @@ impl<'a> Lifter<'a> {
     /// MOVD - move a 32-bit value between a GPR/memory operand and an XMM
     /// register's low dword.
     ///
-    /// - `MOVD xmm, r/m32`: low 32 bits = src; upper 96 bits zeroed.
+    /// - `MOVD xmm, r/m32`: low 32 bits = src, upper 96 zeroed.
     /// - `MOVD r/m32, xmm`: dst = xmm[31:0].
     ///
-    /// (The 64-bit `r/m64` forms decode as `MOVQ`, handled separately.)
+    /// The 64-bit `r/m64` forms decode as `MOVQ` and are handled separately.
     pub(super) fn handle_movd(&mut self, instruction: &Instruction) -> crate::Result<()> {
         match self.operand_kind(instruction, 0) {
             OpKind::Register => {
@@ -890,12 +866,11 @@ impl<'a> Lifter<'a> {
 
     /// MOVLPS / MOVLPD - move 64 bits to/from the low quadword of an XMM.
     ///
-    /// - `MOVLPS xmm, m64`: low 64 bits = `[mem]`; high 64 bits preserved.
-    /// - `MOVLPS m64, xmm`: store the low 64 bits of `xmm` to memory.
+    /// - `MOVLPS xmm, m64`: low 64 bits = `[mem]`, high 64 preserved.
+    /// - `MOVLPS m64, xmm`: store the low 64 bits of `xmm`.
     ///
-    /// Note the preserved high half: unlike `MOVSD xmm, m64`, this is a merging
-    /// load, not a zeroing one. There is no register-to-register form - those
-    /// encodings decode as `MOVHLPS` / `MOVLHPS`.
+    /// A merging load, unlike `MOVSD xmm, m64`. There is no register-to-register
+    /// form - those encodings decode as `MOVHLPS`/`MOVLHPS`.
     pub(super) fn handle_movlps(&mut self, instruction: &Instruction) -> crate::Result<()> {
         match self.operand_kind(instruction, 0) {
             OpKind::Register => {
@@ -975,18 +950,16 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// PSRLW/PSRLD/PSRLQ, PSLLW/PSLLD/PSLLQ, PSRAW/PSRAD - packed per-lane
-    /// shift by a scalar count.
+    /// PSRLW/PSRLD/PSRLQ, PSLLW/PSLLD/PSLLQ, PSRAW/PSRAD - packed per-lane shift
+    /// by a scalar count.
     ///
     /// - `<op> xmm, imm8`: every lane shifts by the immediate.
-    /// - `<op> xmm, xmm/m128`: the count is the low 64 bits of the source
-    ///   (all 64 bits participate, so a huge count is out of range, not
-    ///   truncated).
+    /// - `<op> xmm, xmm/m128`: the count is the low 64 bits of the source, all of
+    ///   which participate, so a huge count is out of range rather than truncated.
     ///
-    /// An out-of-range count (>= the lane width) is *not* the modulo-width
-    /// behaviour of a raw machine shift: the zero-filling shifts produce
-    /// all-zero lanes, while `PSRA*` saturates to each lane's sign, which is
-    /// the same as shifting by `lane_bits - 1`.
+    /// An out-of-range count (>= the lane width) is *not* modulo-width: the
+    /// zero-filling shifts produce all-zero lanes, `PSRA*` saturates to each lane's
+    /// sign.
     pub(super) fn handle_packed_shift(
         &mut self,
         instruction: &Instruction,
@@ -1039,13 +1012,12 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// Packed shift in vector mode: bitcast to the lane type and use
-    /// Cranelift's native lane-wise shift, which lowers to a single host SIMD
-    /// instruction.
+    /// Packed shift in vector mode: bitcast to the lane type and use Cranelift's
+    /// native lane-wise shift, one host SIMD instruction.
     ///
-    /// Cranelift masks the shift amount to the lane width, so the out-of-range
-    /// count has to be handled explicitly: `PSRA*` clamps the count, the
-    /// zero-filling shifts mask the result away.
+    /// Cranelift masks the shift amount to the lane width, so out-of-range counts
+    /// are handled explicitly: `PSRA*` clamps the count, the zero-filling shifts
+    /// mask the result away.
     fn packed_shift_vec(
         &mut self,
         dst: Value,
@@ -1405,16 +1377,13 @@ impl<'a> Lifter<'a> {
         self.set_xmm_lo(idx, merged);
     }
 
-    /// The whole `PUNPCK{L,H}{BW,WD,DQ,QDQ}` family, plus their floating-point
-    /// aliases `UNPCK{L,H}P{S,D}`.
+    /// The whole `PUNPCK{L,H}{BW,WD,DQ,QDQ}` family and its FP aliases
+    /// `UNPCK{L,H}P{S,D}`.
     ///
-    /// Every form interleaves `width`-wide lanes taken from one 64-bit half of
-    /// each operand: the *low* half for `PUNPCKL*`, the *high* half for
-    /// `PUNPCKH*`. Result lane `2i` comes from the destination, lane `2i+1` from
-    /// the source, so the selected half of each operand expands to fill all 128
-    /// bits of the destination.
-    ///
-    /// For example `PUNPCKLDQ` yields `[dst.d0, src.d0, dst.d1, src.d1]`.
+    /// Interleaves `width`-wide lanes from one 64-bit half of each operand - low
+    /// for `PUNPCKL*`, high for `PUNPCKH*`. Result lane `2i` comes from the
+    /// destination, `2i+1` from the source, so the selected half of each expands
+    /// to fill all 128 bits. `PUNPCKLDQ` yields `[dst.d0, src.d0, dst.d1, src.d1]`.
     pub(super) fn handle_punpck(
         &mut self,
         instruction: &Instruction,
@@ -1578,15 +1547,13 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Shared implementation for the SSE3 horizontal double-precision
-    /// instructions (`HADDPD` / `HSUBPD`): the destination's two lanes are
-    /// combined into the result's low lane and the source's two into its high
-    /// one.
+    /// Shared implementation of the SSE3 horizontal double-precision instructions
+    /// (`HADDPD`/`HSUBPD`): the destination's two lanes combine into the result's
+    /// low lane, the source's two into its high one.
     ///
-    /// Both operands are read before either result is written, because the
-    /// source is very often the destination - `haddpd xmm0, xmm0` is how a
-    /// compiler sums a pair - and a lane written early would then be an input to
-    /// the other half.
+    /// Both operands are read before either result is written, because the source
+    /// is very often the destination (`haddpd xmm0, xmm0`) and a lane written early
+    /// would then be an input to the other half.
     fn horizontal_double_arith(
         &mut self,
         instruction: &Instruction,
@@ -1655,20 +1622,17 @@ impl<'a> Lifter<'a> {
         self.builder.ins().bor(lo64, hi_shifted)
     }
 
-    /// DPPS - single-precision dot product of the two operands, broadcast into
-    /// the destination lanes `imm8[3:0]` selects.
+    /// DPPS - single-precision dot product, broadcast into the destination lanes
+    /// `imm8[3:0]` selects.
     ///
     /// `imm8[7:4]` is the *multiply* mask: a lane it clears contributes `+0.0`
-    /// rather than a product, so a NaN or an infinity sitting in a masked-off
-    /// lane cannot reach the sum. `imm8[3:0]` is the *broadcast* mask: a lane it
-    /// clears is written `+0.0` rather than the sum.
+    /// rather than a product, so a NaN or infinity in a masked-off lane cannot
+    /// reach the sum. `imm8[3:0]` is the *broadcast* mask: a lane it clears is
+    /// written `+0.0`.
     ///
-    /// The summation order is architectural, not an implementation choice - the
-    /// SDM specifies the pairwise tree `(t0 + t1) + (t2 + t3)`, each step
-    /// rounded to single precision. Summing left to right would be a different
-    /// (and wrong) result for most inputs, so the tree is written out literally
-    /// here. Every step goes through [`fadd_x86`] / [`fmul_x86`] so a *generated*
-    /// NaN is x86's floating indefinite rather than the host FPU's default.
+    /// The summation order is architectural: the SDM specifies the pairwise tree
+    /// `(t0 + t1) + (t2 + t3)`, each step rounded to single precision, so it is
+    /// written out literally. Every step goes through [`fadd_x86`]/[`fmul_x86`].
     pub(super) fn handle_dpps(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let dst_idx = self.xmm_operand_index(instruction, 0, "dpps")?;
         let dst_lo = self.get_xmm_lo(dst_idx);
@@ -1781,15 +1745,12 @@ impl<'a> Lifter<'a> {
         self.horizontal_single_arith(instruction, "hsubps", fsub_x86(nan))
     }
 
-    /// ADDSUBPS - subtract in the even single-precision lanes, add in the odd
-    /// ones: `dst[2i] -= src[2i]`, `dst[2i+1] += src[2i+1]`.
+    /// ADDSUBPS - subtract in the even single-precision lanes, add in the odd:
+    /// `dst[2i] -= src[2i]`, `dst[2i+1] += src[2i+1]`.
     ///
-    /// This is the instruction a compiler emits for the last step of a complex
-    /// multiply, where one component of the product is a difference of terms
-    /// and the other a sum. It is *not* expressible as "negate the even source
-    /// lanes, then add": a NaN source lane must propagate with the sign bit x86
-    /// gives it, and pre-negating would flip that bit. So both lanes really do
-    /// perform their own operation.
+    /// *Not* expressible as "negate the even source lanes, then add": a NaN source
+    /// lane must propagate with the sign bit x86 gives it, and pre-negating would
+    /// flip that bit. Both lanes really do perform their own operation.
     pub(super) fn handle_addsubps(&mut self, instruction: &Instruction) -> crate::Result<()> {
         if self.try_addsub_vec(instruction, "addsubps", true)? {
             return Ok(());
@@ -2056,14 +2017,12 @@ impl<'a> Lifter<'a> {
 
     /// Shared implementation of every packed-integer add/sub form.
     ///
-    /// In vector mode the 128-bit value is bitcast to the lane type and handed
-    /// to Cranelift's native `iadd`/`isub`/`*_sat`, which lower to a single host
-    /// SIMD instruction. In scalar mode each 64-bit half is processed
-    /// independently: wrapping ops use a SWAR sequence that blocks carries at
-    /// the lane boundaries, saturating ops are expanded per lane.
+    /// In vector mode the value is bitcast to the lane type and handed to
+    /// Cranelift's native `iadd`/`isub`/`*_sat`. In scalar mode each 64-bit half is
+    /// processed independently: wrapping ops use a SWAR sequence that blocks
+    /// carries at the lane boundaries, saturating ops expand per lane.
     ///
-    /// Note that `dst` is always the XMM register operand 0; the source may be
-    /// an XMM register or `m128`.
+    /// `dst` is always the XMM register operand 0; the source may be XMM or `m128`.
     fn packed_int_arith(
         &mut self,
         instruction: &Instruction,
@@ -2168,13 +2127,12 @@ impl<'a> Lifter<'a> {
         self.builder.ins().bxor(diff, correction)
     }
 
-    /// Saturating lane-wise add/sub of two 64-bit lane packs, expanded one lane
-    /// at a time (scalar mode).
+    /// Saturating lane-wise add/sub of two 64-bit lane packs, one lane at a time
+    /// (scalar mode).
     ///
-    /// Each lane is widened into a full `I64`, the arithmetic performed there
-    /// (which cannot overflow, since x86 only defines saturating packed add/sub
-    /// for 8- and 16-bit lanes), clamped to the lane's representable range, and
-    /// shifted back into place.
+    /// Each lane is widened into a full `I64` - where the arithmetic cannot
+    /// overflow, since x86 defines saturating packed add/sub only for 8- and
+    /// 16-bit lanes - clamped to the lane's range, and shifted back into place.
     fn saturating_lanes(
         &mut self,
         a: Value,
@@ -2629,13 +2587,11 @@ impl<'a> Lifter<'a> {
     /// MINSS / MINSD / MINPS / MINPD, MAXSS / MAXSD / MAXPS / MAXPD.
     ///
     /// x86's MIN/MAX are **not** IEEE `minNum`/`maxNum` and are not commutative:
-    /// the result is the destination operand only when the strict comparison
-    /// holds, and the *source* operand otherwise. That single rule covers all
-    /// three documented special cases at once - if either operand is a NaN the
-    /// comparison is false and the source is returned, and `min(+0.0, -0.0)`
-    /// likewise returns the source. So `select(dst < src, dst, src)` (and its
-    /// `>` mirror) is the exact semantics, which is why this cannot use
-    /// Cranelift's NaN-propagating `fmin`/`fmax`.
+    /// the result is the destination only when the strict comparison holds, and the
+    /// *source* otherwise. That one rule covers all three special cases - a NaN
+    /// operand makes the comparison false and returns the source, and
+    /// `min(+0.0, -0.0)` likewise. So `select(dst < src, dst, src)` is exact, which
+    /// is why Cranelift's NaN-propagating `fmin`/`fmax` cannot be used.
     fn fp_min_max(min: bool) -> impl Fn(&mut FunctionBuilder<'a>, Value, Value) -> Value {
         move |b, x, y| {
             let cc = if min {
@@ -2788,13 +2744,8 @@ impl<'a> Lifter<'a> {
     /// ROUNDSD / ROUNDSS / ROUNDPD / ROUNDPS - SSE4.1 rounding with the mode
     /// chosen by `imm8` rather than by MXCSR.
     ///
-    /// The scalar forms preserve the destination's upper bits, exactly as
-    /// `SQRTSD` and `SQRTSS` do, so they reuse the same two writers.
-    ///
-    /// Reached by every `Math.Floor`, `Math.Ceiling` and `Math.Round` a .NET
-    /// program performs: clang and the Mono JIT both emit `ROUNDSD` for
-    /// `floor`/`ceil`/`trunc` instead of calling libm, so a runtime without it
-    /// stops a managed program at its first rounded number.
+    /// The scalar forms preserve the destination's upper bits exactly as `SQRTSD`
+    /// and `SQRTSS` do, so they reuse the same two writers.
     pub(super) fn handle_roundsd(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let dst_idx = self.xmm_operand_index(instruction, 0, "roundsd")?;
         let mode = round_mode(instruction.immediate8());
@@ -3027,17 +2978,15 @@ impl<'a> Lifter<'a> {
 
     /// Convert one float to a signed integer with x86's out-of-range behaviour.
     ///
-    /// `x` is an `F32` or `F64`; `ty` is `I32` or `I64`. When the result is
-    /// unrepresentable - NaN, an infinity, or simply out of range - x86 produces
-    /// the *integer indefinite* value (`INT_MIN` for the destination width)
-    /// rather than saturating. Cranelift's `fcvt_to_sint_sat` already yields
-    /// `INT_MIN` for the too-negative side, so only the "NaN or too positive"
-    /// side needs patching, which is exactly the
-    /// `UnorderedOrGreaterThanOrEqual` predicate against `2^(width-1)`.
+    /// `x` is `F32`/`F64`, `ty` is `I32`/`I64`. For an unrepresentable result - NaN,
+    /// infinity, or out of range - x86 produces the *integer indefinite*
+    /// (`INT_MIN`) rather than saturating. Cranelift's `fcvt_to_sint_sat` already
+    /// yields `INT_MIN` on the too-negative side, so only "NaN or too positive"
+    /// needs patching - exactly the `UnorderedOrGreaterThanOrEqual` predicate
+    /// against `2^(width-1)`.
     ///
-    /// `truncate` selects the `CVTT*` (toward zero) forms; the plain `CVT*`
-    /// forms round per MXCSR.RC, whose reset value - the only rounding mode this
-    /// lifter models - is round-to-nearest-even, i.e. Cranelift's `nearest`.
+    /// `truncate` selects the `CVTT*` (toward zero) forms; the plain `CVT*` forms
+    /// round per MXCSR.RC, whose reset value is the only mode this lifter models.
     fn fp_to_sint_x86(&mut self, x: Value, ty: Type, truncate: bool) -> Value {
         let src_ty = self.builder.func.dfg.value_type(x);
         let x = if truncate {
@@ -3147,13 +3096,12 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// [`Self::read_low_qword_src`] as a 128-bit vector, the consumed quadword
-    /// in lane 0 and lane 1 zeroed.
+    /// [`Self::read_low_qword_src`] as a 128-bit vector, the consumed quadword in
+    /// lane 0 and lane 1 zeroed.
     ///
-    /// Used by the "half-width source" conversions in vector mode: their
-    /// `xmm/m64` operand must not be read with a full `m128` load, but every
-    /// vector op that consumes it (`fvpromote_low`, `swiden_low`) looks only at
-    /// the low half anyway.
+    /// For the half-width-source conversions in vector mode: their `xmm/m64`
+    /// operand must not be read with a full `m128` load, and every vector op that
+    /// consumes it looks only at the low half anyway.
     fn read_low_qword_src_vec(
         &mut self,
         instruction: &Instruction,
@@ -3581,19 +3529,17 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// The lane operation of `RCP*` / `RSQRT*`, applied to the *source* lane
-    /// (`y`) - these are unary instructions expressed through the shared binary
-    /// lane plumbing, so the destination lane `x` is ignored.
+    /// The lane operation of `RCP*`/`RSQRT*`, applied to the *source* lane (`y`) -
+    /// these are unary instructions expressed through the shared binary lane
+    /// plumbing, so the destination lane `x` is ignored.
     ///
-    /// Hardware computes an approximation with a relative error up to
-    /// `1.5 * 2^-12`; the exact quotient emitted here is within that bound but
-    /// will not be bit-identical to a real CPU. Compilers only emit these under
-    /// fast-math, where that difference is already licensed.
+    /// Hardware computes an approximation with relative error up to `1.5 * 2^-12`;
+    /// the exact quotient emitted here is within that bound but not bit-identical.
+    /// Compilers only emit these under fast-math.
     ///
-    /// The square root goes through [`fp_sqrt_x86`] rather than a bare
-    /// Cranelift `sqrt`: a negative lane makes `RSQRT*` *generate* a NaN, and
-    /// that NaN must be x86's sign-set floating indefinite rather than the
-    /// host's default NaN. The following `fdiv` merely propagates it.
+    /// The square root goes through [`fp_sqrt_x86`] rather than a bare `sqrt`: a
+    /// negative lane makes `RSQRT*` *generate* a NaN, which must be x86's sign-set
+    /// indefinite. The following `fdiv` merely propagates it.
     fn fp_reciprocal(
         nan: GeneratedNan,
         sqrt: bool,
@@ -3684,16 +3630,12 @@ impl<'a> Lifter<'a> {
 
     /// LDMXCSR m32 (and its AVX alias `VLDMXCSR`) - load `MXCSR` from memory.
     ///
-    /// Hardware raises `#GP(0)` if any reserved bit (31:16) of the source is
-    /// set. Microlift models no faults of that class (the same choice
-    /// [`Lifter::handle_movaps`]'s alignment behaviour documents), so the
-    /// reserved bits are dropped instead: bits 31:16 of the context field stay
-    /// zero, which is the state a subsequent `STMXCSR` would see on a machine
-    /// where the `LDMXCSR` had been legal. Every defined bit - the six
-    /// exception flags, DAZ, the six masks, RC and FZ - is stored verbatim.
-    ///
-    /// Storing them is all that happens: see [`RegisterContext::mxcsr`] for
-    /// which of those bits the lifted SSE arithmetic actually honours.
+    /// Hardware raises `#GP(0)` if any reserved bit (31:16) of the source is set.
+    /// Microlift models no faults of that class, so the reserved bits are dropped:
+    /// bits 31:16 stay zero, which is what a subsequent `STMXCSR` would see on a
+    /// machine where the `LDMXCSR` had been legal. Every defined bit is stored
+    /// verbatim - see [`RegisterContext::mxcsr`] for which the lifted arithmetic
+    /// actually honours.
     pub(super) fn handle_ldmxcsr(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let ptr = self.mxcsr_mem_ptr(instruction, "ldmxcsr")?;
         let val = self

@@ -16,12 +16,11 @@ pub const DEFAULT_IMPORT_CALL_BUDGET: usize = 4096;
 /// The handler receives the callee VA and the guest state *as an ordinary
 /// function would see it at its entry point*: arguments in the ABI registers,
 /// the stack pointer already past the pushed return address. It writes results
-/// back into the same [`CpuState`] (`rax`, and any host memory it wants to
-/// touch - guest VA == host VA under both oracles). `rip` is managed by the
-/// engine; a handler must not set it.
+/// back into the same [`CpuState`]. `rip` is managed by the engine; a handler
+/// must not set it.
 ///
-/// One table drives one run: it borrows the handler mutably and counts calls,
-/// so [`differential_with_imports`] builds a fresh handler per engine.
+/// One table drives one run: it borrows the handler mutably and counts calls, so
+/// [`differential_with_imports`] builds a fresh handler per engine.
 pub struct ImportTable<'h> {
     vas: Vec<u64>,
     handler: &'h mut dyn FnMut(u64, &mut CpuState),
@@ -174,9 +173,8 @@ impl ImportOracle for MicroliftOracle {
 }
 
 /// Run `code` on both oracles with the same import trampolines and diff the
-/// resulting states. `None` means one engine hit a non-diffable event (a VM
-/// exit Microlift cannot service, an emulator fault), so there is nothing sound
-/// to compare - the same contract as [`super::oracle::differential`].
+/// resulting states. `None` means one engine hit a non-diffable event, so there
+/// is nothing sound to compare.
 ///
 /// `handler_factory` is invoked once per engine: the runs are sequential and
 /// each gets its own handler, so a test can count calls or record arguments per

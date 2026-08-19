@@ -1,64 +1,26 @@
 //! Which condition-flag writes a region actually needs.
 //!
-//! ## Why this exists
+//! Guest flags are written eagerly and the dead ones deleted by the compiler,
+//! which is correct but expensive: the IR is emitted, optimised and
+//! register-allocated before anything decides it was never needed. This answers
+//! the same question one stage earlier, on the guest instruction stream. Ported
+//! from FEX's `RedundantFlagCalculationElimination`.
 //!
-//! Guest flags are SSA `Variable`s written eagerly: an `ADD` emits the IR for
-//! all six of CF/PF/AF/ZF/SF/OF whether or not anything reads them, and the
-//! parity flag alone is a `popcnt`, an `ireduce`, a `band` and a `bxor`. Being
-//! SSA, the dead ones are deleted by the compiler - that is the design note in
-//! `core/mod.rs`, and it is true. It is also the *expensive* way to be right:
-//! the IR is emitted, walked, optimised and register-allocated before anything
-//! decides it was never needed, and a backend's register allocator is
-//! superlinear in the live ranges it is handed.
-//!
-//! So this answers the same question one stage earlier, on the guest's own
-//! instruction stream, where a flag write costs one bit instead of a dozen IR
-//! instructions. It is a port of FEX's `RedundantFlagCalculationElimination`
-//! (`FEXCore/Source/Interface/IR/Passes/`), with one structural difference
-//! forced by where microlift keeps its flags - see [the classification
-//! contract](FlagEffects).
-//!
-//! ## What it computes
-//!
-//! Standard backwards liveness over guest instructions. For each instruction
-//! address, `live_out` is the set of flags some later instruction reads before
-//! anything overwrites it:
+//! Standard backwards liveness; a flag not in `live_out(a)` may be left
+//! uncomputed at `a`:
 //!
 //! ```text
 //! live_in(a)  = reads(a) ∪ (live_out(a) − writes(a))
 //! live_out(a) = ⋃ live_in(s) for s in successors(a)
 //! ```
 //!
-//! A flag not in `live_out(a)` is one the lift may decline to compute at `a`.
-//!
-//! ## Where it refuses to answer
-//!
-//! Everything here is a *may* analysis, so being wrong in the "dead" direction
-//! produces a program that computes the wrong answer with no diagnostic. Three
-//! rules keep that from happening, and each of them says [`FlagSet::ALL`]:
-//!
-//! - **An instruction whose successors are not all known.** A call, a return,
-//!   an indirect branch, a truncated encoding, or any edge leaving the lifted
-//!   region. This is the rule that covers the host: every one of those lifts to
-//!   a `sync_to_context`, which publishes all flags, so all flags are live
-//!   there by construction rather than by anyone remembering to say so.
-//! - **An instruction the guest frontend does not classify.** The default is
-//!   "reads everything, writes nothing", which keeps every earlier write live.
-//!   This is what makes an instruction microlift lifts to an
-//!   `UnimplementedInstruction` exit safe without the analysis knowing which
-//!   instructions those are: an unclassified mnemonic is conservative, and only
-//!   a mnemonic somebody audited is not.
-//! - **An address that was never analysed** - one phase 2 decoded on demand
-//!   that phase 1 never reached. [`FlagLiveness::live_out`] answers `ALL` for
-//!   anything it has no entry for, so the failure mode of a gap is lost
-//!   optimisation rather than lost correctness.
-//!
-//! Note the second rule is where this differs from FEX. FEX classifies its own
-//! IR opcodes and an unrecognised one is *trivial* - no flag effects at all -
-//! which is safe there because flags in FEX IR are explicit values that only
-//! flag-bearing opcodes can touch. Here the unit of classification is the
-//! **guest instruction**, whose flag effects are whatever its Rust handler
-//! does, so an unrecognised one has to mean the opposite.
+//! Being a *may* analysis, a wrong "dead" is a wrong answer with no diagnostic.
+//! Three rules answer [`FlagSet::ALL`]: successors not all known (a call, return,
+//! indirect branch, truncated encoding, or edge leaving the region - each of
+//! which lifts to a `sync_to_context` that publishes every flag); an instruction
+//! the frontend does not classify ("reads everything, writes nothing", which is
+//! what makes an `UnimplementedInstruction` exit safe without the analysis
+//! knowing which those are); and an address never analysed.
 
 use std::collections::{HashMap, HashSet};
 
@@ -67,11 +29,10 @@ use crate::core::GuestArch;
 
 /// A set of guest condition flags, as a bitset in the guest's own numbering.
 ///
-/// The engine never learns what the bits mean: a frontend assigns each of its
-/// flags an index, uses that index consistently in [`FlagEffects`] and when
-/// querying [`LiftEngine::flag_live`](crate::core::LiftEngine::flag_live), and
-/// the dataflow here is just set union and difference. Eight bits is enough for
-/// every guest microlift has (x86-64 uses seven, aarch64 four).
+/// The engine never learns what the bits mean: a frontend assigns each flag an
+/// index and uses it consistently in [`FlagEffects`] and when querying
+/// [`LiftEngine::flag_live`](crate::core::LiftEngine::flag_live). Eight bits
+/// covers every guest here (x86-64 uses seven, aarch64 four).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FlagSet(u8);
 
@@ -80,9 +41,8 @@ impl FlagSet {
     pub const NONE: FlagSet = FlagSet(0);
     /// Every flag, including bits no guest has assigned a meaning to.
     ///
-    /// The unassigned bits are harmless - nothing ever queries them - and
-    /// having `ALL` be "all bits" rather than "all bits this guest uses" is
-    /// what lets the engine stay ignorant of the numbering.
+    /// The unassigned bits are harmless, and "all bits" rather than "all bits this
+    /// guest uses" is what lets the engine stay ignorant of the numbering.
     pub const ALL: FlagSet = FlagSet(u8::MAX);
 
     /// The set containing just `bit`.
@@ -113,23 +73,20 @@ impl FlagSet {
 
 /// What one guest instruction does to the flags, **as its lift implements it**.
 ///
-/// This is the contract, and it is about the Rust handler rather than about the
-/// architecture, because the handler is what actually runs. Two directions, and
-/// they are asymmetric:
+/// The contract is about the Rust handler, not the architecture, and the two
+/// directions are asymmetric:
 ///
-/// - [`writes`](Self::writes) must be a **subset** of the flags the handler
-///   assigns on every path. Claiming a write the handler does not perform lets
-///   the analysis kill an earlier write that something still reads. The
-///   architecture is not the authority here: x86 leaves AF *undefined* after a
-///   logical op and microlift leaves it *unchanged*, so a later reader observes
-///   the older value and `AND` must not claim to write AF.
-/// - [`reads`](Self::reads) must be a **superset** of the flags the handler
-///   consumes. The shift handlers are the reason this is spelled out: x86 says
-///   `SHL` reads no flags, but a shift by a masked count of zero must leave the
-///   flags alone, so the handler loads all five of them to select against.
+/// - [`writes`](Self::writes) must be a **subset** of what the handler assigns
+///   on every path. Claiming a write it does not perform lets the analysis kill
+///   an earlier write something still reads. x86 leaves AF *undefined* after a
+///   logical op where microlift leaves it *unchanged*, so `AND` must not claim
+///   to write AF.
+/// - [`reads`](Self::reads) must be a **superset** of what the handler
+///   consumes. x86 says `SHL` reads no flags, but a shift by a masked count of
+///   zero must leave them alone, so the handler loads all five to select on.
 ///
 /// The default is the safe pair - reads everything, writes nothing - so an
-/// instruction nobody has audited costs optimisation and not correctness.
+/// unaudited instruction costs optimisation and not correctness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FlagEffects {
     /// Flags the lift of this instruction consumes.
@@ -174,10 +131,8 @@ impl Default for FlagEffects {
     }
 }
 
-/// Per-address flag liveness for one lifted region.
-///
-/// Built by [`analyze`] between decode and IR emission, and consulted by the
-/// semantics through
+/// Per-address flag liveness for one lifted region, built by [`analyze`]
+/// between decode and IR emission and consulted through
 /// [`LiftEngine::flag_live`](crate::core::LiftEngine::flag_live).
 #[derive(Debug, Clone, Default)]
 pub struct FlagLiveness {
@@ -185,11 +140,9 @@ pub struct FlagLiveness {
 }
 
 impl FlagLiveness {
-    /// The flags live *after* the instruction at `va` - the ones its lift has
-    /// to compute.
-    ///
-    /// [`FlagSet::ALL`] for an address the analysis has no entry for, which is
-    /// the answer that makes a gap cost nothing but speed.
+    /// The flags live *after* the instruction at `va` - the ones its lift has to
+    /// compute. [`FlagSet::ALL`] for an address with no entry, which is the answer
+    /// that makes a gap cost nothing but speed.
     pub fn live_out(&self, va: u64) -> FlagSet {
         self.live_out.get(&va).copied().unwrap_or(FlagSet::ALL)
     }
@@ -206,10 +159,8 @@ impl FlagLiveness {
 
 /// Where control can go from one instruction, when that is knowable.
 ///
-/// `None` is the conservative answer and covers everything whose successors the
-/// analysis cannot enumerate: a call (which may run anything and comes back
-/// through a context sync), a return, an unresolved indirect branch, an invalid
-/// encoding, and any edge leaving the region.
+/// `None` is the conservative answer, covering a call, a return, an unresolved
+/// indirect branch, an invalid encoding, and any edge leaving the region.
 fn successors<A: GuestArch>(
     addr: u64,
     inst: &A::Instr,
@@ -230,10 +181,9 @@ fn successors<A: GuestArch>(
             v.push(next);
             v
         }
-        // A call is serviced through a context sync whatever kind it is -
-        // inlined fast import, bridge, VM exit, or an in-region callee that
-        // returns through the dispatch. A return and an indirect branch leave
-        // through one too.
+        // Every one of these is serviced through a context sync - an inlined fast
+        // import, a bridge, a VM exit, or an in-region callee returning through
+        // the dispatch.
         ControlFlowKind::Call { .. }
         | ControlFlowKind::Ret
         | ControlFlowKind::IndirectBranch
@@ -254,8 +204,7 @@ fn successors<A: GuestArch>(
 
 /// Compute per-address flag liveness for a decoded region.
 ///
-/// `truncated` reports whether an instruction's encoding runs past the end of
-/// the region - the engine's own `runs_off_region`, passed in rather than
+/// `truncated` is the engine's own `runs_off_region`, passed in rather than
 /// recomputed so the two cannot disagree about which instructions are only
 /// partly present.
 pub(crate) fn analyze<A: GuestArch>(

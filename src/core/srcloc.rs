@@ -1,41 +1,20 @@
-//! Guest source locations: which guest instruction a piece of lifted IR (and,
-//! after compilation, a piece of host machine code) came from.
+//! Guest source locations: which guest instruction a piece of lifted IR - and,
+//! after compilation, a piece of host machine code - came from.
 //!
-//! Cranelift carries a 32-bit [`SourceLoc`] on every IR instruction, preserves
-//! it through optimization and lowering, and hands back the surviving
-//! machine-code ranges on the compiled buffer. The lifter has no *files* or
-//! *lines* to put there, but it does have something better: the virtual address
-//! of the guest instruction being lifted. This module defines that encoding and
-//! the two directions of lookup it enables.
+//! [`SourceLocMap`] converts between a guest VA and Cranelift's [`SourceLoc`];
+//! [`GuestCodeMap`] is the post-compilation product, sorted host code ranges
+//! tagged with the guest VA they implement.
 //!
-//! - [`SourceLocMap`] converts between a guest VA and a `SourceLoc`. It is what
-//!   makes a printed `.clif` function readable - every IR instruction is
-//!   annotated with the guest instruction that produced it - and it is carried
-//!   on [`LiftedCode`](crate::core::LiftedCode) so the mapping outlives the lift.
-//! - [`GuestCodeMap`] is the post-compilation product: sorted host code ranges,
-//!   each tagged with the guest VA it implements. Given a host `RIP` inside a
-//!   JIT-compiled region, [`GuestCodeMap::lookup`] says which guest instruction
-//!   was executing - which is the question worth answering when a lifted region
-//!   crashes.
+//! A `SourceLoc` is a `u32` and `u32::MAX` is reserved as "no location", so a VA
+//! is stored as a *signed* displacement from the lift base, biased into the
+//! unsigned range: within ±2 GiB it round-trips exactly, further away it encodes
+//! as no location rather than a wrong one. Signed because out-of-region branch
+//! targets go backwards as often as forwards.
 //!
-//! # Encoding
-//!
-//! A `SourceLoc` is a `u32`, a guest VA is 64 bits, and `u32::MAX` is reserved
-//! by Cranelift as "no location" ([`SourceLoc::default`]). So a VA is stored as
-//! a *signed* displacement from the region's lift base, biased into the unsigned
-//! range: anything within ±2 GiB of the lifted region round-trips exactly, and
-//! anything further away (or exactly at the reserved encoding) gets no location
-//! rather than a wrong one. Out-of-region branch targets are the reason the
-//! displacement is signed - a jump backwards out of the region is as ordinary as
-//! a jump forwards.
-//!
-//! Note the VA is a *lift-time* address, the same address space the decoder saw,
-//! not the relocated run-time address (see
-//! [`AddressMode`](crate::core::AddressMode)). Under
+//! The VA is a *lift-time* address, so under
 //! [`AddressMode::ImageBaseRelative`](crate::core::AddressMode::ImageBaseRelative)
-//! a debugger comparing against a live PC must subtract the guest's runtime image
-//! base and add the lift base, exactly as
-//! [`LiftEngine::to_lift_va`](crate::core::LiftEngine::to_lift_va) does in IR.
+//! a consumer comparing against a live PC must map it as
+//! [`LiftEngine::to_lift_va`](crate::core::LiftEngine::to_lift_va) does.
 
 use cranelift_codegen::CompiledCode;
 use cranelift_codegen::ir::SourceLoc;
@@ -46,11 +25,9 @@ use cranelift_codegen::ir::SourceLoc;
 /// with Cranelift's reserved "no location" value and is therefore rejected.
 const SIGN_BIAS: u32 = 0x8000_0000;
 
-/// Converts between guest virtual addresses and Cranelift [`SourceLoc`]s for one
-/// lifted region.
-///
-/// Cheap to copy and to keep around: the whole mapping is the region's lift base
-/// plus the fixed encoding described in the [module docs](self).
+/// Converts between guest virtual addresses and Cranelift [`SourceLoc`]s for
+/// one lifted region. Cheap to copy: the whole mapping is the lift base plus
+/// the fixed encoding described in the [module docs](self).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SourceLocMap {
@@ -67,9 +44,8 @@ impl SourceLocMap {
 
     /// Encode guest VA `va` as a `SourceLoc`.
     ///
-    /// Returns [`SourceLoc::default`] (Cranelift's "no location") when `va` is
-    /// more than ~2 GiB away from [`lift_base`](Self::lift_base) and so cannot
-    /// be represented. Never returns a *wrong* location.
+    /// [`SourceLoc::default`] ("no location") when `va` is more than ~2 GiB from
+    /// [`lift_base`](Self::lift_base). Never returns a *wrong* location.
     pub fn encode(&self, va: u64) -> SourceLoc {
         self.try_encode(va).unwrap_or_default()
     }
@@ -99,10 +75,7 @@ impl SourceLocMap {
 }
 
 /// One contiguous run of host machine code, and the guest instruction it was
-/// lifted from.
-///
-/// Offsets are relative to the start of the compiled function, which is what
-/// Cranelift reports and what a JIT caller adds its function pointer to.
+/// lifted from. Offsets are relative to the start of the compiled function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct GuestCodeRange {
@@ -130,11 +103,9 @@ impl GuestCodeRange {
 
 /// Host code offset -> guest instruction map for one compiled function.
 ///
-/// Built from the [`SourceLoc`]s that survived lowering, so it covers only the
-/// code Cranelift actually attributed to a guest instruction: the prologue, the
-/// epilogue, the entry PC-dispatch switch and anything else the engine emits
-/// outside a guest instruction's lifting deliberately carry no location and are
-/// simply absent from the map. Ranges are sorted by `start` and do not overlap.
+/// Built from the [`SourceLoc`]s that survived lowering, so it covers only code
+/// Cranelift attributed to a guest instruction - the prologue and the entry
+/// dispatch deliberately carry none. Sorted by `start`, non-overlapping.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct GuestCodeMap {
@@ -200,10 +171,8 @@ impl GuestCodeMap {
     }
 
     /// Every host code range lifted from guest instruction `va`, in code order.
-    ///
-    /// There can be several: a guest instruction's IR is free to be split,
-    /// duplicated into more than one block, or interleaved with its neighbours
-    /// by scheduling.
+    /// There can be several: a guest instruction's IR may be split, duplicated
+    /// across blocks, or interleaved with its neighbours by scheduling.
     pub fn ranges_for(&self, va: u64) -> impl Iterator<Item = &GuestCodeRange> {
         self.ranges.iter().filter(move |r| r.guest_va == va)
     }
@@ -214,11 +183,10 @@ impl GuestCodeMap {
     }
 
     /// The distinct guest instruction addresses that survived into machine code,
-    /// in ascending order.
+    /// ascending.
     ///
-    /// A guest instruction that is absent was eliminated outright - its result
-    /// was dead. That makes this list a direct read on what the lifter's eager
-    /// flag computation actually costs.
+    /// An absent instruction was eliminated outright - its result was dead - which
+    /// makes this a direct read on what eager flag computation costs.
     pub fn guest_addresses(&self) -> Vec<u64> {
         let mut vas: Vec<u64> = self.ranges.iter().map(|r| r.guest_va).collect();
         vas.sort_unstable();

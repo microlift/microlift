@@ -1,13 +1,9 @@
-//! Value Set Analysis (VSA) - a lightweight abstract interpretation pass for
+//! Value Set Analysis - a lightweight abstract interpretation pass for
 //! resolving indirect control flow at lift time.
 //!
-//! # Overview
-//!
 //! VSA determines the set of possible values a register can hold at each program
-//! point. This enables converting `JMP RAX` from a full runtime dispatch switch
-//! into a targeted dispatch (or even a direct jump) when the value set is small.
-//!
-//! # Lattice
+//! point, which turns `JMP RAX` from a full runtime dispatch switch into a
+//! targeted one (or a direct jump) when the value set is small.
 //!
 //! ```text
 //!              Top   (completely unknown)
@@ -28,13 +24,11 @@ use iced_x86::{
 };
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
-/// Default caller-saved (volatile) general-purpose registers assumed clobbered
-/// across a `CALL`: the union of the System V and Windows x64 volatile sets, so
-/// it is sound under either standard C ABI. Registers not listed here (RBX,
-/// RBP, RSP, R12-R15) are assumed preserved by the callee - which holds only if
-/// the analysed code follows one of those ABIs. See [`ValueSetAnalyzer`] for how
-/// to override this (e.g. [`ValueSetAnalyzer::all_gpr_clobbers`] for the
-/// ABI-agnostic conservative choice).
+/// Default caller-saved GPRs assumed clobbered across a `CALL`: the union of the
+/// System V and Windows x64 volatile sets, so it is sound under either. The rest
+/// (RBX, RBP, RSP, R12-R15) are assumed preserved, which holds only if the
+/// analysed code follows one of those ABIs - see
+/// [`ValueSetAnalyzer::all_gpr_clobbers`] for the conservative choice.
 const DEFAULT_CALL_CLOBBERS: &[Register] = &[
     Register::RAX,
     Register::RCX,
@@ -389,18 +383,15 @@ pub struct ValueSetAnalyzer {
     /// dynamic linker runs. Without this, VSA would infer that a
     /// `JMP [GOT+off]` or `CALL [GOT+off]` targets address 0.
     pub relocation_addresses: HashSet<u64>,
-    /// When `true` (the default), VSA makes no ABI assumptions whatsoever
-    /// about which registers survive a `CALL` or `SYSCALL`: every GPR is
-    /// clobbered across those boundaries, so no value set is ever carried across
-    /// a call, syscall, or (VM-exit-backed) indirect/imported call. This is the
-    /// only choice that preserves runtime semantic equivalence regardless of the
-    /// callee's calling convention or what the host does while servicing a VM
-    /// exit - a resolved indirect target can never depend on a value some callee
-    /// or the host might have changed.
+    /// When `true` (the default), VSA makes no ABI assumptions about which registers
+    /// survive a `CALL` or `SYSCALL`: every GPR is clobbered across those
+    /// boundaries, so no value set is carried across a call, syscall or VM exit.
+    /// This is the only choice that preserves runtime semantic equivalence whatever
+    /// the callee's convention or what the host does servicing an exit.
     ///
     /// Set to `false` (see [`with_standard_abi`](Self::with_standard_abi)) to opt
-    /// into ABI-aware precision, in which case `call_clobbers` / `syscall_clobbers`
-    /// take effect. Only do this for code you know honours the configured ABI.
+    /// into ABI-aware precision, in which case `call_clobbers`/`syscall_clobbers`
+    /// take effect. Only for code known to honour the configured ABI.
     pub conservative: bool,
     /// Registers assumed clobbered across a `CALL` when `conservative == false`
     /// (the callee's caller-saved / volatile set). Registers **not** in this set
@@ -491,12 +482,11 @@ impl ValueSetAnalyzer {
 
     /// Run the analysis over a decoded instruction stream.
     ///
-    /// The instructions should already be topologically sorted (i.e. the normal
-    /// decode order). This is an iterative worklist analysis that runs to a
-    /// fixpoint: a block is re-processed whenever a predecessor changes its entry
-    /// state, so values are correctly widened across control-flow merges. The
-    /// widening operator ([`RegisterValueSet::widen`]) bounds the ascending chain
-    /// (intervals that grow jump to `Top`), guaranteeing termination.
+    /// The instructions should already be in decode order. An iterative worklist
+    /// analysis run to a fixpoint: a block is re-processed whenever a predecessor
+    /// changes its entry state, so values are widened across merges. The widening
+    /// operator ([`RegisterValueSet::widen`]) bounds the ascending chain, which
+    /// guarantees termination.
     pub fn analyze(&mut self, instructions: &[Instruction]) {
         if instructions.is_empty() {
             return;
@@ -865,14 +855,13 @@ impl ValueSetAnalyzer {
         self.indirect_targets(instruction)
     }
 
-    /// Resolve the possible targets of an indirect `JMP`/`CALL` whose operand is
-    /// a register (`JMP rax`, `CALL rax`) or a memory reference (`JMP [mem]`,
-    /// `CALL [rip+off]`). Returns `None` for direct transfers, non-transfer
-    /// instructions, or when the target cannot be narrowed to a finite set.
+    /// Resolve the possible targets of an indirect `JMP`/`CALL` whose operand is a
+    /// register or a memory reference. `None` for direct transfers, non-transfer
+    /// instructions, or a target that cannot be narrowed to a finite set.
     ///
     /// For a memory operand the resolved value is the *contents* of the pointed-to
-    /// location (read from a non-writable [`MemorySegment`]); for a register
-    /// operand it is the register's value set at the transfer.
+    /// location (read from a non-writable [`MemorySegment`]); for a register operand
+    /// it is the register's value set at the transfer.
     pub fn indirect_targets(&self, instruction: &Instruction) -> Option<Vec<u64>> {
         match instruction.mnemonic() {
             Mnemonic::Jmp | Mnemonic::Call => {}
@@ -898,12 +887,10 @@ fn is_indirect_transfer(inst: &Instruction) -> bool {
 /// Run VSA over a region of raw x86-64 code (mapped at `base`) and resolve the
 /// targets of every indirect `JMP`/`CALL` it contains.
 ///
-/// This is the region-level convenience behind
-/// [`crate::cfg::resolved_indirect_targets`]: it linearly decodes `bytes`,
-/// exposes the region itself as a read-only segment (so in-region jump tables and
-/// RIP-relative constant loads resolve), and additionally consults any
-/// caller-supplied `segments` (e.g. a binary's `.rodata`/import sections) for
-/// reads that leave the region.
+/// The region-level convenience behind [`crate::cfg::resolved_indirect_targets`]:
+/// it decodes `bytes`, exposes the region itself as a read-only segment (so
+/// in-region jump tables and RIP-relative constant loads resolve), and consults
+/// any caller-supplied `segments` for reads that leave the region.
 pub fn resolved_indirect_targets(
     bytes: &[u8],
     base: u64,

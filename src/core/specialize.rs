@@ -41,103 +41,75 @@ impl SpecTarget {
 #[non_exhaustive]
 pub enum Spec {
     /// `ROUNDPS` / `ROUNDPD` - packed floating-point rounding to an imm8-selected
-    /// mode.
-    ///
-    /// aarch64: `FRINTN`/`FRINTM`/`FRINTP`/`FRINTZ` on `4S`/`2D`.
-    /// x86-64: `ROUNDPS`/`ROUNDPD`.
-    ///
-    /// Both are one instruction; the portable path is a four- (or two-) lane
-    /// extract/bitcast/round/repack chain, and is by some distance the worst
-    /// ratio in this table.
+    /// mode. One instruction on both targets (`FRINT{N,M,P,Z}` / `ROUNDPS`),
+    /// against a per-lane extract/bitcast/round/repack chain - the worst ratio in
+    /// this table.
     PackedFpRound,
-    /// `HADDPS` / `HSUBPS` / `HADDPD` / `HSUBPD` - horizontal floating-point
-    /// add and subtract of adjacent lanes.
-    ///
-    /// Gathers the even and odd lanes of the two operands with one constant
-    /// shuffle each - `UZP1`/`UZP2` on aarch64 - and applies the ordinary
-    /// packed op to the pair.
+    /// `HADDPS` / `HSUBPS` / `HADDPD` / `HSUBPD` - horizontal FP add and subtract
+    /// of adjacent lanes. Gathers even and odd lanes with one constant shuffle
+    /// each (`UZP1`/`UZP2` on aarch64) and applies the ordinary packed op.
     PackedFpHorizontal,
-    /// `PHADDW` / `PHADDD` / `PHSUBW` / `PHSUBD` / `PHADDSW` / `PHSUBSW` - the
-    /// integer horizontal forms.
-    ///
-    /// The non-saturating adds are literally Cranelift's `iadd_pairwise`
-    /// (`ADDP` on aarch64, `PHADDW`/`PHADDD` on x86-64); the subtracts and the
-    /// saturating pair reuse the same even/odd gather as
+    /// `PHADDW`/`PHADDD`/`PHSUBW`/`PHSUBD`/`PHADDSW`/`PHSUBSW` - integer
+    /// horizontal forms. The non-saturating adds are Cranelift's `iadd_pairwise`;
+    /// the subtracts and saturating pair reuse the even/odd gather from
     /// [`PackedFpHorizontal`](Spec::PackedFpHorizontal).
     PackedIntHorizontal,
     /// `PMADDWD` - signed word multiply with adjacent-pair accumulation into
-    /// dwords.
-    ///
-    /// Emitted in the shape both backends pattern-match: a widening multiply of
-    /// each half followed by `iadd_pairwise`. x86-64 folds the whole tree back
-    /// into a single `PMADDWD`; aarch64 gives `SMULL`/`SMULL2`/`ADDP`.
+    /// dwords. Emitted as a widening multiply of each half plus `iadd_pairwise`,
+    /// which x86-64 folds back into one `PMADDWD` and aarch64 lowers to
+    /// `SMULL`/`SMULL2`/`ADDP`.
     PairwiseMultiplyAdd,
     /// `PMADDUBSW` - unsigned-by-signed byte multiply with saturating
     /// adjacent-pair accumulation into words.
     ///
-    /// x86-64 has an exact CLIF opcode for it (`x86_pmaddubsw`, one
-    /// instruction). aarch64 has no equivalent, so the specialized path is a
-    /// widening multiply, a widening pairwise add (`SADDLP`) and a saturating
-    /// narrow (`SQXTN`) - still around a tenth of the portable expansion.
+    /// x86-64 has an exact opcode (`x86_pmaddubsw`). aarch64 has none, so the path
+    /// is a widening multiply, `SADDLP` and `SQXTN` - still around a tenth of the
+    /// portable expansion.
     MultiplyAddUnsignedSigned,
     /// `PSADBW` - sum of absolute byte differences, one sum per 64-bit half.
     ///
-    /// The absolute difference is `usub_sat(a, b) | usub_sat(b, a)`, which is
-    /// exact for unsigned bytes and lowers to three instructions everywhere;
-    /// the reduction is a ladder of widening pairwise adds (`UADDLP`, `UADDLP`,
-    /// `ADDP`) rather than sixteen scalar lane extractions.
+    /// The absolute difference is `usub_sat(a, b) | usub_sat(b, a)`, exact for
+    /// unsigned bytes; the reduction is `UADDLP`/`UADDLP`/`ADDP` rather than
+    /// sixteen scalar lane extractions.
     SumOfAbsoluteDifferences,
     /// `PMULUDQ` / `PMULDQ` - widening multiply of the *even* dword lanes.
     ///
-    /// Gathers the even dwords with a `UZP1`-shaped shuffle and then multiplies
-    /// the widened low halves, which both backends recognize as a widening
-    /// multiply: `UMULL`/`SMULL` on aarch64. This replaces a full `I64X2`
-    /// `imul`, which aarch64 has no instruction for and expands to a
-    /// seven-instruction `rev64`/`mul`/`xtn`/`addp`/`shll`/`umlal` sequence.
+    /// Gathers the even dwords with a `UZP1`-shaped shuffle and multiplies the
+    /// widened low halves, which both backends recognize as `UMULL`/`SMULL`. This
+    /// replaces a full `I64X2` `imul`, which aarch64 expands to seven instructions.
     WideningEvenMultiply,
     /// `PMULHRSW` - signed word multiply keeping the rounded high 17 bits.
     ///
-    /// x86-64: `x86_pmulhrsw`, which models the instruction exactly.
-    ///
-    /// aarch64: `sqmul_round_sat` (`SQRDMULH`) computes the same
-    /// `(x*y + 0x4000) >> 15` but *saturates*, so it differs from x86 on the
-    /// single input pair `-32768 * -32768` - where x86 wraps to `-32768` and
-    /// `SQRDMULH` gives `32767`. The specialized path restores that one lane
-    /// with a compare-and-select and is still shorter than the portable
-    /// widening expansion.
+    /// x86-64: `x86_pmulhrsw`, which models it exactly. aarch64:
+    /// `sqmul_round_sat` (`SQRDMULH`) computes the same `(x*y + 0x4000) >> 15` but
+    /// *saturates*, differing on the single pair `-32768 * -32768` (x86 wraps to
+    /// `-32768`, `SQRDMULH` gives `32767`). The path restores that lane with a
+    /// compare-and-select and is still shorter than the portable expansion.
     RoundedMultiplyHigh,
     /// CF and OF from the machine's own overflow-producing add, subtract and
     /// multiply, rather than from arithmetic on the result.
     ///
-    /// The portable definitions of those two flags are the expensive half of
-    /// every `ADD`/`SUB`/`CMP`/`INC`/`DEC`/`NEG`/`ADC`/`SBB`/`XADD` and their
-    /// locked forms: CF is a second compare of values the machine already
-    /// compared, and OF is a four-instruction `(lhs ^ res) & (rhs ^ res)`
-    /// sign-bit dance. Both are a *single condition bit the hardware produced
-    /// as a side effect of the arithmetic* - which is exactly what Cranelift's
-    /// `uadd_overflow` / `sadd_overflow` / `usub_overflow` / `ssub_overflow`
-    /// (and `smul_overflow` for the truncating `IMUL` forms) model.
+    /// The portable definitions are the expensive half of every
+    /// `ADD`/`SUB`/`CMP`/`INC`/`DEC`/`NEG`/`ADC`/`SBB`/`XADD` and their locked
+    /// forms: CF is a second compare of values the machine already compared, OF a
+    /// four-instruction sign-bit dance. Both are a single condition bit the
+    /// hardware produced as a side effect - which is what Cranelift's
+    /// `uadd_overflow`/`sadd_overflow`/`usub_overflow`/`ssub_overflow` (and
+    /// `smul_overflow` for the truncating `IMUL`s) model. aarch64 gets
+    /// `ADDS`/`SUBS` + `CSET`; x86-64 gets `add`/`sub` + `setb`/`seto`.
     ///
-    /// aarch64: `ADDS`/`SUBS` and a `CSET` on `HS`/`VS`.
-    /// x86-64: `add`/`sub` and a `setb`/`seto` - the guest's own instruction,
-    /// reading the guest's own flag, after a round trip through the IR.
+    /// Not claimed elsewhere because coverage is partial: riscv64 lowers only
+    /// `uadd_overflow`, and only at `I32`/`I64`. The `IMUL` forms are aarch64-only
+    /// because x64 lowers `smul_overflow` through the register-pinning one-operand
+    /// `imul`, which measured as a loss.
     ///
-    /// Not claimed elsewhere because the coverage is genuinely partial:
-    /// riscv64 lowers `uadd_overflow` alone, and only at `I32`/`I64`, so a
-    /// `SUB` at any width would be a hard lowering failure there. `IMUL`'s
-    /// truncating forms are aarch64-only for a second reason - x64 lowers
-    /// `smul_overflow` through the register-pinning one-operand `imul`, which
-    /// measured as a loss.
-    ///
-    /// It requires [`eliminate_dead_flags`](crate::core::LifterConfig::eliminate_dead_flags),
-    /// and is entirely inert without it. Unlike a vector specialization,
-    /// this one is not an improvement wherever it applies: the portable flag
-    /// arithmetic is dataflow over the sum and dies to ordinary DCE when
-    /// nothing reads it, while an overflow op's condition bit is welded to
-    /// the instruction producing the result and survives. Without liveness
-    /// every site looks live and the feature is a measured regression; with
-    /// it, the dead sites emit a plain `iadd` and the live ones get the short
-    /// form. See `arch/x86_64/semantics/arith_spec.rs`.
+    /// Requires [`eliminate_dead_flags`](crate::core::LifterConfig::eliminate_dead_flags)
+    /// and is inert without it. Unlike the vector specializations this one is not
+    /// an improvement wherever it applies: the portable flag arithmetic is dataflow
+    /// over the sum and dies to DCE when nothing reads it, while an overflow op's
+    /// condition bit is welded to the instruction producing the result and
+    /// survives. Without liveness every site looks live and it is a measured
+    /// regression. See `arch/x86_64/semantics/arith_spec.rs`.
     IntegerOverflowFlags,
     /// Emit `PAUSE` instructions as the host's equivalent mechanism via
     /// the `spin_hint` CLIF opcode.
@@ -198,11 +170,9 @@ impl Spec {
     /// Whether this specialization is inert without
     /// [`LifterConfig::use_vector_xmm`](crate::core::LifterConfig::use_vector_xmm).
     ///
-    /// True for every whole-register vector sequence, which is all of them bar
-    /// two: [`IntegerOverflowFlags`](Spec::IntegerOverflowFlags) rewrites
-    /// scalar integer arithmetic, and [`SpinLoopHint`](Spec::SpinLoopHint) is a
-    /// single operand-free instruction. Neither has anything to do with how XMM
-    /// registers are represented.
+    /// True for every whole-register vector sequence, i.e. all but
+    /// [`IntegerOverflowFlags`](Spec::IntegerOverflowFlags) (scalar integer
+    /// arithmetic) and [`SpinLoopHint`](Spec::SpinLoopHint) (operand-free).
     pub fn requires_vector_xmm(self) -> bool {
         !matches!(self, Spec::IntegerOverflowFlags | Spec::SpinLoopHint)
     }

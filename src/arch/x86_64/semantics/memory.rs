@@ -33,10 +33,9 @@ const LOW_BYTE_FLAG_BITS: [(X86Flag, u8); 5] = [
 /// instruction is not one.
 ///
 /// A register operand's own width is the slot width for every other push, but
-/// not here: `PUSH FS` in 64-bit mode moves `RSP` by **8** and zero-extends the
-/// 16-bit selector into the slot, while `FS`'s `Register::size()` is 2. Only
-/// the `0x66`-prefixed spelling is a 2-byte push. (`FS` and `GS` are the only
-/// segment registers whose push/pop encode at all in long mode.)
+/// not here: `PUSH FS` in long mode moves `RSP` by **8** and zero-extends the
+/// 16-bit selector, while `FS`'s `Register::size()` is 2. Only the
+/// `0x66`-prefixed spelling is a 2-byte push.
 fn segment_stack_slot_size(instruction: &Instruction) -> Option<usize> {
     use iced_x86::Code;
     if !crate::arch::x86_64::regs::is_segment_register(instruction.op0_register()) {
@@ -56,17 +55,14 @@ impl<'a> Lifter<'a> {
     pub(super) fn handle_mov(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let size = self.operand_size(instruction, 0)?;
         let src_val = self.read_operand(instruction, 1, size)?;
-        // `MOV r/m16, Sreg` is the one MOV whose two operands can be different
-        // widths: the source is always a 16-bit selector, while the destination
-        // register may be 32 or 64 bits (`mov eax, cs` / `mov rax, cs`), in
-        // which case the selector is zero-extended into it. `read_operand`
-        // hands back a register at its own width, so widen here rather than
-        // handing `write_operand` a value narrower than the register it is
-        // writing - Cranelift's verifier, not the guest, is what notices that.
+        // `MOV r/m16, Sreg` is the one MOV whose operands can differ in width: the
+        // source is always a 16-bit selector, while the destination register may be
+        // 32 or 64 bits, in which case the selector is zero-extended. `read_operand`
+        // hands back a register at its own width, so widen here rather than handing
+        // `write_operand` a value narrower than the register it writes.
         //
         // A memory destination is *not* widened: `mov [rax], cs` writes 16 bits
-        // whatever the operand size is, and iced reports `memory_size` = 2 for
-        // it, so `size` is already right.
+        // whatever the operand size, and iced reports `memory_size` = 2 for it.
         let src_val = if crate::arch::x86_64::regs::is_segment_register(
             self.operand_register(instruction, 1),
         ) && size > 2
@@ -113,15 +109,13 @@ impl<'a> Lifter<'a> {
 
     /// MOVSXD - sign-extend to the destination register's width.
     ///
-    /// The familiar form is `movsxd r64, r/m32` under `REX.W`, and extending to
-    /// `I64` unconditionally is right for it and wrong for the other two the
-    /// encoding permits. Without `REX.W` the destination is a 32-bit register
-    /// and the instruction is a plain `mov`; with a `0x66` prefix it is 16-bit.
-    /// Both are discouraged by the manual and neither is unreachable: a JIT
-    /// emitting `movsxd ecx, [rdi-0x30]` is what found this, in Mono's generated
-    /// code under rosetta3. Extending to `I64` there produced a value one type
-    /// wider than the register write expected, and the whole region failed
-    /// Cranelift's verifier - an error about IR rather than about the guest.
+    /// The familiar form is `movsxd r64, r/m32` under `REX.W`, but the encoding
+    /// permits two others: without `REX.W` the destination is a 32-bit register and
+    /// the instruction is a plain `mov`; with a `0x66` prefix it is 16-bit. Both
+    /// are discouraged by the manual and neither is unreachable - a JIT emitting
+    /// `movsxd ecx, [rdi-0x30]` is what found this. Extending to `I64`
+    /// unconditionally produced a value one type wider than the register write
+    /// expected, failing Cranelift's verifier.
     pub(super) fn handle_movsxd(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let dst_reg = instruction.op0_register();
         let src_size = self.operand_size(instruction, 1)?;
@@ -617,13 +611,12 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// LAHF - load the low byte of RFLAGS into AH.
+    /// LAHF - load the low byte of RFLAGS into AH: `AH = SF:ZF:0:AF:0:PF:1:CF`.
     ///
-    /// `AH = SF:ZF:0:AF:0:PF:1:CF`. The two zero bits and the one bit are
-    /// architectural: bits 1, 3 and 5 of RFLAGS are reserved and read as 1, 0
-    /// and 0. Overflow is *not* among them - it lives at bit 11, outside the
-    /// byte - which is the difference from `PUSHFQ` and the reason this is a
-    /// list of five flags rather than a loop over [`RFLAGS_FLAG_BITS`].
+    /// The zero and one bits are architectural - RFLAGS bits 1, 3 and 5 read as 1,
+    /// 0 and 0. Overflow is not among them (it is bit 11, outside the byte), which
+    /// is why this is a list of five flags rather than a loop over
+    /// [`RFLAGS_FLAG_BITS`].
     pub(super) fn handle_lahf(&mut self, _instruction: &Instruction) -> crate::Result<()> {
         let mut ah = self.builder.ins().iconst(types::I8, 0x2);
         for (flag, bit) in LOW_BYTE_FLAG_BITS {
@@ -638,9 +631,8 @@ impl<'a> Lifter<'a> {
 
     /// SAHF - store AH into the low byte of RFLAGS.
     ///
-    /// The inverse of [`handle_lahf`](Self::handle_lahf), over the same five
-    /// flags. Overflow is untouched, and so is Direction: neither is in the
-    /// byte.
+    /// The inverse of [`handle_lahf`](Self::handle_lahf), over the same five flags.
+    /// Overflow and Direction are untouched: neither is in the byte.
     pub(super) fn handle_sahf(&mut self, _instruction: &Instruction) -> crate::Result<()> {
         let ah = self.get_reg_val(Register::AH)?;
         for (flag, bit) in LOW_BYTE_FLAG_BITS {

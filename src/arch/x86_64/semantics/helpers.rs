@@ -9,10 +9,9 @@ use iced_x86::{Instruction, OpKind, Register};
 /// A resolved operand location: a guest register, or the already-computed
 /// effective address of a memory operand.
 ///
-/// Exists so a read-modify-write instruction forms its address once. Reading
-/// and writing the same operand through `read_operand`/`write_operand` calls
-/// `get_mem_ptr` twice, which emits the base/index/displacement arithmetic
-/// twice and leaves it to Cranelift's GVN to notice.
+/// Exists so a read-modify-write instruction forms its address once. Going
+/// through `read_operand`/`write_operand` calls `get_mem_ptr` twice, emitting
+/// the base/index/displacement arithmetic twice.
 #[derive(Debug, Clone, Copy)]
 pub enum Place {
     Reg(Register),
@@ -87,12 +86,10 @@ pub fn get_base_reg_64(reg: Register) -> Register {
 impl<'a> Lifter<'a> {
     /// Narrow `val` to `ty`, or return it unchanged if it is already that wide.
     ///
-    /// `ireduce` requires a *strictly* wider source, so an unconditional
-    /// narrowing is not a no-op when the value already has the target type: it
-    /// is malformed IR, and the verifier rejects the whole function rather than
-    /// the instruction. Every caller here reads a value whose width depends on
-    /// an operand size, so "already narrow" is the ordinary case rather than
-    /// the exception.
+    /// `ireduce` requires a *strictly* wider source, so an unconditional narrowing
+    /// is malformed IR when the value already has the target type - and the
+    /// verifier rejects the whole function. Every caller here reads a value whose
+    /// width depends on an operand size, so "already narrow" is the ordinary case.
     pub fn narrow_to(&mut self, ty: Type, val: Value) -> Value {
         if self.builder.func.dfg.value_type(val) == ty {
             val
@@ -190,11 +187,9 @@ impl<'a> Lifter<'a> {
     /// Read a segment selector (`CS`/`SS`/`DS`/`ES`/`FS`/`GS`) as an `I16`.
     ///
     /// The selectors live in the `RegisterContext` and are read in place rather
-    /// than through an SSA variable - see
-    /// [`RegisterState::get_segment_offset`] for why. The load is emitted in
-    /// analysis mode too: unlike a GPR there is no SSA value for it to be pure
-    /// over, and the whole point of the instruction is that it reads state the
-    /// host supplied.
+    /// than through an SSA variable. The load is emitted in analysis mode too:
+    /// there is no SSA value for it to be pure over, and the point of the
+    /// instruction is that it reads state the host supplied.
     fn get_segment_selector(&mut self, reg: Register) -> crate::Result<Value> {
         let offset = RegisterState::get_segment_offset(reg)?;
         let ctx_ptr = self.builder.use_var(self.state.context_ptr);
@@ -204,13 +199,11 @@ impl<'a> Lifter<'a> {
             .load(types::I16, Self::get_regcontext_flags(), ctx_ptr, offset))
     }
 
-    /// Write a segment selector, storing it straight into the
-    /// `RegisterContext`.
+    /// Write a segment selector, storing it straight into the `RegisterContext`.
     ///
-    /// This is selector storage only: the `FS`/`GS` *bases* the lifter actually
-    /// forms addresses with are separate fields and are deliberately left
-    /// alone, where hardware would reload each from the loaded descriptor. See
-    /// [`RegisterContext::cs`](crate::arch::x86_64::context::RegisterContext::cs).
+    /// Selector storage only: the `FS`/`GS` *bases* the lifter forms addresses with
+    /// are separate fields and are deliberately left alone, where hardware would
+    /// reload each from the loaded descriptor.
     fn set_segment_selector(&mut self, reg: Register, val: Value) -> crate::Result<()> {
         if reg == Register::CS {
             // `MOV CS, r/m16` does not encode - the only architectural writes
@@ -233,7 +226,7 @@ impl<'a> Lifter<'a> {
     /// Whether the instruction being lifted has to compute `flag`.
     ///
     /// The x86-64 spelling of [`LiftEngine::flag_live`], and the only place the
-    /// `X86Flag` discriminant is used as a flag *index* - the same numbering
+    /// `X86Flag` discriminant is used as a flag *index* - the numbering
     /// [`crate::arch::x86_64::flag_effects`] classifies in. Always true unless
     /// [`LifterConfig::eliminate_dead_flags`] is on.
     ///
@@ -246,11 +239,9 @@ impl<'a> Lifter<'a> {
     /// Assign `flag`, unless nothing goes on to read it.
     ///
     /// The backstop for the guards in `semantics/flags.rs`: those skip the
-    /// *computation*, which is where the cost is, and this skips the assignment
-    /// whether or not a handler remembered to guard. A handler that computes a
-    /// dead flag anyway is therefore still correct and merely wasteful - the
-    /// value it built has no use and the compiler drops it, which is exactly the
-    /// state the whole lifter was in before this existed.
+    /// *computation*, where the cost is, and this skips the assignment whether or
+    /// not a handler remembered to guard. A handler that computes a dead flag
+    /// anyway is still correct and merely wasteful.
     pub fn set_flag(&mut self, flag: X86Flag, val: Value) -> crate::Result<()> {
         if !self.flag_needed(flag) {
             // Deliberately not an error even for a flag this guest has no
@@ -346,18 +337,16 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// Read both operands of a binary `r/m, r/m/imm` instruction, at the width
-    /// of the destination.
+    /// Read both operands of a binary `r/m, r/m/imm` instruction, at the width of
+    /// the destination.
     ///
     /// Returns `(dst, src)` but reads **src first**, which is the order the
-    /// operands' side effects (a memory source's address computation, a load)
-    /// must appear in. `size` comes from operand 0 and is applied to operand 1
-    /// as well, so a sign-extended immediate (`ADD r64, imm32`) materialises as
-    /// a full-width constant rather than at its encoded width.
+    /// operands' side effects must appear in. `size` comes from operand 0 and is
+    /// applied to operand 1 too, so a sign-extended immediate materialises at full
+    /// width rather than at its encoded width.
     ///
     /// For a read-modify-*write* instruction use
-    /// [`read_binary_rmw`](Self::read_binary_rmw) instead, which hands back the
-    /// destination as a [`Place`] so the store reuses the load's address.
+    /// [`read_binary_rmw`](Self::read_binary_rmw) instead.
     pub fn read_binary_operands(
         &mut self,
         instruction: &Instruction,
@@ -368,12 +357,11 @@ impl<'a> Lifter<'a> {
         Ok((dst, src))
     }
 
-    /// [`read_binary_operands`](Self::read_binary_operands) for an instruction
-    /// that writes its destination back, returning `(place, dst, src)`.
+    /// [`read_binary_operands`](Self::read_binary_operands) for an instruction that
+    /// writes its destination back, returning `(place, dst, src)`.
     ///
     /// The destination is resolved to a [`Place`] once and read through it, so
-    /// [`write_place`](Self::write_place) stores to the effective address the
-    /// load already computed rather than forming it a second time.
+    /// [`write_place`](Self::write_place) stores to the address the load computed.
     pub fn read_binary_rmw(
         &mut self,
         instruction: &Instruction,
@@ -548,12 +536,10 @@ impl<'a> Lifter<'a> {
     /// Read an instruction's immediate operand as an `i64`, honouring x86
     /// sign-extension of `imm8`/`imm32` immediates into wider operands.
     ///
-    /// iced-x86's [`Instruction::immediate64`] returns the *raw, unsigned* bits,
-    /// so the sign-extended operand kinds (`Immediate8to16/32/64`,
-    /// `Immediate32to64`) must go through their matching sign-extending
-    /// accessors - otherwise e.g. `and rax, -16` (`imm8 = 0xf0`) would be read as
-    /// `+240` and mask only the low byte. Callers `iconst(ty, ...)` the result,
-    /// truncating to the operand width, so the low `ty` bits are what matter.
+    /// iced-x86's [`Instruction::immediate64`] returns the *raw, unsigned* bits, so
+    /// the sign-extended operand kinds must go through their matching
+    /// sign-extending accessors - otherwise `and rax, -16` (`imm8 = 0xf0`) would be
+    /// read as `+240` and mask only the low byte.
     pub fn read_imm64(instruction: &Instruction) -> i64 {
         for i in 0..instruction.op_count() {
             match instruction.op_kind(i) {
@@ -571,18 +557,12 @@ impl<'a> Lifter<'a> {
         instruction.immediate64() as i64
     }
 
-    // XMM accessors
+    // XMM accessors.
     //
-    // The lifter supports two backing representations for XMM registers,
-    // selected by [`LifterConfig::use_vector_xmm`]:
-    //   - scalar (default): two `I64` SSA variables per register (lo, hi).
-    //   - vector: a single `I64X2` SSA variable per register.
-    //
-    // The lo/hi accessors below work in both modes; in vector mode they
-    // synthesize lane access via `extractlane`/`insertlane`. Use the native
-    // `get_xmm_vec` / `set_xmm_vec` accessors when an entire 128-bit value
-    // is being moved or operated on, so the vector mode avoids the
-    // lane-shuffle round-trip.
+    // The lo/hi accessors work under both backing representations; in vector mode
+    // they synthesize lane access via `extractlane`/`insertlane`. Use the native
+    // `get_xmm_vec`/`set_xmm_vec` when a whole 128-bit value is moved, so vector
+    // mode avoids the lane-shuffle round trip.
 
     /// Return the low 64 bits of XMM register `idx` (0-15).
     pub fn get_xmm_lo(&mut self, idx: u8) -> Value {

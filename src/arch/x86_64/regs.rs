@@ -214,14 +214,12 @@ impl RegisterState {
 
     /// Byte offset of a segment *selector* within `RegisterContext`.
     ///
-    /// Unlike every other register accessor here this has no matching
-    /// `Variable`: the selectors are deliberately **not** part of the SSA
-    /// register file, and are loaded from / stored to the context in place at
-    /// each use (see [`Lifter::get_reg_val`](crate::arch::x86_64::Lifter::get_reg_val)).
-    /// A guest reads them roughly once - into a diagnostic struct, never into
-    /// control flow - so an SSA variable would buy nothing and cost six more
-    /// values live across every block reachable from the entry dispatch, which
-    /// is exactly what regalloc time is superlinear in.
+    /// Unlike every other register accessor here this has no matching `Variable`:
+    /// the selectors are deliberately not part of the SSA register file and are
+    /// loaded/stored in place at each use. A guest reads them roughly once, into a
+    /// diagnostic struct and never into control flow, so an SSA variable would buy
+    /// nothing and cost six more values live across every block reachable from the
+    /// entry dispatch.
     pub fn get_segment_offset(reg: Register) -> crate::Result<i32> {
         match reg {
             Register::CS => Ok(std::mem::offset_of!(RegisterContext, cs) as i32),

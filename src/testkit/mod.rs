@@ -156,11 +156,10 @@ impl<'a> LiftTest<'a> {
 
     /// Replace the whole [`LifterConfig`].
     ///
-    /// Note this also drops the harness's default
-    /// [`LifterConfig::exit_trampoline_address`] (`Some(EXIT_TRAMPOLINE)`),
-    /// since a supplied config is taken as-is - set it on the config, or call
-    /// [`exit_trampoline`](Self::exit_trampoline) afterwards, for a test whose
-    /// program ends in a `RET` to the sentinel.
+    /// This also drops the harness's default
+    /// [`LifterConfig::exit_trampoline_address`], since a supplied config is taken
+    /// as-is - set it there, or call [`exit_trampoline`](Self::exit_trampoline)
+    /// afterwards, for a test whose program ends in a `RET` to the sentinel.
     pub fn config(mut self, config: LifterConfig) -> Self {
         self.config = config;
         self
@@ -193,14 +192,12 @@ impl<'a> LiftTest<'a> {
         self
     }
 
-    /// Enable target-directed instruction specialization
-    /// (`config.specialization`).
+    /// Enable target-directed instruction specialization.
     ///
-    /// Note this does **not** change what the JIT compiles for - it is always
-    /// the host - so a `.specialize(Specialization::for_target(Aarch64))` run on
-    /// an x86 host produces IR the x86 backend still has to lower. That is
-    /// exactly what the equivalence suite wants (it proves the sequences agree
-    /// on results), but it is not a performance measurement.
+    /// This does **not** change what the JIT compiles for - always the host - so a
+    /// `.specialize(Specialization::for_target(Aarch64))` run on an x86 host
+    /// produces IR the x86 backend still has to lower. That is what the equivalence
+    /// suite wants, but it is not a performance measurement.
     pub fn specialize(mut self, spec: Specialization) -> Self {
         self.config.specialization = spec;
         self
@@ -246,13 +243,12 @@ impl<'a> LiftTest<'a> {
         self
     }
 
-    /// Configure the lift for resumable VM exits: `RuntimeAssisted` execution
-    /// with a resume point at every instruction boundary
-    /// ([`VmResumptionPoints::All`]) and interpreter fallback. Use with
-    /// [`RunOutcome::resume_with`] to drive exit -> mutate -> resume cycles.
+    /// Configure the lift for resumable VM exits: `RuntimeAssisted` execution with a
+    /// resume point at every instruction boundary ([`VmResumptionPoints::All`]) and
+    /// interpreter fallback. Use with [`RunOutcome::resume_with`].
     ///
-    /// `All` rather than the default so a test can resume at any address it
-    /// likes without declaring it first.
+    /// `All` rather than the default so a test can resume at any address without
+    /// declaring it first.
     pub fn resumable(mut self) -> Self {
         self.config.execution_mode = ExecutionMode::RuntimeAssisted;
         self.config.resumption = VmResumptionPoints::All;
@@ -335,15 +331,13 @@ impl<'a> LiftTest<'a> {
         self
     }
 
-    /// Whether the run relocates the region: the lifted code will form guest
-    /// addresses as `image_base + (va - lift_base)` with an `image_base` that is
-    /// not the lift base, so a lift-time VA and the address actually touched at
-    /// runtime are different addresses.
+    /// Whether the run relocates the region: the lifted code forms guest addresses
+    /// as `image_base + (va - lift_base)` with an `image_base` that is not the lift
+    /// base, so a lift-time VA and the address actually touched differ.
     ///
-    /// This is what makes such a run non-diffable against Unicorn, which has no
-    /// relocation step and executes at the lift-time VAs; see
-    /// [`cross_check_unicorn`]. Under [`AddressMode::Direct`] the lifted code
-    /// ignores `image_base` entirely, so there is no relocation to speak of.
+    /// That is what makes such a run non-diffable against Unicorn, which has no
+    /// relocation step. Under [`AddressMode::Direct`] the lifted code ignores
+    /// `image_base` entirely, so there is no relocation to speak of.
     #[cfg(feature = "unicorn-oracle")]
     fn image_is_relocated(&self) -> bool {
         // Mirrors `compile`: an `image_base` seeded through `ctx`/`reg` wins,
@@ -457,48 +451,36 @@ impl<'a> LiftTest<'a> {
 /// Re-run a just-executed program on Unicorn from the same initial state and
 /// assert the two engines' architectural state agrees.
 ///
-/// Soundness guards, all derived from a static decode of the program so no test
-/// needs hand-annotation:
+/// Soundness guards, all derived from a static decode so no test needs
+/// hand-annotation:
 ///
-/// - **Unrelocated image only.** Unicorn has no `image_base`: it executes at the
-///   lift-time VAs. A run whose lifted code forms addresses as
-///   `image_base + (va - lift_base)` with `image_base != lift_base` therefore
-///   touches different memory than Unicorn would for the same guest address, so
-///   the two are not comparable. This is checked by the caller
-///   ([`LiftTest::image_is_relocated`]) rather than here, because it is a
-///   property of the configuration, not of the program. It is a *hard* guard,
-///   not just an accuracy one: Unicorn's `MEM_UNMAPPED` hook identity-maps a
-///   guest page onto the same *host* address, so a read of an unrelocated
-///   lift-time VA (a jump table at `0x2000`, say) faults the host process
-///   instead of the emulator.
-/// - **Clean halt only.** Fires only when the Microlift run reached a clean halt
-///   (`Return`/`None`); any VM exit is non-diffable and skipped. Likewise if
-///   Unicorn itself faults (an instruction it lacks) the comparison is skipped.
-/// - **Shared stack.** The Microlift harness's `initial_rsp` (a live host
-///   allocation) is handed to Unicorn, which identity-maps those pages, so
-///   `rsp`-derived values and the pushed exit trampoline line up on both sides.
-///   The stack is self-healing across the two sequential runs (both re-push the
-///   same bytes), so stack reads/writes stay diffable.
-/// - **No persistent data-memory writes.** Microlift runs *first* and mutates
-///   the shared identity-mapped memory; a program that writes to non-stack
-///   memory (atomics, stores, `xchg [mem]`) would feed Unicorn already-mutated
-///   inputs, so those are skipped. Stack writes (base `RSP`) are exempt.
-/// - **x86-undefined flags masked.** Instructions like `MUL`/`IMUL` (SF/ZF/)
-///   and variable-count shifts/rotates/`BT*` (OF) leave flags *architecturally
-///   undefined*; the two engines may pick different bits without either being
-///   wrong. Those flags (last-writer-wins across the program) are masked out of
-///   the comparison.
+/// - **Unrelocated image only.** Unicorn executes at the lift-time VAs, so a
+///   relocated run touches different memory for the same guest address. Checked
+///   by the caller ([`LiftTest::image_is_relocated`]), since it is a property of
+///   the configuration. A *hard* guard, not an accuracy one: Unicorn's
+///   `MEM_UNMAPPED` hook identity-maps a guest page onto the same *host*
+///   address, so a read of an unrelocated lift-time VA faults the host process.
+/// - **Clean halt only.** Any VM exit is non-diffable and skipped, as is a
+///   Unicorn fault.
+/// - **Shared stack.** The harness's `initial_rsp` is handed to Unicorn, which
+///   identity-maps those pages, so `rsp`-derived values and the pushed exit
+///   trampoline line up. Both runs re-push the same bytes, so the stack is
+///   self-healing and stack accesses stay diffable.
+/// - **No persistent data-memory writes.** Microlift runs first and mutates the
+///   shared memory, so a program writing to non-stack memory would feed Unicorn
+///   already-mutated inputs. Stack writes are exempt.
+/// - **x86-undefined flags masked.** `MUL`/`IMUL` (SF/ZF) and variable-count
+///   shifts/rotates/`BT*` (OF) leave flags architecturally undefined, so the two
+///   engines may pick different bits without either being wrong.
 #[cfg(feature = "unicorn-oracle")]
 fn cross_check_unicorn(bytes: &[u8], ip: u64, init: &oracle::CpuState, outcome: &RunOutcome) {
     use oracle::{CpuOracle, CpuState, DiffOptions, OracleOutcome, diff_states};
 
     // Only a clean `RET` into the exit trampoline is diffable. `ExitReason::None`
-    // means Microlift stopped at the *region boundary* (the program fell off the
-    // end of the lifted bytes, e.g. `RetAddr::None` tests with no `ret`). Unicorn
-    // has no region concept: with `until = EXIT_TRAMPOLINE` it keeps executing
-    // whatever follows the code - the zero-padding decodes as `add [rax], al`,
-    // and the `MEM_UNMAPPED` identity hook then maps an arbitrary guest address
-    // to that *host* address, faulting the host process. So `None` is excluded.
+    // means Microlift stopped at the *region boundary*; Unicorn has no region
+    // concept and would keep executing whatever follows, where the zero-padding
+    // decodes as `add [rax], al` and the identity hook maps an arbitrary guest
+    // address to that *host* address, faulting the process.
     if outcome.exit != ExitReason::Return {
         return;
     }
@@ -667,13 +649,11 @@ impl Harness {
 pub struct RunOutcome {
     /// Snapshot of the register context after the entry returned.
     ///
-    /// `ctx.rsp` borrows from this outcome. It is a raw host address into
-    /// the guest stack owned by the retained [`Harness`], so copying `ctx` out
-    /// and dropping the outcome leaves `rsp` dangling. Feeding such a `ctx`
-    /// back into [`LiftTest::ctx`] is a use-after-free: the non-zero `rsp` is
-    /// honoured as-is and the exit trampoline is written through it. Keep the
-    /// `RunOutcome` alive for as long as the `rsp` is used, or clear `rsp` to
-    /// `0` so the next [`LiftTest`] allocates a fresh stack.
+    /// `ctx.rsp` borrows from this outcome: it is a raw host address into the guest
+    /// stack owned by the retained [`Harness`], so copying `ctx` out and dropping
+    /// the outcome leaves `rsp` dangling, and feeding such a `ctx` back into
+    /// [`LiftTest::ctx`] is a use-after-free. Keep the `RunOutcome` alive as long as
+    /// the `rsp` is used, or clear `rsp` to `0`.
     pub ctx: RegisterContext,
     /// `rsp` at the point the function was first entered (see
     /// [`Harness::initial_rsp`]).
@@ -727,14 +707,12 @@ impl RunOutcome {
 /// Available only under the `unicorn-oracle` feature.
 #[cfg(feature = "unicorn-oracle")]
 impl<'a> LiftTest<'a> {
-    /// Run this program on the Microlift JIT and on Unicorn from the same
-    /// seeded state, returning their architectural [`StateDiff`]. `None` means
-    /// one engine hit a non-diffable event (a VM exit, a fault) so there is
-    /// nothing sound to compare - see [`oracle::differential`].
+    /// Run this program on the Microlift JIT and on Unicorn from the same seeded
+    /// state, returning their architectural [`StateDiff`]. `None` means one engine
+    /// hit a non-diffable event, so there is nothing sound to compare.
     ///
-    /// Only the register/flag/xmm seed and the lift base are carried over; the
-    /// full [`LifterConfig`] is not (the oracle path always JITs in the default
-    /// execution mode). Feed it code from the diffable subset only.
+    /// Only the register/flag/xmm seed and the lift base are carried over, not the
+    /// full [`LifterConfig`]. Feed it code from the diffable subset only.
     pub fn differential_unicorn(&self, opts: oracle::DiffOptions) -> Option<oracle::StateDiff> {
         let state = oracle::CpuState::from_ctx(&self.init);
         oracle::unicorn::differential_unicorn(self.bytes, self.ip, &state, &[], 1 << 20, opts)

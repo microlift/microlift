@@ -1,15 +1,13 @@
 //! CF and OF from the machine's own arithmetic.
 //!
-//! [`Spec::IntegerOverflowFlags`] in the target-specialization table, and the
-//! scalar-integer counterpart to [`super::sse_spec`]. Same shape: every
-//! function here is a guarded early return that either emits the specialized
-//! form and hands back a result, or returns `None` having emitted nothing so
-//! the caller falls through to its portable path.
+//! [`Spec::IntegerOverflowFlags`], the scalar-integer counterpart to
+//! [`super::sse_spec`]. Same shape: every function is a guarded early return
+//! that either emits the specialized form and hands back a result, or returns
+//! `None` having emitted nothing so the caller falls through.
 //!
 //! Nothing here works without
-//! [`eliminate_dead_flags`](crate::core::LifterConfig::eliminate_dead_flags).
-//! That is not a stylistic pairing, it is what the measurement says, and the
-//! reason is worth stating because it is the opposite of the intuition.
+//! [`eliminate_dead_flags`](crate::core::LifterConfig::eliminate_dead_flags) -
+//! not a stylistic pairing but what the measurement says.
 //!
 //! [`Spec::IntegerOverflowFlags`]: crate::core::specialize::Spec::IntegerOverflowFlags
 //! [`Lifter::flag_needed`]: crate::lifter::Lifter::flag_needed
@@ -20,12 +18,11 @@ use cranelift::prelude::*;
 
 /// Which of the two hardware-backed flags this site has to produce.
 ///
-/// Both dead is the interesting case: it is the whole reason these functions
-/// can decline, and the reason the answer depends on
-/// [`FlagLiveness`](crate::core::flags::FlagLiveness) rather than on the
-/// mnemonic alone. Note it is *this* instruction's needs that matter, not the
-/// mnemonic's architectural effects - `ADD` writes both, and at most sites
-/// neither is read before something else overwrites it.
+/// Both dead is the interesting case: it is why these functions can decline,
+/// and why the answer depends on
+/// [`FlagLiveness`](crate::core::flags::FlagLiveness) rather than the mnemonic.
+/// It is *this site's* needs that matter, not the mnemonic's architectural
+/// effects - `ADD` writes both, and at most sites neither is read.
 #[derive(Clone, Copy)]
 struct Wanted {
     carry: bool,
@@ -60,16 +57,12 @@ impl<'a> Lifter<'a> {
     /// Whether this site's operand width is one the target's flag-setting
     /// arithmetic actually has.
     ///
-    /// x86-64 has `ADD`/`SUB` at all four widths and takes every one; aarch64's
-    /// `ADDS`/`SUBS` exist only at 32 and 64 bits, so a Cranelift
-    /// `uadd_overflow` on `I8`/`I16` is *synthesized* there - extend, operate,
-    /// compare the result back against its own width - and that is no cheaper
-    /// than the portable arithmetic it replaces. It is in fact dearer, for the
-    /// reason the whole specialization is gated on liveness: the portable CF/OF
-    /// is ordinary dataflow that DCE deletes wherever nothing reads it, while
-    /// an overflow op welds the condition bit to a result that is read. Measured
-    /// at **+60 bytes** of `.text` per 32-instruction snippet, against -300 or
-    /// better at 32 and 64 bits (`specialize_tests::dump_code_sizes`).
+    /// x86-64 has `ADD`/`SUB` at all four widths. aarch64's `ADDS`/`SUBS` exist
+    /// only at 32 and 64 bits, so `uadd_overflow` on `I8`/`I16` is *synthesized*
+    /// there - extend, operate, compare back - which is dearer than the portable
+    /// arithmetic, for the reason the whole specialization is gated on liveness.
+    /// Measured at **+60 bytes** of `.text` per 32-instruction snippet, against
+    /// -300 or better at 32 and 64 bits (`specialize_tests::dump_code_sizes`).
     fn native_overflow_width_ok(&self, lhs: Value) -> bool {
         if self.config.specialization.target() != SpecTarget::Aarch64 {
             return true;
@@ -79,10 +72,8 @@ impl<'a> Lifter<'a> {
 
     /// `lhs + rhs` with CF and/or OF taken from the add itself.
     ///
-    /// Returns the sum, or `None` when the caller should emit an ordinary
-    /// `iadd` and compute the flags portably (or not at all).
-    ///
-    /// [`Spec::IntegerOverflowFlags`](crate::core::specialize::Spec::IntegerOverflowFlags)
+    /// Returns the sum, or `None` when the caller should emit an ordinary `iadd`
+    /// and compute the flags portably (or not at all).
     pub(super) fn try_native_add_flags(
         &mut self,
         lhs: Value,
@@ -169,9 +160,8 @@ impl<'a> Lifter<'a> {
     /// The two-step `ADC`/`SBB` with each step's carry taken from the machine,
     /// returning the result and the combined carry out.
     ///
-    /// Declines unless CF is live: the result alone is two ordinary adds, and
-    /// OF here is the sign dance on the final result either way - Cranelift's
-    /// `sadd_overflow_cin` would say it in one op, but no backend lowers it.
+    /// Declines unless CF is live: the result alone is two ordinary adds, and OF
+    /// is the sign dance on the final result either way.
     pub(super) fn try_native_adc_sbb_flags(
         &mut self,
         lhs: Value,
@@ -203,23 +193,17 @@ impl<'a> Lifter<'a> {
         Ok(Some((res, cf_out)))
     }
 
-    /// The truncating `IMUL` forms - `imul r, r/m` and `imul r, r/m, imm` -
-    /// with CF and OF taken from the multiply.
+    /// The truncating `IMUL` forms - `imul r, r/m` and `imul r, r/m, imm` - with
+    /// CF and OF taken from the multiply.
     ///
-    /// x86 sets both to "the full product did not fit in the destination",
-    /// which is `smul_overflow`'s bit exactly. The portable path answers the
-    /// same question with a second, widening multiply (`smulhi`) and a compare
-    /// against the sign extension of the low half.
+    /// x86 sets both to "the full product did not fit", which is
+    /// `smul_overflow`'s bit exactly; the portable path answers the same question
+    /// with a second, widening multiply and a compare.
     ///
-    /// **aarch64 only**, and measured rather than assumed
-    /// (`specialize_tests::specializations_shrink_the_compiled_code`): x64
-    /// lowers `smul_overflow` through the *one-operand* `imul`, which writes
-    /// RDX:RAX and so pins both, and the moves that costs are worse than the
-    /// second multiply it saves. aarch64's `MUL`/`SMULH` pair has no such
-    /// constraint. This is the same shape of hole as
-    /// [`Spec::WideningEvenMultiply`](crate::core::specialize::Spec::WideningEvenMultiply)'s:
-    /// a form where the guest architecture's own portable expansion is already
-    /// close to the metal.
+    /// **aarch64 only**, measured rather than assumed: x64 lowers `smul_overflow`
+    /// through the *one-operand* `imul`, which pins RDX:RAX, and those moves cost
+    /// more than the second multiply saves. aarch64's `MUL`/`SMULH` has no such
+    /// constraint.
     ///
     /// Returns the truncated product, or `None` for the portable path.
     pub(super) fn try_native_imul_flags(

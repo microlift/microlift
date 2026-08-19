@@ -1,24 +1,20 @@
 //! SSSE3 / SSE4.1 packed-integer semantics.
 //!
-//! These are the byte/word/dword lane operations a vectorizing compiler emits
-//! around `PSHUFB` and `PMULUDQ`: cross-lane shuffles and rotates, horizontal
-//! and widening arithmetic, the pack/unpack narrowing pairs, lane insert and
+//! The byte/word/dword lane operations a vectorizing compiler emits around
+//! `PSHUFB` and `PMULUDQ`: cross-lane shuffles and rotates, horizontal and
+//! widening arithmetic, the pack/unpack narrowing pairs, lane insert and
 //! extract, sign/zero-extending widening, blends and `PTEST`.
 //!
-//! The portable expansion here is expressed on the `(lo, hi)` 64-bit half pair,
-//! which [`Lifter::get_xmm_lo`](crate::lifter::Lifter::get_xmm_lo) and friends
-//! provide under both XMM backing representations. The lanes are widened into
-//! full `I64`s ([`Lifter::xmm_lanes`]), operated on there - where nothing can
-//! overflow at the widths x86 defines these ops - and repacked
-//! ([`Lifter::pack_xmm_lanes`]). Cranelift folds the resulting mask/shift/OR
-//! chains, so the emitted IR is far larger than the machine code it lowers to.
+//! The portable expansion works on the `(lo, hi)` 64-bit half pair: lanes are
+//! widened into full `I64`s ([`Lifter::xmm_lanes`]), operated on there - where
+//! nothing can overflow at the widths x86 defines these ops - and repacked.
+//! Cranelift folds the resulting mask/shift/OR chains, so the emitted IR is far
+//! larger than the machine code it lowers to.
 //!
-//! Most handlers additionally take a native fast path when XMM registers are
-//! vector-backed, since these expansions run to hundreds of IR instructions for
-//! something the host does in one. `PMADDWD`, `PMADDUBSW`, `PSADBW` and the
-//! horizontal `PHADD*` / `PHSUB*` forms deliberately have none: their
-//! cross-lane accumulation has no portable Cranelift expansion that beats the
-//! scalar one. See [`sse_vec`](super::sse_vec).
+//! Most handlers also take a native fast path when XMM registers are
+//! vector-backed. `PMADDWD`, `PMADDUBSW`, `PSADBW` and the horizontal
+//! `PHADD*`/`PHSUB*` forms deliberately have none: their cross-lane
+//! accumulation has no portable Cranelift expansion that beats the scalar one.
 
 use crate::MicroliftError;
 use crate::arch::x86_64::semantics::helpers::{size_to_type, xmm_register_index};
@@ -147,13 +143,13 @@ impl<'a> Lifter<'a> {
 
     /// PSHUFB - shuffle the destination's bytes by a per-byte index vector.
     ///
-    /// Output byte `i` is `dst[ctl[i] & 0x0F]`, or zero when `ctl[i]`'s high bit
-    /// is set. Note the indices select from the *destination*: this is a full
-    /// cross-lane permutation, not a lane-wise op.
+    /// Output byte `i` is `dst[ctl[i] & 0x0F]`, or zero when `ctl[i]`'s high bit is
+    /// set. The indices select from the *destination*: a full cross-lane
+    /// permutation, not a lane-wise op.
     ///
-    /// Each output byte is produced by shifting the selected half down by
-    /// `(index & 7) * 8` and selecting between the two halves on bit 3, so the
-    /// expansion is a handful of ops per byte rather than a 16-way select tree.
+    /// Each output byte shifts the selected half down by `(index & 7) * 8` and
+    /// selects between the halves on bit 3, so the expansion is a handful of ops
+    /// per byte rather than a 16-way select tree.
     pub(super) fn handle_pshufb(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let dst_idx = self.xmm_operand_index(instruction, 0, "pshufb")?;
 
@@ -211,12 +207,12 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// PALIGNR - byte-granular funnel shift of `dst:src` (a 256-bit temporary
-    /// with the destination in the high half) right by `imm8` bytes.
+    /// PALIGNR - byte-granular funnel shift of `dst:src` (a 256-bit temporary with
+    /// the destination in the high half) right by `imm8` bytes.
     ///
-    /// The count is a lift-time constant, so this is a fixed pair of 64-bit
-    /// funnel extractions: counts of 16..31 shift the destination down into the
-    /// result, and 32 or more clear it.
+    /// The count is a lift-time constant, so this is a fixed pair of 64-bit funnel
+    /// extractions: 16..31 shift the destination down into the result, 32 or more
+    /// clear it.
     pub(super) fn handle_palignr(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let dst_idx = self.xmm_operand_index(instruction, 0, "palignr")?;
         let count = u32::from(instruction.immediate8());
@@ -914,18 +910,16 @@ impl<'a> Lifter<'a> {
         self.lane_extract_to_rm(instruction, width, "pextr")
     }
 
-    /// EXTRACTPS - extract one single-precision lane of an XMM register into a
-    /// GPR or a 32-bit memory location, selected by `imm8[1:0]`.
+    /// EXTRACTPS - extract one single-precision lane of an XMM register into a GPR
+    /// or a 32-bit memory location, selected by `imm8[1:0]`.
     ///
-    /// Despite the floating-point name this is a pure bit copy: no conversion,
-    /// no NaN quieting, no MXCSR effect. It is therefore exactly `PEXTRD`, and
-    /// shares its implementation.
+    /// Despite the name this is a pure bit copy - no conversion, no NaN quieting,
+    /// no MXCSR effect - so it is exactly `PEXTRD` and shares its implementation.
     ///
-    /// `EXTRACTPS` additionally accepts `REX.W`, which the SDM writes as an
-    /// `r64/m32` destination that still zeroes `DEST[63:32]`. iced normalizes
-    /// that back to the 32-bit register, and a 32-bit GPR write already
-    /// zero-extends, so the prefix needs no handling of its own - both spellings
-    /// land on the same IR.
+    /// It also accepts `REX.W`, which the SDM writes as an `r64/m32` destination
+    /// that still zeroes `DEST[63:32]`. iced normalizes that back to the 32-bit
+    /// register and a 32-bit GPR write already zero-extends, so both spellings land
+    /// on the same IR.
     pub(super) fn handle_extractps(&mut self, instruction: &Instruction) -> crate::Result<()> {
         self.lane_extract_to_rm(instruction, PackedWidth::Dword, "extractps")
     }
@@ -977,17 +971,16 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// PHMINPOSUW - find the smallest *unsigned* word of the source, and report
-    /// both it and where it was.
+    /// PHMINPOSUW - find the smallest *unsigned* word of the source and report both
+    /// it and where it was.
     ///
-    /// `DEST[15:0]` is the minimum, `DEST[18:16]` its lane index, and every
-    /// remaining bit is zeroed. Ties keep the *lowest* index, which is why the
-    /// running comparison below is a strict `<`: an equal lane never displaces
-    /// the one already held.
+    /// `DEST[15:0]` is the minimum, `DEST[18:16]` its lane index, every other bit
+    /// zeroed. Ties keep the *lowest* index, which is why the running comparison is
+    /// a strict `<`.
     ///
-    /// There is no vector fast path. Cranelift has no horizontal minimum, so a
-    /// native expansion would be the same seven-step select chain over
-    /// `extractlane`s - i.e. the scalar one with extra bitcasts.
+    /// No vector fast path: Cranelift has no horizontal minimum, so a native
+    /// expansion would be the same select chain over `extractlane`s with extra
+    /// bitcasts.
     pub(super) fn handle_phminposuw(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let dst_idx = self.xmm_operand_index(instruction, 0, "phminposuw")?;
         let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
@@ -1015,19 +1008,18 @@ impl<'a> Lifter<'a> {
 
     /// MPSADBW - eight overlapping sums of absolute byte differences.
     ///
-    /// `imm8[1:0]` picks which dword of the source is the 4-byte reference
-    /// block; `imm8[2]` picks whether the destination's 11-byte window starts at
-    /// byte 0 or byte 4. Result word `i` is the sum of the absolute differences
-    /// between the reference block and the destination bytes at `window + i`, so
-    /// consecutive results overlap by three bytes - that sliding window is the
-    /// whole point of the instruction and the reason it has no lane-wise form.
+    /// `imm8[1:0]` picks which dword of the source is the 4-byte reference block;
+    /// `imm8[2]` picks whether the destination's 11-byte window starts at byte 0 or
+    /// 4. Result word `i` sums the absolute differences between the reference block
+    /// and the destination bytes at `window + i`, so consecutive results overlap by
+    /// three bytes.
     ///
     /// Each byte is zero-extended into an `I64` first, so `|x - y|` is
     /// `umax - umin` with nothing to overflow, and the maximum sum (`4 * 255`)
-    /// cannot saturate the word it is written to.
+    /// cannot saturate its word.
     ///
-    /// No vector fast path: the sliding window crosses lanes at byte
-    /// granularity with no Cranelift primitive behind it.
+    /// No vector fast path: the sliding window crosses lanes at byte granularity
+    /// with no Cranelift primitive behind it.
     pub(super) fn handle_mpsadbw(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let dst_idx = self.xmm_operand_index(instruction, 0, "mpsadbw")?;
         let dst_lo = self.get_xmm_lo(dst_idx);

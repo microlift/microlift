@@ -56,13 +56,11 @@ impl<'a> Lifter64<'a> {
 
     /// Selective sync - only writes registers/flags dirtied since the last load.
     ///
-    /// DANGEROUS - DO NOT USE. Retained for reference only; all VM-exit paths
-    /// now use the full [`Self::sync_to_context`] instead. See the x86-64
-    /// `sync_to_context_selective` doc comment for the full explanation: the
-    /// dirty set is accumulated in block-emission (address) order, so it does
-    /// not reflect the registers written along the runtime paths reaching an
-    /// exit. Across a backward edge (a loop) a live register can be dropped and
-    /// reloaded stale on resume, silently corrupting guest state.
+    /// DANGEROUS - DO NOT USE. Retained for reference only; every VM-exit path uses
+    /// the full [`Self::sync_to_context`]. See the x86-64
+    /// `sync_to_context_selective` for the full explanation: the dirty set is
+    /// accumulated in emission order, so across a backward edge a live register can
+    /// be dropped and reloaded stale.
     #[allow(dead_code)]
     pub fn sync_to_context_selective(
         &mut self,

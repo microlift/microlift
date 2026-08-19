@@ -1,12 +1,9 @@
 //! x86-64 guest register context (the FFI struct passed to lifted code).
 //!
-//! Kept as a flat `#[repr(C)]` struct so existing host/test code that reads
-//! fields by name (`ctx.rax`, `ctx.rip`, ) is unaffected. The
-//! architecture-neutral control fields are **not** inline: they are the
-//! embedded [`ControlHeader`], which is the one definition every guest shares.
+//! A flat `#[repr(C)]` struct, except for the architecture-neutral control
+//! fields, which are the embedded [`ControlHeader`] every guest shares.
 //! `Deref`/`DerefMut` forward to it, so `ctx.exit_reason` and
-//! `ctx.image_base = base` keep working as if the fields were still declared
-//! here.
+//! `ctx.image_base = base` work as if those fields were declared here.
 
 /// The value `MXCSR` holds after a processor reset / `FXRSTOR` of a fresh
 /// state: all six exception flags clear, all six exception masks set, round to
@@ -89,17 +86,14 @@ pub struct RegisterContext {
     /// Reads/writes through `gs:` prefixed addresses add this base.
     pub gs_base: u64,
 
-    /// x87 data registers in true 80-bit extended precision, one physical
-    /// register per 16-byte slot laid out as `[mantissa, sign_exp]`:
-    ///  - `[0]` = the 64-bit significand (explicit integer bit at position 63);
-    ///  - `[1]` = the sign bit (15) and 15-bit biased exponent in the low 16
-    ///    bits (upper 48 bits unused/zero).
+    /// x87 data registers in true 80-bit extended precision, one physical register
+    /// per 16-byte slot laid out as `[mantissa, sign_exp]`: `[0]` is the 64-bit
+    /// significand (explicit integer bit at 63), `[1]` the sign bit (15) and 15-bit
+    /// biased exponent in the low 16 bits.
     ///
-    /// This matches the FXSAVE `_st[i]` layout (10 bytes used, 16-byte slot), so
-    /// a host runtime can copy each register to/from the native x87 save area
-    /// without any format conversion. The architectural `ST(i)` register maps to
-    /// the physical slot `(fpu_top + i) & 7`; pushes decrement `fpu_top` and
-    /// pops increment it.
+    /// This matches the FXSAVE `_st[i]` layout, so a host can copy each register
+    /// to/from the native x87 save area with no format conversion. `ST(i)` maps to
+    /// physical slot `(fpu_top + i) & 7`.
     pub fpr: [[u64; 2]; 8],
     /// Top-of-stack pointer (0-7). `ST(0)` lives in `fpr[fpu_top]`.
     pub fpu_top: u16,
@@ -115,42 +109,34 @@ pub struct RegisterContext {
     /// exchange with memory is expanded from / collapsed into this on the fly.
     pub fpu_tag: u16,
 
-    /// SSE control and status register, read by `STMXCSR` and written by
-    /// `LDMXCSR`.
+    /// SSE control and status register, read by `STMXCSR` and written by `LDMXCSR`.
     ///
-    /// The field is architecturally faithful *as storage* - whatever `LDMXCSR`
-    /// writes, `STMXCSR` reads back - but the lifter does not currently let it
-    /// influence SSE arithmetic: rounding is always round-to-nearest-even
-    /// (`RC = 00`), FZ/DAZ are not applied to denormals, and the six exception
-    /// flags (bits 5:0) are never set by a lifted SSE instruction. Code that
-    /// saves, modifies and restores `MXCSR` therefore behaves correctly; code
-    /// that changes the rounding mode and expects arithmetic to follow it, or
-    /// that polls the sticky exception flags, does not.
+    /// Architecturally faithful *as storage* - whatever `LDMXCSR` writes,
+    /// `STMXCSR` reads back - but it does not influence SSE arithmetic: rounding is
+    /// always nearest-even, FZ/DAZ are not applied, and the exception flags are
+    /// never set by a lifted instruction. Code that saves, modifies and restores
+    /// `MXCSR` behaves correctly; code that changes the rounding mode and expects
+    /// arithmetic to follow, or polls the sticky flags, does not.
     pub mxcsr: u32,
 
     /// The six segment *selectors*, as read by `MOV r/m16, Sreg` and
     /// `PUSH FS`/`PUSH GS`.
     ///
-    /// These are **selectors, not bases**: the address a `fs:`/`gs:`-prefixed
-    /// access forms comes from [`fs_base`](Self::fs_base) /
-    /// [`gs_base`](Self::gs_base), which are entirely independent fields here.
-    /// That mirrors 64-bit hardware, where `WRFSBASE`/`arch_prctl` move a base
-    /// without touching the selector - but it also means the reverse does *not*
-    /// hold: writing `fs` or `gs` (`MOV Sreg, r/m16`, `POP FS`) stores the
-    /// selector and leaves the base alone, where hardware would reload the base
-    /// from the descriptor table. A guest that changes its TLS by loading a
-    /// selector is therefore not modelled; one that reads its selectors for a
-    /// diagnostic record - which is what these exist for - is.
+    /// **Selectors, not bases**: a `fs:`/`gs:`-prefixed access forms its address
+    /// from [`fs_base`](Self::fs_base)/[`gs_base`](Self::gs_base), which are
+    /// independent fields. That mirrors 64-bit hardware, where `WRFSBASE` moves a
+    /// base without touching the selector - but the reverse does *not* hold here:
+    /// writing `fs` or `gs` stores the selector and leaves the base alone, where
+    /// hardware would reload it from the descriptor. A guest that retargets its TLS
+    /// by loading a selector is out of scope; one that reads its selectors for a
+    /// diagnostic record is the case this exists for.
     ///
-    /// Like `MXCSR`, they are faithful storage rather than a control input:
-    /// nothing in the lifter interprets them, and a segment override other than
-    /// `FS`/`GS` is ignored when forming an address (all four have base 0 in
-    /// long mode).
+    /// Like `MXCSR`, faithful storage rather than a control input: nothing
+    /// interprets them, and a segment override other than `FS`/`GS` is ignored when
+    /// forming an address.
     ///
-    /// Written by the lifter only through the segment-register semantics; the
-    /// host is expected to seed them, since their correct values are a property
-    /// of the guest OS rather than of the code being lifted
-    /// ([`CS_USER64_DARWIN`] / [`CS_USER64_LINUX`] and friends).
+    /// The host is expected to seed them, since the correct values are a property
+    /// of the guest OS ([`CS_USER64_DARWIN`]/[`CS_USER64_LINUX`] and friends).
     pub cs: u16,
     pub ss: u16,
     pub ds: u16,
@@ -163,35 +149,30 @@ pub struct RegisterContext {
 
     /// Where the region that just exited says to go next: the address of a
     /// [`BlockLinkEntry`](crate::core::link::BlockLinkEntry) in
-    /// [`link_table`](Self::link_table), or **zero for "no link - service this
-    /// exit yourself"**.
+    /// [`link_table`](Self::link_table), or **zero for "no link - service this exit
+    /// yourself"**.
     ///
-    /// The host clears it before every entry and reads it after; lifted code
-    /// writes it only on a table hit. Which is why zero is the answer for an
-    /// exit that has no probe at all - a syscall, an import call, a fault - with
-    /// nothing in those paths having to know that linking exists.
+    /// The host clears it before every entry and reads it after; lifted code writes
+    /// it only on a table hit, which is why zero is the answer for an exit with no
+    /// probe at all.
     ///
-    /// Last in the struct on purpose: it is new, and everything above it has an
-    /// offset something already depends on.
+    /// Last in the struct on purpose: everything above it has an offset something
+    /// already depends on.
     pub link_hit: u64,
 }
 
 impl Default for RegisterContext {
     /// A context in the processor's post-reset state: everything zero except
-    /// `mxcsr` and `fpu_cw`, whose reset values ([`MXCSR_RESET`],
-    /// [`X87_CW_RESET`]) are not zero. Zero in those two fields would mean
-    /// "every floating-point exception unmasked", which no real thread starts
-    /// out in and which would make `STMXCSR`/`FNSTCW` report an impossible
-    /// state.
+    /// `mxcsr` and `fpu_cw` ([`MXCSR_RESET`], [`X87_CW_RESET`]). Zero in those two
+    /// would mean "every floating-point exception unmasked", which no real thread
+    /// starts in.
     ///
-    /// `cs`/`ss` are the same kind of exception, for the same reason - a
-    /// 64-bit thread with `CS = 0` is not a state that exists - but unlike the
-    /// FP fields their value is a property of the *guest OS*, not of the
-    /// processor. The default is Darwin's ([`CS_USER64_DARWIN`],
-    /// [`SS_USER64_DARWIN`]); a host running a Linux or Windows guest should
-    /// overwrite them ([`CS_USER64_LINUX`], [`SS_USER64_LINUX`]). `ds`/`es` and
-    /// the `fs`/`gs` *selectors* are 0, which is what a real 64-bit user-mode
-    /// process reports.
+    /// `cs`/`ss` are the same kind of exception - a 64-bit thread with `CS = 0` is
+    /// not a state that exists - but their value is a property of the *guest OS*,
+    /// not the processor. The default is Darwin's; a host running a Linux or
+    /// Windows guest should overwrite them ([`CS_USER64_LINUX`],
+    /// [`SS_USER64_LINUX`]). `ds`/`es` and the `fs`/`gs` selectors are 0, which is
+    /// what a real 64-bit user-mode process reports.
     fn default() -> Self {
         Self {
             rax: 0,
@@ -267,17 +248,13 @@ impl std::ops::DerefMut for RegisterContext {
 
 /// Convert an 80-bit x87 extended-precision value to the raw bits of an `f64`.
 ///
-/// A convenience round-tripper for host runtimes that need to view a guest x87
-/// register as an `f64`. It is exact for zero and for normal values within
-/// the `f64` exponent range (and round-trips with [`f64_bits_to_f80`]), but it
-/// truncates the significand and flushes denormals to zero rather than
-/// rounding.
+/// For host runtimes that need to view a guest x87 register as an `f64`. Exact
+/// for zero and for normals in the `f64` exponent range (and round-trips with
+/// [`f64_bits_to_f80`]), but it truncates the significand and flushes denormals
+/// to zero rather than rounding.
 ///
-/// It is therefore *not* identical to the narrowing the lifter emits for
-/// `FST m32/m64`, which uses the precise softfloat path
-/// ([`crate::arch::x86_64::Lifter::f80_to_f64`]) with round-to-nearest-even and
-/// full subnormal handling. Use this only for interop/inspection, not to
-/// reproduce lifted `FST` results bit-for-bit.
+/// So it is *not* the narrowing the lifter emits for `FST m32/m64`, which uses
+/// the precise softfloat path. Use this for interop and inspection only.
 #[inline]
 pub fn f80_to_f64_bits(mantissa: u64, sign_exp: u16) -> u64 {
     let sign = ((sign_exp >> 15) & 1) as u64;
@@ -293,14 +270,12 @@ pub fn f80_to_f64_bits(mantissa: u64, sign_exp: u16) -> u64 {
     (sign << 63) | (exp64 << 52) | frac
 }
 
-/// Convert the raw bits of an `f64` to an 80-bit x87 extended-precision value,
-/// returning `(mantissa, sign_exp)` in the same layout [`f80_to_f64_bits`]
-/// consumes.
+/// Convert the raw bits of an `f64` to an 80-bit x87 value, returning
+/// `(mantissa, sign_exp)` in the layout [`f80_to_f64_bits`] consumes.
 ///
-/// `f64` is a strict subset of the 80-bit format, so this widening is **exact**
-/// for every finite `f64` except denormals, which are flushed to zero. It is
-/// used at lift time by `FLDZ`/`FLD1`/`FLDPI` to encode their (normal, in-range)
-/// constants, where it agrees with the lifter's general `f64_to_f80` path.
+/// `f64` is a strict subset of the 80-bit format, so this is **exact** for every
+/// finite `f64` except denormals, which are flushed to zero. Used at lift time
+/// by `FLDZ`/`FLD1`/`FLDPI` for their in-range constants.
 #[inline]
 pub fn f64_bits_to_f80(bits: u64) -> (u64, u16) {
     let sign = (bits >> 63) & 1;

@@ -74,9 +74,7 @@ fn run(bytes: &[u8], mut ctx: RegisterContext) -> RegisterContext {
     ctx
 }
 
-// ---------------------------------------------------------------------------
 // 1. SHLD / SHRD with count 0
-// ---------------------------------------------------------------------------
 
 #[test]
 fn shld_count_zero_is_noop() {
@@ -108,9 +106,7 @@ fn shld_count_four_shifts_in_src_bits() {
     assert_eq!(out.rax, 0x2345_678F, "shld eax,ebx,4 result");
 }
 
-// ---------------------------------------------------------------------------
 // 2. XADD same-register operand ordering
-// ---------------------------------------------------------------------------
 
 #[test]
 fn xadd_same_register_doubles() {
@@ -132,9 +128,7 @@ fn xadd_distinct_registers_swap_and_add() {
     assert_eq!(out.rbx, 100, "xadd src gets the old dst");
 }
 
-// ---------------------------------------------------------------------------
 // 3. BT-family memory bit-string addressing
-// ---------------------------------------------------------------------------
 
 #[test]
 fn bt_mem_bit_index_beyond_operand() {
@@ -183,9 +177,7 @@ fn bt_mem_negative_index_addresses_below_base() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // 4. FST m32/m64 of specials and rounding
-// ---------------------------------------------------------------------------
 
 fn fld_fstp_roundtrip_f64(value: f64) -> f64 {
     let mut buf: [u64; 2] = [value.to_bits(), 0];
@@ -236,9 +228,7 @@ fn fstp_m32_infinity_roundtrip() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // 5. Shift flags: OF for count==1, PF update
-// ---------------------------------------------------------------------------
 
 #[test]
 fn shl_by_one_defines_of() {
@@ -282,9 +272,7 @@ fn shift_count_zero_preserves_flags() {
     assert_eq!(out.rax & 0xFF, 0xFF, "shl by 0 must not change the value");
 }
 
-// ---------------------------------------------------------------------------
 // 6. 0x67 32-bit address-size operands must verify
-// ---------------------------------------------------------------------------
 
 #[test]
 fn addr32_operand_produces_verifiable_ir() {
@@ -297,9 +285,7 @@ fn addr32_operand_produces_verifiable_ir() {
         .expect("32-bit address-size operand must produce verifiable IR");
 }
 
-// ---------------------------------------------------------------------------
 // 7. UD2 / INT3 relocation-correct RIP
-// ---------------------------------------------------------------------------
 
 #[test]
 fn ud2_reports_relocated_rip() {
@@ -329,9 +315,7 @@ fn int3_reports_relocated_rip() {
     assert_eq!(out.rip, 0x5555_0000 + 1, "INT3 RIP must be relocated");
 }
 
-// ---------------------------------------------------------------------------
 // 8. Fast imports needing stack args are placed on the stack, not miscompiled
-// ---------------------------------------------------------------------------
 
 #[test]
 fn fast_import_with_seven_int_args_compiles() {
@@ -374,9 +358,7 @@ fn fast_import_with_seven_int_args_compiles() {
         .expect("import with a stack-passed argument must compile");
 }
 
-// ---------------------------------------------------------------------------
 // 9. BSF / BSR leave the destination unchanged when src == 0
-// ---------------------------------------------------------------------------
 
 #[test]
 fn bsf_zero_source_preserves_destination() {

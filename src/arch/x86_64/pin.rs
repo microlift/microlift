@@ -1,17 +1,15 @@
 //! x86-64's pinnable registers, by name.
 //!
-//! [`PinnedReg`] is a class and an architectural number, which is what keeps
+//! [`PinnedReg`] is a class and an architectural number, which keeps
 //! [`crate::core::pin`] free of any guest's register names - and unreadable at a
-//! call site. These constants are the readable spelling, and the numbering they
-//! encode is [`GPR_ORDER`](crate::arch::x86_64::regs::GPR_ORDER) for the
-//! integer registers and the XMM number for the vector ones.
+//! call site. These constants are the readable spelling; the numbering is
+//! [`GPR_ORDER`](crate::arch::x86_64::regs::GPR_ORDER) for the integer registers
+//! and the XMM number for the vector ones.
 //!
-//! There is deliberately no recommended set here. Which registers are worth
-//! a slot is a property of the guest program - a C++ engine spends its
-//! time in `RSP`/`RBP`/`RDI` and a codec in `XMM0`-`XMM3` - and microlift has no
-//! way to know which it is looking at. See
+//! There is deliberately no recommended set: which registers are worth a slot is
+//! a property of the guest program. See
 //! [`PinnedAbi::check_budget`](crate::core::pin::PinnedAbi::check_budget) for
-//! how many slots there are to spend.
+//! how many there are to spend.
 
 use crate::core::pin::PinnedReg;
 

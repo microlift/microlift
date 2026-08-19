@@ -1,15 +1,13 @@
 //! The eager flag updates, and the guards that stop them being eager.
 //!
-//! Every `update_flags_*` here assigns a fixed set of flags, and the set is
-//! what [`crate::arch::x86_64::flag_effects`] classifies each mnemonic as
-//! writing - the two must agree, and the table is written against *this file*.
+//! Every `update_flags_*` assigns a fixed set of flags, and that set is what
+//! [`crate::arch::x86_64::flag_effects`] classifies each mnemonic as writing -
+//! the two must agree, and the table is written against *this file*.
 //!
-//! Each flag's computation is wrapped in [`Lifter::flag_needed`]. With
-//! [`LifterConfig::eliminate_dead_flags`] off that is a constant `true` and the
-//! IR is exactly what it always was; with it on, a flag nothing reads costs
-//! nothing to not compute. The parity flag is the one that motivated this - a
-//! `popcnt`, an `ireduce`, a `band` and a `bxor` on every arithmetic
-//! instruction in the program, for a flag almost nothing looks at.
+//! Each flag's computation is wrapped in [`Lifter::flag_needed`], a constant
+//! `true` unless [`LifterConfig::eliminate_dead_flags`] is on. Parity is what
+//! motivated it: a `popcnt`, an `ireduce`, a `band` and a `bxor` on every
+//! arithmetic instruction in the program, for a flag almost nothing reads.
 //!
 //! [`LifterConfig::eliminate_dead_flags`]: crate::core::LifterConfig::eliminate_dead_flags
 //! [`Spec::IntegerOverflowFlags`]: crate::core::specialize::Spec::IntegerOverflowFlags
@@ -46,13 +44,13 @@ impl<'a> Lifter<'a> {
         self.builder.ins().band_imm_u(af_shifted, 1)
     }
 
-    /// ZF, SF, AF and PF - the four flags every add- and subtract-shaped
-    /// operation derives the same way, from the operands and the result and
-    /// from nothing about how the result was produced.
+    /// ZF, SF, AF and PF - the four flags every add- and subtract-shaped operation
+    /// derives the same way, from the operands and the result and from nothing
+    /// about how the result was produced.
     ///
-    /// Factored out because that is precisely the part
-    /// [`Spec::IntegerOverflowFlags`] does *not* change: CF and OF have a
-    /// machine instruction behind them and these four do not.
+    /// Factored out because that is precisely what [`Spec::IntegerOverflowFlags`]
+    /// does *not* change: CF and OF have a machine instruction behind them, these
+    /// four do not.
     ///
     /// [`Spec::IntegerOverflowFlags`]: crate::core::specialize::Spec::IntegerOverflowFlags
     fn update_flags_zsap(
@@ -273,14 +271,13 @@ impl<'a> Lifter<'a> {
     /// `lhs + rhs + cf_in` (`is_adc`) or `lhs - rhs - cf_in`, and every flag an
     /// `ADC`/`SBB` writes.
     ///
-    /// `cf_in` is the incoming carry already widened to the operand type. The
-    /// carry *out* is the expensive half - two compares and an `or`, or two
-    /// overflow-producing instructions - and is built only when something reads
-    /// CF; the two-step result is needed either way.
+    /// `cf_in` is the incoming carry already widened to the operand type. The carry
+    /// *out* is the expensive half and is built only when something reads CF; the
+    /// two-step result is needed either way.
     ///
     /// Cranelift has exact opcodes for this shape (`uadd_overflow_cin`,
-    /// `usub_overflow_bin`), but no backend lowers them, so the carry chain is
-    /// spelled out as two ordinary overflow ops.
+    /// `usub_overflow_bin`) but no backend lowers them, so the carry chain is spelled
+    /// out as two ordinary overflow ops.
     pub fn adc_sbb_with_flags(
         &mut self,
         lhs: Value,
@@ -310,10 +307,9 @@ impl<'a> Lifter<'a> {
     /// three-operand `IMUL` forms write.
     ///
     /// Those are CF and OF alone, both meaning "the full signed product did not
-    /// fit"; ZF/SF/AF/PF are architecturally undefined and left as they were.
-    /// The portable answer needs a second, widening multiply to see the bits
-    /// that were dropped, so a dead CF *and* OF saves the whole `smulhi` and
-    /// not just an assignment.
+    /// fit"; ZF/SF/AF/PF are undefined and left as they were. The portable answer
+    /// needs a second, widening multiply to see the dropped bits, so a dead CF
+    /// *and* OF saves the whole `smulhi`.
     pub fn imul_with_flags(&mut self, lhs: Value, rhs: Value, size: usize) -> crate::Result<Value> {
         if let Some(res) = self.try_native_imul_flags(lhs, rhs)? {
             return Ok(res);
@@ -331,12 +327,11 @@ impl<'a> Lifter<'a> {
         Ok(res)
     }
 
-    /// `lhs + rhs + cf_in` / `lhs - rhs - cf_in` and nothing else - no flags
-    /// read, none written.
+    /// `lhs + rhs + cf_in` / `lhs - rhs - cf_in` and nothing else - no flags read,
+    /// none written.
     ///
     /// The locked `ADC`/`SBB` retry loop needs the result on every iteration but
-    /// the flags only for the iteration that won, so it computes the two
-    /// separately.
+    /// the flags only for the iteration that won.
     pub(super) fn adc_sbb_value(
         &mut self,
         lhs: Value,
@@ -474,20 +469,20 @@ impl<'a> Lifter<'a> {
     }
 
     /// Update flags for a shift operation (SHL/SHR/SAR/SHLD/SHRD).
-    /// `orig` is the pre-shift destination value, `res` the result (both in the
-    /// operand type), `cf_bit` the last bit shifted out (for CF), `count` the
-    /// masked shift count, `size` the operand size in bytes.
     ///
-    /// Per x86 semantics: if the masked shift count is 0, **no flags are
-    /// affected** - including CF/ZF/SF/OF/PF. We must preserve the prior flag
-    /// values in that case rather than clobbering them with the (garbage)
-    /// values that fall out of the shift formula for count=0.
+    /// `orig` is the pre-shift destination, `res` the result (both in the operand
+    /// type), `cf_bit` the last bit shifted out, `count` the masked count, `size`
+    /// the operand size in bytes.
     ///
-    /// OF is architecturally defined only for count == 1, where for every shift
-    /// flavour it equals "the sign changed": SHL's `MSB(res) ^ CF` and SHRD's
-    /// documented definition both reduce to `MSB(orig) ^ MSB(res)`, SHR's
-    /// `MSB(orig)` matches because `MSB(res)` is 0, and SAR's 0 matches because
-    /// the sign is preserved. For counts > 1 OF is undefined; we clear it.
+    /// If the masked count is 0, **no flags are affected** - so the prior values
+    /// must be preserved rather than clobbered with the garbage the shift formula
+    /// produces at count 0.
+    ///
+    /// OF is architecturally defined only for count == 1, where for every flavour
+    /// it is "the sign changed": SHL's `MSB(res) ^ CF` and SHRD's definition both
+    /// reduce to `MSB(orig) ^ MSB(res)`, SHR's `MSB(orig)` matches because
+    /// `MSB(res)` is 0, and SAR's 0 matches because the sign is preserved. For
+    /// counts > 1 it is undefined and cleared here.
     pub fn update_flags_shift(
         &mut self,
         orig: Value,
@@ -498,12 +493,9 @@ impl<'a> Lifter<'a> {
     ) -> crate::Result<()> {
         let bit_width = (size * 8) as i64;
 
-        // Every flag here is a read-modify-write, so a dead one skips its old
-        // value, its new value *and* the select between them - three savings
-        // per flag rather than one, which is why this handler is where the
-        // guards pay best. `flag_effects` classifies a shift as reading exactly
-        // this set, so the `use_var`s below are covered: a value one of them
-        // reads cannot have been elided at its definition.
+        // Every flag here is a read-modify-write, so a dead one skips its old value,
+        // its new value *and* the select between them. `flag_effects` classifies a
+        // shift as reading exactly this set, so the `use_var`s below are covered.
         let (zf, sf, cf, of, pf) = (
             self.flag_needed(X86Flag::Zero),
             self.flag_needed(X86Flag::Sign),

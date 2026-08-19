@@ -1,34 +1,20 @@
 //! SSE4.2 `CRC32` - the CRC-32C (Castagnoli) accumulator.
 //!
-//! `CRC32 r32/r64, r/m8/16/32/64` folds its source operand into the 32-bit
-//! running remainder held in the destination's low half, using the *reflected*
-//! CRC-32C polynomial. Nothing about it touches the flags.
+//! `CRC32 r32/r64, r/m8/16/32/64` folds its source into the 32-bit running
+//! remainder in the destination's low half, using the *reflected* CRC-32C
+//! polynomial. No flags are touched.
 //!
-//! ## Why a bit-serial expansion
-//!
-//! Hardware does this in a few cycles with a dedicated unit; software normally
-//! does it with a 256-entry table. A lifter has neither: there is no host
-//! instruction Cranelift exposes for it, and a table would have to live
-//! somewhere the lifted code can address, which means guest memory this crate
-//! does not own. What is left is the textbook bit-serial loop, and the identity
-//! that makes it cheap enough to unroll:
+//! Cranelift exposes no host instruction for it, and the usual 256-entry table
+//! would have to live in guest memory this crate does not own. What is left is
+//! the bit-serial loop, made cheap enough to unroll by:
 //!
 //! > XORing a whole `k`-bit chunk of data into the low bits of the remainder and
-//! > then shifting `k` times is the same as consuming the data one bit at a
-//! > time, for any `k` up to the register width (32).
+//! > then shifting `k` times is the same as consuming the data one bit at a time,
+//! > for any `k` up to the register width (32).
 //!
-//! So an `m8` source is 8 shift steps, an `m32` source is 32, and an `m64`
-//! source is two 32-bit folds of 32 steps each - never 64 separate data XORs.
-//!
-//! ## Why the kernels are outlined
-//!
-//! Each step is four IR instructions, so the 64-bit form is ~260 of them. That
-//! is the same argument the x87 softfloat kernels make
-//! ([`softfloat`](super::softfloat)), and it uses the same mechanism:
-//! [`Crc32Kernel`] wraps one width's expansion in a shared helper function that
-//! every `CRC32` site in the region calls, and
-//! [`LifterConfig::outline_helpers`](crate::core::LifterConfig::outline_helpers)
-//! turns it back into an inline expansion for a region with a single use.
+//! So `m8` is 8 shift steps and `m32` is 32; `m64` is two 32-bit folds. At four
+//! IR instructions a step the 64-bit form is ~260, so [`Crc32Kernel`] outlines
+//! each width into a shared helper, as the x87 softfloat kernels do.
 
 use crate::MicroliftError;
 use crate::lifter::Lifter;
@@ -42,10 +28,8 @@ const POLY: i64 = 0x82F6_3B78;
 
 /// Fold `bits` bits of `data` into the 32-bit remainder `crc`.
 ///
-/// `crc` is an `I32`; `data` is an `I64` whose low `bits` bits are the operand
-/// (anything above them is ignored). The result is an `I32`.
-///
-/// `bits` must be 8, 16, 32 or 64.
+/// `crc` is an `I32`; `data` is an `I64` whose low `bits` bits are the operand.
+/// The result is an `I32`. `bits` must be 8, 16, 32 or 64.
 pub fn emit_crc32c(b: &mut FunctionBuilder, crc: Value, data: Value, bits: u32) -> Value {
     debug_assert!(matches!(bits, 8 | 16 | 32 | 64));
     let low = b.ins().ireduce(types::I32, data);
@@ -164,12 +148,8 @@ impl<'a> Lifter<'a> {
     /// `CRC32 r32/r64, r/m8/16/32/64`.
     ///
     /// The remainder lives in the destination's low 32 bits whatever the
-    /// destination width, and the result is written back by the ordinary
-    /// register-write rule - so the `r64` forms zero the upper half explicitly
-    /// rather than through a 32-bit write, since the value they produce is a
-    /// 32-bit one either way.
-    ///
-    /// No flag is touched, by the architecture and by this handler alike.
+    /// destination width, so the `r64` forms zero the upper half explicitly rather
+    /// than through a 32-bit write. No flag is touched.
     pub(super) fn handle_crc32(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let src_size = self.operand_size(instruction, 1)?;
         let kernel = Crc32Kernel::for_size(src_size).ok_or_else(|| {

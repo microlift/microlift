@@ -67,10 +67,8 @@ impl GuestArch for X86_64 {
     ///
     /// The XMM answer is `None` without
     /// [`LifterConfig::use_vector_xmm`](crate::core::LifterConfig::use_vector_xmm),
-    /// because the scalar representation splits that register into two
-    /// variables and a slot carries one value - the prerequisite-switch pattern
-    /// the specializations already use. An index past the end of either bank is
-    /// `None` for the ordinary reason.
+    /// because the scalar representation splits that register into two variables
+    /// and a slot carries one value. An index past either bank is `None`.
     fn pinned_slot_type(
         reg: crate::core::pin::PinnedReg,
         config: &LifterConfig,

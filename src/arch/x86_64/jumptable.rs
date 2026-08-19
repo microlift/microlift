@@ -1,42 +1,27 @@
 //! **Experimental** recovery of Clang-style jump tables.
 //!
-//! An indirect `JMP` normally ends a region: the engine cannot name its
-//! successors, so [`ControlFlowKind::IndirectBranch`] contributes no block
-//! leaders and the lifted code dispatches to a `UnknownJump` VM exit for any
-//! target that does not happen to already be a block. A C `switch` compiled by
-//! Clang is the common case where the successors *are* statically knowable -
-//! they sit in a table in read-only memory, and the caller has already told us
-//! what read-only memory looks like via [`LifterConfig::segments`].
-//!
-//! This pass pattern-matches the two shapes Clang emits on x86-64 and reads the
-//! table out of those segments, so the targets become ordinary block leaders and
-//! the exit disappears from the hot path.
+//! An indirect `JMP` normally ends a region: [`ControlFlowKind::IndirectBranch`]
+//! contributes no block leaders, so the lifted code dispatches to an
+//! `UnknownJump` VM exit. A Clang-compiled `switch` is the common case where the
+//! successors *are* statically knowable - they sit in a table in read-only
+//! memory, which the caller has described via [`LifterConfig::segments`]. This
+//! pass matches the two shapes Clang emits on x86-64:
 //!
 //! ```text
-//! ; PIC / -fPIC: table holds i32 displacements from the table itself
-//!     cmp    edi, 3
-//!     ja     .default
-//!     mov    eax, edi
+//! ; PIC: table holds i32 displacements from the table itself
 //!     lea    rcx, [rip + .LJTI]
 //!     movsxd rdx, dword ptr [rcx + rax*4]
 //!     add    rdx, rcx
 //!     jmp    rdx
 //!
 //! ; non-PIC: table holds absolute addresses
-//!     cmp    edi, 3
-//!     ja     .default
-//!     mov    eax, edi
 //!     jmp    qword ptr [.LJTI + rax*8]
 //! ```
 //!
 //! **Being wrong here is cheap, and that is the design.** A recovered target is
-//! only ever *added* to the leader set: dispatch still happens on the address
-//! the guest actually computed at run time, so a bogus entry lifts a block that
-//! nothing reaches (wasted code, never wrong code), and a missed entry just
-//! leaves the pre-existing `UnknownJump` exit in place. That is why the matcher
-//! is allowed a heuristic unbounded mode when no `cmp`/`ja` range check is
-//! found. It is *not* a licence to be sloppy about where entries are read
-//! from - writable segments are never trusted, exactly as in [`crate::vsa`].
+//! only ever *added* as a leader, and dispatch still happens on the address the
+//! guest computes - so a bogus entry lifts a block nothing reaches and a missed
+//! entry leaves the pre-existing exit. Writable segments are never trusted.
 //!
 //! [`ControlFlowKind::IndirectBranch`]: crate::arch::ControlFlowKind::IndirectBranch
 //! [`LifterConfig::segments`]: crate::core::LifterConfig::segments
@@ -94,11 +79,10 @@ pub struct JumpTable {
 
 /// Run the pass over a region of x86-64 code mapped at `base`.
 ///
-/// Returns one entry per indirect `JMP` whose table could be recovered, keyed by
-/// the address of that `JMP`. `segments` supplies the read-only memory the table
-/// is read from; the region itself is added as a read-only segment, so a table
-/// emitted inside the lifted code (common for a `switch` at the end of a
-/// function) resolves without the caller describing it.
+/// One entry per indirect `JMP` whose table could be recovered, keyed by that
+/// `JMP`'s address. `segments` supplies the read-only memory the table is read
+/// from; the region itself is added as one, so a table emitted inside the lifted
+/// code resolves without the caller describing it.
 pub fn analyze_jump_tables(
     bytes: &[u8],
     base: u64,

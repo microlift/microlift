@@ -16,13 +16,11 @@ impl<'a> Lifter<'a> {
     /// Gather the even and odd lanes of `(a, b)` into two vectors, in the order
     /// x86's horizontal instructions want them.
     ///
-    /// Result lane `j` of the even vector is source lane `2j` counted across
-    /// both operands, so for `HADDPS` the pair is
-    /// `([d0,d2,s0,s2], [d1,d3,s1,s3])` and applying any binary op lane-wise
-    /// gives `[d0+d1, d2+d3, s0+s1, s2+s3]` - the instruction's definition,
-    /// including its "destination's results low, source's high" layout.
-    ///
-    /// Both masks are the byte patterns aarch64 lowers to `UZP1` and `UZP2`.
+    /// Result lane `j` of the even vector is source lane `2j` counted across both
+    /// operands, so for `HADDPS` the pair is `([d0,d2,s0,s2], [d1,d3,s1,s3])` and a
+    /// lane-wise binary op gives `[d0+d1, d2+d3, s0+s1, s2+s3]` - the instruction's
+    /// definition, layout included. Both masks are the byte patterns aarch64 lowers
+    /// to `UZP1` and `UZP2`.
     fn horizontal_pair(&mut self, a: Value, b: Value, bits: u32) -> (Value, Value) {
         let even = Self::lane_shuffle_mask(bits, |j| 2 * j);
         let odd = Self::lane_shuffle_mask(bits, |j| 2 * j + 1);
@@ -31,14 +29,12 @@ impl<'a> Lifter<'a> {
 
     /// `ROUNDPS` / `ROUNDPD` as one packed rounding instruction.
     ///
-    /// `FRINTN`/`FRINTM`/`FRINTP`/`FRINTZ` on aarch64, `ROUNDPS`/`ROUNDPD` on
-    /// x86-64, against a portable path that extracts each lane from its 64-bit
-    /// half, bitcasts it to a float, rounds it and packs it back.
+    /// `FRINT{N,M,P,Z}` on aarch64, `ROUNDPS`/`ROUNDPD` on x86-64, against a
+    /// portable path that extracts each lane from its 64-bit half, bitcasts,
+    /// rounds and packs back.
     ///
-    /// No x86 NaN fixup is needed and none is emitted: rounding never creates a
-    /// NaN from a non-NaN operand, and a NaN input is quieted and propagated
-    /// identically by every backend here - which is exactly why the portable
-    /// path calls the same [`apply_round`] with no fixup either.
+    /// No x86 NaN fixup is needed: rounding never creates a NaN from a non-NaN
+    /// operand, and a NaN input is quieted and propagated identically everywhere.
     ///
     /// [`Spec::PackedFpRound`]
     pub(super) fn try_packed_round_spec(
@@ -64,13 +60,11 @@ impl<'a> Lifter<'a> {
     }
 
     /// `HADDPS` / `HSUBPS` / `HADDPD` / `HSUBPD` - horizontal float add and
-    /// subtract.
+    /// subtract: two constant shuffles and the ordinary packed op.
     ///
-    /// Two constant shuffles and the ordinary packed op. The op goes through
-    /// [`vec_fp_arith_x86`](Lifter::vec_fp_arith_x86) for the same reason the
-    /// non-horizontal forms do: a lane whose result is a NaN that neither
-    /// operand supplied performed an invalid operation and owes x86's sign-set
-    /// indefinite, not the host's default NaN.
+    /// The op goes through [`vec_fp_arith_x86`](Lifter::vec_fp_arith_x86) for the
+    /// same reason the non-horizontal forms do: a lane whose result is a NaN
+    /// neither operand supplied owes x86's sign-set indefinite.
     ///
     /// [`Spec::PackedFpHorizontal`]
     pub(super) fn try_horizontal_fp_spec(
@@ -106,12 +100,10 @@ impl<'a> Lifter<'a> {
 
     /// `PHADDW` / `PHADDD` / `PHSUBW` / `PHSUBD` / `PHADDSW` / `PHSUBSW`.
     ///
-    /// The plain adds are literally `iadd_pairwise`, whose definition -
-    /// first operand's pairwise sums in the low half, second's in the high -
-    /// is `PHADD*`'s definition, so they become a single `ADDP` (aarch64) or
-    /// `PHADDW`/`PHADDD` (x86-64). The other three have no pairwise opcode and
-    /// reuse the even/odd gather, which costs one extra shuffle and still
-    /// lowers to three instructions against a sixteen-lane scalar expansion.
+    /// The plain adds are literally `iadd_pairwise`, whose definition matches
+    /// `PHADD*`'s, so they become one `ADDP` or `PHADDW`/`PHADDD`. The other three
+    /// have no pairwise opcode and reuse the even/odd gather, costing one extra
+    /// shuffle and still lowering to three instructions.
     pub(super) fn try_horizontal_int_spec(
         &mut self,
         instruction: &Instruction,
@@ -157,13 +149,13 @@ impl<'a> Lifter<'a> {
 
     /// `PMADDWD` - signed word multiply, adjacent products summed into dwords.
     ///
-    /// Written in the exact shape both backends pattern-match: a widening
-    /// multiply of each half, then `iadd_pairwise`. x86-64 folds the entire
-    /// tree back into one `pmaddwd`; aarch64 gives `SMULL`, `SMULL2`, `ADDP`.
+    /// Written in the shape both backends pattern-match: a widening multiply of
+    /// each half, then `iadd_pairwise`. x86-64 folds the tree back into one
+    /// `pmaddwd`; aarch64 gives `SMULL`, `SMULL2`, `ADDP`.
     ///
-    /// The one input pair that overflows a dword - `-32768 * -32768` twice -
-    /// wraps, because `imul` on `I32X4` wraps. That is what hardware does, and
-    /// it is why this cannot use a saturating narrow.
+    /// The one input pair that overflows a dword - `-32768 * -32768` twice - wraps,
+    /// because `imul` on `I32X4` wraps. That is what hardware does, and why this
+    /// cannot use a saturating narrow.
     ///
     /// [`Spec::PairwiseMultiplyAdd`]
     pub(super) fn try_pmaddwd_spec(&mut self, instruction: &Instruction) -> crate::Result<bool> {
@@ -196,20 +188,16 @@ impl<'a> Lifter<'a> {
     /// `PMADDUBSW` - unsigned destination bytes times signed source bytes,
     /// adjacent products summed into words with signed saturation.
     ///
-    /// Cranelift has an exact opcode for this - `x86_pmaddubsw` - and it is
-    /// deliberately not used: its x86-64 rule is gated on `has_ssse3`, which is
-    /// **off** in the baseline `x86_64` feature set, so an AOT caller that did
-    /// not pass `isa_settings` would get a hard lowering failure rather than a
-    /// slow path. The sequence below lowers on every backend:
+    /// Cranelift's exact `x86_pmaddubsw` is deliberately not used: its x86-64 rule
+    /// is gated on `has_ssse3`, **off** in the baseline feature set, so an AOT
+    /// caller that passed no `isa_settings` would get a hard lowering failure
+    /// rather than a slow path. The sequence below lowers everywhere:
     ///
-    /// 1. The byte products are computed in `I16X8`, which is exact - a
-    ///    `u8 * i8` spans `-32640..=32385` and cannot overflow a word.
-    /// 2. Each product vector is widened and pairwise-added in `I32X4`, in the
-    ///    `iadd_pairwise(swiden_low v, swiden_high v)` shape aarch64 lowers to
-    ///    a single `SADDLP`. The sum is computed at 32 bits precisely so that
-    ///    saturation happens once, at the end, rather than wrapping first.
-    /// 3. `snarrow` saturates the two `I32X4` halves back into one `I16X8`,
-    ///    destination results low - which is the `SQXTN`/`SQXTN2` pair.
+    /// 1. Byte products in `I16X8`, exact - a `u8 * i8` spans `-32640..=32385`.
+    /// 2. Each product vector widened and pairwise-added in `I32X4`, in the
+    ///    `iadd_pairwise(swiden_low v, swiden_high v)` shape aarch64 lowers to one
+    ///    `SADDLP`. At 32 bits precisely so saturation happens once, at the end.
+    /// 3. `snarrow` saturates the two halves back into one `I16X8` - `SQXTN`/`SQXTN2`.
     ///
     /// [`Spec::MultiplyAddUnsignedSigned`]
     pub(super) fn try_pmaddubsw_spec(&mut self, instruction: &Instruction) -> crate::Result<bool> {
@@ -251,20 +239,17 @@ impl<'a> Lifter<'a> {
     }
 
     /// `PSADBW` - sum of absolute byte differences, one sum per 64-bit half,
-    /// deposited in that half's low word with the rest of the half zeroed.
+    /// deposited in that half's low word with the rest zeroed.
     ///
     /// The absolute difference of two *unsigned* bytes is
-    /// `usub_sat(a, b) | usub_sat(b, a)`: exactly one of the two saturating
-    /// subtracts is non-zero (both are zero when the bytes are equal), so the
-    /// OR is a select with no compare. Three instructions, everywhere.
+    /// `usub_sat(a, b) | usub_sat(b, a)`: exactly one saturating subtract is
+    /// non-zero, so the OR is a select with no compare. Three instructions.
     ///
-    /// The reduction is then a ladder of widening pairwise adds - byte pairs to
-    /// words (`UADDLP`), word pairs to dwords (`UADDLP`), dword pairs to the
-    /// two half-sums (`ADDP`). The final stage stays in `I32X4` rather than
-    /// widening to `I64X2` first, because `iadd_pairwise` is not defined on
-    /// 64-bit lanes and because the sum cannot exceed `16 * 255`, so 32 bits is
-    /// ample; `uwiden_low` then both selects the two live lanes and supplies
-    /// the zero upper halves the instruction requires.
+    /// The reduction is a ladder of widening pairwise adds - bytes to words
+    /// (`UADDLP`), words to dwords (`UADDLP`), dwords to the two half-sums
+    /// (`ADDP`). The last stage stays in `I32X4` because `iadd_pairwise` is not
+    /// defined on 64-bit lanes and the sum cannot exceed `16 * 255`; `uwiden_low`
+    /// then both selects the live lanes and supplies the required zero halves.
     ///
     /// [`Spec::SumOfAbsoluteDifferences`]
     pub(super) fn try_psadbw_spec(&mut self, instruction: &Instruction) -> crate::Result<bool> {
@@ -302,16 +287,14 @@ impl<'a> Lifter<'a> {
 
     /// `PMULUDQ` / `PMULDQ` - widening multiply of the even dword lanes.
     ///
-    /// The portable path masks or sign-extends each 64-bit lane down to its
-    /// even dword and then does a full `I64X2` `imul` - an operation aarch64
-    /// has no instruction for at all, and which Cranelift expands into a
-    /// seven-instruction `rev64`/`mul`/`xtn`/`addp`/`shll`/`umlal` sequence.
+    /// The portable path masks each 64-bit lane down to its even dword and does a
+    /// full `I64X2` `imul`, which aarch64 has no instruction for and Cranelift
+    /// expands into seven.
     ///
     /// Instead, gather each operand's even dwords into its low half with a
-    /// `UZP1`-shaped shuffle, and multiply the widened low halves. Written that
-    /// way - both operands widened on the *same* side - the backend recognizes
-    /// a widening multiply and emits `UMULL`/`SMULL`, which is precisely this
-    /// instruction. Three instructions in total.
+    /// `UZP1`-shaped shuffle and multiply the widened low halves. Written with both
+    /// operands widened on the *same* side, the backend recognizes a widening
+    /// multiply and emits `UMULL`/`SMULL` - three instructions in total.
     ///
     /// [`Spec::WideningEvenMultiply`]
     pub(super) fn try_pmuldq_spec(
@@ -355,20 +338,16 @@ impl<'a> Lifter<'a> {
     /// `PMULHRSW` - signed word multiply keeping the rounded high 17 bits,
     /// `(((a * b) >> 14) + 1) >> 1`.
     ///
-    /// aarch64 only. Cranelift has an exact `x86_pmulhrsw` opcode, but - like
-    /// `x86_pmaddubsw` - its x86-64 rule is gated on `has_ssse3`, which the
-    /// baseline `x86_64` feature set leaves off; and the portable expansion is
-    /// already three instructions there, so there is nothing to win.
+    /// aarch64 only. Cranelift's exact `x86_pmulhrsw` is gated on `has_ssse3` like
+    /// `x86_pmaddubsw`, and the portable expansion is already three instructions on
+    /// x86-64, so there is nothing to win there.
     ///
-    /// On aarch64 this is `SQRDMULH` plus a fixup. Cranelift's
-    /// `sqmul_round_sat` computes `signed_saturate((x*y + 0x4000) >> 15)`,
-    /// which is the same arithmetic - but x86 *truncates* the result to 16 bits
-    /// where `SQRDMULH` *saturates*, and there is exactly one input pair where
-    /// that shows: `-32768 * -32768` gives `0x8000` (`-32768`) on x86 and
-    /// `0x7FFF` after saturation. Both operand lanes must be the minimum for it
-    /// to arise, so the fixup is two compares, an AND and a select - and the
-    /// whole sequence is still shorter than the portable widen/shift/round/narrow
-    /// expansion it replaces.
+    /// On aarch64 this is `SQRDMULH` plus a fixup: `sqmul_round_sat` computes the
+    /// same `(x*y + 0x4000) >> 15`, but x86 *truncates* to 16 bits where `SQRDMULH`
+    /// *saturates*, and exactly one input pair shows it - `-32768 * -32768` gives
+    /// `0x8000` on x86 and `0x7FFF` after saturation. Both lanes must be the
+    /// minimum, so the fixup is two compares, an AND and a select, and the whole
+    /// sequence is still shorter than the portable expansion.
     ///
     /// [`Spec::RoundedMultiplyHigh`]
     pub(super) fn try_pmulhrsw_spec(&mut self, instruction: &Instruction) -> crate::Result<bool> {

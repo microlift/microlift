@@ -1,44 +1,24 @@
 //! Runtime-supplied **bridges**: the third import kind.
 //!
-//! A fast import ([`LifterConfig::register_fast_import`]) inlines a real
-//! Cranelift `call` to the host function, marshaling arguments out of the guest
-//! register file. That requires the callee's signature to be expressible as
-//! [`FunctionArgumentType`](crate::function_traits::FunctionArgumentType)s and
-//! placeable by a [`CallAbi`](crate::core::abi::CallAbi) - which rules out
-//! variadics, struct-by-value, and anything else the descriptor cannot spell.
-//! Those imports are demoted to an `ImportedFunctionCall` VM exit today.
-//!
-//! A **bridge** removes that restriction. Instead of reproducing the callee's
-//! signature, the lifter calls one runtime-supplied trampoline with a fixed
-//! signature and hands it the whole guest context:
+//! A fast import inlines a real Cranelift `call`, which requires the callee's
+//! signature to be expressible as a
+//! [`FunctionArgumentType`](crate::function_traits::FunctionArgumentType) list
+//! placeable by a [`CallAbi`](crate::core::abi::CallAbi) - ruling out variadics
+//! and struct-by-value. A **bridge** drops that: the lifter calls one
+//! runtime-supplied trampoline with a fixed signature and hands it the context.
 //!
 //! ```text
 //! extern "C" fn(ctx: *mut RegisterContext, import_va: u64) -> u32
 //! ```
 //!
-//! The bridge reads whatever it needs out of `ctx`, does the call (or the
-//! redirect, or the error), writes results back into `ctx`, and returns:
+//! The return value is the protocol: **0** = handled, reload the declared
+//! clobbers and fall through inline with no VM exit; **non-zero** = return now,
+//! leaving `exit_reason`/`exit_code` as the bridge wrote them;
+//! [`RESUME_LINKED`] = return now, *and* the exit is linkable, so a bridged
+//! indirect call into guest code needs no host round trip.
 //!
-//! - **0** - handled. The lifted code reloads the declared clobbers from the
-//!   context and **falls through inline**; the block is not terminated and no
-//!   VM exit occurs. This is the common case, and it costs one call.
-//! - **non-zero** - the runtime wants out. The lifted code returns immediately,
-//!   leaving `exit_reason` / `exit_code` exactly as the bridge wrote them. This
-//!   covers everything a slow `ImportedFunctionCall` exit covers today: an ABI
-//!   error the runtime stops on, `longjmp`, a control redirect, or a transfer
-//!   into another guest image.
-//! - [`RESUME_LINKED`] - a particular non-zero: the runtime wants out, and
-//!   the only thing left to do is continue at the `rip` it has written. Where
-//!   block linking is on, the lifted code probes the link table for that address
-//!   before returning, so a bridged indirect call into guest code - a C++
-//!   virtual call, which is a quarter of all exits in a real program - can be
-//!   resolved without a host round trip. Any other non-zero value returns
-//!   unconditionally, which is what a bridge that has parked an error, or that
-//!   wants its exit serviced, must do.
-//!
-//! `import_va` is passed as a second argument so one compiled bridge per symbol
-//! serves every stub and slot that names it - the runtime keeps its own side
-//! table rather than the lifter compiling N bridges for N call sites.
+//! `import_va` is a second argument so one compiled bridge per symbol serves
+//! every stub and slot that names it.
 //!
 //! [`LifterConfig::register_fast_import`]: crate::core::LifterConfig::register_fast_import
 
@@ -47,14 +27,14 @@ use std::sync::atomic::AtomicPtr;
 /// The bridge return value meaning "exit, and you may link".
 ///
 /// Distinct from a bare non-zero because the two differ in what the host is
-/// still owed. An ordinary exit may have an error parked on the thread, a call
+/// still owed: an ordinary exit may have an error parked on the thread, a call
 /// left to service, or a `rip` that is a resume point rather than a
-/// destination - and a link would skip the host that was supposed to notice.
-/// This value asserts the opposite: guest state is complete, `rip` is where
-/// execution continues, and nothing is waiting.
+/// destination, and a link would skip the host that was supposed to notice.
+/// This value asserts guest state is complete and `rip` is where execution
+/// continues.
 ///
-/// Two, not one, so that a bridge written before this existed - returning `1`
-/// for every exit - keeps exactly the behaviour it had.
+/// Two rather than one so a bridge written before this existed keeps its
+/// behaviour.
 pub const RESUME_LINKED: u32 = 2;
 
 /// Where the lifted code finds the bridge function's address.
@@ -63,44 +43,35 @@ pub enum BridgeTarget {
     /// Baked into the code as an `iconst`. Immutable for the life of the
     /// compiled region, one call, no load.
     Direct(*const u8),
-    /// Loaded from a runtime-owned slot immediately before each call: one
-    /// dependent load, and the runtime can re-point the slot at any time
-    /// without re-lifting anything.
+    /// Loaded from a runtime-owned slot immediately before each call: one dependent
+    /// load, and the runtime can re-point the slot without re-lifting anything.
     ///
-    /// The emitted load is deliberately **not** marked `readonly`, so Cranelift
-    /// may not hoist it out of a loop or CSE it across the call. The read side
-    /// is a plain (relaxed) load; publication on the runtime side must be a
-    /// **release** store. That is sound on both supported hosts: x86-64 stores
-    /// are release-ordered, and on aarch64 the address dependency between this
-    /// load and the `call_indirect` that consumes it orders the callee's code
-    /// and data against the publishing store.
+    /// The load is deliberately **not** `readonly`, so Cranelift may not hoist it
+    /// out of a loop or CSE it across the call. The read is a relaxed load;
+    /// publication must be a **release** store. Sound on both hosts: x86-64 stores
+    /// are release-ordered, and on aarch64 the address dependency to the
+    /// `call_indirect` orders the callee's code and data against the store.
     Slot(*const AtomicPtr<()>),
 }
 
 /// Which parts of the guest register file a bridge touches.
 ///
-/// The lifter stores only `reads` into the `RegisterContext` before the call
-/// and reloads only `writes` after it; registers outside `writes` keep their
-/// SSA values across the call site. For a bridge specialized to, say,
-/// `int foo(int, char *)` that is two stores and one reload instead of a full
-/// context sync.
+/// Only `reads` is stored into the context before the call and only `writes`
+/// reloaded after; registers outside `writes` keep their SSA values. For a
+/// bridge specialized to `int foo(int, char *)` that is two stores and one
+/// reload instead of a full context sync. Defaults to [`BridgeEffects::full`],
+/// which is what the slow exit already pays, so a bridge is never slower than
+/// the exit it replaces.
 ///
-/// The default is [`BridgeEffects::full`] - everything read, everything
-/// clobbered - which is the same cost the slow `ImportedFunctionCall` exit pays
-/// today, so a bridge is never slower than the exit it replaces.
-///
-/// **This is not `sync_to_context_selective`.** That method (see
-/// `arch/x86_64/sync.rs`, marked *DANGEROUS - DO NOT USE*) is unsound because
-/// its dirty set is an emission-order side effect that misses loop-carried
-/// writes, i.e. it reasons - wrongly - about the whole CFG. A `RegMask` here is
-/// *declared by the callee* and applied at exactly one call site with no CFG
-/// reasoning at all: "store these variables now, reload these after". Different
-/// mechanism entirely.
+/// **This is not `sync_to_context_selective`** (`arch/x86_64/sync.rs`, marked
+/// *DANGEROUS - DO NOT USE*), which infers a dirty set from emission order and
+/// misses loop-carried writes. A `RegMask` is *declared by the callee* and
+/// applied at one call site with no CFG reasoning at all.
 ///
 /// Getting a mask wrong is still a correctness bug, just a local one: a
-/// register the bridge reads but did not declare in `reads` is stale in the
-/// context, and one it clobbers but did not declare in `writes` keeps its stale
-/// SSA value afterwards. When in doubt, widen the mask.
+/// register read but not declared in `reads` is stale in the context, and one
+/// clobbered but not in `writes` keeps its stale SSA value. When in doubt,
+/// widen the mask.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BridgeEffects {
     /// Guest state the bridge reads out of the context. Written to the context
@@ -135,13 +106,12 @@ impl Default for BridgeEffects {
     }
 }
 
-/// A set of guest registers, as a bitmask over the guest frontend's canonical
+/// A set of guest registers, as a bitmask over the frontend's canonical
 /// register indices.
 ///
-/// For x86-64 the GPR bit order is the architectural encoding order
-/// (`RAX`=0, `RCX`=1, `RDX`=2, `RBX`=3, `RSP`=4, `RBP`=5, `RSI`=6, `RDI`=7,
-/// `R8`..`R15`=8..15) and the vector bits are `XMM0`..`XMM15`. Build masks with
-/// the helpers in [`crate::arch::x86_64::abi`] rather than by writing raw bits.
+/// For x86-64 the GPR bit order is the architectural encoding order (`RAX`=0
+/// through `R15`=15) and the vector bits are `XMM0`..`XMM15`. Build masks with
+/// the helpers in [`crate::arch::x86_64::abi`], not by writing raw bits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RegMask {
     /// Bit `i` selects general-purpose register `i`.
@@ -254,10 +224,8 @@ impl Default for RegMask {
 }
 
 /// A runtime-supplied bridge registered for one import address (or for the
-/// indirect-call / tail-jump dispatch as a whole).
-///
-/// See the [module docs](self) for the calling contract and the meaning of the
-/// return value.
+/// indirect-call / tail-jump dispatch as a whole). See the [module docs](self)
+/// for the calling contract.
 #[derive(Debug, Clone)]
 pub struct BridgeImport {
     /// Diagnostic name; not used for linkage.
@@ -314,20 +282,16 @@ pub enum ImportKind {
 
 /// A lift-time view of which addresses are imports.
 ///
-/// The engine queries this **per direct-call instruction while lifting**,
-/// rather than snapshotting a map when the [`LifterConfig`] is built. That is
-/// what makes `dlopen`/`dlsym` work without re-plumbing the lifter: a region
-/// lifted *before* a `dlopen` contains no calls into that image (the image did
-/// not exist), so nothing already compiled needs patching - what matters is
-/// that a region lifted *after* the `dlopen` sees the new sites, which it does
-/// as soon as the runtime's own view has them.
+/// Queried **per direct-call instruction while lifting** rather than
+/// snapshotted when the [`LifterConfig`] is built, which is what makes
+/// `dlopen`/`dlsym` work without re-plumbing anything: a region lifted before a
+/// `dlopen` contains no calls into that image, so nothing compiled needs
+/// patching, and a region lifted after it sees the new sites.
 ///
-/// The residual case - a slot that rebinds underneath code that is already
-/// compiled - is covered by [`BridgeTarget::Slot`], which reloads the target
-/// before every call and so needs no re-lift either.
+/// A slot that rebinds underneath already-compiled code is covered by
+/// [`BridgeTarget::Slot`], which reloads before every call.
 ///
-/// Lifting is not the hot path, so a virtual call per direct call site is free;
-/// back this with the runtime's existing loader view instead of copying it.
+/// Lifting is not the hot path, so a virtual call per call site is free.
 ///
 /// [`LifterConfig`]: crate::core::LifterConfig
 pub trait ImportRegistry: std::fmt::Debug + Send + Sync {

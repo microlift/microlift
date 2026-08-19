@@ -1,25 +1,21 @@
 //! Shared exit/control state exchanged between lifted guest code and the host.
 //!
-//! [`ControlHeader`] is the definition of the control fields every guest
-//! exposes (`exit_reason`, `exit_code`, `imported_function_va`, `image_base`),
-//! and every guest's `RegisterContext` embeds it as its `control` field -
-//! one struct, not two declarations that have to be kept in agreement. Each
-//! context also derefs to it, so a host that wrote `ctx.exit_reason` before the
-//! header existed still does.
+//! [`ControlHeader`] defines the control fields every guest exposes
+//! (`exit_reason`, `exit_code`, `imported_function_va`, `image_base`), and every
+//! guest's `RegisterContext` embeds it as its `control` field - one struct
+//! rather than two declarations to keep in agreement. Each context derefs to
+//! it, so `ctx.exit_reason` still resolves.
 //!
-//! The generic engine reaches the fields only through the arch's offset
-//! accessors ([`GuestArch::exit_reason_offset`] etc.), so the host's
-//! exit/dispatch loop reads why a region exited without knowing which guest ISA
-//! produced it. The per-arch register banks (and the architectural PC) live
-//! alongside the header in the arch-specific context struct.
+//! The engine reaches the fields only through the arch's offset accessors
+//! ([`GuestArch::exit_reason_offset`] etc.), so the host's dispatch loop reads
+//! exit state without knowing which guest ISA produced it.
 //!
 //! [`GuestArch::exit_reason_offset`]: crate::core::GuestArch::exit_reason_offset
 
 /// Architecture-neutral control fields shared by every guest's register
-/// context, embedded `#[repr(C)]` in each of them. The engine accesses them
-/// through the arch's offset accessors, so the host reads exit state uniformly
-/// across guests; `core::exit::tests::both_guests_locate_the_same_header` is
-/// what holds those accessors to this struct.
+/// context, embedded `#[repr(C)]` in each of them.
+/// `core::exit::tests::both_guests_locate_the_same_header` is what holds the
+/// per-arch offset accessors to this struct.
 #[repr(C)]
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ControlHeader {
@@ -38,9 +34,8 @@ pub struct ControlHeader {
 impl ControlHeader {
     /// An all-zero header: no exit reason, no callee, no image base.
     ///
-    /// Spelled as a `const` rather than reached through [`Default`] so a guest
-    /// context's own `Default` stays a plain struct literal usable in `const`
-    /// context.
+    /// A `const` rather than [`Default`] so a guest context's own `Default` stays
+    /// a plain struct literal usable in `const` context.
     pub const ZERO: Self = Self {
         exit_reason: 0,
         exit_code: 0,
@@ -67,30 +62,26 @@ pub enum ExitReason {
     /// The code that was about to be executed did not decode as a
     /// valid guest instruction.
     InvalidInstruction = 5,
-    /// A `CALL` to a registered import address was intercepted (and the import
-    /// either had no fast-call metadata or has a variadic/unsupported ABI).
+    /// A `CALL` to a registered import address was intercepted (the import had no
+    /// fast-call metadata, or a variadic/unsupported ABI).
     ///
-    /// `ControlHeader::imported_function_va` holds the callee address. The PC
-    /// field holds the address of the instruction after the `CALL` - the resume
-    /// point once the host has handled the call.
+    /// `ControlHeader::imported_function_va` holds the callee; the PC field holds
+    /// the instruction after the `CALL`, i.e. the resume point.
     ///
-    /// **The stack pointer is unchanged.** The host is expected to call the
-    /// target as a native C function and then resume the guest at the PC.
+    /// **The stack pointer is unchanged.** The host calls the target as a native C
+    /// function and resumes the guest at the PC.
     ImportedFunctionCall = 6,
 
     /// An indirect `CALL` (via register or memory) to an address that was not
     /// registered as an import.
     ///
-    /// `ControlHeader::imported_function_va` holds the runtime-resolved callee
-    /// address. The PC field holds the resume point (the instruction after the
-    /// `CALL`).
+    /// `ControlHeader::imported_function_va` holds the runtime-resolved callee; the
+    /// PC field holds the resume point.
     ///
-    /// **The stack pointer is unchanged.** The host must decide how to dispatch
-    /// the callee:
-    /// - If the target is a **native function**, call it via C and resume at the
-    ///   PC - no stack adjustment is needed.
-    /// - If the target is **guest code**, push the return address before
-    ///   re-entering the guest so the callee's eventual `RET` finds it.
+    /// **The stack pointer is unchanged.** The host dispatches: for a **native**
+    /// target, call it via C and resume at the PC with no stack adjustment; for
+    /// **guest code**, push the return address before re-entering so the callee's
+    /// `RET` finds it.
     IndirectCall = 7,
 
     /// A `UD2`/equivalent invalid-opcode trap was executed intentionally (e.g.
@@ -103,11 +94,9 @@ pub enum ExitReason {
     /// advancing the PC past the instruction before re-entering the guest.
     Breakpoint = 9,
 
-    /// A `CPUID` instruction was executed. This is a resumable VM exit: the PC
-    /// points to the instruction *after* `CPUID` (the resume point). `rax` and
-    /// `rcx` hold the leaf and sub-leaf inputs. The runtime should populate
-    /// `rax`, `rbx`, `rcx`, and `rdx` with the desired CPUID response and
-    /// re-enter the guest at the PC.
+    /// A `CPUID` instruction was executed. Resumable: the PC points *after*
+    /// `CPUID`, `rax`/`rcx` hold the leaf and sub-leaf. The runtime populates
+    /// `rax`/`rbx`/`rcx`/`rdx` and re-enters at the PC.
     Cpuid = 10,
 
     /// An `XGETBV` instruction was executed. This is a resumable VM exit: the
@@ -116,36 +105,31 @@ pub enum ExitReason {
     /// `rdx` (bits 63:32) with the value of XCR[rcx] and re-enter at the PC.
     Xgetbv = 11,
 
-    /// A software interrupt was raised by `INT imm8`, `INT1`/`ICEBP`, or `INTO`
-    /// (the latter only when `OF=1`). The interrupt vector is stored in
-    /// `ControlHeader::exit_code` (e.g. `0x80` for `INT 0x80`, `1` for `INT1`,
-    /// `4` for a taken `INTO`). The PC points to the instruction *after* the
-    /// `INT`, matching the return address a real CPU would push: the host
-    /// services the vector and re-enters the guest at the PC to resume.
+    /// A software interrupt from `INT imm8`, `INT1`/`ICEBP`, or `INTO` (the last
+    /// only when `OF=1`). The vector is in `ControlHeader::exit_code`. The PC
+    /// points *after* the `INT`, matching the return address a real CPU would push:
+    /// the host services the vector and re-enters at the PC.
     ///
-    /// Note that `INT3` (the dedicated `0xCC` breakpoint opcode) reports
-    /// [`ExitReason::Breakpoint`] instead, so debuggers can distinguish it from
-    /// a general software interrupt.
+    /// `INT3` (the dedicated `0xCC` opcode) reports [`ExitReason::Breakpoint`]
+    /// instead, so debuggers can tell it apart.
     Interrupt = 12,
 
-    /// An I/O port *input* string instruction (`INSB`/`INSW`/`INSD`) was
-    /// executed. Port I/O cannot be performed from the lifted code, so this is
-    /// a VM exit and the host must emulate the access in full. The PC points
-    /// *at* the instruction; `exit_code` holds the element size in bytes (1, 2,
-    /// or 4). The source port number is in `DX`, the destination is `ES:[RDI]`,
-    /// and the host must honour `DF` (and `RCX` when the instruction carried a
-    /// `REP` prefix) when advancing `RDI`/`RCX`. After servicing the access the
-    /// host advances the PC past the instruction and re-enters the guest.
+    /// An I/O port *input* string instruction (`INSB`/`INSW`/`INSD`). Port I/O
+    /// cannot be performed from lifted code, so the host emulates it in full.
+    ///
+    /// The PC points *at* the instruction; `exit_code` holds the element size (1,
+    /// 2 or 4). Port in `DX`, destination `ES:[RDI]`. The host must honour `DF`
+    /// (and `RCX` under a `REP` prefix) when advancing `RDI`/`RCX`, then advance
+    /// the PC past the instruction and re-enter.
     PortInput = 13,
 
-    /// An I/O port *output* string instruction (`OUTSB`/`OUTSW`/`OUTSD`) was
-    /// executed. As with [`ExitReason::PortInput`], port I/O cannot be performed
-    /// from the lifted code, so the host must emulate the access in full. The PC
-    /// points *at* the instruction; `exit_code` holds the element size in bytes
-    /// (1, 2, or 4). The destination port number is in `DX`, the source is
-    /// `DS:[RSI]`, and the host must honour `DF` (and `RCX` when the instruction
-    /// carried a `REP` prefix) when advancing `RSI`/`RCX`. After servicing the
-    /// access the host advances the PC past the instruction and re-enters.
+    /// An I/O port *output* string instruction (`OUTSB`/`OUTSW`/`OUTSD`). As with
+    /// [`ExitReason::PortInput`], the host emulates the access in full.
+    ///
+    /// The PC points *at* the instruction; `exit_code` holds the element size (1,
+    /// 2 or 4). Port in `DX`, source `DS:[RSI]`. The host must honour `DF` (and
+    /// `RCX` under a `REP` prefix) when advancing `RSI`/`RCX`, then advance the PC
+    /// past the instruction and re-enter.
     PortOutput = 14,
 
     /// An `RDTSC` instruction was executed. This is a resumable VM exit: the PC
@@ -154,11 +138,9 @@ pub enum ExitReason {
     /// timestamp-counter value and re-enter the guest at the PC.
     Rdtsc = 15,
 
-    /// A `DIV`/`IDIV` raised a divide error (#DE): either the divisor was zero
-    /// or the quotient did not fit in the destination. This is a fault, so the
-    /// PC points *at* the faulting `DIV`/`IDIV` (not past it) and no guest
-    /// registers have been modified. The host delivers #DE (interrupt vector 0)
-    /// to the guest.
+    /// A `DIV`/`IDIV` raised a divide error (#DE) - divisor zero, or a quotient
+    /// that did not fit. A fault: the PC points *at* the faulting instruction and
+    /// no guest registers have been modified. The host delivers #DE (vector 0).
     DivideError = 16,
 }
 
@@ -230,11 +212,10 @@ impl std::fmt::Display for ExitReason {
     }
 }
 
-/// Describes what kind of guest control transfer caused an `UnknownJump` VM exit.
+/// What kind of guest control transfer caused an `UnknownJump` VM exit.
 ///
-/// Stored in `ControlHeader::exit_code` whenever `exit_reason == UnknownJump`.
-/// Other exit reasons give `exit_code` their own meaning (e.g.
-/// `UnimplementedInstruction` stores the raw guest opcode there).
+/// Stored in `ControlHeader::exit_code` whenever `exit_reason == UnknownJump`;
+/// other reasons give that field their own meaning.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -258,22 +239,21 @@ pub enum TransferKind {
     /// lifted region, so the lifter never saw all of it and refused to guess.
     ///
     /// Only [`LifterConfig::region_tail_exit`] produces this, and only for a
-    /// variable-length guest. Nothing has happened yet: the PC is the address of
-    /// that instruction, no guest state past the previous instruction has
+    /// variable-length guest. Nothing has happened yet: the PC is that
+    /// instruction's address, no guest state past the previous instruction has
     /// changed, and the stack is untouched. The host lifts a fresh region
-    /// **starting at the PC** - which is guaranteed to contain the whole
-    /// instruction, since a region always holds at least its own first one - and
-    /// re-enters.
+    /// **starting at the PC** - guaranteed to contain the whole instruction, since
+    /// a region always holds its own first one - and re-enters.
     ///
     /// [`LifterConfig::region_tail_exit`]: crate::core::LifterConfig::region_tail_exit
     RegionTail = 6,
-    /// The region was entered at a PC that is not one of its resume points, so
-    /// the entry dispatch declined to start anywhere.
+    /// The region was entered at a PC that is not one of its resume points, so the
+    /// entry dispatch declined to start anywhere.
     ///
-    /// Only [`LifterConfig::strict_resume`] produces this, and it is reached
-    /// before any guest instruction is lifted: the PC is exactly what the host
-    /// set, and no register, flag or stack slot has changed. The host translates
-    /// a region beginning at that PC and enters that one instead.
+    /// Only [`LifterConfig::strict_resume`] produces this, and it is reached before
+    /// any guest instruction is lifted: the PC is exactly what the host set and no
+    /// register, flag or stack slot has changed. The host translates a region
+    /// beginning at that PC and enters that instead.
     ///
     /// [`LifterConfig::strict_resume`]: crate::core::LifterConfig::strict_resume
     NoResumePoint = 7,
@@ -401,13 +381,9 @@ mod tests {
     use crate::core::GuestArch;
     use std::mem::offset_of;
 
-    /// Every guest's control fields are the *same* struct, not two structs that
-    /// happen to agree - so each arch's `GuestArch` offsets must be its own
-    /// header's base plus the header's own field offsets.
-    ///
-    /// This is what the abstraction is for: before the header was embedded,
-    /// both contexts declared the four fields inline and nothing checked that
-    /// they stayed in step.
+    /// Every guest's control fields are the *same* struct, not two that happen to
+    /// agree - so each arch's `GuestArch` offsets must be its own header's base
+    /// plus the header's own field offsets.
     #[test]
     fn both_guests_locate_the_same_header() {
         macro_rules! check {

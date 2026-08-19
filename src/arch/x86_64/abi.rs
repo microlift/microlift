@@ -58,15 +58,14 @@ pub fn xmm_mask(indices: &[u8]) -> RegMask {
     mask
 }
 
-/// The [`BridgeEffects`] for a bridge that follows a described guest calling
+/// The [`BridgeEffects`] for a bridge following a described guest calling
 /// convention: it reads the argument registers `abi` would place `arg_types`
 /// in, and clobbers the return register plus the flags.
 ///
-/// A convenience for the common case - it is *not* a safety net. It cannot know
-/// about a callee that reads memory the guest owns, walks a varargs list, or
-/// (like most real C functions) clobbers the caller-saved registers the guest
-/// still cares about, so start from [`BridgeEffects::full`] and narrow
-/// deliberately if you are not sure. `None` when `abi` cannot place every
+/// A convenience, **not** a safety net - it cannot know about a callee that
+/// reads guest memory, walks a varargs list, or clobbers caller-saved
+/// registers the guest still cares about. Start from [`BridgeEffects::full`]
+/// and narrow deliberately if unsure. `None` when `abi` cannot place every
 /// argument, which is exactly when a hand-written mask is required.
 pub fn abi_bridge_effects(
     abi: &CallAbi,
@@ -138,12 +137,11 @@ impl CallAbi {
         }
     }
 
-    /// Microsoft x64 (the single convention 64-bit Windows uses - what `stdcall`,
-    /// `fastcall` and `cdecl` all collapse to when compiled for x86-64).
+    /// Microsoft x64 - the single convention 64-bit Windows uses.
     ///
-    /// Four positional argument slots: RCX/RDX/R8/R9 for integers, XMM0–XMM3 for
-    /// floats, and an FP argument consumes the integer slot at its position (and
-    /// vice versa). Arguments five and up go on the stack above the caller's
+    /// Four positional argument slots: RCX/RDX/R8/R9 for integers, XMM0-XMM3 for
+    /// floats, with an FP argument consuming the integer slot at its position and
+    /// vice versa. Arguments five and up go on the stack above the caller's
     /// 32-byte shadow space. Integer returns in RAX, FP returns in XMM0.
     pub fn win64() -> Self {
         Self {

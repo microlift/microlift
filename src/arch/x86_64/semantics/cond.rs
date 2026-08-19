@@ -52,9 +52,7 @@ impl Cond {
     /// The condition this one is the negation of, paired with whether that
     /// negation is in effect. `(Self::Le, true)` for [`Cond::G`], and so on.
     ///
-    /// The positive member of each pair is the one whose expression is cheaper
-    /// to build, which for the four flag-pair conditions means the one that
-    /// needs no final complement.
+    /// The positive member of each pair is the one that needs no final complement.
     fn base(self) -> (Base, bool) {
         match self {
             Cond::O => (Base::Of, false),

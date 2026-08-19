@@ -45,9 +45,7 @@
 use microlift::context::TransferKind;
 use microlift::testkit::prelude::*;
 
-// ---------------------------------------------------------------------------
 // Test helpers
-// ---------------------------------------------------------------------------
 
 /// Lift `bytes` at VA `0x1000`, compile with the JIT backend, run with `ctx`,
 /// and return the updated context.
@@ -74,9 +72,7 @@ fn compile_and_run_with_stack(bytes: &[u8], ctx: RegisterContext) -> (RegisterCo
     (out.ctx, out.initial_rsp)
 }
 
-// ---------------------------------------------------------------------------
 // Bug 1: out-of-region direct CALL does not push return address
-// ---------------------------------------------------------------------------
 
 /// An out-of-region `CALL` must:
 ///   1. Decrement RSP by 8.
@@ -194,9 +190,7 @@ fn test_out_of_region_call_exit_metadata_is_correct() {
     assert_eq!(ctx.rip, 0x1005);
 }
 
-// ---------------------------------------------------------------------------
 // Bug 2: PUSH imm8 (Immediate8to64) sign-extension
-// ---------------------------------------------------------------------------
 
 /// `push imm8` (opcode `6A`) sign-extends the 8-bit operand to 64 bits.
 /// `push -1` (`6A FF`) must store `0xFFFF_FFFF_FFFF_FFFF` on the stack.
@@ -290,9 +284,7 @@ fn test_push_positive_imm8_unaffected() {
     assert_eq!(ctx.rax, 1u64);
 }
 
-// ---------------------------------------------------------------------------
 // IndirectCall exit reason contract
-// ---------------------------------------------------------------------------
 
 /// `CALL RAX` (indirect call via register) exits with `ExitReason::IndirectCall`.
 /// RSP is intentionally left unchanged - the host decides whether to dispatch
@@ -365,9 +357,7 @@ fn test_indirect_call_via_mem_exits_with_indirect_call_reason() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // Baseline: in-region CALL/RET correctly maintains RSP (should always pass)
-// ---------------------------------------------------------------------------
 
 /// An in-region `CALL` must decrement RSP and push the return address, and
 /// the matching `RET` must pop it.  RSP must be balanced across the pair.

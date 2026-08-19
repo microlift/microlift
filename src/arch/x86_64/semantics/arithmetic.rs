@@ -47,14 +47,9 @@ impl<'a> Lifter<'a> {
         // operand writes below are ordered against each other, not against them.
         let result = self.add_with_flags(dst_val, src_val, size)?;
         // Hardware order: TEMP <- SRC + DEST; SRC <- DEST; DEST <- TEMP. The
-        // destination write must come last so `xadd r, r` (same register both
-        // ways) ends up holding the sum, not the old value.
-        //
-        // A memory destination used to need the opposite order, because
-        // `write_operand` re-derived the effective address and so would have
-        // seen the source register after this instruction overwrote it. The
-        // address is now frozen in `place` before either write, so one order
-        // serves both operand kinds.
+        // destination write must come last so `xadd r, r` ends up holding the sum,
+        // not the old value. `place` froze the address, so one order serves both
+        // operand kinds.
         self.set_reg_val(src_reg, dst_val)?;
         self.write_place(place, result)
     }
@@ -107,15 +102,12 @@ impl<'a> Lifter<'a> {
                 let rax = self.get_reg_val(Register::RAX)?;
                 let src = self.read_operand(instruction, 0, size)?;
 
-                // `rax` is the whole 64-bit register and needs narrowing;
-                // `src` was read at the operand's own width and usually does
-                // not. See [`Lifter::narrow_to`].
+                // `rax` is the whole 64-bit register and needs narrowing; `src` was read at
+                // the operand's own width and usually does not.
                 let rax_narrow = self.narrow_to(ty, rax);
                 let src_narrow = self.narrow_to(ty, src);
 
-                // Low half
                 let lo = self.builder.ins().imul(rax_narrow, src_narrow);
-                // High half (signed)
                 let hi = self.builder.ins().smulhi(rax_narrow, src_narrow);
 
                 // Write results based on size:
@@ -211,8 +203,8 @@ impl<'a> Lifter<'a> {
                     _ => unreachable!(),
                 };
                 let acc = self.get_reg_val(acc_reg)?;
-                // `acc_reg` is AX/EAX/RAX, so this is already the operand's
-                // width - but say so rather than assume it.
+                // Already the operand's width, since `acc_reg` is AX/EAX/RAX - say so rather
+                // than assume it.
                 let acc_narrow = self.narrow_to(ty, acc);
                 let lo = self.builder.ins().imul(acc_narrow, src);
                 let hi = self.builder.ins().umulhi(acc_narrow, src);
@@ -384,15 +376,14 @@ impl<'a> Lifter<'a> {
             .ins()
             .brif(overflow, de_block, &[], after_ovf, &[]);
 
-        // Fault path first: emit the #DE exit so `de_block` is terminated before
-        // we switch away to the continuation (the frontend forbids leaving an
-        // unfilled block).
+        // Fault path first, so `de_block` is terminated before we switch away (the
+        // frontend forbids leaving an unfilled block).
         self.builder.switch_to_block(de_block);
         self.builder.seal_block(de_block);
         self.emit_divide_error(instruction)?;
 
-        // Non-faulting path: commit quotient and remainder, then leave the
-        // builder here so the engine keeps lifting from the continuation.
+        // Non-faulting path: commit quotient and remainder, and leave the builder
+        // here so the engine keeps lifting from the continuation.
         self.builder.switch_to_block(after_ovf);
         self.builder.seal_block(after_ovf);
         let quot_n = self.builder.ins().ireduce(ty, quot);
@@ -439,10 +430,9 @@ impl<'a> Lifter<'a> {
             self.builder.ins().uextend(i128, o)
         };
 
-        // Count leading zeros using the two native 64-bit CLZ operations. A
-        // zero dividend has clz=128; it is handled by the n < d fast path
-        // below, but the select also keeps the normalization shift in range
-        // for the benefit of IR validation and targets with strict shifts.
+        // Two native 64-bit CLZ ops. A zero dividend has clz=128, handled by the
+        // n < d fast path below; the select also keeps the normalization shift in
+        // range for IR validation and targets with strict shifts.
         let hi = self.builder.ins().ushr_imm_u(n, 64);
         let hi = self.builder.ins().ireduce(types::I64, hi);
         let lo = self.builder.ins().ireduce(types::I64, n);
@@ -476,9 +466,8 @@ impl<'a> Lifter<'a> {
         self.builder.append_block_param(fast_exit, i128); // q = 0
         self.builder.append_block_param(fast_exit, i128); // r = n
 
-        // Since d is known non-zero at the call site, n < d is already a
-        // complete result. This is especially useful for the common small
-        // dividend cases and avoids entering the loop at all.
+        // d is known non-zero at the call site, so n < d is already a complete
+        // result - and avoids entering the loop at all for small dividends.
         self.builder.ins().brif(
             n_lt_d,
             fast_exit,

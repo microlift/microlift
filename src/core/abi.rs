@@ -1,24 +1,18 @@
 //! Guest calling-convention descriptors for fast-import calls.
 //!
-//! A fast import is a guest `CALL` into a host function that the lifter turns
-//! into an inline Cranelift call. Doing that requires knowing **where the guest
-//! put the arguments** - which is a property of the ABI the *guest binary* was
-//! compiled for, not of the host we happen to be running on. A guest compiled
-//! for Windows passes its first integer argument in RCX; a SysV guest uses RDI.
+//! Turning a guest `CALL` into an inline Cranelift call requires knowing **where
+//! the guest put the arguments** - a property of the ABI the *guest binary* was
+//! compiled for, not of the host. A Windows guest passes its first integer
+//! argument in RCX; a SysV guest uses RDI.
 //!
-//! [`CallAbi`] is that description, supplied per registered import (see
-//! [`LifterConfig::register_fast_import`](crate::core::LifterConfig::register_fast_import)),
-//! so a single lifted region can mix imports using different conventions.
-//! Ready-made descriptors for x86-64 live in [`crate::arch::x86_64::abi`].
+//! [`CallAbi`] is that description, supplied per registered import, so one
+//! lifted region can mix conventions. x86-64 presets live in
+//! [`crate::arch::x86_64::abi`].
 //!
-//! Note the two independent conventions in play:
-//!
-//! - The **guest** ABI ([`CallAbi`]'s register/stack lists) says where to *read*
-//!   argument values from the guest register file and stack.
-//! - The **host** ABI ([`CallAbi::host_call_conv`]) is the Cranelift
-//!   [`CallConv`] of the native function being called, i.e. how Cranelift should
-//!   place those values when it emits the call. It defaults to the host's
-//!   convention ([`crate::os::get_host_calling_conv`]).
+//! Two independent conventions are in play: the **guest** ABI ([`CallAbi`]'s
+//! register/stack lists) says where to *read* argument values from, while the
+//! **host** ABI ([`CallAbi::host_call_conv`]) is the Cranelift [`CallConv`] of
+//! the native callee, i.e. where Cranelift places them when it emits the call.
 
 use crate::function_traits::FunctionArgumentType;
 use cranelift_codegen::isa::CallConv;
@@ -26,8 +20,7 @@ use cranelift_codegen::isa::CallConv;
 /// A guest general-purpose register, in the guest frontend's own numbering.
 ///
 /// For x86-64 the payload is `iced_x86::Register as u32`; construct these with
-/// the `From<Register>` impl in [`crate::arch::x86_64::abi`] rather than by
-/// writing raw numbers.
+/// the `From<Register>` impl in [`crate::arch::x86_64::abi`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GuestReg(pub u32);
 
@@ -89,12 +82,11 @@ impl CallAbi {
     ///
     /// `arg_types[0]` is the return type and is skipped; the walk stops at the
     /// first `VariadicList`/`None` marker, matching
-    /// [`build_import_sig`](crate::core::build_import_sig) so the emitted call
-    /// always carries exactly as many arguments as its signature declares.
+    /// [`build_import_sig`](crate::core::build_import_sig).
     ///
-    /// Returns `None` when an argument cannot be placed - i.e. the registers of
-    /// its class are exhausted and this ABI has no `stack_args` rule. Callers
-    /// treat that as "demote this import to the slow path".
+    /// `None` when an argument cannot be placed - its class's registers are
+    /// exhausted and this ABI has no `stack_args` rule - which callers treat as
+    /// "demote to the slow path".
     pub fn place_args(
         &self,
         arg_types: &[FunctionArgumentType],
