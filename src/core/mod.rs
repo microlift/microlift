@@ -962,6 +962,11 @@ pub struct LifterConfig {
     /// up. See [`crate::core::link`] for what is emitted.
     /// Off by default.
     pub block_link: Option<BlockLinkConfig>,
+    /// Emit the link probe at each exit site rather than once per region.
+    ///
+    /// Disabled by default in the name of preventing emitted code size from bloating
+    /// to an extreme degree.
+    pub inline_link_probes: bool,
     /// Optimizations for the emitted code. Some optimizations can trade off semantic accuracy
     /// of not commonly relied upon behavior, such as NAN accuracy.
     pub optimizations: Optimizations,
@@ -1000,6 +1005,7 @@ impl Default for LifterConfig {
             strict_resume: false,
             eliminate_dead_flags: false,
             block_link: None,
+            inline_link_probes: false,
             optimizations: Optimizations::none(),
         }
     }
@@ -1330,6 +1336,10 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         }
     }
 
+    pub fn get_regcontext_flags() -> MemFlagsData {
+        MemFlagsData::trusted().with_can_move()
+    }
+
     /// Whether `reg` is carried in a machine register across region boundaries
     /// rather than in the `RegisterContext`.
     ///
@@ -1396,7 +1406,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             let offset = A::pinned_slot_offset(reg).expect("a pinned slot has a context offset");
             let val = self.builder.use_var(var);
             self.builder.ins().store(
-                MemFlagsData::trusted().with_can_move(),
+                Self::get_regcontext_flags(),
                 val,
                 ctx_ptr,
                 offset,
@@ -1425,7 +1435,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             let offset = A::pinned_slot_offset(reg).expect("a pinned slot has a context offset");
             let val = self.builder.ins().load(
                 ty,
-                MemFlagsData::trusted().with_can_move(),
+                Self::get_regcontext_flags(),
                 ctx_ptr,
                 offset,
             );
@@ -1724,7 +1734,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         let val = self.builder.ins().iconst(types::I32, code as i64);
         self.builder
             .ins()
-            .store(MemFlagsData::trusted(), val, ctx_ptr, A::exit_code_offset());
+            .store(Self::get_regcontext_flags(), val, ctx_ptr, A::exit_code_offset());
     }
 
     /// Declare that the VM exit just emitted **resumes at `va`**.
@@ -1754,7 +1764,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         let ctx_ptr = self.builder.use_var(A::context_ptr_var(&self.state));
         let val = self.builder.ins().iconst(types::I32, reason as i64);
         self.builder.ins().store(
-            MemFlagsData::trusted(),
+            Self::get_regcontext_flags(),
             val,
             ctx_ptr,
             A::exit_reason_offset(),
@@ -1839,7 +1849,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         match self.config.address_mode {
             AddressMode::ImageBaseRelative => self.builder.ins().load(
                 types::I64,
-                MemFlagsData::trusted(),
+                Self::get_regcontext_flags(),
                 ctx_ptr,
                 A::image_base_offset(),
             ),
@@ -1903,16 +1913,42 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         };
         self.builder
             .ins()
-            .store(MemFlagsData::trusted(), pc_val, ctx_ptr, A::pc_offset());
+            .store(Self::get_regcontext_flags(), pc_val, ctx_ptr, A::pc_offset());
 
         let reason_val = self.builder.ins().iconst(types::I32, reason as i64);
         self.builder.ins().store(
-            MemFlagsData::trusted(),
+            Self::get_regcontext_flags(),
             reason_val,
             ctx_ptr,
             A::exit_reason_offset(),
         );
         Ok(())
+    }
+
+    /// Dispatch `target` - a lift-time VA in a register - to the in-region block
+    /// that begins there, falling through to `external` when none does.
+    pub fn emit_region_switch(&mut self, target: Value, external: Block) {
+        let span = self.lift_end.wrapping_sub(self.lift_base);
+        let inside = self.builder.create_block();
+        let rel = self
+            .builder
+            .ins()
+            .iadd_imm_s(target, (self.lift_base as i64).wrapping_neg());
+        let outside =
+            self.builder
+                .ins()
+                .icmp_imm_u(IntCC::UnsignedGreaterThanOrEqual, rel, span as i64);
+        self.builder.ins().brif(outside, external, &[], inside, &[]);
+
+        self.builder.switch_to_block(inside);
+        self.builder.seal_block(inside);
+        let mut switch = Switch::new();
+        for (&offset, &block) in &self.blocks {
+            if self.in_region(offset) {
+                switch.set_entry(offset as u128, block);
+            }
+        }
+        switch.emit(&mut self.builder, target, external);
     }
 
     /// Whether this lift emits link probes at all, for a semantics handler that
@@ -1950,16 +1986,20 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
     /// With linking off this is exactly `return_`, which is what makes it safe
     /// to use at every such site unconditionally.
     pub fn emit_exit(&mut self, pc: Option<Value>) {
-        match self.block_link() {
-            Some(_) => {
-                let pc = match pc {
-                    Some(pc) => pc,
-                    None => self.runtime_current_ip(),
-                };
-                let block = self.link_probe_block();
-                self.builder.ins().jump(block, &[pc.into()]);
-            }
-            None => self.emit_host_return(),
+        if self.block_link().is_none() {
+            return self.emit_host_return();
+        }
+        let pc = match pc {
+            Some(pc) => pc,
+            None => self.runtime_current_ip(),
+        };
+        if self.config.inline_link_probes {
+            // Leaves the builder in the probe's `out` block, which is terminated.
+            // Every caller either stops here or switches somewhere itself.
+            self.emit_link_probe(pc);
+        } else {
+            let block = self.link_probe_block();
+            self.builder.ins().jump(block, &[pc.into()]);
         }
     }
 
@@ -2008,23 +2048,32 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         let Some(block) = self.link_block else {
             return Ok(());
         };
+        self.builder.switch_to_block(block);
+        let pc = self.builder.block_params(block)[0];
+        self.visited_blocks.insert(block);
+        self.emit_link_probe(pc);
+        Ok(())
+    }
+
+    /// Emit one probe, terminating the current block and leaving the builder in
+    /// the probe's `out` arm.
+    fn emit_link_probe(&mut self, pc: Value) {
         let (link, offsets) = self
             .block_link()
-            .expect("a link block exists only when linking is on");
+            .expect("a probe is only emitted when linking is on");
 
+        let probe = self.builder.create_block();
         let hit = self.builder.create_block();
         let out = self.builder.create_block();
 
-        self.builder.switch_to_block(block);
-        let pc = self.builder.block_params(block)[0];
         let ctx_ptr = self.builder.use_var(A::context_ptr_var(&self.state));
         let table =
             self.builder
                 .ins()
-                .load(types::I64, MemFlagsData::trusted(), ctx_ptr, offsets.table);
+                .load(types::I64, Self::get_regcontext_flags(), ctx_ptr, offsets.table);
         // A host that has not published a table for this thread is not an error
-        // and not a special case: it simply never links.
-        let probe = self.builder.create_block();
+        // and not a special case: it simply never links. It is also what keeps the
+        // row loads, which are `notrap`, off a null table.
         self.builder.ins().brif(table, probe, &[], out, &[]);
 
         self.builder.switch_to_block(probe);
@@ -2038,7 +2087,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         let key = self
             .builder
             .ins()
-            .load(types::I64, MemFlagsData::trusted(), entry, 0);
+            .load(types::I64, Self::get_regcontext_flags(), entry, 0);
         let matches = self.builder.ins().icmp(IntCC::Equal, key, pc);
         self.builder.ins().brif(matches, hit, &[], out, &[]);
 
@@ -2050,28 +2099,33 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         self.builder.switch_to_block(hit);
         self.builder
             .ins()
-            .store(MemFlagsData::trusted(), pc, ctx_ptr, A::pc_offset());
+            .store(Self::get_regcontext_flags(), pc, ctx_ptr, A::pc_offset());
         if self.pinned() {
             // The branch, rather than the answer: the successor is entered with the
             // pinned registers still in place, so nothing is published for a host
             // that is not going to run. `image_base` is the exception - under
             // `HostResume` the host sets it from the row before entering, and here
             // there is no host to do it.
+            //
+            // Hoisting these beside `key`, so the `br` does not wait on a load
+            // started after the branch that selected it, is 0.616 s against
+            // 0.589 s - worse. The two loads land on the miss path as well, and
+            // the machine was already hiding the latency.
             let image_base = self.builder.ins().load(
                 types::I64,
-                MemFlagsData::trusted(),
+                Self::get_regcontext_flags(),
                 entry,
                 crate::core::link::IMAGE_BASE_OFFSET,
             );
             self.builder.ins().store(
-                MemFlagsData::trusted(),
+                Self::get_regcontext_flags(),
                 image_base,
                 ctx_ptr,
                 A::image_base_offset(),
             );
             let code = self.builder.ins().load(
                 types::I64,
-                MemFlagsData::trusted(),
+                Self::get_regcontext_flags(),
                 entry,
                 crate::core::link::CODE_OFFSET,
             );
@@ -2081,17 +2135,16 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         } else {
             self.builder
                 .ins()
-                .store(MemFlagsData::trusted(), entry, ctx_ptr, offsets.hit);
+                .store(Self::get_regcontext_flags(), entry, ctx_ptr, offsets.hit);
             self.emit_host_return();
         }
 
         self.builder.switch_to_block(out);
         self.emit_host_return();
 
-        for block in [block, probe, hit, out] {
+        for block in [probe, hit, out] {
             self.visited_blocks.insert(block);
         }
-        Ok(())
     }
 
     pub fn lift(&mut self, bytes: &[u8], ip: u64) -> crate::Result<()> {
@@ -2454,7 +2507,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             let ctx_ptr = self.builder.use_var(A::context_ptr_var(&self.state));
             let pc_val = self.builder.ins().load(
                 types::I64,
-                MemFlagsData::trusted(),
+                Self::get_regcontext_flags(),
                 ctx_ptr,
                 A::pc_offset(),
             );

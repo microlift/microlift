@@ -13,10 +13,6 @@ use cranelift::prelude::*;
 use iced_x86::Register;
 
 impl<'a> Lifter<'a> {
-    pub(super) fn get_regcontext_flags() -> MemFlagsData {
-        MemFlagsData::trusted().with_can_move()
-    }
-
     /// Store exactly the registers in `mask` into the `RegisterContext`, and
     /// nothing else - no PC, no `exit_reason`, no `exit_code`.
     ///

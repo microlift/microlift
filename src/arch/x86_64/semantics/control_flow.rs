@@ -57,13 +57,8 @@ impl<'a> Lifter<'a> {
         // Back into lift-time VA space, which is what the block map is keyed on.
         let target_offset = self.to_lift_va(target_val);
 
-        let mut switch = cranelift_frontend::Switch::new();
-        for (&offset, &block) in &self.blocks {
-            switch.set_entry(offset as u128, block);
-        }
-
         let external_block = self.builder.create_block();
-        switch.emit(&mut self.builder, target_offset, external_block);
+        self.emit_region_switch(target_offset, external_block);
 
         self.builder.switch_to_block(external_block);
         self.builder.seal_block(external_block);
@@ -162,15 +157,10 @@ impl<'a> Lifter<'a> {
     /// exactly the return its callee's `RET` would have, after the stack pointer
     /// has already been adjusted.
     fn emit_return_dispatch(&mut self, target_ip: Value) -> crate::Result<()> {
-        let mut switch = cranelift_frontend::Switch::new();
         let target_offset = self.to_lift_va(target_ip);
 
-        for (&offset, &block) in &self.blocks {
-            switch.set_entry(offset as u128, block);
-        }
-
         let external_check_block = self.builder.create_block();
-        switch.emit(&mut self.builder, target_offset, external_check_block);
+        self.emit_region_switch(target_offset, external_check_block);
 
         self.builder.switch_to_block(external_check_block);
         self.builder.seal_block(external_check_block);
