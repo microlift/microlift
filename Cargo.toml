@@ -6,9 +6,28 @@ edition = "2024"
 [features]
 disasm = ["dep:capstone"]
 serde = ["dep:serde"]
-testkit = []
+# `cross-targets` is what the test suite needs: several targets AOT-compile the
+# same lift for x86-64, aarch64 and riscv64 to prove the IR lowers everywhere.
+testkit = ["cross-targets"]
 fuzzing = ["testkit", "dep:proptest"]
 unicorn-oracle = ["testkit", "dep:unicorn-engine"]
+
+arch-x86 = ["cranelift-codegen/x86"]
+arch-arm64 = ["cranelift-codegen/arm64"]
+arch-riscv64 = ["cranelift-codegen/riscv64"]
+arch-s390x = ["cranelift-codegen/s390x"]
+arch-pulley = ["cranelift-codegen/pulley"]
+
+# Enable Cranelift's timing feature. Disabled by default as it can
+# cause unexpected TLS access during program destruction, making
+# it potentially panic in a high level emulator.
+pass-timing = ["cranelift-codegen/timing"]
+
+# The three targets microlift is actually exercised against.
+cross-targets = ["arch-x86", "arch-arm64", "arch-riscv64"]
+# Every native backend. Note this deliberately excludes `arch-pulley`, which
+# upstream's own `all-arch` includes.
+all-arch = ["cross-targets", "arch-s390x"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"], optional = true }
@@ -23,7 +42,7 @@ capstone = { version = "0.13", optional = true }
 iced-x86 = "1"
 target-lexicon = "0.13"
 thiserror = "1"
-cranelift-codegen = { git = "https://github.com/microlift/wasmtime", branch = "microlift_experimental", version = "0.136.0-dev", features = ["all-arch"] }
+cranelift-codegen = { git = "https://github.com/microlift/wasmtime", branch = "microlift_experimental", version = "0.136.0-dev", default-features = false, features = ["std", "unwind", "host-arch"] }
 yaxpeax-arm = "0.4.0"
 yaxpeax-arch = "0.3.2"
 function_traits = { git = "https://github.com/microlift/function_traits.git", version = "0.1.0" }
@@ -228,3 +247,9 @@ required-features = ["testkit"]
 [[test]]
 name = "pinned_link_tests"
 required-features = ["testkit"]
+
+# Cross-compiles the same lift for x86-64, aarch64 and riscv64, so it needs
+# those backends compiled in.
+[[test]]
+name = "obj_tests"
+required-features = ["cross-targets"]

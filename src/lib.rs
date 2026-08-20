@@ -2,6 +2,16 @@ use thiserror::Error;
 
 pub use function_traits;
 
+// We use our own Cranelift fork, so this is incredibly necessary and not just convenience.
+pub use cranelift;
+pub use cranelift_codegen;
+pub use cranelift_frontend;
+pub use cranelift_jit;
+pub use cranelift_module;
+pub use cranelift_native;
+pub use cranelift_object;
+pub use target_lexicon;
+
 pub mod arch;
 pub mod backend;
 pub mod cfg;

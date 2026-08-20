@@ -384,6 +384,23 @@ impl CraneliftBackend {
     }
 }
 
+fn missing_arch_feature(triple: &Triple) -> Option<&'static str> {
+    use target_lexicon::Architecture;
+
+    Some(match triple.architecture {
+        Architecture::X86_64 | Architecture::X86_64h | Architecture::X86_32(_) => "arch-x86",
+        Architecture::Aarch64(_) => "arch-arm64",
+        Architecture::Riscv64(_) => "arch-riscv64",
+        Architecture::S390x => "arch-s390x",
+        Architecture::Pulley32
+        | Architecture::Pulley64
+        | Architecture::Pulley32be
+        | Architecture::Pulley64be => "arch-pulley",
+        // Not a target Cranelift has a backend for at all - no feature helps.
+        _ => return None,
+    })
+}
+
 pub struct ArtifactBackend;
 
 impl ArtifactBackend {
@@ -405,8 +422,15 @@ impl ArtifactBackend {
             Triple::host()
         };
 
-        let mut isa_builder = cranelift_codegen::isa::lookup(triple_obj)
-            .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
+        let mut isa_builder = cranelift_codegen::isa::lookup(triple_obj.clone()).map_err(|e| {
+            crate::MicroliftError::CraneliftError(match missing_arch_feature(&triple_obj) {
+                Some(feature) => format!(
+                    "no Cranelift backend for {triple_obj}: {e} \
+                     (build microlift with the `{feature}` feature)"
+                ),
+                None => e.to_string(),
+            })
+        })?;
 
         for (name, value) in isa_settings {
             isa_builder.set(name, value).map_err(|e| {
