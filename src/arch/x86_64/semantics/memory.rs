@@ -202,7 +202,7 @@ impl<'a> Lifter<'a> {
             }
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 0)?;
-                self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0)
+                self.builder.ins().load(ty, self.guest_flags, ptr, 0)
             }
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -214,9 +214,7 @@ impl<'a> Lifter<'a> {
         let rsp = self.get_reg_val(Register::RSP)?;
         let new_rsp = self.builder.ins().iadd_imm_s(rsp, -(push_size as i64));
         self.set_reg_val(Register::RSP, new_rsp)?;
-        self.builder
-            .ins()
-            .store(MemFlagsData::new(), val, new_rsp, 0);
+        self.builder.ins().store(self.guest_flags, val, new_rsp, 0);
         Ok(())
     }
 
@@ -233,7 +231,7 @@ impl<'a> Lifter<'a> {
         let ty = size_to_type(pop_size);
 
         let rsp = self.get_reg_val(Register::RSP)?;
-        let val = self.builder.ins().load(ty, MemFlagsData::new(), rsp, 0);
+        let val = self.builder.ins().load(ty, self.guest_flags, rsp, 0);
 
         let new_rsp = self.builder.ins().iadd_imm_s(rsp, pop_size as i64);
         self.set_reg_val(Register::RSP, new_rsp)?;
@@ -244,7 +242,7 @@ impl<'a> Lifter<'a> {
             }
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 0)?;
-                self.builder.ins().store(MemFlagsData::new(), val, ptr, 0);
+                self.builder.ins().store(self.guest_flags, val, ptr, 0);
             }
             _ => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -264,7 +262,7 @@ impl<'a> Lifter<'a> {
         let old_rbp = self
             .builder
             .ins()
-            .load(types::I64, MemFlagsData::new(), rbp, 0);
+            .load(types::I64, self.guest_flags, rbp, 0);
         self.set_reg_val(Register::RBP, old_rbp)?;
         let new_rsp = self.builder.ins().iadd_imm_s(rbp, 8);
         self.set_reg_val(Register::RSP, new_rsp)?;
@@ -429,9 +427,9 @@ impl<'a> Lifter<'a> {
         let ty = size_to_type(size);
         let (_, si, di) = Self::string_addr_regs(addr_size);
         let sptr = self.string_ptr(si)?;
-        let val = self.builder.ins().load(ty, MemFlagsData::new(), sptr, 0);
+        let val = self.builder.ins().load(ty, self.guest_flags, sptr, 0);
         let dptr = self.string_ptr(di)?;
-        self.builder.ins().store(MemFlagsData::new(), val, dptr, 0);
+        self.builder.ins().store(self.guest_flags, val, dptr, 0);
         // DF=0: increment both pointers; DF=1: decrement.
         self.string_advance(si, size)?;
         self.string_advance(di, size)?;
@@ -473,7 +471,7 @@ impl<'a> Lifter<'a> {
         let (_, _, di) = Self::string_addr_regs(addr_size);
         let dptr = self.string_ptr(di)?;
         let val = self.get_reg_val(Self::string_acc_reg(size))?;
-        self.builder.ins().store(MemFlagsData::new(), val, dptr, 0);
+        self.builder.ins().store(self.guest_flags, val, dptr, 0);
         self.string_advance(di, size)?;
         Ok(())
     }
@@ -496,7 +494,7 @@ impl<'a> Lifter<'a> {
         let ty = size_to_type(size);
         let (_, si, _) = Self::string_addr_regs(addr_size);
         let sptr = self.string_ptr(si)?;
-        let val = self.builder.ins().load(ty, MemFlagsData::new(), sptr, 0);
+        let val = self.builder.ins().load(ty, self.guest_flags, sptr, 0);
         self.set_reg_val(Self::string_acc_reg(size), val)?;
         self.string_advance(si, size)?;
         Ok(())
@@ -585,7 +583,7 @@ impl<'a> Lifter<'a> {
         self.set_reg_val(Register::RSP, new_rsp)?;
         self.builder
             .ins()
-            .store(MemFlagsData::new(), rflags, new_rsp, 0);
+            .store(self.guest_flags, rflags, new_rsp, 0);
         Ok(())
     }
 
@@ -597,7 +595,7 @@ impl<'a> Lifter<'a> {
         let rflags = self
             .builder
             .ins()
-            .load(types::I64, MemFlagsData::new(), rsp, 0);
+            .load(types::I64, self.guest_flags, rsp, 0);
         let new_rsp = self.builder.ins().iadd_imm_s(rsp, 8);
         self.set_reg_val(Register::RSP, new_rsp)?;
 

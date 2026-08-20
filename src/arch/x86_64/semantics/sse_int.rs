@@ -125,7 +125,7 @@ impl<'a> Lifter<'a> {
             }
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, op_index)?;
-                let flags = MemFlagsData::new();
+                let flags = self.guest_flags;
                 Ok(match bits {
                     8 => self.builder.ins().uload8(types::I64, flags, ptr, 0),
                     16 => self.builder.ins().uload16(types::I64, flags, ptr, 0),
@@ -956,7 +956,7 @@ impl<'a> Lifter<'a> {
             }
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 0)?;
-                let flags = MemFlagsData::new();
+                let flags = self.guest_flags;
                 match bits {
                     8 => self.builder.ins().istore8(flags, value, ptr, 0),
                     16 => self.builder.ins().istore16(flags, value, ptr, 0),

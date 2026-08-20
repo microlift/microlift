@@ -39,7 +39,7 @@ impl<'a> Lifter<'a> {
                 let target_val = self
                     .builder
                     .ins()
-                    .load(types::I64, MemFlagsData::new(), ptr, 0);
+                    .load(types::I64, self.guest_flags, ptr, 0);
                 self.emit_runtime_indirect_jump(target_val)?;
             }
             other => {
@@ -125,10 +125,7 @@ impl<'a> Lifter<'a> {
         // real hardware; zero-extending the popped slot matches what the CPU
         // loads into RIP.
         let slot_ty = size_to_type(slot_size as usize);
-        let popped = self
-            .builder
-            .ins()
-            .load(slot_ty, MemFlagsData::new(), rsp, 0);
+        let popped = self.builder.ins().load(slot_ty, self.guest_flags, rsp, 0);
         let target_ip = if slot_ty == types::I64 {
             popped
         } else {
@@ -226,12 +223,7 @@ impl<'a> Lifter<'a> {
 
                     let ctx_ptr = self.builder.use_var(self.state.context_ptr);
                     let va_offset = <X86_64 as GuestArch>::imported_function_va_offset();
-                    self.builder.ins().store(
-                        MemFlagsData::trusted(),
-                        rebased_callee,
-                        ctx_ptr,
-                        va_offset,
-                    );
+                    self.ctx_store(rebased_callee, ctx_ptr, va_offset);
 
                     // Push the return address onto the guest stack exactly as a
                     // real CALL does, so the callee can RET correctly.
@@ -241,7 +233,7 @@ impl<'a> Lifter<'a> {
                     self.set_reg_val(Register::RSP, new_rsp)?;
                     self.builder
                         .ins()
-                        .store(MemFlagsData::new(), ret_addr, new_rsp, 0);
+                        .store(self.guest_flags, ret_addr, new_rsp, 0);
 
                     self.sync_to_context(None, ExitReason::UnknownJump)?;
                     self.write_exit_code(TransferKind::DirectCall as u32);
@@ -264,7 +256,7 @@ impl<'a> Lifter<'a> {
                 self.set_reg_val(Register::RSP, new_rsp)?;
                 self.builder
                     .ins()
-                    .store(MemFlagsData::new(), ret_addr, new_rsp, 0);
+                    .store(self.guest_flags, ret_addr, new_rsp, 0);
 
                 let target_block = self.get_block_with_kind(target, TransferKind::DirectCall);
                 self.builder.ins().jump(target_block, &[]);
@@ -288,7 +280,7 @@ impl<'a> Lifter<'a> {
                 let target_val = self
                     .builder
                     .ins()
-                    .load(types::I64, MemFlagsData::new(), ptr, 0);
+                    .load(types::I64, self.guest_flags, ptr, 0);
                 self.emit_indirect_call_exit(target_val)
             }
             other => Err(MicroliftError::UnsupportedInstruction {
@@ -322,7 +314,7 @@ impl<'a> Lifter<'a> {
                 let target_val = self
                     .builder
                     .ins()
-                    .load(types::I64, MemFlagsData::new(), ptr, 0);
+                    .load(types::I64, self.guest_flags, ptr, 0);
                 let sig = self.analysis_call_sig();
                 self.builder.ins().call_indirect(sig, target_val, &[]);
             }
@@ -383,7 +375,7 @@ impl<'a> Lifter<'a> {
         let ret_ip = self
             .builder
             .ins()
-            .load(types::I64, MemFlagsData::new(), rsp, 0);
+            .load(types::I64, self.guest_flags, rsp, 0);
         let new_rsp = self.builder.ins().iadd_imm_s(rsp, 8);
         self.set_reg_val(Register::RSP, new_rsp)?;
 
@@ -418,9 +410,7 @@ impl<'a> Lifter<'a> {
         let ctx_ptr = self.builder.use_var(self.state.context_ptr);
         let va_val = self.builder.ins().iconst(types::I64, import_va as i64);
         let va_offset = <X86_64 as GuestArch>::imported_function_va_offset();
-        self.builder
-            .ins()
-            .store(MemFlagsData::trusted(), va_val, ctx_ptr, va_offset);
+        self.ctx_store(va_val, ctx_ptr, va_offset);
 
         self.sync_to_context(None, ExitReason::ImportedFunctionCall)?;
         self.emit_host_return();
@@ -448,9 +438,7 @@ impl<'a> Lifter<'a> {
 
         let ctx_ptr = self.builder.use_var(self.state.context_ptr);
         let va_offset = <X86_64 as GuestArch>::imported_function_va_offset();
-        self.builder
-            .ins()
-            .store(MemFlagsData::trusted(), target_val, ctx_ptr, va_offset);
+        self.ctx_store(target_val, ctx_ptr, va_offset);
 
         self.sync_to_context(None, ExitReason::IndirectCall)?;
         self.emit_host_return();
@@ -475,6 +463,24 @@ impl<'a> Lifter<'a> {
     /// Stack arguments are read at `RSP + offset`: the fast path replaces the
     /// `CALL` outright, so no return address has been pushed and RSP still
     /// points where the guest's caller left it.
+    ///
+    /// # A fast import must not touch the `RegisterContext`
+    ///
+    /// Reading or writing it - directly, or by re-entering guest code against
+    /// the same context - is **undefined behaviour**. This path publishes no
+    /// registers and reloads none: the region's state is in machine registers
+    /// and stays there across the call, so the context holds whatever it held
+    /// at entry and the region will overwrite anything the callee put there.
+    /// A callee that needs the whole context is a
+    /// [bridge](crate::core::bridge), and one the host must service is a slow
+    /// import; both exist precisely for this.
+    ///
+    /// The rule also underwrites [`crate::core::regsync`]: with it, a register
+    /// this region never defined provably still holds its entry-loaded value
+    /// even past a fast call, so its store back really is idempotent. (If a
+    /// future caller needs the escape hatch, the shape is a per-import flag
+    /// asking for full materialisation around the call, not a blanket
+    /// pessimisation of every import.)
     fn emit_fast_import_call(&mut self, fast_call: FastCall) -> crate::Result<()> {
         let FastCall {
             target,
@@ -553,15 +559,14 @@ impl<'a> Lifter<'a> {
                 } else {
                     lo
                 };
-                self.builder
-                    .ins()
-                    .bitcast(cl_ty, Self::get_regcontext_flags(), bits)
+                // `bitcast`'s memflags carry endianness, not aliasing.
+                self.builder.ins().bitcast(cl_ty, MemFlagsData::new(), bits)
             }
             ArgLocation::Stack(offset) => {
+                // A stack argument is guest memory, not context.
                 let rsp = self.get_reg_val(Register::RSP)?;
-                self.builder
-                    .ins()
-                    .load(cl_ty, Self::get_regcontext_flags(), rsp, offset as i32)
+                let flags = self.guest_flags;
+                self.builder.ins().load(cl_ty, flags, rsp, offset as i32)
             }
         };
         Ok(val)
@@ -580,16 +585,15 @@ impl<'a> Lifter<'a> {
                 // Float -> raw bits, zero-extended into the low half of the
                 // vector register; the high half is cleared.
                 let bits = if ty == FunctionArgumentType::SinglePrecisionFp {
-                    let i32_val = self.builder.ins().bitcast(
-                        types::I32,
-                        Self::get_regcontext_flags(),
-                        ret_val,
-                    );
+                    let i32_val =
+                        self.builder
+                            .ins()
+                            .bitcast(types::I32, MemFlagsData::new(), ret_val);
                     self.builder.ins().uextend(types::I64, i32_val)
                 } else {
                     self.builder
                         .ins()
-                        .bitcast(types::I64, Self::get_regcontext_flags(), ret_val)
+                        .bitcast(types::I64, MemFlagsData::new(), ret_val)
                 };
                 let zero = self.builder.ins().iconst(types::I64, 0);
                 self.set_xmm_lo(idx, bits);

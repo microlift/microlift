@@ -63,11 +63,6 @@ pub enum BridgeTarget {
 /// which is what the slow exit already pays, so a bridge is never slower than
 /// the exit it replaces.
 ///
-/// **This is not `sync_to_context_selective`** (`arch/x86_64/sync.rs`, marked
-/// *DANGEROUS - DO NOT USE*), which infers a dirty set from emission order and
-/// misses loop-carried writes. A `RegMask` is *declared by the callee* and
-/// applied at one call site with no CFG reasoning at all.
-///
 /// Getting a mask wrong is still a correctness bug, just a local one: a
 /// register read but not declared in `reads` is stale in the context, and one
 /// clobbered but not in `writes` keeps its stale SSA value. When in doubt,

@@ -25,7 +25,9 @@ Vectorized instructions such as the ones in SSE are emitted as native vectorized
 
 Some instructions do not have peephole optimizations necessary for efficient emulation of some x86-64 semantics. We plan to address this by directly contributing CLIF passes to Cranelift from our fork where not domain-specific, and by adding our own optimizations at lift time.
 
-Additionally, we also recommend enabling the `enable_alias_analysis` option in Cranelift flags if you wish to inspect IR. This will eliminate dead load/stores done on the CPU context structure.
+Additionally, compile with `opt_level = "speed"` (or `speed_and_size`) if you care about the register-context traffic: Cranelift's alias analysis runs inside the egraph pass, which only runs above `opt_level = none`, and the lifter tags every context field with its own alias region so that analysis can see the exit stores writing back exactly what the entry loads read.
+
+The lifter also drops that traffic itself, unconditionally and at any opt level, via `LifterConfig::lazy_register_sync` (on by default) - a region never stores back a register it did not write.
 
 ## Notes for non-JIT users
 

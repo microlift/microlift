@@ -1,5 +1,7 @@
 use crate::MicroliftError;
-use crate::arch::x86_64::regs::{RegisterState, is_segment_register};
+use crate::arch::x86_64::regs::{FLAG_ORDER, RegisterState, gpr_index, is_segment_register};
+use crate::arch::x86_64::sync::{FS_BASE_SLOT, GS_BASE_SLOT};
+use crate::core::regsync::RegSlot;
 use crate::lifter::{Lifter, X86Flag};
 use cranelift::prelude::*;
 use iced_x86::{Instruction, OpKind, Register};
@@ -174,8 +176,9 @@ impl<'a> Lifter<'a> {
                 self.builder.ins().bor(cleared, val_64)
             };
             self.builder.def_var(var, new_full_val);
-            // Mark this register dirty for selective sync.
-            self.state.dirty_gprs.insert(base_reg);
+            // The write set the lazy-sync prune reads; see `core::regsync`.
+            let idx = gpr_index(base_reg).expect("a GPR variable has a GPR_ORDER index");
+            self.mark_written(RegSlot::Gpr(idx));
             Ok(())
         } else {
             Err(MicroliftError::UnsupportedInstruction {
@@ -193,10 +196,7 @@ impl<'a> Lifter<'a> {
     fn get_segment_selector(&mut self, reg: Register) -> crate::Result<Value> {
         let offset = RegisterState::get_segment_offset(reg)?;
         let ctx_ptr = self.builder.use_var(self.state.context_ptr);
-        Ok(self
-            .builder
-            .ins()
-            .load(types::I16, Self::get_regcontext_flags(), ctx_ptr, offset))
+        Ok(self.ctx_load(types::I16, ctx_ptr, offset))
     }
 
     /// Write a segment selector, storing it straight into the `RegisterContext`.
@@ -217,9 +217,7 @@ impl<'a> Lifter<'a> {
         let offset = RegisterState::get_segment_offset(reg)?;
         let ctx_ptr = self.builder.use_var(self.state.context_ptr);
         let val_i16 = self.narrow_to(types::I16, val);
-        self.builder
-            .ins()
-            .store(Self::get_regcontext_flags(), val_i16, ctx_ptr, offset);
+        self.ctx_store(val_i16, ctx_ptr, offset);
         Ok(())
     }
 
@@ -257,8 +255,11 @@ impl<'a> Lifter<'a> {
                 self.builder.ins().ireduce(types::I8, val)
             };
             self.builder.def_var(var, val_i8);
-            // Mark this flag dirty for selective sync.
-            self.state.dirty_flags.insert(flag);
+            let idx = FLAG_ORDER
+                .iter()
+                .position(|&f| f == flag)
+                .expect("a flag variable has a FLAG_ORDER index");
+            self.mark_written(RegSlot::Flag(idx as u8));
             Ok(())
         } else {
             Err(MicroliftError::UnsupportedInstruction {
@@ -317,7 +318,7 @@ impl<'a> Lifter<'a> {
             OpKind::Register => self.get_reg_val(self.operand_register(instruction, op_index)),
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, op_index)?;
-                Ok(self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0))
+                Ok(self.builder.ins().load(ty, self.guest_flags, ptr, 0))
             }
             OpKind::Immediate32to64 => {
                 Ok(self.builder.ins().iconst(ty, instruction.immediate32to64()))
@@ -408,7 +409,7 @@ impl<'a> Lifter<'a> {
             Place::Reg(reg) => self.get_reg_val(reg),
             Place::Mem(ptr) => {
                 let ty = size_to_type(size);
-                Ok(self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0))
+                Ok(self.builder.ins().load(ty, self.guest_flags, ptr, 0))
             }
         }
     }
@@ -417,7 +418,7 @@ impl<'a> Lifter<'a> {
         match place {
             Place::Reg(reg) => self.set_reg_val(reg, val),
             Place::Mem(ptr) => {
-                self.builder.ins().store(MemFlagsData::new(), val, ptr, 0);
+                self.builder.ins().store(self.guest_flags, val, ptr, 0);
                 Ok(())
             }
         }
@@ -446,7 +447,7 @@ impl<'a> Lifter<'a> {
             OpKind::Register => self.set_reg_val(self.operand_register(instruction, op_index), val),
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, op_index)?;
-                self.builder.ins().store(MemFlagsData::new(), val, ptr, 0);
+                self.builder.ins().store(self.guest_flags, val, ptr, 0);
                 Ok(())
             }
             _ => Err(MicroliftError::UnsupportedInstruction {
@@ -588,7 +589,7 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// Write the low 64 bits of XMM register `idx` (0-15) and mark dirty.
+    /// Write the low 64 bits of XMM register `idx` (0-15).
     pub fn set_xmm_lo(&mut self, idx: u8, val: Value) {
         if self.state.use_vector_xmm {
             let var = *self.state.xmms_vec.get(&idx).unwrap();
@@ -599,10 +600,15 @@ impl<'a> Lifter<'a> {
             let var = *self.state.xmms_lo.get(&idx).unwrap();
             self.builder.def_var(var, val);
         }
-        self.state.dirty_xmms.insert(idx);
+        // In vector mode both halves are the one variable, so writing either
+        // defines the whole register.
+        self.mark_written(RegSlot::Vec(idx));
+        if self.state.use_vector_xmm {
+            self.mark_written(RegSlot::VecHi(idx));
+        }
     }
 
-    /// Write the high 64 bits of XMM register `idx` (0-15) and mark dirty.
+    /// Write the high 64 bits of XMM register `idx` (0-15).
     pub fn set_xmm_hi(&mut self, idx: u8, val: Value) {
         if self.state.use_vector_xmm {
             let var = *self.state.xmms_vec.get(&idx).unwrap();
@@ -613,7 +619,10 @@ impl<'a> Lifter<'a> {
             let var = *self.state.xmms_hi.get(&idx).unwrap();
             self.builder.def_var(var, val);
         }
-        self.state.dirty_xmms.insert(idx);
+        self.mark_written(RegSlot::VecHi(idx));
+        if self.state.use_vector_xmm {
+            self.mark_written(RegSlot::Vec(idx));
+        }
     }
 
     /// Return the full 128-bit value of XMM register `idx` (0-15) as a
@@ -652,7 +661,8 @@ impl<'a> Lifter<'a> {
             self.builder.def_var(lo_var, lo);
             self.builder.def_var(hi_var, hi);
         }
-        self.state.dirty_xmms.insert(idx);
+        self.mark_written(RegSlot::Vec(idx));
+        self.mark_written(RegSlot::VecHi(idx));
     }
 
     /// Read the current FS segment base from the SSA variable.
@@ -665,15 +675,15 @@ impl<'a> Lifter<'a> {
         self.builder.use_var(self.state.gs_base)
     }
 
-    /// Write a new FS segment base and mark it dirty.
+    /// Write a new FS segment base.
     pub fn set_fs_base(&mut self, val: Value) {
         self.builder.def_var(self.state.fs_base, val);
-        self.state.dirty_fs_base = true;
+        self.mark_written(FS_BASE_SLOT);
     }
 
-    /// Write a new GS segment base and mark it dirty.
+    /// Write a new GS segment base.
     pub fn set_gs_base(&mut self, val: Value) {
         self.builder.def_var(self.state.gs_base, val);
-        self.state.dirty_gs_base = true;
+        self.mark_written(GS_BASE_SLOT);
     }
 }

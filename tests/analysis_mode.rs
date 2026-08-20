@@ -16,6 +16,11 @@ use microlift::os::get_host_calling_conv;
 /// Lift `bytes` at `base` and return the Cranelift IR text, optionally in
 /// analysis mode.
 fn lift_ir(bytes: &[u8], base: u64, analysis_mode: bool) -> String {
+    lift_ir_with(bytes, base, analysis_mode, true)
+}
+
+/// [`lift_ir`], with control over [`LifterConfig::lazy_register_sync`].
+fn lift_ir_with(bytes: &[u8], base: u64, analysis_mode: bool, lazy: bool) -> String {
     let mut func = Function::with_name_signature(
         UserFuncName::user(0, 0),
         Signature::new(get_host_calling_conv()),
@@ -27,6 +32,7 @@ fn lift_ir(bytes: &[u8], base: u64, analysis_mode: bool) -> String {
 
     let config = LifterConfig {
         analysis_mode,
+        lazy_register_sync: lazy,
         ..Default::default()
     };
     let mut lifter = Lifter::with_config(builder, config);
@@ -77,13 +83,24 @@ fn analysis_mode_omits_context_writeback() {
         "analysis IR must not store guest state back:\n{analysis}"
     );
 
-    // And it should be dramatically smaller overall.
+    // And the write-back is most of what execution IR carries. Measured
+    // against a lift with the lazy-sync prune off, because with it on the
+    // execution IR has already shed the stores for registers this snippet
+    // never wrote - which is a different saving, not this one. Line counts
+    // exclude the alias-region preamble, which both modes declare.
+    let eager = lift_ir_with(&MOV_RET, 0x1000, false, false);
     assert!(
-        analysis.lines().count() * 2 < exec.lines().count(),
-        "analysis IR ({} lines) should be much smaller than exec IR ({} lines)",
-        analysis.lines().count(),
-        exec.lines().count()
+        body_lines(&analysis) * 2 < body_lines(&eager),
+        "analysis IR ({} lines) should be much smaller than eager exec IR ({} lines)",
+        body_lines(&analysis),
+        body_lines(&eager)
     );
+}
+
+fn body_lines(ir: &str) -> usize {
+    ir.lines()
+        .filter(|l| !l.trim_start().starts_with("region"))
+        .count()
 }
 
 #[test]

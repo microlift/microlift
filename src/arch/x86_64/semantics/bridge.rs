@@ -56,9 +56,7 @@ impl<'a> Lifter<'a> {
 
         let ctx_ptr = self.builder.use_var(self.state.context_ptr);
         let va_offset = <X86_64 as GuestArch>::imported_function_va_offset();
-        self.builder
-            .ins()
-            .store(MemFlagsData::trusted(), callee, ctx_ptr, va_offset);
+        self.ctx_store(callee, ctx_ptr, va_offset);
 
         self.sync_regs_masked(reads)?;
         self.publish_pinned()?;
@@ -123,9 +121,8 @@ impl<'a> Lifter<'a> {
             self.builder.switch_to_block(link_block);
             self.builder.seal_block(link_block);
             let ctx_ptr = self.builder.use_var(self.state.context_ptr);
-            let pc = self.builder.ins().load(
+            let pc = self.ctx_load(
                 types::I64,
-                MemFlagsData::trusted(),
                 ctx_ptr,
                 <crate::arch::x86_64::X86_64 as crate::core::GuestArch>::pc_offset(),
             );
@@ -144,13 +141,13 @@ impl<'a> Lifter<'a> {
             BridgeTarget::Direct(ptr) => self.builder.ins().iconst(types::I64, ptr as i64),
             BridgeTarget::Slot(slot) => {
                 let slot_addr = self.builder.ins().iconst(types::I64, slot as i64);
-                // `trusted()` is notrap+aligned but deliberately *not* readonly:
-                // the slot is live-updatable, so this load must not be hoisted
-                // out of a loop or CSE'd across the call it feeds. See
-                // `BridgeTarget::Slot` for the ordering argument.
-                self.builder
-                    .ins()
-                    .load(types::I64, MemFlagsData::trusted(), slot_addr, 0)
+                // notrap+aligned but not readonly: the slot is
+                // live-updatable, so this load must not be hoisted out of a
+                // loop or CSE'd across the call it feeds. See
+                // `BridgeTarget::Slot` for the ordering argument. Its own alias
+                // region, because it is host memory rather than context.
+                let flags = self.host_slot_flags;
+                self.builder.ins().load(types::I64, flags, slot_addr, 0)
             }
         }
     }

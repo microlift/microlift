@@ -425,7 +425,7 @@ impl<'a> Lifter<'a> {
                 Ok(self
                     .builder
                     .ins()
-                    .load(fty.lane_type(), MemFlagsData::new(), ptr, 0))
+                    .load(fty.lane_type(), self.guest_flags, ptr, 0))
             }
             other => Err(crate::MicroliftError::UnsupportedInstruction {
                 mnemonic: format!("{}-scalar-fp-src-op{}-{:?}", who, op_index, other),

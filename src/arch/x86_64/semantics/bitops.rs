@@ -618,7 +618,7 @@ impl<'a> Lifter<'a> {
                         .ins()
                         .iconst(ty, (instruction.immediate8() as i64) & (bits - 1)),
                 };
-                let base = self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0);
+                let base = self.builder.ins().load(ty, self.guest_flags, ptr, 0);
                 Ok((base, masked, size, Some(ptr)))
             }
             other => Err(MicroliftError::UnsupportedInstruction {
@@ -653,9 +653,7 @@ impl<'a> Lifter<'a> {
     ) -> crate::Result<()> {
         match ptr {
             Some(ptr) => {
-                self.builder
-                    .ins()
-                    .store(MemFlagsData::new(), result, ptr, 0);
+                self.builder.ins().store(self.guest_flags, result, ptr, 0);
                 Ok(())
             }
             None => self.set_reg_val(instruction.op0_register(), result),

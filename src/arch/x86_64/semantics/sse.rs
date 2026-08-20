@@ -391,11 +391,11 @@ impl<'a> Lifter<'a> {
                 let lo = self
                     .builder
                     .ins()
-                    .load(types::I64, MemFlagsData::new(), ptr, 0);
+                    .load(types::I64, self.guest_flags, ptr, 0);
                 let hi = self
                     .builder
                     .ins()
-                    .load(types::I64, MemFlagsData::new(), ptr, 8);
+                    .load(types::I64, self.guest_flags, ptr, 8);
                 Ok((lo, hi))
             }
             other => Err(MicroliftError::UnsupportedInstruction {
@@ -431,8 +431,8 @@ impl<'a> Lifter<'a> {
             }
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, op_index)?;
-                self.builder.ins().store(MemFlagsData::new(), lo, ptr, 0);
-                self.builder.ins().store(MemFlagsData::new(), hi, ptr, 8);
+                self.builder.ins().store(self.guest_flags, lo, ptr, 0);
+                self.builder.ins().store(self.guest_flags, hi, ptr, 8);
                 Ok(())
             }
             other => Err(MicroliftError::UnsupportedInstruction {
@@ -468,7 +468,7 @@ impl<'a> Lifter<'a> {
                 Ok(self
                     .builder
                     .ins()
-                    .load(types::I64X2, MemFlagsData::new(), ptr, 0))
+                    .load(types::I64X2, self.guest_flags, ptr, 0))
             }
             other => Err(MicroliftError::UnsupportedInstruction {
                 mnemonic: format!("xmm-src-vec-op{}-{:?}", op_index, other),
@@ -501,7 +501,7 @@ impl<'a> Lifter<'a> {
             }
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, op_index)?;
-                self.builder.ins().store(MemFlagsData::new(), val, ptr, 0);
+                self.builder.ins().store(self.guest_flags, val, ptr, 0);
                 Ok(())
             }
             other => Err(MicroliftError::UnsupportedInstruction {
@@ -550,7 +550,7 @@ impl<'a> Lifter<'a> {
                             let ptr = self.get_mem_ptr(instruction, 1)?;
                             self.builder
                                 .ins()
-                                .load(types::I64, MemFlagsData::new(), ptr, 0)
+                                .load(types::I64, self.guest_flags, ptr, 0)
                         }
                         other => {
                             return Err(MicroliftError::UnsupportedInstruction {
@@ -582,7 +582,7 @@ impl<'a> Lifter<'a> {
                 })?;
                 let lo = self.get_xmm_lo(src_idx);
                 let ptr = self.get_mem_ptr(instruction, 0)?;
-                self.builder.ins().store(MemFlagsData::new(), lo, ptr, 0);
+                self.builder.ins().store(self.guest_flags, lo, ptr, 0);
             }
             other => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -730,10 +730,10 @@ impl<'a> Lifter<'a> {
                     OpKind::Memory => {
                         // MOVSS xmm, m32 - load 32 bits, zero upper 96 bits.
                         let ptr = self.get_mem_ptr(instruction, 1)?;
-                        let val32 =
-                            self.builder
-                                .ins()
-                                .load(types::I32, MemFlagsData::new(), ptr, 0);
+                        let val32 = self
+                            .builder
+                            .ins()
+                            .load(types::I32, self.guest_flags, ptr, 0);
                         let lo = self.builder.ins().uextend(types::I64, val32);
                         let hi = self.builder.ins().iconst(types::I64, 0);
                         self.set_xmm_lo(dst_idx, lo);
@@ -757,7 +757,7 @@ impl<'a> Lifter<'a> {
                 let lo = self.get_xmm_lo(src_idx);
                 let val32 = self.builder.ins().ireduce(types::I32, lo);
                 let ptr = self.get_mem_ptr(instruction, 0)?;
-                self.builder.ins().store(MemFlagsData::new(), val32, ptr, 0);
+                self.builder.ins().store(self.guest_flags, val32, ptr, 0);
             }
             other => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -790,7 +790,7 @@ impl<'a> Lifter<'a> {
                             let ptr = self.get_mem_ptr(instruction, 1)?;
                             self.builder
                                 .ins()
-                                .load(types::I32, MemFlagsData::new(), ptr, 0)
+                                .load(types::I32, self.guest_flags, ptr, 0)
                         }
                         other => {
                             return Err(MicroliftError::UnsupportedInstruction {
@@ -816,7 +816,7 @@ impl<'a> Lifter<'a> {
                 let lo = self.get_xmm_lo(src_idx);
                 let val32 = self.builder.ins().ireduce(types::I32, lo);
                 let ptr = self.get_mem_ptr(instruction, 0)?;
-                self.builder.ins().store(MemFlagsData::new(), val32, ptr, 0);
+                self.builder.ins().store(self.guest_flags, val32, ptr, 0);
             }
             other => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -845,7 +845,7 @@ impl<'a> Lifter<'a> {
                 let hi = self
                     .builder
                     .ins()
-                    .load(types::I64, MemFlagsData::new(), ptr, 0);
+                    .load(types::I64, self.guest_flags, ptr, 0);
                 self.set_xmm_hi(dst_idx, hi);
             }
             OpKind::Memory => {
@@ -853,7 +853,7 @@ impl<'a> Lifter<'a> {
                 let src_idx = self.xmm_operand_index(instruction, 1, "movhps")?;
                 let hi = self.get_xmm_hi(src_idx);
                 let ptr = self.get_mem_ptr(instruction, 0)?;
-                self.builder.ins().store(MemFlagsData::new(), hi, ptr, 0);
+                self.builder.ins().store(self.guest_flags, hi, ptr, 0);
             }
             other => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -885,7 +885,7 @@ impl<'a> Lifter<'a> {
                 let lo = self
                     .builder
                     .ins()
-                    .load(types::I64, MemFlagsData::new(), ptr, 0);
+                    .load(types::I64, self.guest_flags, ptr, 0);
                 self.set_xmm_lo(dst_idx, lo);
             }
             OpKind::Memory => {
@@ -893,7 +893,7 @@ impl<'a> Lifter<'a> {
                 let src_idx = self.xmm_operand_index(instruction, 1, "movlps")?;
                 let lo = self.get_xmm_lo(src_idx);
                 let ptr = self.get_mem_ptr(instruction, 0)?;
-                self.builder.ins().store(MemFlagsData::new(), lo, ptr, 0);
+                self.builder.ins().store(self.guest_flags, lo, ptr, 0);
             }
             other => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -937,7 +937,7 @@ impl<'a> Lifter<'a> {
                 let ptr = self.get_mem_ptr(instruction, 1)?;
                 self.builder
                     .ins()
-                    .load(types::I64, MemFlagsData::new(), ptr, 0)
+                    .load(types::I64, self.guest_flags, ptr, 0)
             }
             other => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -1003,7 +1003,7 @@ impl<'a> Lifter<'a> {
                 let v = self
                     .builder
                     .ins()
-                    .load(types::I64, MemFlagsData::new(), ptr, 0);
+                    .load(types::I64, self.guest_flags, ptr, 0);
                 Ok(ShiftCount::Dynamic(v))
             }
             other => Err(MicroliftError::UnsupportedInstruction {
@@ -1268,7 +1268,7 @@ impl<'a> Lifter<'a> {
                         let lo = self
                             .builder
                             .ins()
-                            .load(types::I64, MemFlagsData::new(), ptr, 0);
+                            .load(types::I64, self.guest_flags, ptr, 0);
                         let hi = self.builder.ins().iconst(types::I64, 0);
                         self.set_xmm_lo(dst_idx, lo);
                         self.set_xmm_hi(dst_idx, hi);
@@ -1290,7 +1290,7 @@ impl<'a> Lifter<'a> {
                 })?;
                 let lo = self.get_xmm_lo(src_idx);
                 let ptr = self.get_mem_ptr(instruction, 0)?;
-                self.builder.ins().store(MemFlagsData::new(), lo, ptr, 0);
+                self.builder.ins().store(self.guest_flags, lo, ptr, 0);
             }
             other => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -1325,7 +1325,7 @@ impl<'a> Lifter<'a> {
                 Ok(self
                     .builder
                     .ins()
-                    .load(types::I64, MemFlagsData::new(), ptr, 0))
+                    .load(types::I64, self.guest_flags, ptr, 0))
             }
             other => Err(MicroliftError::UnsupportedInstruction {
                 mnemonic: format!("scalar-f64-src-op{}-{:?}", op_index, other),
@@ -1356,7 +1356,7 @@ impl<'a> Lifter<'a> {
                 Ok(self
                     .builder
                     .ins()
-                    .load(types::I32, MemFlagsData::new(), ptr, 0))
+                    .load(types::I32, self.guest_flags, ptr, 0))
             }
             other => Err(MicroliftError::UnsupportedInstruction {
                 mnemonic: format!("scalar-f32-src-op{}-{:?}", op_index, other),
@@ -2872,7 +2872,7 @@ impl<'a> Lifter<'a> {
                     }
                 };
                 let ptr = self.get_mem_ptr(instruction, op_index)?;
-                self.builder.ins().load(ty, MemFlagsData::new(), ptr, 0)
+                self.builder.ins().load(ty, self.guest_flags, ptr, 0)
             }
             other => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -3088,7 +3088,7 @@ impl<'a> Lifter<'a> {
                 Ok(self
                     .builder
                     .ins()
-                    .load(types::I64, MemFlagsData::new(), ptr, 0))
+                    .load(types::I64, self.guest_flags, ptr, 0))
             }
             other => Err(MicroliftError::UnsupportedInstruction {
                 mnemonic: format!("{}-src-{:?}", who, other),
@@ -3619,12 +3619,9 @@ impl<'a> Lifter<'a> {
     pub(super) fn handle_stmxcsr(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let ctx = self.builder.use_var(self.state.context_ptr);
         let off = std::mem::offset_of!(RegisterContext, mxcsr) as i32;
-        let mxcsr = self
-            .builder
-            .ins()
-            .load(types::I32, MemFlagsData::trusted(), ctx, off);
+        let mxcsr = self.ctx_load(types::I32, ctx, off);
         let ptr = self.mxcsr_mem_ptr(instruction, "stmxcsr")?;
-        self.builder.ins().store(MemFlagsData::new(), mxcsr, ptr, 0);
+        self.builder.ins().store(self.guest_flags, mxcsr, ptr, 0);
         Ok(())
     }
 
@@ -3641,13 +3638,11 @@ impl<'a> Lifter<'a> {
         let val = self
             .builder
             .ins()
-            .load(types::I32, MemFlagsData::new(), ptr, 0);
+            .load(types::I32, self.guest_flags, ptr, 0);
         let val = self.builder.ins().band_imm_u(val, MXCSR_MASK as i64);
         let ctx = self.builder.use_var(self.state.context_ptr);
         let off = std::mem::offset_of!(RegisterContext, mxcsr) as i32;
-        self.builder
-            .ins()
-            .store(MemFlagsData::trusted(), val, ctx, off);
+        self.ctx_store(val, ctx, off);
         Ok(())
     }
 

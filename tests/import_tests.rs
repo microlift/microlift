@@ -156,7 +156,7 @@ fn test_import_fast_call_strlen() {
 /// Round 1: the lifter exits with `ImportedFunctionCall`.
 ///   - `ctx.imported_function_va` == `IMPORT_VA`.
 ///   - `ctx.rip` == 0x100F (the `ret` instruction - the resume point).
-///   - `ctx.rdi` holds the string pointer (synced by `sync_to_context_selective`).
+///   - `ctx.rdi` holds the string pointer (published by the exit's `sync_to_context`).
 ///
 /// The host reads `ctx.rdi`, calls `host_strlen` itself, writes the result
 /// into `ctx.rax`, and invokes the lifted function a second time.
@@ -195,7 +195,7 @@ fn test_import_slow_call_strlen_with_resume() {
         LIFT_BASE + 15,
         "rip should point to the instruction after the CALL (the ret)"
     );
-    // RDI was synced by sync_to_context_selective and holds the string ptr.
+    // RDI was published by the exit's full sync and holds the string ptr.
     assert_eq!(
         ctx.rdi, string_ptr,
         "rdi should hold the string pointer arg"

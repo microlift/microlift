@@ -16,9 +16,11 @@ use crate::MicroliftError;
 use crate::arch::aarch64::Aarch64;
 use crate::arch::aarch64::Lifter64;
 use crate::arch::aarch64::decode::A64Instr;
-use crate::arch::aarch64::regs::{Nzcv, ZR};
+use crate::arch::aarch64::regs::{FLAG_ORDER, Nzcv, ZR};
+use crate::arch::aarch64::sync::SP_SLOT;
 use crate::core::GuestArch;
 use crate::core::exit::{ExitReason, TransferKind};
+use crate::core::regsync::RegSlot;
 use cranelift::prelude::*;
 use yaxpeax_arm::armv8::a64::{Opcode, Operand, ShiftStyle, SizeCode};
 
@@ -144,10 +146,10 @@ impl<'a> Lifter64<'a> {
         };
         if num == ZR {
             self.builder.def_var(self.state.sp, full);
-            self.state.dirty_sp = true;
+            self.mark_written(SP_SLOT);
         } else {
             self.builder.def_var(self.state.gprs[&num], full);
-            self.state.dirty_gprs.insert(num);
+            self.mark_written(RegSlot::Gpr(num as u8));
         }
     }
 
@@ -190,7 +192,11 @@ impl<'a> Lifter64<'a> {
             self.builder.ins().ireduce(types::I8, val)
         };
         self.builder.def_var(self.state.flags[&flag], v8);
-        self.state.dirty_flags.insert(flag);
+        let idx = FLAG_ORDER
+            .iter()
+            .position(|&f| f == flag)
+            .expect("a flag variable has a FLAG_ORDER index");
+        self.mark_written(RegSlot::Flag(idx as u8));
     }
 
     fn get_flag(&mut self, flag: Nzcv) -> Value {
@@ -631,7 +637,7 @@ impl<'a> Lifter64<'a> {
         let (t, sz, _) = decode_reg(op0).ok_or_else(|| Self::bad_operand("ldr", op0))?;
         let ty = size_ty(sz);
         let (addr, wb) = self.mem_address(op1)?;
-        let val = self.builder.ins().load(ty, MemFlagsData::new(), addr, 0);
+        let val = self.builder.ins().load(ty, self.guest_flags, addr, 0);
         self.write_reg_val(t, false, ty, val);
         self.apply_writeback(wb);
         Ok(())
@@ -642,7 +648,7 @@ impl<'a> Lifter64<'a> {
         let ty = size_ty(sz);
         let val = self.read_reg_val(t, false, ty);
         let (addr, wb) = self.mem_address(op1)?;
-        self.builder.ins().store(MemFlagsData::new(), val, addr, 0);
+        self.builder.ins().store(self.guest_flags, val, addr, 0);
         self.apply_writeback(wb);
         Ok(())
     }
@@ -658,10 +664,8 @@ impl<'a> Lifter64<'a> {
         let v1 = self.read_reg_val(t1, false, ty);
         let v2 = self.read_reg_val(t2, false, ty);
         let (addr, wb) = self.mem_address(op2)?;
-        self.builder.ins().store(MemFlagsData::new(), v1, addr, 0);
-        self.builder
-            .ins()
-            .store(MemFlagsData::new(), v2, addr, elem);
+        self.builder.ins().store(self.guest_flags, v1, addr, 0);
+        self.builder.ins().store(self.guest_flags, v2, addr, elem);
         self.apply_writeback(wb);
         Ok(())
     }
@@ -675,8 +679,8 @@ impl<'a> Lifter64<'a> {
         let ty = size_ty(sz);
         let elem = ty.bytes() as i32;
         let (addr, wb) = self.mem_address(op2)?;
-        let v1 = self.builder.ins().load(ty, MemFlagsData::new(), addr, 0);
-        let v2 = self.builder.ins().load(ty, MemFlagsData::new(), addr, elem);
+        let v1 = self.builder.ins().load(ty, self.guest_flags, addr, 0);
+        let v2 = self.builder.ins().load(ty, self.guest_flags, addr, elem);
         self.write_reg_val(t1, false, ty, v1);
         self.write_reg_val(t2, false, ty, v2);
         self.apply_writeback(wb);
@@ -808,9 +812,7 @@ impl<'a> Lifter64<'a> {
 
         let ctx_ptr = self.builder.use_var(self.state.context_ptr);
         let va_offset = <Aarch64 as GuestArch>::imported_function_va_offset();
-        self.builder
-            .ins()
-            .store(MemFlagsData::trusted(), target, ctx_ptr, va_offset);
+        self.ctx_store(target, ctx_ptr, va_offset);
 
         self.sync_to_context(None, ExitReason::IndirectCall)?;
         self.emit_host_return();

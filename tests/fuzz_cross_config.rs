@@ -50,6 +50,36 @@ proptest! {
         }
     }
 
+    /// Dropping the context traffic the region had no use for may not change a
+    /// single bit of state, at any optimization level.
+    #[test]
+    fn lazy_register_sync_changes_nothing(
+        op in any_alu_op(),
+        a in any::<u64>(),
+        b in any::<u64>(),
+    ) {
+        let bytes = alu_snippet(op, a, b);
+        let base = LiftTest::new(&bytes)
+            .opt(Opt::None)
+            .with_config(|c| c.lazy_register_sync = false)
+            .run();
+        let base = fingerprint(&base.ctx);
+
+        for opt in [Opt::None, Opt::Speed, Opt::SpeedAndSize] {
+            for lazy in [false, true] {
+                let out = LiftTest::new(&bytes)
+                    .opt(opt)
+                    .with_config(|c| c.lazy_register_sync = lazy)
+                    .run();
+                prop_assert_eq!(
+                    &fingerprint(&out.ctx), &base,
+                    "context-sync divergence for {:?} {:#x},{:#x} at opt={:?} lazy={}",
+                    op, a, b, opt, lazy
+                );
+            }
+        }
+    }
+
     /// Skipping the flag writes nothing reads may not change a single bit of
     /// state - flags very much included, since a mistake in the classification
     /// shows up there and nowhere else.

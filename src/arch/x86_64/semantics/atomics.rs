@@ -72,10 +72,10 @@ impl<'a> Lifter<'a> {
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 0)?;
                 // atomic_cas: if *ptr == acc_narrow { *ptr = src_val }; returns old *ptr
-                let old =
-                    self.builder
-                        .ins()
-                        .atomic_cas(MemFlagsData::new(), ptr, acc_narrow, src_val);
+                let old = self
+                    .builder
+                    .ins()
+                    .atomic_cas(self.guest_flags, ptr, acc_narrow, src_val);
 
                 // Update flags as CMP acc, old  (acc - old)
                 self.sub_with_flags(acc_narrow, old, size)?;
@@ -137,7 +137,7 @@ impl<'a> Lifter<'a> {
         let old = self
             .builder
             .ins()
-            .atomic_cas(MemFlagsData::new(), ptr, expected, replacement);
+            .atomic_cas(self.guest_flags, ptr, expected, replacement);
 
         let succeeded = self.builder.ins().icmp(IntCC::Equal, old, expected);
         self.set_flag(X86Flag::Zero, succeeded)?;
@@ -196,7 +196,7 @@ impl<'a> Lifter<'a> {
                 let old =
                     self.builder
                         .ins()
-                        .atomic_cas(MemFlagsData::new(), ptr, expected, replacement);
+                        .atomic_cas(self.guest_flags, ptr, expected, replacement);
                 let succeeded = self.builder.ins().icmp(IntCC::Equal, old, expected);
                 let (lo, hi) = self.builder.ins().isplit(old);
                 (lo, hi, succeeded)
@@ -206,7 +206,7 @@ impl<'a> Lifter<'a> {
             // behaviour - `CMPXCHG16B` writes the destination even when the
             // comparison fails (it writes the value back unchanged).
             _ => {
-                let flags = MemFlagsData::new();
+                let flags = self.guest_flags;
                 let lo = self.builder.ins().load(types::I64, flags, ptr, 0);
                 let hi = self.builder.ins().load(types::I64, flags, ptr, 8);
                 let lo_eq = self.builder.ins().icmp(IntCC::Equal, lo, rax);
@@ -271,10 +271,10 @@ impl<'a> Lifter<'a> {
         let ty = size_to_type(size);
         let ptr = self.get_mem_ptr(instruction, 0)?;
         let src = self.read_operand(instruction, 1, size)?;
-        let old =
-            self.builder
-                .ins()
-                .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::Add, ptr, src);
+        let old = self
+            .builder
+            .ins()
+            .atomic_rmw(ty, self.guest_flags, AtomicRmwOp::Add, ptr, src);
         self.add_with_flags(old, src, size)?;
         Ok(())
     }
@@ -284,10 +284,10 @@ impl<'a> Lifter<'a> {
         let ty = size_to_type(size);
         let ptr = self.get_mem_ptr(instruction, 0)?;
         let src = self.read_operand(instruction, 1, size)?;
-        let old =
-            self.builder
-                .ins()
-                .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::Sub, ptr, src);
+        let old = self
+            .builder
+            .ins()
+            .atomic_rmw(ty, self.guest_flags, AtomicRmwOp::Sub, ptr, src);
         self.sub_with_flags(old, src, size)?;
         Ok(())
     }
@@ -325,7 +325,7 @@ impl<'a> Lifter<'a> {
         let done_b = self.builder.create_block();
         self.builder.append_block_param(done_b, ty); // value that was swapped out
 
-        let init = self.builder.ins().atomic_load(ty, MemFlagsData::new(), ptr);
+        let init = self.builder.ins().atomic_load(ty, self.guest_flags, ptr);
         self.builder.ins().jump(loop_b, &[init.into()]);
 
         self.builder.switch_to_block(loop_b);
@@ -336,7 +336,7 @@ impl<'a> Lifter<'a> {
         let observed = self
             .builder
             .ins()
-            .atomic_cas(MemFlagsData::new(), ptr, cur, result);
+            .atomic_cas(self.guest_flags, ptr, cur, result);
         let swapped = self.builder.ins().icmp(IntCC::Equal, observed, cur);
         self.builder
             .ins()
@@ -355,10 +355,10 @@ impl<'a> Lifter<'a> {
         let ty = size_to_type(size);
         let ptr = self.get_mem_ptr(instruction, 0)?;
         let src = self.read_operand(instruction, 1, size)?;
-        let old =
-            self.builder
-                .ins()
-                .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::And, ptr, src);
+        let old = self
+            .builder
+            .ins()
+            .atomic_rmw(ty, self.guest_flags, AtomicRmwOp::And, ptr, src);
         let result = self.builder.ins().band(old, src);
         self.update_flags_logical(result, size)?;
         Ok(())
@@ -372,7 +372,7 @@ impl<'a> Lifter<'a> {
         let old = self
             .builder
             .ins()
-            .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::Or, ptr, src);
+            .atomic_rmw(ty, self.guest_flags, AtomicRmwOp::Or, ptr, src);
         let result = self.builder.ins().bor(old, src);
         self.update_flags_logical(result, size)?;
         Ok(())
@@ -383,10 +383,10 @@ impl<'a> Lifter<'a> {
         let ty = size_to_type(size);
         let ptr = self.get_mem_ptr(instruction, 0)?;
         let src = self.read_operand(instruction, 1, size)?;
-        let old =
-            self.builder
-                .ins()
-                .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::Xor, ptr, src);
+        let old = self
+            .builder
+            .ins()
+            .atomic_rmw(ty, self.guest_flags, AtomicRmwOp::Xor, ptr, src);
         let result = self.builder.ins().bxor(old, src);
         self.update_flags_logical(result, size)?;
         Ok(())
@@ -397,10 +397,10 @@ impl<'a> Lifter<'a> {
         let ty = size_to_type(size);
         let ptr = self.get_mem_ptr(instruction, 0)?;
         let one = self.builder.ins().iconst(ty, 1);
-        let old =
-            self.builder
-                .ins()
-                .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::Add, ptr, one);
+        let old = self
+            .builder
+            .ins()
+            .atomic_rmw(ty, self.guest_flags, AtomicRmwOp::Add, ptr, one);
         self.inc_dec_with_flags(old, one, true, size)?;
         Ok(())
     }
@@ -410,10 +410,10 @@ impl<'a> Lifter<'a> {
         let ty = size_to_type(size);
         let ptr = self.get_mem_ptr(instruction, 0)?;
         let one = self.builder.ins().iconst(ty, 1);
-        let old =
-            self.builder
-                .ins()
-                .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::Sub, ptr, one);
+        let old = self
+            .builder
+            .ins()
+            .atomic_rmw(ty, self.guest_flags, AtomicRmwOp::Sub, ptr, one);
         self.inc_dec_with_flags(old, one, false, size)?;
         Ok(())
     }
@@ -431,10 +431,10 @@ impl<'a> Lifter<'a> {
             src_val
         };
         // atomic fetch-add: returns old *ptr, then *ptr += src
-        let old =
-            self.builder
-                .ins()
-                .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::Add, ptr, src);
+        let old = self
+            .builder
+            .ins()
+            .atomic_rmw(ty, self.guest_flags, AtomicRmwOp::Add, ptr, src);
         // src register gets the pre-add memory value
         self.set_reg_val(src_reg, old)?;
         self.add_with_flags(old, src, size)?;
@@ -461,13 +461,10 @@ impl<'a> Lifter<'a> {
             reg_val
         };
         // atomic swap: returns old *ptr, writes reg_narrow to *ptr
-        let old = self.builder.ins().atomic_rmw(
-            ty,
-            MemFlagsData::new(),
-            AtomicRmwOp::Xchg,
-            ptr,
-            reg_narrow,
-        );
+        let old =
+            self.builder
+                .ins()
+                .atomic_rmw(ty, self.guest_flags, AtomicRmwOp::Xchg, ptr, reg_narrow);
         self.set_reg_val(reg, old)?;
         // XCHG does not modify flags.
         Ok(())
@@ -491,7 +488,7 @@ impl<'a> Lifter<'a> {
         let done_b = self.builder.create_block();
         self.builder.append_block_param(done_b, ty); // value that was swapped out
 
-        let init = self.builder.ins().atomic_load(ty, MemFlagsData::new(), ptr);
+        let init = self.builder.ins().atomic_load(ty, self.guest_flags, ptr);
         self.builder.ins().jump(loop_b, &[init.into()]);
 
         self.builder.switch_to_block(loop_b);
@@ -501,7 +498,7 @@ impl<'a> Lifter<'a> {
         let observed = self
             .builder
             .ins()
-            .atomic_cas(MemFlagsData::new(), ptr, cur, result);
+            .atomic_cas(self.guest_flags, ptr, cur, result);
         let swapped = self.builder.ins().icmp(IntCC::Equal, observed, cur);
         self.builder
             .ins()
@@ -527,7 +524,7 @@ impl<'a> Lifter<'a> {
         let all_ones = self.builder.ins().iconst(ty, -1);
         self.builder
             .ins()
-            .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::Xor, ptr, all_ones);
+            .atomic_rmw(ty, self.guest_flags, AtomicRmwOp::Xor, ptr, all_ones);
         Ok(())
     }
 
@@ -591,23 +588,19 @@ impl<'a> Lifter<'a> {
             BitOp::Set => {
                 self.builder
                     .ins()
-                    .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::Or, ptr, mask)
+                    .atomic_rmw(ty, self.guest_flags, AtomicRmwOp::Or, ptr, mask)
             }
             BitOp::Reset => {
                 let all_ones = self.builder.ins().iconst(ty, -1);
                 let inv_mask = self.builder.ins().bxor(mask, all_ones);
-                self.builder.ins().atomic_rmw(
-                    ty,
-                    MemFlagsData::new(),
-                    AtomicRmwOp::And,
-                    ptr,
-                    inv_mask,
-                )
+                self.builder
+                    .ins()
+                    .atomic_rmw(ty, self.guest_flags, AtomicRmwOp::And, ptr, inv_mask)
             }
             BitOp::Complement => {
                 self.builder
                     .ins()
-                    .atomic_rmw(ty, MemFlagsData::new(), AtomicRmwOp::Xor, ptr, mask)
+                    .atomic_rmw(ty, self.guest_flags, AtomicRmwOp::Xor, ptr, mask)
             }
         };
 

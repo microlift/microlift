@@ -7,7 +7,7 @@ use crate::core::LifterConfig;
 use cranelift::prelude::*;
 use cranelift_frontend::{FunctionBuilder, Variable};
 use iced_x86::Register;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum X86Flag {
@@ -20,6 +20,22 @@ pub enum X86Flag {
     /// Direction flag - controls string-operation pointer direction.
     Direction,
 }
+
+/// The seven modelled condition flags, in a fixed order.
+///
+/// Iterating this rather than `RegisterState::flags` is what makes the context
+/// sync deterministic: a `HashMap` walk emits the same stores in a different
+/// order under every process, which changes x86 displacement encodings and so
+/// changes `.text` between two lifts of identical bytes.
+pub const FLAG_ORDER: [X86Flag; 7] = [
+    X86Flag::Carry,
+    X86Flag::Parity,
+    X86Flag::Auxiliary,
+    X86Flag::Zero,
+    X86Flag::Sign,
+    X86Flag::Overflow,
+    X86Flag::Direction,
+];
 
 /// The 16 general-purpose registers in architectural encoding order.
 ///
@@ -44,6 +60,28 @@ pub const GPR_ORDER: [Register; 16] = [
     Register::R15,
 ];
 
+/// [`GPR_ORDER`]'s names, for the alias-region descriptions that appear in a
+/// `.clif` dump.
+pub const GPR_NAMES: [&str; 16] = [
+    "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13",
+    "r14", "r15",
+];
+
+/// [`FLAG_ORDER`]'s names, for the same reason.
+pub const FLAG_NAMES: [&str; 7] = ["cf", "pf", "af", "zf", "sf", "of", "df"];
+
+/// XMM register names, and the names of their high halves in scalar mode.
+pub const XMM_NAMES: [&str; 16] = [
+    "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10",
+    "xmm11", "xmm12", "xmm13", "xmm14", "xmm15",
+];
+
+/// High halves of [`XMM_NAMES`], used only when `use_vector_xmm` is off.
+pub const XMM_HI_NAMES: [&str; 16] = [
+    "xmm0.hi", "xmm1.hi", "xmm2.hi", "xmm3.hi", "xmm4.hi", "xmm5.hi", "xmm6.hi", "xmm7.hi",
+    "xmm8.hi", "xmm9.hi", "xmm10.hi", "xmm11.hi", "xmm12.hi", "xmm13.hi", "xmm14.hi", "xmm15.hi",
+];
+
 /// The six segment-selector registers, in architectural encoding order
 /// (`ES`=0, `CS`=1, `SS`=2, `DS`=3, `FS`=4, `GS`=5).
 pub const SEGMENT_ORDER: [Register; 6] = [
@@ -54,6 +92,10 @@ pub const SEGMENT_ORDER: [Register; 6] = [
     Register::FS,
     Register::GS,
 ];
+
+/// [`SEGMENT_ORDER`]'s names, for the alias-region descriptions in a `.clif`
+/// dump.
+pub const SEGMENT_NAMES: [&str; 6] = ["es", "cs", "ss", "ds", "fs", "gs"];
 
 /// Whether `reg` is one of the six segment-selector registers.
 pub fn is_segment_register(reg: Register) -> bool {
@@ -68,7 +110,12 @@ pub fn gpr_index(reg: Register) -> Option<u8> {
     GPR_ORDER.iter().position(|&r| r == full).map(|i| i as u8)
 }
 
-/// Mapping of x86 registers to Cranelift variables, plus dirty-bit tracking.
+/// Mapping of x86 registers to Cranelift variables.
+///
+/// Which of them a region actually *wrote* is not tracked here: it is a
+/// property of the lift rather than of the register file, and it lives on the
+/// engine as [`LiftEngine::mark_written`](crate::core::LiftEngine::mark_written)
+/// - see [`crate::core::regsync`].
 pub struct RegisterState {
     pub gprs: HashMap<Register, Variable>,
     pub flags: HashMap<X86Flag, Variable>,
@@ -87,13 +134,6 @@ pub struct RegisterState {
     pub fs_base: Variable,
     /// GS segment base address SSA variable.
     pub gs_base: Variable,
-
-    // --- dirty-bit tracking (written since the last context reload) ---
-    pub dirty_gprs: HashSet<Register>,
-    pub dirty_flags: HashSet<X86Flag>,
-    pub dirty_xmms: HashSet<u8>,
-    pub dirty_fs_base: bool,
-    pub dirty_gs_base: bool,
 }
 
 impl RegisterState {
@@ -106,17 +146,7 @@ impl RegisterState {
         }
 
         let mut flags = HashMap::new();
-        let flag_types = [
-            X86Flag::Carry,
-            X86Flag::Parity,
-            X86Flag::Auxiliary,
-            X86Flag::Zero,
-            X86Flag::Sign,
-            X86Flag::Overflow,
-            X86Flag::Direction,
-        ];
-
-        for &flag in &flag_types {
+        for &flag in &FLAG_ORDER {
             let var = builder.declare_var(types::I8);
             flags.insert(flag, var);
         }
@@ -152,11 +182,6 @@ impl RegisterState {
             use_vector_xmm,
             fs_base,
             gs_base,
-            dirty_gprs: HashSet::new(),
-            dirty_flags: HashSet::new(),
-            dirty_xmms: HashSet::new(),
-            dirty_fs_base: false,
-            dirty_gs_base: false,
         }
     }
 

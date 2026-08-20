@@ -21,12 +21,7 @@ impl<'a> Lifter<'a> {
                 let ctx_ptr = self.builder.use_var(self.state.context_ptr);
                 let handler_offset =
                     std::mem::offset_of!(crate::context::RegisterContext, syscall_handler) as i32;
-                let handler_ptr = self.builder.ins().load(
-                    types::I64,
-                    MemFlagsData::trusted(),
-                    ctx_ptr,
-                    handler_offset,
-                );
+                let handler_ptr = self.ctx_load(types::I64, ctx_ptr, handler_offset);
 
                 let has_handler = self
                     .builder
@@ -49,6 +44,9 @@ impl<'a> Lifter<'a> {
                     .ins()
                     .call_indirect(sig, handler_ptr, &[ctx_ptr]);
                 self.load_state_from_context()?;
+                // The handler may have written any field, so nothing past here
+                // still holds its entry value; see `Lifter::mark_all_written`.
+                self.mark_all_written();
                 self.builder.ins().jump(resume_block, &[]);
 
                 self.builder.switch_to_block(exit_block);

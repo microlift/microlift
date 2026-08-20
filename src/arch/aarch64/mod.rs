@@ -15,7 +15,7 @@ use cranelift_frontend::{FunctionBuilder, Variable};
 
 use context::Aarch64RegisterContext;
 use decode::A64Instr;
-use regs::Aarch64RegState;
+use regs::{Aarch64RegState, FLAG_NAMES, FLAG_ORDER, GPR_NAMES, GPR_ORDER};
 
 /// aarch64 guest architecture marker.
 pub struct Aarch64;
@@ -87,6 +87,27 @@ impl GuestArch for Aarch64 {
 
     fn control_flow(i: &Self::Instr) -> crate::arch::ControlFlow {
         decode::control_flow(i)
+    }
+
+    /// Every constant-offset `Aarch64RegisterContext` field, one alias region
+    /// each - see [`crate::core::alias`]. The V registers are absent because
+    /// they are not SSA variables here yet.
+    fn context_fields(_config: &LifterConfig) -> Vec<(i32, &'static str)> {
+        let mut fields: Vec<(i32, &'static str)> = Vec::with_capacity(40);
+        for (&reg, &name) in GPR_ORDER.iter().zip(GPR_NAMES.iter()) {
+            fields.push((Aarch64RegState::get_gpr_offset(reg), name));
+        }
+        fields.push((Aarch64RegState::get_sp_offset(), "sp"));
+        for (&flag, &name) in FLAG_ORDER.iter().zip(FLAG_NAMES.iter()) {
+            fields.push((Aarch64RegState::get_flag_offset(flag), name));
+        }
+        fields.push((Aarch64RegState::get_tpidr_offset(), "tpidr_el0"));
+        fields.push((Self::pc_offset(), "pc"));
+        fields.push((Self::image_base_offset(), "image_base"));
+        fields.push((Self::exit_reason_offset(), "exit_reason"));
+        fields.push((Self::exit_code_offset(), "exit_code"));
+        fields.push((Self::imported_function_va_offset(), "imported_function_va"));
+        fields
     }
 
     fn lift_instruction(lifter: &mut LiftEngine<'_, Self>, i: &Self::Instr) -> crate::Result<()> {

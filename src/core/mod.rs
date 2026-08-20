@@ -5,12 +5,14 @@
 //! `Lifter<'a>` is an alias for `LiftEngine<'a, X86_64>`.
 
 pub mod abi;
+pub mod alias;
 pub mod bridge;
 pub mod exit;
 pub mod flags;
 pub mod link;
 pub mod optimize;
 pub mod pin;
+pub mod regsync;
 pub mod specialize;
 pub mod srcloc;
 
@@ -31,7 +33,7 @@ use crate::function_traits::{DynamicSymbol, FunctionArgumentType};
 use crate::os::get_host_calling_conv;
 use cranelift::prelude::*;
 use cranelift_codegen::ir::{
-    ExtFuncData, ExternalName, FuncRef, Function, SigRef, SourceLoc, UserExternalName,
+    ExtFuncData, ExternalName, FuncRef, Function, Inst, SigRef, SourceLoc, UserExternalName,
     UserExternalNameRef, UserFuncName,
 };
 use cranelift_codegen::isa::CallConv;
@@ -55,8 +57,6 @@ pub trait GuestArch: Sized {
     /// the universal `context_ptr` / `image_base` variables).
     type RegState;
 
-    // --- context layout (drives the shared sync/exit code) ---
-
     /// Byte offset of the architectural PC field within the guest's
     /// `RegisterContext`.
     fn pc_offset() -> i32;
@@ -74,8 +74,6 @@ pub trait GuestArch: Sized {
     fn block_link_offsets() -> Option<BlockLinkOffsets> {
         None
     }
-
-    // --- pinned register file (see [`crate::core::pin`]) ---
 
     /// The Cranelift type a pinned `reg` is passed as, or `None` to refuse it.
     ///
@@ -99,17 +97,19 @@ pub trait GuestArch: Sized {
         None
     }
 
-    // --- universal SSA variables held inside the register file ---
-
     /// The variable holding the pointer to the guest `RegisterContext`.
     fn context_ptr_var(state: &Self::RegState) -> Variable;
     /// The variable holding the runtime image base (for ASLR-resilient PC).
     fn image_base_var(state: &Self::RegState) -> Variable;
 
-    // --- register file construction ---
     fn new_state(builder: &mut FunctionBuilder, config: &LifterConfig) -> Self::RegState;
 
-    // --- decode (phase 1) ---
+    /// Every `RegisterContext` field reachable at a constant offset, as
+    /// `(offset, name)`.
+    fn context_fields(_config: &LifterConfig) -> Vec<(i32, &'static str)> {
+        Vec::new()
+    }
+
     fn decode_region(bytes: &[u8], ip: u64) -> Vec<Self::Instr>;
     /// Decode the single instruction at the start of `bytes`, at virtual address
     /// `ip`. `None` only when `bytes` is too short to hold any instruction;
@@ -162,7 +162,6 @@ pub trait GuestArch: Sized {
         HashMap::new()
     }
 
-    // --- per-instruction lift + state sync (delegate to inherent methods) ---
     fn lift_instruction(lifter: &mut LiftEngine<'_, Self>, i: &Self::Instr) -> crate::Result<()>;
     fn load_state_from_context(lifter: &mut LiftEngine<'_, Self>) -> crate::Result<()>;
     fn sync_to_context(
@@ -776,8 +775,7 @@ pub struct LifterConfig {
     /// time rather than snapshotted here.
     ///
     /// Consulted only for addresses absent from [`imports`](Self::imports), so
-    /// an explicit registration always wins. This is what makes `dlopen`/`dlsym`
-    /// calls work without re-plumbing anything.
+    /// an explicit registration always wins.
     pub import_registry: Option<Arc<dyn ImportRegistry>>,
     /// Optional bridge for indirect calls whose target is only known at run time
     /// (`CALL reg` / `CALL [mem]` to an unregistered address).
@@ -795,44 +793,26 @@ pub struct LifterConfig {
     /// fast paths, instead of scalar lo/hi 64-bit pairs (the default).
     ///
     /// Off by default because the scalar form avoids relying on Cranelift's
-    /// vector lowering, which AOT targets without SIMD (e.g. RISC-V64) need.
+    /// vector lowering, which AOT targets without SIMD (e.g. RISCV-64) need.
     pub use_vector_xmm: bool,
     /// Which target-specific instruction specializations the lifter may apply.
     ///
-    /// The semantics are written out of Cranelift ops that lower on *every*
-    /// backend, which is the only safe default for a lifter that does not know
-    /// its consumer, and occasionally dozens of IR instructions where a real
-    /// SIMD target has one. Tell the lifter what it is feeding and it emits the
-    /// short form.
-    ///
-    /// Defaults to [`Specialization::generic`]: nothing enabled, output identical
-    /// to a lifter without the knob. Set it from the triple the backend will
-    /// compile for - [`Specialization::host`] for the JIT,
-    /// [`Specialization::for_triple`] for AOT.
-    ///
-    /// Each specialization declares a prerequisite and is **silently inert**
-    /// without it: the vector ones need [`use_vector_xmm`](Self::use_vector_xmm),
-    /// while [`Spec::IntegerOverflowFlags`](crate::core::specialize::Spec::IntegerOverflowFlags)
-    /// needs [`eliminate_dead_flags`](Self::eliminate_dead_flags) instead, since
-    /// without flag liveness it is a measured regression.
-    ///
-    /// **No specialization changes a result bit** - see
-    /// [`crate::core::specialize`] for the contract and its equivalence suite.
+    /// No specialization changes semantics, it only helps with their speed.
     pub specialization: Specialization,
     /// How a guest 128-bit compare-and-swap (`CMPXCHG16B`) is lowered. See
     /// [`Atomic128Mode`]; defaults to the portable, non-atomic emulation.
     pub atomic128: Atomic128Mode,
-    /// What bit pattern an SSE instruction's *generated* NaN gets. See
+    /// What bit pattern an SSE instruction's generated NaN gets. See
     /// [`GeneratedNan`]; defaults to [`GeneratedNan::X86Exact`], which is what
     /// hardware does and costs six or seven instructions per FP operation.
     pub generated_nan: GeneratedNan,
-    /// Produce *inspection* IR for static analysis rather than runnable IR.
+    /// Produce inspection IR for static analysis rather than runnable IR.
     ///
     /// The entry PC-dispatch becomes a direct jump to the first block, context
     /// write-back is skipped so registers stay pure SSA, and out-of-region exit
     /// stubs become bare `return`s.
     ///
-    /// The result is a clean CFG of the guest's own blocks, but it does **not**
+    /// The result is a clean CFG of the guest's own blocks, but it does not
     /// write guest state back, so it must never be executed.
     pub analysis_mode: bool,
     /// The guest return address that means "leave the region and hand control
@@ -851,36 +831,12 @@ pub struct LifterConfig {
     pub outline_helpers: bool,
     /// Tag every emitted IR instruction with the guest instruction it was lifted
     /// from, as a Cranelift `SourceLoc` (see [`crate::core::srcloc`]).
-    ///
-    /// Pure debug info: Cranelift treats a `SourceLoc` as opaque metadata, so
-    /// this changes neither codegen nor optimization. It answers "which guest
-    /// instruction is this?" of printed IR, of compiled machine code, or of a
-    /// host `RIP` in a crash - otherwise near-unanswerable once blocks have been
-    /// merged, duplicated and scheduled.
-    ///
-    /// On by default; the generated code pays nothing for it. The lift-time half
-    /// comes back as [`LiftedCode::source_map`], the compiled half is
-    /// [`GuestCodeMap`](crate::core::srcloc::GuestCodeMap).
     pub emit_source_locs: bool,
+    /// Keep out of the emitted code the context loads and stores the region had
+    /// no use for - see [`crate::core::regsync`].
+    pub lazy_register_sync: bool,
     /// Exit rather than decode when an instruction's bytes run past the end of
     /// the region.
-    ///
-    /// For a host that cuts regions on a **fixed grid** (a page, a cache line)
-    /// rather than on instruction boundaries. A decoder given fewer bytes than
-    /// an encoding needs reports *invalid*, indistinguishably from a byte that
-    /// is not an instruction - so an ordinary `mov` at the end of a page would
-    /// otherwise become a fatal [`ExitReason::InvalidInstruction`].
-    ///
-    /// With this on, an instruction that begins inside the region and ends
-    /// outside it - by its decoded length, or by coming back invalid within
-    /// [`MAX_INSTRUCTION_LEN`](GuestArch::MAX_INSTRUCTION_LEN) of the end - is
-    /// not lifted at all. It becomes an [`ExitReason::UnknownJump`] with
-    /// [`TransferKind::RegionTail`], PC at that instruction and nothing
-    /// executed, so the host lifts a fresh region there and re-enters.
-    ///
-    /// **Progress is guaranteed** because the region's first instruction is
-    /// exempt: a region always holds its own entry instruction, so the re-lift
-    /// cannot produce the same exit at the same address.
     ///
     /// [`ExitReason::InvalidInstruction`]: crate::core::exit::ExitReason::InvalidInstruction
     /// [`ExitReason::UnknownJump`]: crate::core::exit::ExitReason::UnknownJump
@@ -888,29 +844,10 @@ pub struct LifterConfig {
     pub region_tail_exit: bool,
     /// The guest page size [`page_bounded_extent`](Self::page_bounded_extent)
     /// cuts regions on.
-    ///
-    /// A knob because the answer is as much a property of the host as of the
-    /// guest: an x86-64 program assumes 4 KiB, Apple Silicon gives it 16 KiB,
-    /// and the larger page is strictly better here - a quarter as many regions,
-    /// a quarter as many boundaries to straddle.
     pub page_size: u64,
-    /// The sub-ranges of the byte slice that are actually **code**, when the host
+    /// The sub-ranges of the byte slice that are actually code, when the host
     /// knows and the slice is not all of it. Empty - the default - means the
     /// whole slice.
-    ///
-    /// A host that discovers a region by following control flow finds a *set of
-    /// basic blocks*, not an interval. Between them lie bytes no block reaches:
-    /// an embedded jump table, alignment padding, a trampoline's inline
-    /// argument. Handing the lift the spanning interval hands it those holes
-    /// too, and phase 1's linear sweep decodes them into whatever they happen
-    /// to mean.
-    ///
-    /// Naming the ranges closes that: everything outside them is never decoded,
-    /// never a leader, and an edge into it is an ordinary out-of-region exit.
-    ///
-    /// Contract: ascending, disjoint, non-empty, contained in the slice. Input
-    /// is clamped, sorted and merged rather than rejected. A lift whose entry
-    /// falls in no range fails as it would for an entry past the end.
     pub block_ranges: Vec<Range<u64>>,
     /// Extra addresses the host wants the entry dispatch to offer, on top of
     /// whatever [`resumption`](Self::resumption) produces.
@@ -928,19 +865,10 @@ pub struct LifterConfig {
     /// code* - it changes how much IR the compiler is handed to get there,
     /// which is where a recompiler's time goes.
     ///
-    /// [`crate::core::flags`] runs a backwards liveness pass between phase 1 and
-    /// phase 2, and each handler asks [`LiftEngine::flag_live`] before emitting
-    /// a flag. It is conservative wherever it cannot see: any call, return,
-    /// indirect branch or edge out of the region marks every flag live.
-    ///
-    /// **Off by default** because soundness rests on the per-instruction
+    /// Off by default because soundness rests on the per-instruction
     /// classifications in [`GuestArch::flag_effects`] matching what the handlers
     /// do, and a wrong entry there is a wrong answer rather than an error. Inert
     /// on a frontend that does not implement it.
-    ///
-    /// It also unlocks
-    /// [`Spec::IntegerOverflowFlags`](crate::core::specialize::Spec::IntegerOverflowFlags),
-    /// which is inert without it.
     pub eliminate_dead_flags: bool,
     /// Exit rather than guess when the entry PC matches no resume point.
     ///
@@ -998,6 +926,7 @@ impl Default for LifterConfig {
             exit_trampoline_address: None,
             outline_helpers: true,
             emit_source_locs: true,
+            lazy_register_sync: true,
             region_tail_exit: false,
             page_size: 4096,
             block_ranges: Vec::new(),
@@ -1025,6 +954,13 @@ impl LifterConfig {
     ///
     /// Demoted to a slow `ImportedFunctionCall` exit when variadic, or when
     /// `abi` cannot place all the arguments.
+    ///
+    /// **The callee must not touch the `RegisterContext`**, directly or by
+    /// re-entering guest code against it: a fast call runs inline with the
+    /// region's state in machine registers, so nothing is published before it
+    /// and nothing is reloaded after. Doing so is undefined behaviour. Register
+    /// a [bridge](crate::core::bridge) for a callee that wants the context, or
+    /// a [slow import](Self::register_slow_import) for one the host services.
     pub fn register_fast_import(&mut self, va: u64, symbol: DynamicSymbol, abi: CallAbi) {
         Arc::make_mut(&mut self.imports).insert(va, ImportKind::Fast(FastImport { symbol, abi }));
     }
@@ -1237,6 +1173,36 @@ pub struct LiftEngine<'a, A: GuestArch = crate::arch::x86_64::X86_64> {
     /// `return_call_indirect` and the tail-call sites share it. `None` until
     /// first use, and forever when nothing is pinned.
     pinned_sig: Option<SigRef>,
+
+    /// Memflags for each `RegisterContext` field, keyed by its byte offset -
+    /// one alias region apiece, interned once in [`Self::with_config`] from
+    /// [`GuestArch::context_fields`]. Read through [`Self::ctx_store`] /
+    /// [`Self::ctx_load`], never directly.
+    ctx_flags: HashMap<i32, MemFlagsData>,
+    /// Memflags for the x87 register stack, which is addressed `TOP`-relative
+    /// and so gets one region for the whole array.
+    x87_flags: MemFlagsData,
+    /// Memflags for a guest memory access. A **field** rather than a method so
+    /// `self.builder.ins().load(ty, self.guest_flags, ptr, 0)` borrow-checks;
+    /// a `&self` method in the same expression would not.
+    pub guest_flags: MemFlagsData,
+    /// Memflags for host memory reached through this region that is not the
+    /// context - today only a rebindable bridge slot.
+    pub host_slot_flags: MemFlagsData,
+    /// Memflags for a row of the host's block-link table.
+    link_table_flags: MemFlagsData,
+
+    /// Every guest register something defined during this lift, in the
+    /// frontend's own numbering. The write set of [`crate::core::regsync`];
+    /// **never cleared**, because the question it answers is "anywhere in the
+    /// region", not "before this point".
+    written_slots: HashSet<regsync::RegSlot>,
+    /// Full-sync stores, with the register each writes back, in emission order.
+    /// Candidates for the prune in [`Self::finish`].
+    ctx_stores: Vec<(Inst, regsync::RegSlot)>,
+    /// Entry-state loads. Candidates for the prune, decided by a use scan of the
+    /// finished IR rather than by a slot, so no read set has to be maintained.
+    ctx_loads: Vec<Inst>,
 }
 
 /// A helper under construction: its body plus the `UserExternalName` slot whose
@@ -1292,6 +1258,30 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             }
         };
 
+        // One alias region per context field, plus the three whole-object ones.
+        // Interned up front rather than on demand: `MemFlagsData` is `Copy`, so
+        // a field read borrows disjointly from `self.builder` and an access
+        // needs no `let` line to satisfy the borrow checker.
+        let mut ctx_flags: HashMap<i32, MemFlagsData> = HashMap::new();
+        for (offset, name) in A::context_fields(&config) {
+            let flags = alias::region_flags(builder.func, offset as u32, name);
+            // NB: the insert is the point, so it must not live inside a
+            // `debug_assert!` - that compiles out under `--release` and leaves
+            // every context access without a region.
+            let previous = ctx_flags.insert(offset, flags);
+            debug_assert!(
+                previous.is_none(),
+                "two RegisterContext fields claim offset {offset} ({name}); \
+                 an address may belong to at most one alias region"
+            );
+        }
+        let x87_flags = alias::region_flags(builder.func, alias::X87_STACK_ID, "x87 stack");
+        let host_slot_flags =
+            alias::region_flags(builder.func, alias::HOST_SLOT_ID, "host bridge slot");
+        let link_table_flags =
+            alias::region_flags(builder.func, alias::LINK_TABLE_ID, "block-link table");
+        let guest_flags = alias::guest_memory_flags(builder.func);
+
         // Built lazily by `fast_call_for` when a call site is actually lifted.
         // Building eagerly cost time proportional to the whole program's import
         // table, per region, and declared every import as an external whether or
@@ -1333,11 +1323,170 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             link_block: None,
             pinned_slots,
             pinned_sig: None,
+            ctx_flags,
+            x87_flags,
+            guest_flags,
+            host_slot_flags,
+            link_table_flags,
+            written_slots: HashSet::new(),
+            ctx_stores: Vec::new(),
+            ctx_loads: Vec::new(),
         }
     }
 
-    pub fn get_regcontext_flags() -> MemFlagsData {
-        MemFlagsData::trusted().with_can_move()
+    /// Store `val` into the `RegisterContext` field at `offset`, tagged with
+    /// that field's alias region.
+    ///
+    /// **The only way to write the context.** A store carrying no region is a
+    /// fence that wipes Cranelift's last-store state for every region, so a
+    /// hand-rolled `builder.ins().store(MemFlagsData::trusted(), ..)` at a
+    /// context address does not merely miss an optimisation - it disables the
+    /// analysis for everything after it. Panics on an offset
+    /// [`GuestArch::context_fields`] does not list, which is the diagnostic
+    /// that keeps the list complete.
+    pub fn ctx_store(&mut self, val: Value, ctx_ptr: Value, offset: i32) -> Inst {
+        let flags = self.ctx_field_flags(offset);
+        self.builder.ins().store(flags, val, ctx_ptr, offset)
+    }
+
+    /// Load the `RegisterContext` field at `offset`. The read half of
+    /// [`Self::ctx_store`]; the same completeness rule applies.
+    pub fn ctx_load(&mut self, ty: types::Type, ctx_ptr: Value, offset: i32) -> Value {
+        let flags = self.ctx_field_flags(offset);
+        self.builder.ins().load(ty, flags, ctx_ptr, offset)
+    }
+
+    /// Memflags for the x87 register stack, which is addressed `TOP`-relative
+    /// and so shares one region across the whole `fpr` array.
+    pub fn x87_flags(&self) -> MemFlagsData {
+        self.x87_flags
+    }
+
+    /// Record that something defined `slot`'s SSA variable in this region.
+    ///
+    /// **Every definition of a guest register must reach this**, and this is
+    /// the whole audit: what the prune in [`crate::core::regsync`] concludes
+    /// about a register is only as good as the frontend's honesty here. The
+    /// safe direction is to over-report - a slot marked written merely keeps
+    /// its stores, which is today's behaviour.
+    ///
+    /// Not needed for a pinned slot: those are function parameters and results,
+    /// the full sync skips them, and so nothing about them is ever recorded as
+    /// prunable in the first place.
+    pub fn mark_written(&mut self, slot: regsync::RegSlot) {
+        self.written_slots.insert(slot);
+    }
+
+    /// Whether anything in this region defined `slot`.
+    pub fn slot_written(&self, slot: regsync::RegSlot) -> bool {
+        self.written_slots.contains(&slot)
+    }
+
+    /// [`Self::ctx_store`] for a guest register in the *full* sync, recording
+    /// the store so the prune can drop it if nothing ever wrote `slot`.
+    ///
+    /// Only the full sync may use this. A masked sync (`sync_regs_masked`,
+    /// [`Self::publish_pinned`]) serves a host call happening *while the region
+    /// runs*, so its stores are not idempotent in the sense the prune needs and
+    /// must always be emitted.
+    pub fn ctx_store_reg(
+        &mut self,
+        slot: regsync::RegSlot,
+        val: Value,
+        ctx_ptr: Value,
+        offset: i32,
+    ) {
+        let inst = self.ctx_store(val, ctx_ptr, offset);
+        if self.lazy_register_sync() {
+            self.ctx_stores.push((inst, slot));
+        }
+    }
+
+    /// [`Self::ctx_load`] for the region's entry state, recording the load so
+    /// the prune can drop it once nothing is left that reads it.
+    pub fn ctx_load_reg(&mut self, ty: types::Type, ctx_ptr: Value, offset: i32) -> Value {
+        let val = self.ctx_load(ty, ctx_ptr, offset);
+        if self.lazy_register_sync() {
+            let inst = self.builder.func.dfg.value_def(val).unwrap_inst();
+            self.ctx_loads.push(inst);
+        }
+        val
+    }
+
+    /// Whether the lazy-sync prune is running for this lift.
+    ///
+    /// Off in analysis mode: that IR is for reading, it deliberately emits no
+    /// write-back at all, and its entry loads are what keep the register file
+    /// visible as pure SSA.
+    fn lazy_register_sync(&self) -> bool {
+        self.config.lazy_register_sync && !self.config.analysis_mode
+    }
+
+    /// Drop the context traffic the region turned out not to need.
+    ///
+    /// Runs at the very end of [`Self::finish`], and the position is
+    /// load-bearing in both directions. It must be after `fill_link_probe`,
+    /// which is still emitting `use_var`s under a pinned ABI; and after
+    /// `seal_all_blocks`, both because sealing appends branch arguments and
+    /// aliases away the block params it turns out not to need - so the use scan
+    /// wants a final layout - and because before sealing every unfilled block
+    /// still holds a pending block-param demand, which would make "no remaining
+    /// uses" mean nothing.
+    ///
+    /// See [`crate::core::regsync`] for why "written nowhere in the region" is
+    /// the right question and why it is only answerable here.
+    fn prune_untouched_sync(&mut self) {
+        if !self.lazy_register_sync() {
+            return;
+        }
+        let stores = std::mem::take(&mut self.ctx_stores);
+        let loads = std::mem::take(&mut self.ctx_loads);
+        let written = std::mem::take(&mut self.written_slots);
+
+        // A store whose register nothing ever defined writes back the value the
+        // entry load read out of that very field.
+        for (inst, slot) in stores {
+            if !written.contains(&slot) {
+                self.builder.func.layout.remove_inst(inst);
+            }
+        }
+
+        // With those gone, an entry load may have no consumer left. Ask the IR
+        // rather than a read set: a value no instruction names cannot be needed
+        // by one, whatever the frontend believes it did.
+        let func = &mut *self.builder.func;
+        let mut used: HashSet<Value> = HashSet::new();
+        for block in func.layout.blocks() {
+            for inst in func.layout.block_insts(block) {
+                for arg in func.dfg.inst_values(inst) {
+                    used.insert(func.dfg.resolve_aliases(arg));
+                }
+            }
+        }
+        for inst in loads {
+            if func.layout.inst_block(inst).is_none() {
+                continue;
+            }
+            let dead = func
+                .dfg
+                .inst_results(inst)
+                .iter()
+                .all(|&v| !used.contains(&func.dfg.resolve_aliases(v)));
+            if dead {
+                func.dfg.clear_results(inst);
+                func.layout.remove_inst(inst);
+            }
+        }
+    }
+
+    fn ctx_field_flags(&self, offset: i32) -> MemFlagsData {
+        match self.ctx_flags.get(&offset) {
+            Some(&flags) => flags,
+            None => panic!(
+                "no alias region for RegisterContext offset {offset}; \
+                 add the field to GuestArch::context_fields"
+            ),
+        }
     }
 
     /// Whether `reg` is carried in a machine register across region boundaries
@@ -1405,12 +1554,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         for (reg, var, _) in slots {
             let offset = A::pinned_slot_offset(reg).expect("a pinned slot has a context offset");
             let val = self.builder.use_var(var);
-            self.builder.ins().store(
-                Self::get_regcontext_flags(),
-                val,
-                ctx_ptr,
-                offset,
-            );
+            self.ctx_store(val, ctx_ptr, offset);
         }
         Ok(())
     }
@@ -1433,12 +1577,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         let slots = self.pinned_slots.clone();
         for (reg, var, ty) in slots {
             let offset = A::pinned_slot_offset(reg).expect("a pinned slot has a context offset");
-            let val = self.builder.ins().load(
-                ty,
-                Self::get_regcontext_flags(),
-                ctx_ptr,
-                offset,
-            );
+            let val = self.ctx_load(ty, ctx_ptr, offset);
             self.builder.def_var(var, val);
         }
         Ok(())
@@ -1732,9 +1871,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
     pub fn write_exit_code(&mut self, code: u32) {
         let ctx_ptr = self.builder.use_var(A::context_ptr_var(&self.state));
         let val = self.builder.ins().iconst(types::I32, code as i64);
-        self.builder
-            .ins()
-            .store(Self::get_regcontext_flags(), val, ctx_ptr, A::exit_code_offset());
+        self.ctx_store(val, ctx_ptr, A::exit_code_offset());
     }
 
     /// Declare that the VM exit just emitted **resumes at `va`**.
@@ -1763,12 +1900,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
     pub fn write_exit_reason(&mut self, reason: ExitReason) {
         let ctx_ptr = self.builder.use_var(A::context_ptr_var(&self.state));
         let val = self.builder.ins().iconst(types::I32, reason as i64);
-        self.builder.ins().store(
-            Self::get_regcontext_flags(),
-            val,
-            ctx_ptr,
-            A::exit_reason_offset(),
-        );
+        self.ctx_store(val, ctx_ptr, A::exit_reason_offset());
     }
 
     /// Whether the instruction at `addr` runs off the end of the lifted bytes.
@@ -1847,12 +1979,9 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
     /// silently producing a relocated address.
     pub fn image_base_at_entry(&mut self, ctx_ptr: Value) -> Value {
         match self.config.address_mode {
-            AddressMode::ImageBaseRelative => self.builder.ins().load(
-                types::I64,
-                Self::get_regcontext_flags(),
-                ctx_ptr,
-                A::image_base_offset(),
-            ),
+            AddressMode::ImageBaseRelative => {
+                self.ctx_load(types::I64, ctx_ptr, A::image_base_offset())
+            }
             AddressMode::Direct => {
                 let base = self.lift_base;
                 self.builder.ins().iconst(types::I64, base as i64)
@@ -1911,17 +2040,10 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         } else {
             self.runtime_current_ip()
         };
-        self.builder
-            .ins()
-            .store(Self::get_regcontext_flags(), pc_val, ctx_ptr, A::pc_offset());
+        self.ctx_store(pc_val, ctx_ptr, A::pc_offset());
 
         let reason_val = self.builder.ins().iconst(types::I32, reason as i64);
-        self.builder.ins().store(
-            Self::get_regcontext_flags(),
-            reason_val,
-            ctx_ptr,
-            A::exit_reason_offset(),
-        );
+        self.ctx_store(reason_val, ctx_ptr, A::exit_reason_offset());
         Ok(())
     }
 
@@ -2067,10 +2189,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         let out = self.builder.create_block();
 
         let ctx_ptr = self.builder.use_var(A::context_ptr_var(&self.state));
-        let table =
-            self.builder
-                .ins()
-                .load(types::I64, Self::get_regcontext_flags(), ctx_ptr, offsets.table);
+        let table = self.ctx_load(types::I64, ctx_ptr, offsets.table);
         // A host that has not published a table for this thread is not an error
         // and not a special case: it simply never links. It is also what keeps the
         // row loads, which are `notrap`, off a null table.
@@ -2084,10 +2203,8 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             .ins()
             .ishl_imm_u(slot, crate::core::link::ENTRY_SIZE.trailing_zeros() as i64);
         let entry = self.builder.ins().iadd(table, offset);
-        let key = self
-            .builder
-            .ins()
-            .load(types::I64, Self::get_regcontext_flags(), entry, 0);
+        let row = self.link_table_flags;
+        let key = self.builder.ins().load(types::I64, row, entry, 0);
         let matches = self.builder.ins().icmp(IntCC::Equal, key, pc);
         self.builder.ins().brif(matches, hit, &[], out, &[]);
 
@@ -2097,9 +2214,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         // callee in `imported_function_va`, and a host services it by swapping the
         // two. Redundant at every other site.
         self.builder.switch_to_block(hit);
-        self.builder
-            .ins()
-            .store(Self::get_regcontext_flags(), pc, ctx_ptr, A::pc_offset());
+        self.ctx_store(pc, ctx_ptr, A::pc_offset());
         if self.pinned() {
             // The branch, rather than the answer: the successor is entered with the
             // pinned registers still in place, so nothing is published for a host
@@ -2111,31 +2226,23 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             // started after the branch that selected it, is 0.616 s against
             // 0.589 s - worse. The two loads land on the miss path as well, and
             // the machine was already hiding the latency.
+            let row = self.link_table_flags;
             let image_base = self.builder.ins().load(
                 types::I64,
-                Self::get_regcontext_flags(),
+                row,
                 entry,
                 crate::core::link::IMAGE_BASE_OFFSET,
             );
-            self.builder.ins().store(
-                Self::get_regcontext_flags(),
-                image_base,
-                ctx_ptr,
-                A::image_base_offset(),
-            );
-            let code = self.builder.ins().load(
-                types::I64,
-                Self::get_regcontext_flags(),
-                entry,
-                crate::core::link::CODE_OFFSET,
-            );
+            self.ctx_store(image_base, ctx_ptr, A::image_base_offset());
+            let code =
+                self.builder
+                    .ins()
+                    .load(types::I64, row, entry, crate::core::link::CODE_OFFSET);
             let sig = self.pinned_signature_ref();
             let args = self.pinned_call_args();
             self.builder.ins().return_call_indirect(sig, code, &args);
         } else {
-            self.builder
-                .ins()
-                .store(Self::get_regcontext_flags(), entry, ctx_ptr, offsets.hit);
+            self.ctx_store(entry, ctx_ptr, offsets.hit);
             self.emit_host_return();
         }
 
@@ -2505,12 +2612,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             self.visited_blocks.insert(dispatch);
 
             let ctx_ptr = self.builder.use_var(A::context_ptr_var(&self.state));
-            let pc_val = self.builder.ins().load(
-                types::I64,
-                Self::get_regcontext_flags(),
-                ctx_ptr,
-                A::pc_offset(),
-            );
+            let pc_val = self.ctx_load(types::I64, ctx_ptr, A::pc_offset());
             let entry_va = self.to_lift_va(pc_val);
 
             // Which addresses get an arm. Under [`VmResumptionPoints::All`] every
@@ -2629,6 +2731,8 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
 
         self.clear_source_loc();
         self.builder.seal_all_blocks();
+        // After sealing: the use scan reads the finished layout.
+        self.prune_untouched_sync();
         self.finalize_helper_indices();
         Ok(())
     }

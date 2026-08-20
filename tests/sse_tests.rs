@@ -454,7 +454,7 @@ fn test_movq_roundtrip_gpr_xmm() {
 //  Mirror a representative subset of the bitwise / move handlers above
 //  but flip on the I64X2 backing representation. This exercises the
 //  vector load/store paths in `load_state_from_context` /
-//  `sync_to_context_selective` and the vector fast paths in
+//  `sync_to_context` and the vector fast paths in
 //  handle_xorps / handle_andps / handle_orps / handle_andnps /
 //  handle_movaps.
 

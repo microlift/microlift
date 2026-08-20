@@ -10,7 +10,6 @@ use crate::core::LifterConfig;
 use cranelift::prelude::*;
 use cranelift_frontend::{FunctionBuilder, Variable};
 use std::collections::HashMap;
-use std::collections::HashSet;
 
 /// NZCV condition flags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -25,10 +24,34 @@ pub enum Nzcv {
     V,
 }
 
+/// X0-X30 in register-number order. Iterating this rather than
+/// `Aarch64RegState::gprs` is what keeps the context sync deterministic; see
+/// [`FLAG_ORDER`].
+pub const GPR_ORDER: [u16; 31] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+    26, 27, 28, 29, 30,
+];
+
+/// [`GPR_ORDER`]'s names, for the alias-region descriptions in a `.clif` dump.
+pub const GPR_NAMES: [&str; 31] = [
+    "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14",
+    "x15", "x16", "x17", "x18", "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27",
+    "x28", "x29", "x30",
+];
+
+/// [`FLAG_ORDER`]'s names, for the same reason.
+pub const FLAG_NAMES: [&str; 4] = ["n", "z", "c", "v"];
+
+/// The four condition flags, in a fixed order.
+///
+/// A `HashMap` walk emits the same stores in a different order under every
+/// process, which changes `.text` between two lifts of identical bytes.
+pub const FLAG_ORDER: [Nzcv; 4] = [Nzcv::N, Nzcv::Z, Nzcv::C, Nzcv::V];
+
 /// The zero-register index (XZR/WZR). Reads yield 0; writes are discarded.
 pub const ZR: u16 = 31;
 
-/// Mapping of aarch64 registers to Cranelift variables, plus dirty tracking.
+/// Mapping of aarch64 registers to Cranelift variables.
 pub struct Aarch64RegState {
     /// X0–X30 (indices 0–30) as I64 SSA variables. X31 (XZR) is not stored.
     pub gprs: HashMap<u16, Variable>,
@@ -40,12 +63,6 @@ pub struct Aarch64RegState {
     pub tpidr_el0: Variable,
     pub context_ptr: Variable,
     pub image_base: Variable,
-
-    // --- dirty-bit tracking ---
-    pub dirty_gprs: HashSet<u16>,
-    pub dirty_sp: bool,
-    pub dirty_flags: HashSet<Nzcv>,
-    pub dirty_tpidr: bool,
 }
 
 impl Aarch64RegState {
@@ -73,10 +90,6 @@ impl Aarch64RegState {
             tpidr_el0,
             context_ptr,
             image_base,
-            dirty_gprs: HashSet::new(),
-            dirty_sp: false,
-            dirty_flags: HashSet::new(),
-            dirty_tpidr: false,
         }
     }
 

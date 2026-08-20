@@ -50,8 +50,6 @@ const SW_CC_MASK: i64 = SW_C0 | SW_C1 | SW_C2 | SW_C3;
 const F80_INT_BIT: i64 = 0x8000_0000_0000_0000u64 as i64;
 
 impl<'a> Lifter<'a> {
-    // --- low-level x87 state access -------------------------------------
-
     fn fpu_ctx_ptr(&mut self) -> Value {
         self.builder.use_var(self.state.context_ptr)
     }
@@ -60,10 +58,7 @@ impl<'a> Lifter<'a> {
     fn fpu_load_top(&mut self) -> Value {
         let ctx = self.fpu_ctx_ptr();
         let off = std::mem::offset_of!(RegisterContext, fpu_top) as i32;
-        let t = self
-            .builder
-            .ins()
-            .load(types::I16, MemFlagsData::trusted(), ctx, off);
+        let t = self.ctx_load(types::I16, ctx, off);
         self.builder.ins().uextend(types::I32, t)
     }
 
@@ -72,9 +67,7 @@ impl<'a> Lifter<'a> {
         let ctx = self.fpu_ctx_ptr();
         let off = std::mem::offset_of!(RegisterContext, fpu_top) as i32;
         let t16 = self.builder.ins().ireduce(types::I16, top);
-        self.builder
-            .ins()
-            .store(MemFlagsData::trusted(), t16, ctx, off);
+        self.ctx_store(t16, ctx, off);
     }
 
     /// Pointer to the physical 16-byte slot backing architectural `ST(i)`.
@@ -99,14 +92,9 @@ impl<'a> Lifter<'a> {
     /// Read `ST(i)` as a raw 80-bit `(mant: i64, se: i32)` pair.
     fn fpu_read_st_raw(&mut self, i: u32) -> (Value, Value) {
         let p = self.fpu_st_ptr(i);
-        let mant = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::trusted(), p, 0);
-        let se16 = self
-            .builder
-            .ins()
-            .load(types::I16, MemFlagsData::trusted(), p, 8);
+        let x87 = self.x87_flags();
+        let mant = self.builder.ins().load(types::I64, x87, p, 0);
+        let se16 = self.builder.ins().load(types::I16, x87, p, 8);
         let se = self.builder.ins().uextend(types::I32, se16);
         (mant, se)
     }
@@ -124,13 +112,10 @@ impl<'a> Lifter<'a> {
     }
 
     fn fpu_write_ptr_raw(&mut self, p: Value, mant: Value, se: Value) {
+        let x87 = self.x87_flags();
         let se16 = self.builder.ins().ireduce(types::I16, se);
-        self.builder
-            .ins()
-            .store(MemFlagsData::trusted(), mant, p, 0);
-        self.builder
-            .ins()
-            .store(MemFlagsData::trusted(), se16, p, 8);
+        self.builder.ins().store(x87, mant, p, 0);
+        self.builder.ins().store(x87, se16, p, 8);
     }
 
     /// Decrement `TOP`, store a raw `(mant, se)` pair into the new `ST(0)`, and
@@ -159,10 +144,7 @@ impl<'a> Lifter<'a> {
     fn fpu_load_tag(&mut self) -> Value {
         let ctx = self.fpu_ctx_ptr();
         let off = std::mem::offset_of!(RegisterContext, fpu_tag) as i32;
-        let t = self
-            .builder
-            .ins()
-            .load(types::I16, MemFlagsData::trusted(), ctx, off);
+        let t = self.ctx_load(types::I16, ctx, off);
         self.builder.ins().uextend(types::I32, t)
     }
 
@@ -171,9 +153,7 @@ impl<'a> Lifter<'a> {
         let ctx = self.fpu_ctx_ptr();
         let off = std::mem::offset_of!(RegisterContext, fpu_tag) as i32;
         let t16 = self.builder.ins().ireduce(types::I16, tag);
-        self.builder
-            .ins()
-            .store(MemFlagsData::trusted(), t16, ctx, off);
+        self.ctx_store(t16, ctx, off);
     }
 
     /// Set physical register `phys` (an `I32` value, 0-7) valid or empty in the
@@ -201,8 +181,6 @@ impl<'a> Lifter<'a> {
             })
         }
     }
-
-    // --- 80-bit extended conversions ------------------------------------
 
     /// Convert a raw 80-bit `(mant, se)` value to an `f64`, rounding the
     /// significand to nearest-even (the x87 default; the control word's rounding
@@ -486,8 +464,6 @@ impl<'a> Lifter<'a> {
         self.builder.ins().select(too_large, indef, r)
     }
 
-    // --- memory operand helpers -----------------------------------------
-
     /// Load a floating-point memory operand (`m32`/`m64`/`m80`) as a raw 80-bit
     /// `(mant, se)` pair. All widths convert exactly (each is a subset of the
     /// 80-bit format).
@@ -502,7 +478,7 @@ impl<'a> Lifter<'a> {
                 let f32v = self
                     .builder
                     .ins()
-                    .load(types::F32, MemFlagsData::new(), ptr, 0);
+                    .load(types::F32, self.guest_flags, ptr, 0);
                 let f64v = self.builder.ins().fpromote(types::F64, f32v);
                 Ok(self.f64_to_f80(f64v))
             }
@@ -510,18 +486,18 @@ impl<'a> Lifter<'a> {
                 let f64v = self
                     .builder
                     .ins()
-                    .load(types::F64, MemFlagsData::new(), ptr, 0);
+                    .load(types::F64, self.guest_flags, ptr, 0);
                 Ok(self.f64_to_f80(f64v))
             }
             MemorySize::Float80 => {
                 let mant = self
                     .builder
                     .ins()
-                    .load(types::I64, MemFlagsData::new(), ptr, 0);
+                    .load(types::I64, self.guest_flags, ptr, 0);
                 let se16 = self
                     .builder
                     .ins()
-                    .load(types::I16, MemFlagsData::new(), ptr, 8);
+                    .load(types::I16, self.guest_flags, ptr, 8);
                 let se = self.builder.ins().uextend(types::I32, se16);
                 Ok((mant, se))
             }
@@ -543,20 +519,20 @@ impl<'a> Lifter<'a> {
                 let v = self
                     .builder
                     .ins()
-                    .load(types::I16, MemFlagsData::new(), ptr, 0);
+                    .load(types::I16, self.guest_flags, ptr, 0);
                 self.builder.ins().sextend(types::I64, v)
             }
             MemorySize::Int32 => {
                 let v = self
                     .builder
                     .ins()
-                    .load(types::I32, MemFlagsData::new(), ptr, 0);
+                    .load(types::I32, self.guest_flags, ptr, 0);
                 self.builder.ins().sextend(types::I64, v)
             }
             MemorySize::Int64 => self
                 .builder
                 .ins()
-                .load(types::I64, MemFlagsData::new(), ptr, 0),
+                .load(types::I64, self.guest_flags, ptr, 0),
             other => {
                 return Err(MicroliftError::UnsupportedInstruction {
                     mnemonic: format!("fpu-load-int-{:?}", other),
@@ -619,16 +595,16 @@ impl<'a> Lifter<'a> {
                         // softfloat kernels).
                         let f64v = self.f80_to_f64(mant, se);
                         let f32v = self.builder.ins().fdemote(types::F32, f64v);
-                        self.builder.ins().store(MemFlagsData::new(), f32v, ptr, 0);
+                        self.builder.ins().store(self.guest_flags, f32v, ptr, 0);
                     }
                     MemorySize::Float64 => {
                         let f64v = self.f80_to_f64(mant, se);
-                        self.builder.ins().store(MemFlagsData::new(), f64v, ptr, 0);
+                        self.builder.ins().store(self.guest_flags, f64v, ptr, 0);
                     }
                     MemorySize::Float80 => {
                         let se16 = self.builder.ins().ireduce(types::I16, se);
-                        self.builder.ins().store(MemFlagsData::new(), mant, ptr, 0);
-                        self.builder.ins().store(MemFlagsData::new(), se16, ptr, 8);
+                        self.builder.ins().store(self.guest_flags, mant, ptr, 0);
+                        self.builder.ins().store(self.guest_flags, se16, ptr, 8);
                     }
                     other => {
                         return Err(MicroliftError::UnsupportedInstruction {
@@ -670,14 +646,14 @@ impl<'a> Lifter<'a> {
         match instruction.memory_size() {
             MemorySize::Int16 => {
                 let v = self.builder.ins().ireduce(types::I16, int64);
-                self.builder.ins().store(MemFlagsData::new(), v, ptr, 0);
+                self.builder.ins().store(self.guest_flags, v, ptr, 0);
             }
             MemorySize::Int32 => {
                 let v = self.builder.ins().ireduce(types::I32, int64);
-                self.builder.ins().store(MemFlagsData::new(), v, ptr, 0);
+                self.builder.ins().store(self.guest_flags, v, ptr, 0);
             }
             MemorySize::Int64 => {
-                self.builder.ins().store(MemFlagsData::new(), int64, ptr, 0);
+                self.builder.ins().store(self.guest_flags, int64, ptr, 0);
             }
             other => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -844,8 +820,6 @@ impl<'a> Lifter<'a> {
         self.fpu_write_st_raw(0, rm, rse);
         Ok(())
     }
-
-    // --- transcendentals ------------------------------------------------
     //
     // `FSIN`/`FCOS`/`FSINCOS`/`FPTAN` share one out-of-range protocol and one
     // softfloat kernel, and differ only in what they leave on the stack.
@@ -938,7 +912,7 @@ impl<'a> Lifter<'a> {
 
     /// The stack half of `FSINCOS`/`FPTAN`: replace `ST(0)` with `lower` and push
     /// `upper` - unless the argument was out of range, in which case `ST(0)` keeps
-    /// `orig` and **nothing is pushed**.
+    /// `orig` and nothing is pushed.
     ///
     /// Branchless: when out of range `TOP` stays put and *both* stores land on the
     /// original `ST(0)` slot, writing the same untouched value twice.
@@ -1082,20 +1056,13 @@ impl<'a> Lifter<'a> {
     fn fpu_store_cc(&mut self, cc: Value) {
         let ctx = self.fpu_ctx_ptr();
         let off = std::mem::offset_of!(RegisterContext, fpu_sw) as i32;
-        let sw = self
-            .builder
-            .ins()
-            .load(types::I16, MemFlagsData::trusted(), ctx, off);
+        let sw = self.ctx_load(types::I16, ctx, off);
         let sw = self.builder.ins().uextend(types::I32, sw);
         let cleared = self.builder.ins().band_imm_u(sw, !SW_CC_MASK);
         let merged = self.builder.ins().bor(cleared, cc);
         let merged16 = self.builder.ins().ireduce(types::I16, merged);
-        self.builder
-            .ins()
-            .store(MemFlagsData::trusted(), merged16, ctx, off);
+        self.ctx_store(merged16, ctx, off);
     }
-
-    // --- conditional moves ----------------------------------------------
 
     /// FCMOVcc - conditionally copy `ST(i)` into `ST(0)` based on the integer
     /// flags. `cond` is a non-zero `I8` when the move should occur.
@@ -1171,8 +1138,6 @@ impl<'a> Lifter<'a> {
         self.handle_fcmov_cond(instruction, cond)
     }
 
-    // --- control / misc -------------------------------------------------
-
     /// FNSTSW - store the status word (with the live `TOP` field) to `AX` or a
     /// 16-bit memory operand.
     pub(super) fn handle_fnstsw(&mut self, instruction: &Instruction) -> crate::Result<()> {
@@ -1185,7 +1150,7 @@ impl<'a> Lifter<'a> {
             }
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 0)?;
-                self.builder.ins().store(MemFlagsData::new(), sw16, ptr, 0);
+                self.builder.ins().store(self.guest_flags, sw16, ptr, 0);
             }
             other => {
                 return Err(MicroliftError::UnsupportedInstruction {
@@ -1200,12 +1165,9 @@ impl<'a> Lifter<'a> {
     pub(super) fn handle_fnstcw(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let ctx = self.fpu_ctx_ptr();
         let cw_off = std::mem::offset_of!(RegisterContext, fpu_cw) as i32;
-        let cw = self
-            .builder
-            .ins()
-            .load(types::I16, MemFlagsData::trusted(), ctx, cw_off);
+        let cw = self.ctx_load(types::I16, ctx, cw_off);
         let ptr = self.get_mem_ptr(instruction, 0)?;
-        self.builder.ins().store(MemFlagsData::new(), cw, ptr, 0);
+        self.builder.ins().store(self.guest_flags, cw, ptr, 0);
         Ok(())
     }
 
@@ -1215,12 +1177,10 @@ impl<'a> Lifter<'a> {
         let cw = self
             .builder
             .ins()
-            .load(types::I16, MemFlagsData::new(), ptr, 0);
+            .load(types::I16, self.guest_flags, ptr, 0);
         let ctx = self.fpu_ctx_ptr();
         let cw_off = std::mem::offset_of!(RegisterContext, fpu_cw) as i32;
-        self.builder
-            .ins()
-            .store(MemFlagsData::trusted(), cw, ctx, cw_off);
+        self.ctx_store(cw, ctx, cw_off);
         Ok(())
     }
 
@@ -1277,10 +1237,7 @@ impl<'a> Lifter<'a> {
     fn fpu_status_word(&mut self) -> Value {
         let ctx = self.fpu_ctx_ptr();
         let sw_off = std::mem::offset_of!(RegisterContext, fpu_sw) as i32;
-        let sw = self
-            .builder
-            .ins()
-            .load(types::I16, MemFlagsData::trusted(), ctx, sw_off);
+        let sw = self.ctx_load(types::I16, ctx, sw_off);
         let sw = self.builder.ins().uextend(types::I32, sw);
         // Insert TOP into bits 11-13.
         let sw = self.builder.ins().band_imm_u(sw, !0x3800);
@@ -1304,19 +1261,14 @@ impl<'a> Lifter<'a> {
     fn fpu_expand_tag_word(&mut self) -> Value {
         let abridged = self.fpu_load_tag();
         let ctx = self.fpu_ctx_ptr();
+        let x87 = self.x87_flags();
         let fpr_off = std::mem::offset_of!(RegisterContext, fpr) as i32;
 
         let mut word = self.builder.ins().iconst(types::I32, 0);
         for i in 0..8i32 {
             let slot = fpr_off + i * 16;
-            let mant = self
-                .builder
-                .ins()
-                .load(types::I64, MemFlagsData::trusted(), ctx, slot);
-            let se = self
-                .builder
-                .ins()
-                .load(types::I16, MemFlagsData::trusted(), ctx, slot + 8);
+            let mant = self.builder.ins().load(types::I64, x87, ctx, slot);
+            let se = self.builder.ins().load(types::I16, x87, ctx, slot + 8);
             let se = self.builder.ins().uextend(types::I32, se);
             let exp = self.builder.ins().band_imm_u(se, 0x7FFF);
 
@@ -1401,10 +1353,7 @@ impl<'a> Lifter<'a> {
 
         let ctx = self.fpu_ctx_ptr();
         let cw_off = std::mem::offset_of!(RegisterContext, fpu_cw) as i32;
-        let cw = self
-            .builder
-            .ins()
-            .load(types::I16, MemFlagsData::trusted(), ctx, cw_off);
+        let cw = self.ctx_load(types::I16, ctx, cw_off);
         let sw = self.fpu_status_word();
         let tw = self.fpu_expand_tag_word();
         let tw = self.builder.ins().ireduce(types::I16, tw);
@@ -1417,37 +1366,23 @@ impl<'a> Lifter<'a> {
         let zero16 = self.builder.ins().iconst(types::I16, 0);
         if wide {
             for off in [0, 8, 16] {
-                self.builder
-                    .ins()
-                    .store(MemFlagsData::new(), zero64, ptr, off);
+                self.builder.ins().store(self.guest_flags, zero64, ptr, off);
             }
-            self.builder
-                .ins()
-                .store(MemFlagsData::new(), zero32, ptr, 24);
+            self.builder.ins().store(self.guest_flags, zero32, ptr, 24);
         } else {
-            self.builder
-                .ins()
-                .store(MemFlagsData::new(), zero64, ptr, 0);
-            self.builder
-                .ins()
-                .store(MemFlagsData::new(), zero32, ptr, 8);
-            self.builder
-                .ins()
-                .store(MemFlagsData::new(), zero16, ptr, 12);
+            self.builder.ins().store(self.guest_flags, zero64, ptr, 0);
+            self.builder.ins().store(self.guest_flags, zero32, ptr, 8);
+            self.builder.ins().store(self.guest_flags, zero16, ptr, 12);
         }
-        self.builder.ins().store(MemFlagsData::new(), cw, ptr, 0);
+        self.builder.ins().store(self.guest_flags, cw, ptr, 0);
+        self.builder.ins().store(self.guest_flags, sw, ptr, stride);
         self.builder
             .ins()
-            .store(MemFlagsData::new(), sw, ptr, stride);
-        self.builder
-            .ins()
-            .store(MemFlagsData::new(), tw, ptr, stride * 2);
+            .store(self.guest_flags, tw, ptr, stride * 2);
 
         // FNSTENV masks all six floating-point exceptions.
         let masked = self.builder.ins().bor_imm_u(cw, 0x3F);
-        self.builder
-            .ins()
-            .store(MemFlagsData::trusted(), masked, ctx, cw_off);
+        self.ctx_store(masked, ctx, cw_off);
         Ok(())
     }
 
@@ -1469,25 +1404,21 @@ impl<'a> Lifter<'a> {
         let cw = self
             .builder
             .ins()
-            .load(types::I16, MemFlagsData::new(), ptr, 0);
+            .load(types::I16, self.guest_flags, ptr, 0);
         let sw = self
             .builder
             .ins()
-            .load(types::I16, MemFlagsData::new(), ptr, stride);
+            .load(types::I16, self.guest_flags, ptr, stride);
         let tw = self
             .builder
             .ins()
-            .load(types::I16, MemFlagsData::new(), ptr, stride * 2);
+            .load(types::I16, self.guest_flags, ptr, stride * 2);
 
         let ctx = self.fpu_ctx_ptr();
         let cw_off = std::mem::offset_of!(RegisterContext, fpu_cw) as i32;
         let sw_off = std::mem::offset_of!(RegisterContext, fpu_sw) as i32;
-        self.builder
-            .ins()
-            .store(MemFlagsData::trusted(), cw, ctx, cw_off);
-        self.builder
-            .ins()
-            .store(MemFlagsData::trusted(), sw, ctx, sw_off);
+        self.ctx_store(cw, ctx, cw_off);
+        self.ctx_store(sw, ctx, sw_off);
 
         let sw32 = self.builder.ins().uextend(types::I32, sw);
         let top = self.builder.ins().ushr_imm_u(sw32, 11);
@@ -1508,14 +1439,9 @@ impl<'a> Lifter<'a> {
     pub(super) fn handle_fnclex(&mut self, _instruction: &Instruction) -> crate::Result<()> {
         let ctx = self.fpu_ctx_ptr();
         let sw_off = std::mem::offset_of!(RegisterContext, fpu_sw) as i32;
-        let sw = self
-            .builder
-            .ins()
-            .load(types::I16, MemFlagsData::trusted(), ctx, sw_off);
+        let sw = self.ctx_load(types::I16, ctx, sw_off);
         let cleared = self.builder.ins().band_imm_u(sw, !0x80FF);
-        self.builder
-            .ins()
-            .store(MemFlagsData::trusted(), cleared, ctx, sw_off);
+        self.ctx_store(cleared, ctx, sw_off);
         Ok(())
     }
 
@@ -1532,18 +1458,10 @@ impl<'a> Lifter<'a> {
         let sw_off = std::mem::offset_of!(RegisterContext, fpu_sw) as i32;
         let top_off = std::mem::offset_of!(RegisterContext, fpu_top) as i32;
         let tag_off = std::mem::offset_of!(RegisterContext, fpu_tag) as i32;
-        self.builder
-            .ins()
-            .store(MemFlagsData::trusted(), cw, ctx, cw_off);
-        self.builder
-            .ins()
-            .store(MemFlagsData::trusted(), zero, ctx, sw_off);
-        self.builder
-            .ins()
-            .store(MemFlagsData::trusted(), zero, ctx, top_off);
-        self.builder
-            .ins()
-            .store(MemFlagsData::trusted(), zero, ctx, tag_off);
+        self.ctx_store(cw, ctx, cw_off);
+        self.ctx_store(zero, ctx, sw_off);
+        self.ctx_store(zero, ctx, top_off);
+        self.ctx_store(zero, ctx, tag_off);
         Ok(())
     }
 }
