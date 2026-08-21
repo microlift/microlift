@@ -453,15 +453,7 @@ fn test_cmpxchg16b_emulated_lowers_everywhere() {
 #[test]
 fn test_cmpxchg16b_native_emits_the_instruction() {
     let obj = ArtifactBackend::compile_lifted_to_object(
-        microlift::core::LiftedCode {
-            func: lift_cmpxchg16b(Atomic128Mode::Native),
-            imports: Vec::new(),
-            helpers: Vec::new(),
-            analysis_call_targets: Default::default(),
-            source_map: Default::default(),
-            resume_points: Vec::new(),
-            entry_thunk: None,
-        },
+        microlift::core::LiftedCode::from_function(lift_cmpxchg16b(Atomic128Mode::Native)),
         Some("x86_64-unknown-linux-gnu"),
         None,
         &[("has_cmpxchg16b", "true")],

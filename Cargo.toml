@@ -8,7 +8,9 @@ disasm = ["dep:capstone"]
 serde = ["dep:serde"]
 # `cross-targets` is what the test suite needs: several targets AOT-compile the
 # same lift for x86-64, aarch64 and riscv64 to prove the IR lowers everywhere.
-testkit = ["cross-targets"]
+testkit = ["cross-targets", "runtime"]
+# A built in runtime implementation for Microlift.
+runtime = []
 fuzzing = ["testkit", "dep:proptest"]
 unicorn-oracle = ["testkit", "dep:unicorn-engine"]
 
@@ -238,6 +240,30 @@ required-features = ["testkit"]
 
 [[test]]
 name = "regctx_sync_tests"
+required-features = ["testkit"]
+
+[[test]]
+name = "opt_in_inertness_tests"
+required-features = ["testkit"]
+
+[[test]]
+name = "callret_tests"
+required-features = ["testkit"]
+
+[[test]]
+name = "link_cell_tests"
+required-features = ["testkit"]
+
+[[test]]
+name = "invalidation_tests"
+required-features = ["testkit"]
+
+[[test]]
+name = "runtime_tests"
+required-features = ["testkit"]
+
+[[test]]
+name = "code_extent_tests"
 required-features = ["testkit"]
 
 [[test]]

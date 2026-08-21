@@ -1,11 +1,12 @@
 use crate::Result;
 use crate::core::srcloc::{GuestCodeMap, SourceLocMap};
+use crate::core::link::{BlockLinkEntry, CELL_SYMBOL, ENTRY_SIZE};
 use crate::core::{HelperFunction, LiftedCode};
 use cranelift::prelude::*;
 use cranelift_codegen::ir::Function;
 use cranelift_codegen::settings::Configurable;
 use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{Linkage, Module};
+use cranelift_module::{DataDescription, DataId, Linkage, Module};
 use cranelift_native::builder as native_builder;
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use object::{Object, ObjectSection};
@@ -81,6 +82,44 @@ fn define_helpers<M: Module>(module: &mut M, pending: Vec<PendingHelper>) -> Res
             .map_err(|e| crate::MicroliftError::CraneliftError(format!("{e:?}")))?;
     }
     Ok(())
+}
+
+/// Declare and define this region's link-cell array, if it has one.
+///
+/// The array is `sites` rows of zeroed [`BlockLinkEntry`] - a
+/// [`LinkSite`](crate::core::link::LinkSite) each - which the host installs into
+/// after compiling their targets. Zero-initialised is the *correct* initial
+/// state, not merely a convenient one: the probe reads `code == 0` as "not
+/// installed", so an artifact restored from disk with a `.bss` array starts
+/// uninstalled and links nothing until the host says otherwise.
+///
+/// It must be `DataId(0)`, because the IR names it `ExternalName::user(1, 0)`
+/// and cannot know an index the module assigns. That holds because
+/// `compile_lifted*` requires a fresh module and this is declared before
+/// anything else in it - asserted here rather than assumed, since the failure
+/// mode is a relocation pointing at some other object.
+fn define_cell_array<M: Module>(module: &mut M, sites: usize) -> Result<Option<DataId>> {
+    if sites == 0 {
+        return Ok(None);
+    }
+    let id = module
+        .declare_data(CELL_SYMBOL, Linkage::Export, true, false)
+        .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
+    assert_eq!(
+        id.as_u32(),
+        0,
+        "the link-cell array must be DataId(0); `compile_lifted*` was given a module that \
+         already held data"
+    );
+
+    let mut description = DataDescription::new();
+    description.define_zeroinit(sites * ENTRY_SIZE as usize);
+    // The probe's loads are `aligned`, and a row is 32 bytes.
+    description.set_align(ENTRY_SIZE);
+    module
+        .define_data(id, &description)
+        .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
+    Ok(Some(id))
 }
 
 /// Define a [`LiftedCode`]'s region body and, when it has one, the entry thunk
@@ -176,6 +215,15 @@ pub struct CompiledRegion {
     pub entry: *const u8,
     /// Entry point for a link row.
     pub link_target: *const u8,
+    /// This region's zeroed link-cell array, one
+    /// [`BlockLinkEntry`](crate::core::link::BlockLinkEntry) per
+    /// [`LiftedCode::link_sites`](crate::core::LiftedCode::link_sites) in the
+    /// same order, or null when the lift emitted none.
+    ///
+    /// The host installs cell `i` by writing the row for `link_sites[i].target`
+    /// into it, and retracts it by zeroing that row's `code`. Writable, unlike
+    /// the two code pointers beside it.
+    pub link_cells: *mut BlockLinkEntry,
 }
 
 #[cfg(feature = "disasm")]
@@ -273,6 +321,9 @@ impl CraneliftBackend {
             ));
         }
         let source_map = code.source_map;
+        // Before anything else in this module, so it is `DataId(0)` - the index
+        // the IR's `ExternalName::user(1, 0)` names.
+        let cells = define_cell_array(&mut self.module, code.link_sites.len())?;
         let pending = declare_externals(&mut self.module, &[], code.helpers)?;
 
         // The map is read out of the body's compiled buffer inside
@@ -288,6 +339,9 @@ impl CraneliftBackend {
             CompiledRegion {
                 entry: self.module.get_finalized_function(ids.entry),
                 link_target: self.module.get_finalized_function(ids.link_target),
+                link_cells: cells.map_or(std::ptr::null_mut(), |id| {
+                    self.module.get_finalized_data(id).0 as *mut BlockLinkEntry
+                }),
             },
             map,
         ))
@@ -298,15 +352,7 @@ impl CraneliftBackend {
     /// Note this cannot carry outlined helpers; see
     /// [`compile_lifted`](Self::compile_lifted).
     pub fn compile(&mut self, func: Function) -> Result<*const u8> {
-        self.compile_lifted(LiftedCode {
-            func,
-            imports: Vec::new(),
-            helpers: Vec::new(),
-            analysis_call_targets: Vec::new(),
-            source_map: SourceLocMap::default(),
-            resume_points: Vec::new(),
-            entry_thunk: None,
-        })
+        self.compile_lifted(LiftedCode::from_function(func))
     }
 
     /// JIT-compile a `RuntimeAssisted`-mode function that uses relocatable
@@ -325,15 +371,7 @@ impl CraneliftBackend {
         isa_settings: &[(&str, &str)],
     ) -> Result<*const u8> {
         Self::compile_lifted_with_fast_imports(
-            LiftedCode {
-                func,
-                imports: imports.to_vec(),
-                helpers: Vec::new(),
-                analysis_call_targets: Vec::new(),
-                source_map: SourceLocMap::default(),
-                resume_points: Vec::new(),
-                entry_thunk: None,
-            },
+            LiftedCode::from_function_with_imports(func, imports.to_vec()),
             flags,
             isa_settings,
         )
@@ -465,15 +503,7 @@ impl ArtifactBackend {
         isa_settings: &[(&str, &str)],
     ) -> Result<Vec<u8>> {
         Self::compile_lifted_to_object(
-            LiftedCode {
-                func,
-                imports: imports.to_vec(),
-                helpers: Vec::new(),
-                analysis_call_targets: Vec::new(),
-                source_map: SourceLocMap::default(),
-                resume_points: Vec::new(),
-                entry_thunk: None,
-            },
+            LiftedCode::from_function_with_imports(func, imports.to_vec()),
             triple,
             flags,
             isa_settings,
@@ -511,6 +541,10 @@ impl ArtifactBackend {
                 .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
         let mut module = ObjectModule::new(obj_builder);
 
+        // As in the JIT path: first, so it is `DataId(0)`. In an object it
+        // lands in `.bss`, which is exactly the uninstalled state a cached
+        // artifact must load in.
+        define_cell_array(&mut module, code.link_sites.len())?;
         let pending = declare_externals(&mut module, &code.imports, code.helpers)?;
 
         let (_id, map) = define_region(&mut module, code.func, code.entry_thunk, source_map)?;
@@ -530,15 +564,7 @@ impl ArtifactBackend {
         flags: Option<settings::Flags>,
     ) -> Result<Vec<u8>> {
         Self::compile_lifted_to_object(
-            LiftedCode {
-                func,
-                imports: Vec::new(),
-                helpers: Vec::new(),
-                analysis_call_targets: Vec::new(),
-                source_map: SourceLocMap::default(),
-                resume_points: Vec::new(),
-                entry_thunk: None,
-            },
+            LiftedCode::from_function(func),
             triple,
             flags,
             &[],
@@ -551,15 +577,7 @@ impl ArtifactBackend {
         flags: Option<settings::Flags>,
     ) -> Result<Vec<u8>> {
         Self::compile_lifted_to_raw(
-            LiftedCode {
-                func,
-                imports: Vec::new(),
-                helpers: Vec::new(),
-                analysis_call_targets: Vec::new(),
-                source_map: SourceLocMap::default(),
-                resume_points: Vec::new(),
-                entry_thunk: None,
-            },
+            LiftedCode::from_function(func),
             triple,
             flags,
         )

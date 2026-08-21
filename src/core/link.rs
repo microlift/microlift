@@ -1,24 +1,48 @@
 //! Block linking: letting a translated region resolve its own successor.
 //!
-//! The lifted code performs **no validation** beyond the address compare, so for
+//! The lifted code performs no validation beyond the address compare, so for
 //! every [`BlockLinkEntry`] it publishes the host must guarantee:
 //!
-//! - `code` is a compiled translation that *can be entered at* `guest_pc`
+//! - `code` is a compiled translation that can be entered at `guest_pc`
 //!   ([`LiftedCode::resume_points`] is the exact set), with the `image_base` that
 //!   translation wants (`pc = image_base + (ip - lift_base)`).
 //! - `code` stays mapped while the entry is reachable. Overwriting it is the only
 //!   way to retract it, and nothing here is atomic - one table per guest thread
-//!   is the intended shape.
+//!   is the intended behavior.
 //! - The table is `entries` rows long and at least 8-byte aligned; the probe's
 //!   loads are `notrap`/`aligned`, so a misaligned table is undefined.
 //!
 //! An entry may be stale in the one way that does not matter: naming an older
-//! translation that also covers the PC. Two translations of the same address are
-//! interchangeable, which is what makes a direct-mapped table with no
-//! invalidation sound.
+//! translation of the same, unchanged guest bytes. Two such translations are
+//! interchangeable, and that is what makes a collision a miss rather than an
+//! error - the direct-mapped table evicts silently and correctly, because losing
+//! a row costs a lookup and nothing else.
+//!
+//! It may not be stale in the way that matters. A row outlives the validity
+//! of the translation it names as soon as the guest bytes under `guest_pc`
+//! change, the range is unmapped, or the host frees the translation - and lifted
+//! code performs no check that would notice. The address compare proves the row
+//! is about this PC; it never proves the row is still *true*. Three cases a
+//! real host produces:
+//!
+//! - Self-modifying or generated guest code. The row names a translation of
+//!   bytes that no longer exist. ([`LifterConfig::region_tail_exit`] exists for
+//!   exactly this guest.)
+//! - Unmapping - `munmap`, `dlclose`, an image unload.
+//! - Eviction, which is not the guest's fault at all and is unavoidable in
+//!   any bounded cache.
+//!
+//! Retraction is the host's. What a translation depends on is [`LiftedCode::covered`] plus
+//! [`LiftedCode::data_dependencies`]; [`crate::runtime::CodeCache`] is an
+//! implementation of the protocol, and [`crate::runtime`] is where the rest of
+//! the host's obligations are written down.
 //!
 //! [`LinkDispatch`] decides what a region does with a match; everything above
 //! holds for both shapes.
+//!
+//! [`LifterConfig::region_tail_exit`]: crate::core::LifterConfig::region_tail_exit
+//! [`LiftedCode::covered`]: crate::core::LiftedCode::covered
+//! [`LiftedCode::data_dependencies`]: crate::core::LiftedCode::data_dependencies
 //!
 //! [`RegisterContext`]: crate::arch::x86_64::context::RegisterContext
 //! [`LifterConfig::block_link`]: crate::core::LifterConfig::block_link
@@ -26,8 +50,8 @@
 
 use crate::core::pin::PinnedAbi;
 
-/// One row of a host's block-link table: *"guest `guest_pc` is compiled, it is
-/// at `code`, and it wants `image_base`"*.
+/// One row of a host's block-link table: "guest `guest_pc` is compiled, it is
+/// at `code`, and it wants `image_base`".
 ///
 /// `#[repr(C)]` and exactly 32 bytes because lifted code indexes it with a
 /// shift - the layout is ABI, not an implementation detail. The trailing word
@@ -60,6 +84,66 @@ pub const CODE_OFFSET: i32 = 8;
 /// to set it from the row.
 pub const IMAGE_BASE_OFFSET: i32 = 16;
 
+/// What an exit whose destination is known at **lift time** links through.
+///
+/// A [`BlockLinkEntry`] like any other, but one the host installs at an index
+/// the lifter chose rather than at [`BlockLinkConfig::slot`] of a PC. That is
+/// the whole difference, and everything follows from it:
+///
+/// - No hashing and no collisions. The probe's shift/mask/scale/add/compare
+///   becomes a load and a null test. Two hot targets sixteen bytes apart alias
+///   into one table row and turn a link into a permanent miss; two cells cannot.
+/// - `guest_pc` is never read by lifted code. It is the host's own record of
+///   what the cell is for, which is exactly what retraction needs.
+/// - `code == 0` means "not installed". Zero is not a code address for the
+///   same reason zero is not a guest PC, so a freshly zeroed array is a valid
+///   uninstalled state and clearing a cell is how a link is retracted.
+///
+/// This is Microlift's answer to FEX's backpatched `b`/`bl`. FEX rewrites the
+/// call site because the host address of a static target is not known until
+/// first execution and a stub is its only way to learn it; a Microlift host
+/// knows at cache-insert time, so the first execution of a static edge is
+/// already a load and a branch rather than a callback into the runtime. A cell
+/// is also data: no instruction encoder in the lifter, no I-cache
+/// maintenance, no cross-modifying-code rules, and it survives being cached to
+/// disk as an AOT artifact.
+///
+/// Reported as [`LiftedCode::link_sites`], in cell order.
+///
+/// [`LiftedCode::link_sites`]: crate::core::LiftedCode::link_sites
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkSite {
+    /// The guest address this cell is about, as a **lift-time** VA.
+    ///
+    /// Lift-time, not run-time: it never enters the compiled code, so it stays
+    /// meaningful for an artifact that will be relocated. A host relocates it
+    /// the way the lifter's `runtime_addr` would before matching it against a
+    /// translation.
+    pub target: u64,
+    /// Why the lifter wanted a cell here.
+    pub kind: LinkSiteKind,
+}
+
+/// What kind of transfer a [`LinkSite`] serves.
+///
+/// Only affects what a host may usefully do with it - lifted code treats every
+/// cell identically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkSiteKind {
+    /// A branch, call or fallthrough leaving the region for a constant address.
+    /// FEX's `BranchOps.cpp` inline-constant case.
+    StaticEdge,
+    /// The address a call *returns* to - a resume point inside this very region.
+    /// Reserved for the call-return stack; not yet emitted.
+    CallReturn,
+}
+
+/// The symbol name of a region's link-cell array.
+///
+/// One data object per compiled region, `link_sites.len()` rows long and
+/// zero-initialised, so an artifact loaded from disk starts uninstalled.
+pub const CELL_SYMBOL: &str = "lifted_cells";
+
 /// The shape of the host's link table, as the lifter must know it.
 ///
 /// Both fields are baked into the emitted probe, so changing either means
@@ -85,8 +169,8 @@ pub struct BlockLinkConfig {
 /// What a region does with the successor it resolved: hand it to the host, or
 /// branch to it.
 ///
-/// **The boundary between the two shapes of block linking.** Both use the same
-/// table, geometry and probe up to the address compare, and differ only in the
+/// The boundary between the two shapes of block linking. Both use the same
+/// table, layout and probe up to the address compare, and differ only in the
 /// three instructions after it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkDispatch {
@@ -94,14 +178,14 @@ pub enum LinkDispatch {
     ///
     /// The host reads the row and calls the code it names, so the register file
     /// still goes out to the context and back on every region entry - what is
-    /// deleted is the host's *decision*, not its spill. A region under this mode
-    /// is an ordinary `extern "C" fn(*mut RegisterContext)`.
+    /// deleted is the host's decision. A region under this mode is an ordinary
+    /// `extern "C" fn(*mut RegisterContext)`.
     HostResume,
     /// Tail-call the code the row names, carrying the pinned registers with it.
     ///
     /// The host does not see the link: the successor is entered by a
     /// `return_call_indirect` with the guest state in [`PinnedAbi`] still in
-    /// machine registers, so the fill and spill are paid once per *chain* instead
+    /// machine registers, so the fill and spill are paid once per chain instead
     /// of once per region. See [`crate::core::pin`].
     ///
     /// Inert, falling back to [`HostResume`](Self::HostResume), when the ABI is
@@ -132,7 +216,7 @@ impl BlockLinkConfig {
     /// held in registers rather than by returning the row to the host.
     ///
     /// Every region reachable through the table must be lifted under this exact
-    /// config - the geometry *and* the ABI. See [`crate::core::pin`].
+    /// config - the geometry and the ABI. See [`crate::core::pin`].
     #[must_use]
     pub fn pinned(mut self, abi: PinnedAbi) -> Self {
         self.dispatch = LinkDispatch::Pinned(abi);
@@ -174,6 +258,10 @@ pub struct BlockLinkOffsets {
     pub table: i32,
     /// Byte offset of the word the probe writes the matching entry's **address**
     /// into. Zero means "no link; service this exit yourself".
+    ///
+    /// The address of a [`BlockLinkEntry`], which today is always a row of
+    /// [`table`](Self::table). A host should dereference it rather than assume
+    /// it lies inside its own table.
     ///
     /// The host clears it before entering rather than the probe clearing it on a
     /// miss: that puts the store on the once-per-entry path, and lets an exit with

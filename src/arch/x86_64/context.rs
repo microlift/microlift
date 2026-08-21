@@ -155,10 +155,23 @@ pub struct RegisterContext {
     /// The host clears it before every entry and reads it after; lifted code writes
     /// it only on a table hit, which is why zero is the answer for an exit with no
     /// probe at all.
-    ///
-    /// Last in the struct on purpose: everything above it has an offset something
-    /// already depends on.
     pub link_hit: u64,
+    /// Base of this thread's call-return ring
+    /// ([`CallRetEntry`](crate::core::callret::CallRetEntry)), or null.
+    ///
+    /// Null disables return prediction for the thread with no special case, the
+    /// same way a null [`link_table`](Self::link_table) disables linking. The
+    /// ring must be [`CallRetConfig::bytes`] long, 8-byte aligned, and zeroed -
+    /// zero is the "empty frame" marker, so a fresh allocation is already valid.
+    ///
+    /// [`CallRetConfig::bytes`]: crate::core::callret::CallRetConfig::bytes
+    pub callret_base: *mut crate::core::callret::CallRetEntry,
+    /// Byte offset of the top frame within the ring.
+    ///
+    /// Any value is valid, including zero: the ring has no invalid state, which
+    /// is what lets the emitted push and pop carry no bounds check. See
+    /// [`crate::core::callret`].
+    pub callret_off: u64,
 }
 
 impl Default for RegisterContext {
@@ -219,6 +232,8 @@ impl Default for RegisterContext {
             fs: 0,
             gs: 0,
             link_hit: 0,
+            callret_base: std::ptr::null_mut(),
+            callret_off: 0,
         }
     }
 }
@@ -308,11 +323,25 @@ mod tests {
     }
 
     /// The link fields are pointer-sized and pointer-aligned, which is what the
-    /// probe's `trusted` (notrap, aligned) loads and stores assume.
+    /// probe's `trusted` (notrap, aligned) loads and stores assume. The same
+    /// holds for the call-return ring's, for the same reason.
     #[test]
     fn the_link_fields_are_aligned_for_the_probe() {
         assert_eq!(std::mem::offset_of!(RegisterContext, link_table) % 8, 0);
         assert_eq!(std::mem::offset_of!(RegisterContext, link_hit) % 8, 0);
+        assert_eq!(std::mem::offset_of!(RegisterContext, callret_base) % 8, 0);
+        assert_eq!(std::mem::offset_of!(RegisterContext, callret_off) % 8, 0);
+    }
+
+    /// `link_hit`'s doc comment tells the next person to append. This is what
+    /// catches them if they insert instead: every offset at or below `xmm` is
+    /// one a host may have hardcoded, and the alignment test above would not
+    /// notice a field slipped in among the flags.
+    #[test]
+    fn appending_a_field_does_not_move_the_ones_below_it() {
+        assert_eq!(std::mem::offset_of!(RegisterContext, link_table), 144);
+        assert_eq!(std::mem::offset_of!(RegisterContext, xmm), 192);
+        assert_eq!(std::mem::offset_of!(RegisterContext, link_hit), 616);
     }
 
     /// A fresh context links nothing and claims nothing: a null table is what
@@ -323,5 +352,6 @@ mod tests {
         let ctx = RegisterContext::new();
         assert!(ctx.link_table.is_null());
         assert_eq!(ctx.link_hit, 0);
+        assert!(ctx.callret_base.is_null());
     }
 }

@@ -19,6 +19,8 @@ pub mod context;
 pub mod core;
 pub mod lifter;
 pub mod os;
+#[cfg(feature = "runtime")]
+pub mod runtime;
 #[cfg(feature = "testkit")]
 pub mod testkit;
 pub mod vsa;

@@ -351,6 +351,25 @@ impl<'a> LiftTest<'a> {
     }
 
     /// Lift and compile, but do not run. Returns a ready-to-enter [`Harness`].
+    /// Lift and compile into a [`Translation`] for the
+    /// [`runtime`](crate::runtime) module.
+    ///
+    /// The counterpart to [`compile`](Self::compile): that one produces a
+    /// `Harness`, which owns a guest stack and is entered directly, while this
+    /// produces something a [`CodeCache`](crate::runtime::CodeCache) can hold
+    /// and a [`ThreadRuntime`](crate::runtime::ThreadRuntime) can dispatch to.
+    /// The stack is the runtime's to provide.
+    #[cfg(feature = "runtime")]
+    pub fn translation(self) -> Result<crate::runtime::Translation, TestError> {
+        let image_base = self.image_base;
+        let flags = self.opt.flags();
+        let code =
+            lift_to_code::<X86_64>(self.bytes, self.ip, self.config).map_err(TestError::Lift)?;
+        let backend = CraneliftBackend::with_flags(flags, &[]).map_err(TestError::Compile)?;
+        crate::runtime::Translation::compile_with(code, image_base, backend)
+            .map_err(TestError::Compile)
+    }
+
     pub fn compile(self) -> Result<Harness, TestError> {
         let code =
             lift_to_code::<X86_64>(self.bytes, self.ip, self.config).map_err(TestError::Lift)?;

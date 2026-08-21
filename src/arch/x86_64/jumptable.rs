@@ -75,6 +75,21 @@ pub struct JumpTable {
     pub bounded: bool,
     /// The recovered targets, in table order, de-duplicated.
     pub targets: Vec<u64>,
+    /// How many entries were actually read out of the table.
+    pub entries: u64,
+}
+
+impl JumpTable {
+    /// The guest bytes the table itself occupies.
+    ///
+    /// A translation built on this table depends on these bytes as surely as it
+    /// depends on the code, which is what
+    /// [`LiftedCode::data_dependencies`](crate::core::LiftedCode::data_dependencies)
+    /// reports. Note the dependency is benign in one direction the code's is
+    /// not - see that field.
+    pub fn extent(&self) -> std::ops::Range<u64> {
+        self.table..self.table + self.entries * self.entry_size as u64
+    }
 }
 
 /// Run the pass over a region of x86-64 code mapped at `base`.
@@ -149,7 +164,7 @@ fn match_jump_table(
     }
 
     let bound = find_bound(instrs, jmp_idx, access.index);
-    let targets = read_targets(&access, kind, bound, segments, region)?;
+    let (targets, entries) = read_targets(&access, kind, bound, segments, region)?;
 
     Some(JumpTable {
         jump_ip: jmp.ip(),
@@ -159,6 +174,7 @@ fn match_jump_table(
         index: access.index,
         bounded: bound.is_some(),
         targets,
+        entries,
     })
 }
 
@@ -318,7 +334,7 @@ fn read_targets(
     bound: Option<u64>,
     segments: &[MemorySegment],
     region: &std::ops::Range<u64>,
-) -> Option<Vec<u64>> {
+) -> Option<(Vec<u64>, u64)> {
     let count = match bound {
         Some(0) => return None,
         Some(n) if n > MAX_ENTRIES => return None,
@@ -327,6 +343,10 @@ fn read_targets(
     };
 
     let mut targets: Vec<u64> = Vec::new();
+    // Counted separately from `targets`, which de-duplicates. The loop can also
+    // stop early on the unbounded path, so neither `count` nor `targets.len()`
+    // is the number of entries actually read.
+    let mut entries = 0u64;
     for i in 0..count {
         let addr = access
             .table
@@ -349,12 +369,13 @@ fn read_targets(
         if bound.is_none() && !region.contains(&target) {
             break;
         }
+        entries = i + 1;
         if !targets.contains(&target) {
             targets.push(target);
         }
     }
 
-    (!targets.is_empty()).then_some(targets)
+    (!targets.is_empty()).then_some((targets, entries))
 }
 
 /// Read `size` bytes at `addr` from the *non-writable* segments only. Writable

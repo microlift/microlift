@@ -194,6 +194,10 @@ impl<'a> Lifter<'a> {
         self.builder.switch_to_block(unknown_block);
         self.sync_to_context(Some(target_ip), ExitReason::UnknownJump)?;
         self.write_exit_code(TransferKind::Return as u32);
+        // After the trampoline test, so a `RET` to the host's sentinel stays
+        // deliberately unlinkable - and after the sync, so a miss leaves the
+        // context exactly as the host has always seen it.
+        self.emit_callret_pop(target_ip);
         self.emit_exit(Some(target_ip));
 
         self.block_terminated = true;
@@ -235,12 +239,24 @@ impl<'a> Lifter<'a> {
                         .ins()
                         .store(self.guest_flags, ret_addr, new_rsp, 0);
 
+                    // Record where this call comes back to, so the callee's
+                    // `RET` can find its way here without a lookup. The cell it
+                    // names is one of *this* region's - the return address is a
+                    // resume point of the region making the call.
+                    self.emit_callret_push(instruction.next_ip(), ret_addr);
+
                     self.sync_to_context(None, ExitReason::UnknownJump)?;
                     self.write_exit_code(TransferKind::DirectCall as u32);
-                    // Linkable: the return address is pushed and `rip` is the callee, so the
-                    // host has nothing left to do but enter it. `Some(rebased_callee)` because
-                    // `current_ip` here is the *return* address.
-                    self.emit_exit(Some(rebased_callee));
+                    // Linkable, and *statically* linkable: the return address is pushed and
+                    // `rip` is the callee, so the host has nothing left to do but enter it -
+                    // and the callee is a lift-time constant, which is what earns it a cell.
+                    // `Some(rebased_callee)` because `current_ip` here is the *return*
+                    // address, not where execution continues.
+                    self.emit_static_exit(
+                        target,
+                        Some(rebased_callee),
+                        crate::core::link::LinkSiteKind::StaticEdge,
+                    );
                     self.block_terminated = true;
                     return Ok(());
                 }

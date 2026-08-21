@@ -1,3 +1,4 @@
 /target
 test-artifacts/
 .cargo/config.toml
+.vscode

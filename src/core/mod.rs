@@ -9,6 +9,7 @@ pub mod alias;
 pub mod bridge;
 pub mod exit;
 pub mod flags;
+pub mod callret;
 pub mod link;
 pub mod optimize;
 pub mod pin;
@@ -28,6 +29,7 @@ use crate::core::link::{BlockLinkConfig, BlockLinkOffsets};
 use crate::core::optimize::Optimizations;
 use crate::core::pin::{PinnedAbi, PinnedReg};
 use crate::core::specialize::Specialization;
+use crate::core::callret::{CallRetConfig, CallRetOffsets};
 use crate::core::srcloc::SourceLocMap;
 use crate::function_traits::{DynamicSymbol, FunctionArgumentType};
 use crate::os::get_host_calling_conv;
@@ -72,6 +74,14 @@ pub trait GuestArch: Sized {
     /// Where this guest's context keeps the two block-linking fields, or `None`,
     /// which makes [`LifterConfig::block_link`] inert for this guest.
     fn block_link_offsets() -> Option<BlockLinkOffsets> {
+        None
+    }
+
+    /// Where this guest's context keeps the call-return ring's base and offset,
+    /// or `None` for a guest that has not made room for them - which makes
+    /// [`LifterConfig::call_return_stack`] inert, exactly as
+    /// [`Self::block_link_offsets`] makes [`LifterConfig::block_link`] inert.
+    fn call_return_offsets() -> Option<crate::core::callret::CallRetOffsets> {
         None
     }
 
@@ -158,7 +168,7 @@ pub trait GuestArch: Sized {
         _bytes: &[u8],
         _base: u64,
         _segments: &[crate::context::MemorySegment],
-    ) -> HashMap<u64, Vec<u64>> {
+    ) -> HashMap<u64, JumpTableInfo> {
         HashMap::new()
     }
 
@@ -225,6 +235,84 @@ pub struct LiftedCode {
     /// the results back. Backends declare the body **after** the helpers,
     /// continuing the same index space, and export the thunk as the entry point.
     pub entry_thunk: Option<Function>,
+    /// The guest bytes this translation was derived from, ascending and
+    /// disjoint, as **lift-time** VAs.
+    ///
+    /// **The invalidation key.** A write anywhere in these ranges may change
+    /// what the region means, so a host holding the translation must discard
+    /// it: the address compare a link performs proves a row is *about* a PC,
+    /// never that it is still true. See [`crate::core::link`].
+    ///
+    /// Exactly [`LifterConfig::block_ranges`] clamped to the region, so a lift
+    /// given holes depends on no byte inside one. It over-approximates the
+    /// instructions actually decoded, which is the safe direction:
+    /// [`SourceLocMap::guest_addresses`] is a *subset* (an instruction whose
+    /// result is dead leaves no trace), and keying invalidation on a subset
+    /// would miss a write.
+    pub covered: Vec<Range<u64>>,
+    /// Guest bytes **outside** [`covered`](Self::covered) that were read at lift
+    /// time and baked into the code: today only the tables recovered by
+    /// [`LifterConfig::analyze_jump_tables`]. Empty otherwise.
+    ///
+    /// Separate from `covered` because the two differ in what a host may do
+    /// about them. `covered` is code, and a host that write-protects guest code
+    /// pages to catch self-modification covers these only if it protects them
+    /// too.
+    ///
+    /// Staleness here is benign in the way staleness in `covered` is not: the
+    /// jump-table pass only ever *adds* block leaders and dispatch still happens
+    /// on the runtime address, so a table whose bytes changed leaves unreachable
+    /// code lifted and falls back to the pre-existing exit. It is reported so a
+    /// host can be exact, not because it must be.
+    pub data_dependencies: Vec<Range<u64>>,
+    /// This region's link cells, in cell order - cell `i` is `link_sites[i]`,
+    /// at byte `i * 32` of the array.
+    ///
+    /// Empty unless [`LifterConfig::link_cells`] was on. A host installs a cell
+    /// by writing a [`BlockLinkEntry`](crate::core::link::BlockLinkEntry) for
+    /// [`LinkSite::target`](crate::core::link::LinkSite::target) into it, and
+    /// retracts it by zeroing the row's `code`. See
+    /// [`CompiledRegion::link_cells`](crate::backend::CompiledRegion::link_cells)
+    /// for where the array itself is.
+    pub link_sites: Vec<crate::core::link::LinkSite>,
+}
+
+impl LiftedCode {
+    /// Wrap a bare [`Function`] as a `LiftedCode` that reports **no** imports,
+    /// helpers, source locations, resume points or guest extent.
+    ///
+    /// For the older `Function`-taking backend entry points, which are handed
+    /// IR with no record of where it came from. Every field is empty because
+    /// that is the honest answer, not because it is a placeholder: a host that
+    /// needs resume points or an invalidation key must lift through
+    /// [`lift_to_code`] and compile through
+    /// [`compile_lifted_region`](crate::backend::CraneliftBackend::compile_lifted_region).
+    pub fn from_function(func: Function) -> Self {
+        Self {
+            func,
+            imports: Vec::new(),
+            helpers: Vec::new(),
+            analysis_call_targets: Vec::new(),
+            source_map: SourceLocMap::default(),
+            resume_points: Vec::new(),
+            entry_thunk: None,
+            covered: Vec::new(),
+            data_dependencies: Vec::new(),
+            link_sites: Vec::new(),
+        }
+    }
+
+    /// [`from_function`](Self::from_function) with relocatable fast-call
+    /// imports, whose index `i` must correspond to `ExternalName::user(0, i)`.
+    pub fn from_function_with_imports(
+        func: Function,
+        imports: Vec<(&'static str, *const u8, Signature)>,
+    ) -> Self {
+        Self {
+            imports,
+            ..Self::from_function(func)
+        }
+    }
 }
 
 /// The pinned ABI a lift will actually run under, or `None`.
@@ -358,6 +446,9 @@ pub fn lift_to_code<A: GuestArch>(
     let imports = std::mem::take(&mut engine.aot_imports);
     let source_map = engine.source_map;
     let resume_points = std::mem::take(&mut engine.emitted_resume_points);
+    let covered = std::mem::take(&mut engine.covered);
+    let link_sites = std::mem::take(&mut engine.link_sites);
+    let data_dependencies = engine.jump_table_extents();
     let helpers = engine.take_helpers();
 
     // Release the mutable borrow of `func` held by the builder/engine.
@@ -378,6 +469,9 @@ pub fn lift_to_code<A: GuestArch>(
         source_map,
         resume_points,
         entry_thunk,
+        covered,
+        data_dependencies,
+        link_sites,
     })
 }
 
@@ -895,6 +989,54 @@ pub struct LifterConfig {
     /// Disabled by default in the name of preventing emitted code size from bloating
     /// to an extreme degree.
     pub inline_link_probes: bool,
+    /// Give every exit whose destination is known at **lift time** a
+    /// [`LinkSite`] of its own, so it links through a dedicated cell instead of
+    /// hashing a PC into the shared table. Off by default.
+    ///
+    /// Microlift's answer to FEX's backpatched direct branches; see
+    /// [`LinkSite`] for why it is a data cell rather than a rewritten call site,
+    /// and for what it buys over the probe. Inert unless [`block_link`] is on -
+    /// a cell is a [`BlockLinkEntry`] and the whole mechanism is part of block
+    /// linking, not an alternative to it.
+    ///
+    /// **This makes the compiled region bigger, and is meant to.** The probe
+    /// stays as the fallback - a cell is empty until its target is compiled, and
+    /// empty again after an invalidation - so a cell is a fast path bolted in
+    /// front of the slow one rather than a replacement for it. Measured over
+    /// reachable out-of-region conditional branches: **+42 bytes of `.text` per
+    /// exit on x86-64 and +28 on aarch64**, plus 32 bytes of zero-initialised
+    /// data per *distinct* target.
+    ///
+    /// So the case for it is never code size. It is what the exit *executes*: a
+    /// load and a branch instead of a shift, mask, scale, add, load and compare
+    /// - and, mattering more, a lookup that cannot collide, where the table
+    /// aliases two hot targets sixteen bytes apart into one row and turns a link
+    /// into a permanent miss. That is not visible in a size measurement, which
+    /// is why this is opt-in and why the tests that prove it works are
+    /// behavioural (`link_cell_tests`, which reaches a successor with the table
+    /// detached) rather than a size delta.
+    ///
+    /// Budget accordingly: on a page-bounded region of branch-dense code, cells
+    /// can rival the code itself.
+    ///
+    /// [`LinkSite`]: crate::core::link::LinkSite
+    /// [`block_link`]: Self::block_link
+    /// [`BlockLinkEntry`]: crate::core::link::BlockLinkEntry
+    pub link_cells: bool,
+    /// Predict a guest `RET` out of a ring of `<return address, link cell>`
+    /// frames pushed at each call, instead of hashing the popped address into
+    /// the shared table. Off by default.
+    ///
+    /// A port of FEX's call-return shadow stack, with the one substitution
+    /// Cranelift forces on it - see [`crate::core::callret`] for what that is,
+    /// what it buys, and why the ring needs no guard pages.
+    ///
+    /// Requires [`link_cells`](Self::link_cells): a hit hands back a cell, so
+    /// there is nothing for one to name without them. Also inert unless
+    /// [`block_link`](Self::block_link) is on and the guest supplies
+    /// [`GuestArch::call_return_offsets`] - all three asked in
+    /// `LiftEngine::call_return`.
+    pub call_return_stack: Option<crate::core::callret::CallRetConfig>,
     /// Optimizations for the emitted code. Some optimizations can trade off semantic accuracy
     /// of not commonly relied upon behavior, such as NAN accuracy.
     pub optimizations: Optimizations,
@@ -935,6 +1077,8 @@ impl Default for LifterConfig {
             eliminate_dead_flags: false,
             block_link: None,
             inline_link_probes: false,
+            link_cells: false,
+            call_return_stack: None,
             optimizations: Optimizations::none(),
         }
     }
@@ -1147,7 +1291,7 @@ pub struct LiftEngine<'a, A: GuestArch = crate::arch::x86_64::X86_64> {
     /// address of the indirect branch they dispatch. Empty unless
     /// [`LifterConfig::analyze_jump_tables`] is set. Recorded for inspection -
     /// leader discovery has already consumed it by the time the lift returns.
-    pub jump_tables: HashMap<u64, Vec<u64>>,
+    pub jump_tables: HashMap<u64, JumpTableInfo>,
     /// The guest addresses the entry dispatch was given an arm for, ascending.
     /// Handed out as [`LiftedCode::resume_points`].
     pub emitted_resume_points: Vec<u64>,
@@ -1191,6 +1335,23 @@ pub struct LiftEngine<'a, A: GuestArch = crate::arch::x86_64::X86_64> {
     pub host_slot_flags: MemFlagsData,
     /// Memflags for a row of the host's block-link table.
     link_table_flags: MemFlagsData,
+    /// Memflags for a cell of this region's own link-cell array. A separate
+    /// region from the table: same row type, never the same memory.
+    link_cell_flags: MemFlagsData,
+    /// Memflags for a frame of the host's call-return ring.
+    callret_flags: MemFlagsData,
+    /// This region's link-cell array, in cell order. Reported as
+    /// [`LiftedCode::link_sites`].
+    link_sites: Vec<crate::core::link::LinkSite>,
+    /// Cell index by target address, so two branches to one address share a
+    /// cell and the second links the moment the first does.
+    link_cell_by_target: HashMap<u64, usize>,
+    /// The `GlobalValue` naming the cell array's base, created on first use.
+    ///
+    /// One per function, so Cranelift materializes the symbol's address once
+    /// and every site shares it - which is what makes the second cell probe in
+    /// a region cost a load and a branch and nothing more.
+    link_cell_base: Option<cranelift_codegen::ir::GlobalValue>,
 
     /// Every guest register something defined during this lift, in the
     /// frontend's own numbering. The write set of [`crate::core::regsync`];
@@ -1224,6 +1385,22 @@ const PROVISIONAL_HELPER_INDEX: u32 = 0x8000_0000;
 /// Namespace used for the external functions referenced by analysis-mode
 /// `call`s. Distinct from namespace `0` (AOT imports) so the
 /// [`LiftEngine::analysis_call_targets`] index space is unambiguous.
+/// One recovered jump table, in the guest-agnostic terms the engine needs.
+///
+/// The frontend's own type ([`crate::arch::x86_64::jumptable::JumpTable`]) knows
+/// far more; this is the part that crosses [`GuestArch::jump_table_targets`].
+/// The extent travels with the targets rather than being recomputed because the
+/// pass is the only thing that knows how many entries it read - `targets` is
+/// de-duplicated and says nothing about the table's size.
+#[derive(Debug, Clone)]
+pub struct JumpTableInfo {
+    /// The recovered successors, in table order, de-duplicated. Contributed as
+    /// block leaders.
+    pub targets: Vec<u64>,
+    /// The guest bytes the table occupies, which the translation now depends on.
+    pub extent: Range<u64>,
+}
+
 pub const ANALYSIS_CALL_NAMESPACE: u32 = 1;
 
 impl<'a, A: GuestArch> LiftEngine<'a, A> {
@@ -1280,6 +1457,10 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             alias::region_flags(builder.func, alias::HOST_SLOT_ID, "host bridge slot");
         let link_table_flags =
             alias::region_flags(builder.func, alias::LINK_TABLE_ID, "block-link table");
+        let link_cell_flags =
+            alias::region_flags(builder.func, alias::LINK_CELL_ID, "link cells");
+        let callret_flags =
+            alias::region_flags(builder.func, alias::CALLRET_ID, "call-return ring");
         let guest_flags = alias::guest_memory_flags(builder.func);
 
         // Built lazily by `fast_call_for` when a call site is actually lifted.
@@ -1328,6 +1509,11 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             guest_flags,
             host_slot_flags,
             link_table_flags,
+            link_cell_flags,
+            callret_flags,
+            link_sites: Vec::new(),
+            link_cell_by_target: HashMap::new(),
+            link_cell_base: None,
             written_slots: HashSet::new(),
             ctx_stores: Vec::new(),
             ctx_loads: Vec::new(),
@@ -1694,6 +1880,27 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
     /// Take the finished helper bodies out of the engine. Valid only after
     /// [`Self::finish`] has assigned their final indices; [`lift_to_code`] is
     /// the normal caller.
+    /// The guest bytes recovered jump tables occupy, normalized the way
+    /// [`Self::covered`] is: ascending, disjoint, adjacent ranges merged.
+    ///
+    /// Reported as [`LiftedCode::data_dependencies`]. Empty unless
+    /// [`LifterConfig::analyze_jump_tables`] ran.
+    pub fn jump_table_extents(&self) -> Vec<Range<u64>> {
+        let mut extents: Vec<Range<u64>> =
+            self.jump_tables.values().map(|t| t.extent.clone()).collect();
+        extents.sort_by_key(|r| r.start);
+        let mut merged: Vec<Range<u64>> = Vec::with_capacity(extents.len());
+        for range in extents {
+            match merged.last_mut() {
+                // Two tables can overlap - a `switch` compiled as a table of
+                // tables shares bytes - so this coalesces rather than appending.
+                Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+                _ => merged.push(range),
+            }
+        }
+        merged
+    }
+
     pub fn take_helpers(&mut self) -> Vec<HelperFunction> {
         std::mem::take(&mut self.helpers)
             .into_iter()
@@ -2065,10 +2272,18 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         self.builder.switch_to_block(inside);
         self.builder.seal_block(inside);
         let mut switch = Switch::new();
-        for (&offset, &block) in &self.blocks {
-            if self.in_region(offset) {
-                switch.set_entry(offset as u128, block);
-            }
+        // Sorted for the same reason as `finish`'s stub loop: a `HashMap`'s
+        // order is per-instance, and `Switch::emit` builds its dispatch from the
+        // order entries were added.
+        let mut arms: Vec<(u64, Block)> = self
+            .blocks
+            .iter()
+            .filter(|&(&offset, _)| self.in_region(offset))
+            .map(|(&offset, &block)| (offset, block))
+            .collect();
+        arms.sort_unstable_by_key(|&(offset, _)| offset);
+        for (offset, block) in arms {
+            switch.set_entry(offset as u128, block);
         }
         switch.emit(&mut self.builder, target, external);
     }
@@ -2091,6 +2306,340 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         }
         let config = self.config.block_link?;
         Some((config, A::block_link_offsets()?))
+    }
+
+    /// Whether this lift gives lift-time-known exits a cell of their own.
+    ///
+    /// Both conditions in one place, mirroring [`Self::block_link`]: the host
+    /// asked for cells, *and* this lift is linking at all. A cell is a
+    /// [`BlockLinkEntry`] and there is nothing for one to mean without the rest
+    /// of block linking.
+    fn link_cells(&self) -> bool {
+        self.config.link_cells && self.block_link().is_some()
+    }
+
+    /// The cell index for `target`, allocating one if this is the first branch
+    /// to that address in this region.
+    ///
+    /// De-duplicated by target, which is what makes a `switch` whose arms all
+    /// leave the region cost one cell per distinct destination rather than one
+    /// per edge - and means the second branch to an address links the instant
+    /// the first one does.
+    fn link_cell_for(&mut self, target: u64, kind: crate::core::link::LinkSiteKind) -> usize {
+        if let Some(&index) = self.link_cell_by_target.get(&target) {
+            return index;
+        }
+        let index = self.link_sites.len();
+        self.link_sites
+            .push(crate::core::link::LinkSite { target, kind });
+        self.link_cell_by_target.insert(target, index);
+        index
+    }
+
+    /// The base address of this region's cell array, as a value.
+    ///
+    /// A relocated symbol rather than a baked constant: the artifact must
+    /// survive being cached to disk and mapped at a different address, which is
+    /// the same property [`AddressMode::ImageBaseRelative`] exists to preserve.
+    /// Namespace 1 is `cranelift-module`'s `DataId` space, so the backend maps
+    /// it with no convention of its own - note it is numerically the same as
+    /// [`ANALYSIS_CALL_NAMESPACE`], which is harmless because analysis-mode IR
+    /// is never compiled and never emits a cell.
+    fn link_cell_base(&mut self) -> Value {
+        let gv = match self.link_cell_base {
+            Some(gv) => gv,
+            None => {
+                let name = self
+                    .builder
+                    .func
+                    .declare_imported_user_function(UserExternalName {
+                        namespace: 1,
+                        index: 0,
+                    });
+                let gv = self
+                    .builder
+                    .func
+                    .create_global_value(cranelift_codegen::ir::GlobalValueData::Symbol {
+                        name: ExternalName::user(name),
+                        offset: 0.into(),
+                        // **Far, though the array is defined in the same object as
+                        // the code.** `colocated` does not mean "same object", it
+                        // means "within `adrp` range" - and a JIT does not honour
+                        // that. `cranelift-jit` hands executable and writable
+                        // allocations out of two separate `mmap`s, and over a long
+                        // run those drift: measured at 6 GiB apart in a host that
+                        // had been translating for half a minute, which overflows
+                        // `Aarch64AdrPrelPgHi21` (`compiled_blob.rs` panics rather
+                        // than veneering, the way it does for a far `bl`). `Far`
+                        // costs a `ldr`/`b` around an 8-byte literal instead of
+                        // `adrp`/`add`, and an `Abs8` relocation cannot be out of
+                        // range.
+                        colocated: false,
+                        tls: false,
+                    });
+                self.link_cell_base = Some(gv);
+                gv
+            }
+        };
+        self.builder.ins().symbol_value(types::I64, gv)
+    }
+
+    /// Terminate a linkable exit whose destination is known at **lift time**,
+    /// trying its own cell before falling back to [`Self::emit_exit`].
+    ///
+    /// ```text
+    ///   static(k, pc):  cells = &lifted_cells        ; one relocated symbol per region
+    ///                   cell  = cells + k*32
+    ///                   code  = cell.code;  if code == 0 goto slow
+    ///   hit:            ctx.pc = pc
+    ///                   [pinned]     ctx.image_base = cell.image_base
+    ///                                return_call_indirect code(ctx, slots...)
+    ///                   [hostresume] ctx.link_hit = cell ; return
+    ///   slow:           <exactly emit_exit(pc)>
+    /// ```
+    ///
+    /// Four instructions on the fast path against the probe's nine, and - which
+    /// matters more than the count - **no collisions**: the table aliases two
+    /// targets sixteen bytes apart into one row and turns a link into a
+    /// permanent miss, and a cell cannot.
+    ///
+    /// The fallback is not a formality. A cell is empty until the host installs
+    /// it, which it can only do once the target has been translated, so the
+    /// probe is what serves every edge whose destination has not been compiled
+    /// yet - and the shared table is what serves it after an
+    /// [invalidation](crate::runtime::CodeCache::invalidate_range) zeroes the
+    /// cell again.
+    ///
+    /// `target` is the destination as a lift-time VA, which is what the host
+    /// installs against; `pc` is the same address as a run-time value, exactly
+    /// as [`Self::emit_exit`] wants it. Exactly `emit_exit` when
+    /// [`Self::link_cells`] is off.
+    pub fn emit_static_exit(
+        &mut self,
+        target: u64,
+        pc: Option<Value>,
+        kind: crate::core::link::LinkSiteKind,
+    ) {
+        if !self.link_cells() {
+            return self.emit_exit(pc);
+        }
+        let pc = match pc {
+            Some(pc) => pc,
+            None => self.runtime_current_ip(),
+        };
+        self.emit_cell_probe(target, pc, kind);
+        // Reached only when the cell is empty. `pc` was defined in the block
+        // that branched here, which dominates it, so it is still in scope.
+        self.emit_exit(Some(pc));
+    }
+
+    /// Emit one cell probe, terminating the current block and leaving the
+    /// builder in the `slow` arm. See [`Self::emit_static_exit`].
+    fn emit_cell_probe(&mut self, target: u64, pc: Value, kind: crate::core::link::LinkSiteKind) {
+        let index = self.link_cell_for(target, kind);
+        let cell_offset = index as i64 * crate::core::link::ENTRY_SIZE as i64;
+
+        let base = self.link_cell_base();
+        let cell = self.builder.ins().iadd_imm_s(base, cell_offset);
+        self.emit_cell_dispatch(cell, pc);
+    }
+
+    /// Take the link a [`BlockLinkEntry`](crate::core::link::BlockLinkEntry) at
+    /// `cell` names, or fall through.
+    ///
+    /// Terminates the current block and leaves the builder in the `slow` arm.
+    /// Shared by the static-edge probe, where `cell` is a constant offset into
+    /// this region's own array, and by the call-return pop, where it is a
+    /// pointer read out of a ring frame and may belong to another region
+    /// entirely - which is fine, because a cell is just an address.
+    fn emit_cell_dispatch(&mut self, cell: Value, pc: Value) {
+        let (_, offsets) = self
+            .block_link()
+            .expect("a cell is only dispatched when linking is on");
+
+        let hit = self.builder.create_block();
+        let slow = self.builder.create_block();
+
+        let flags = self.link_cell_flags;
+        let code = self
+            .builder
+            .ins()
+            .load(types::I64, flags, cell, crate::core::link::CODE_OFFSET);
+        // Zero is "not installed". It is not a code address for the same reason
+        // zero is not a guest PC, so a zeroed array is a valid initial state and
+        // clearing a cell is how the host retracts the link.
+        self.builder.ins().brif(code, hit, &[], slow, &[]);
+
+        self.builder.switch_to_block(hit);
+        let ctx_ptr = self.builder.use_var(A::context_ptr_var(&self.state));
+        // Committed for the same reason the table probe commits it: one exit
+        // shape has a `rip` that is not where it continues.
+        self.ctx_store(pc, ctx_ptr, A::pc_offset());
+        if self.pinned() {
+            let image_base = self.builder.ins().load(
+                types::I64,
+                flags,
+                cell,
+                crate::core::link::IMAGE_BASE_OFFSET,
+            );
+            self.ctx_store(image_base, ctx_ptr, A::image_base_offset());
+            let sig = self.pinned_signature_ref();
+            let args = self.pinned_call_args();
+            self.builder.ins().return_call_indirect(sig, code, &args);
+        } else {
+            // The cell's *address*, exactly as the table probe hands back a
+            // row's - the host dereferences either without caring which it got.
+            self.ctx_store(cell, ctx_ptr, offsets.hit);
+            self.emit_host_return();
+        }
+
+        self.builder.switch_to_block(slow);
+        self.builder.seal_block(hit);
+        self.builder.seal_block(slow);
+    }
+
+    /// The call-return ring's geometry and context offsets, if this lift
+    /// predicts returns at all.
+    ///
+    /// All three conditions in one place, mirroring [`Self::block_link`]: the
+    /// host asked for a ring, cells are on (a hit hands back a cell, so there is
+    /// nothing for one to name without them), and this guest's context has
+    /// somewhere to keep the pointer.
+    fn call_return(&self) -> Option<(CallRetConfig, CallRetOffsets)> {
+        if !self.link_cells() {
+            return None;
+        }
+        let config = self.config.call_return_stack?;
+        Some((config, A::call_return_offsets()?))
+    }
+
+    /// Push a frame recording that a return to `ret_pc` should enter the region
+    /// containing it, via a cell of this region's own array.
+    ///
+    /// ```text
+    ///   push(ret_pc, k):  base = ctx.callret_base;  if base == 0 goto done
+    ///                     off  = (ctx.callret_off - 16) & MASK
+    ///                     [base+off] = { ret_pc, &cells[k] }
+    ///                     ctx.callret_off = off
+    ///   done:
+    /// ```
+    ///
+    /// No bounds check, and none is missing: the ring is a power of two and the
+    /// mask is the wrap, so overflow overwrites the oldest frame - whose `RET`
+    /// then misses and falls back to the probe. See [`crate::core::callret`] for
+    /// why that is the whole of the overflow story.
+    ///
+    /// `ret_pc` is the return address as a run-time value; `ret_va` is the same
+    /// address as a lift-time VA, which is what the cell is installed against.
+    /// Inert when [`Self::call_return`] is `None`.
+    pub fn emit_callret_push(&mut self, ret_va: u64, ret_pc: Value) {
+        let Some((config, offsets)) = self.call_return() else {
+            return;
+        };
+        let index = self.link_cell_for(ret_va, crate::core::link::LinkSiteKind::CallReturn);
+
+        let push = self.builder.create_block();
+        let done = self.builder.create_block();
+
+        let ctx_ptr = self.builder.use_var(A::context_ptr_var(&self.state));
+        let base = self.ctx_load(types::I64, ctx_ptr, offsets.base);
+        // A host that has not allocated a ring is not an error and not a special
+        // case, exactly as with a null `link_table`. It also keeps the frame
+        // store, which is `notrap`, off a null pointer.
+        self.builder.ins().brif(base, push, &[], done, &[]);
+
+        self.builder.switch_to_block(push);
+        let old = self.ctx_load(types::I64, ctx_ptr, offsets.offset);
+        let grown = self
+            .builder
+            .ins()
+            .iadd_imm_s(old, -(crate::core::callret::FRAME_SIZE as i64));
+        let off = self.builder.ins().band_imm_u(grown, config.mask());
+        let frame = self.builder.ins().iadd(base, off);
+
+        let cells = self.link_cell_base();
+        let cell = self
+            .builder
+            .ins()
+            .iadd_imm_s(cells, index as i64 * crate::core::link::ENTRY_SIZE as i64);
+
+        let flags = self.callret_flags;
+        self.builder.ins().store(flags, ret_pc, frame, 0);
+        self.builder
+            .ins()
+            .store(flags, cell, frame, crate::core::callret::CELL_OFFSET);
+        self.ctx_store(off, ctx_ptr, offsets.offset);
+        self.builder.ins().jump(done, &[]);
+
+        self.builder.switch_to_block(done);
+        self.builder.seal_block(push);
+        self.builder.seal_block(done);
+    }
+
+    /// Take the top ring frame if it is about `pc`, or fall through.
+    ///
+    /// ```text
+    ///   pop(pc):  base = ctx.callret_base;  if base == 0 goto slow
+    ///             off  = ctx.callret_off
+    ///             if [base+off].guest_pc != pc goto slow
+    ///             ctx.callret_off = (off + 16) & MASK
+    ///             cell = [base+off].cell        ; then the cell hit arm
+    ///   slow:     <the caller's existing exit>
+    /// ```
+    ///
+    /// Terminates the current block and leaves the builder in `slow`, like
+    /// [`Self::emit_cell_dispatch`], which it ends in. Two loads and a compare
+    /// against the probe's six instructions - and it cannot collide.
+    ///
+    /// **The pointer only advances on a match.** That is what makes underflow
+    /// impossible: a frame nobody pushed holds zero, and no guest returns to
+    /// zero, so a pop that finds one simply misses and leaves the pointer where
+    /// it was.
+    ///
+    /// Inert when [`Self::call_return`] is `None`, in which case the caller's
+    /// exit is emitted exactly as before.
+    pub fn emit_callret_pop(&mut self, pc: Value) {
+        let Some((config, offsets)) = self.call_return() else {
+            return;
+        };
+
+        let check = self.builder.create_block();
+        let take = self.builder.create_block();
+        let slow = self.builder.create_block();
+
+        let ctx_ptr = self.builder.use_var(A::context_ptr_var(&self.state));
+        let base = self.ctx_load(types::I64, ctx_ptr, offsets.base);
+        self.builder.ins().brif(base, check, &[], slow, &[]);
+
+        self.builder.switch_to_block(check);
+        let off = self.ctx_load(types::I64, ctx_ptr, offsets.offset);
+        let frame = self.builder.ins().iadd(base, off);
+        let flags = self.callret_flags;
+        let expected = self.builder.ins().load(types::I64, flags, frame, 0);
+        let matches = self.builder.ins().icmp(IntCC::Equal, expected, pc);
+        self.builder.ins().brif(matches, take, &[], slow, &[]);
+
+        self.builder.switch_to_block(take);
+        // Popped only now, on the match. A miss must leave the ring alone: the
+        // frame it declined still belongs to some outer call.
+        let next = self
+            .builder
+            .ins()
+            .iadd_imm_s(off, crate::core::callret::FRAME_SIZE as i64);
+        let next = self.builder.ins().band_imm_u(next, config.mask());
+        self.ctx_store(next, ctx_ptr, offsets.offset);
+        let cell =
+            self.builder
+                .ins()
+                .load(types::I64, flags, frame, crate::core::callret::CELL_OFFSET);
+        // Ends in its own `slow` arm, which falls through to ours.
+        self.emit_cell_dispatch(cell, pc);
+        self.builder.ins().jump(slow, &[]);
+
+        self.builder.switch_to_block(slow);
+        self.builder.seal_block(check);
+        self.builder.seal_block(take);
+        self.builder.seal_block(slow);
     }
 
     /// Terminate a VM exit the host answers by **continuing at a guest address**,
@@ -2385,7 +2934,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                     // resolved this branch, its in-region targets are leaders
                     // like any other branch target; out-of-region ones stay the
                     // host's problem and keep the exit path they already had.
-                    if let Some(targets) = self.jump_tables.get(&addr) {
+                    if let Some(targets) = self.jump_tables.get(&addr).map(|t| &t.targets) {
                         for &t in targets {
                             if self.in_region(t) {
                                 leaders.insert(t);
@@ -2454,7 +3003,16 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             }
         }
 
-        for &leader in &leaders {
+        // Sorted, because `get_block` *creates* the block and Cranelift numbers
+        // blocks in creation order. `leaders` is a `HashSet` whose iteration
+        // order is per-instance, so walking it directly makes the emitted IR -
+        // and, downstream, the link-cell indices `link_cell_for` hands out in
+        // emission order - different on every lift of the same bytes. The
+        // compiled machine code was reproducible anyway; the IR and the cell
+        // array were not, and an artifact cached on disk needs both.
+        let mut ordered: Vec<u64> = leaders.iter().copied().collect();
+        ordered.sort_unstable();
+        for leader in ordered {
             self.get_block(leader);
         }
 
@@ -2511,7 +3069,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                     // Linkable: the host's whole answer to a fallthrough exit is
                     // to enter a region at `cur`.
                     A::sync_to_context(self, None, ExitReason::None)?;
-                    self.emit_exit(None);
+                    self.emit_static_exit(cur, None, crate::core::link::LinkSiteKind::StaticEdge);
                     self.block_terminated = true;
                     break;
                 }
@@ -2546,7 +3104,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                             self.current_ip = cur;
                             self.set_source_loc(cur);
                             A::sync_to_context(self, None, ExitReason::None)?;
-                            self.emit_exit(None);
+                            self.emit_static_exit(cur, None, crate::core::link::LinkSiteKind::StaticEdge);
                             self.block_terminated = true;
                             break;
                         }
@@ -2566,7 +3124,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                     // every later arrival at the same cut is a table hit.
                     A::sync_to_context(self, None, ExitReason::UnknownJump)?;
                     self.write_exit_code(TransferKind::RegionTail as u32);
-                    self.emit_exit(None);
+                    self.emit_static_exit(cur, None, crate::core::link::LinkSiteKind::StaticEdge);
                     self.block_terminated = true;
                     break;
                 }
@@ -2691,7 +3249,16 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
     /// are VM exits to addresses outside the lifted region.
     pub fn finish(&mut self) -> crate::Result<()> {
         let mut processed_blocks = HashSet::new();
-        let all_offsets: Vec<u64> = self.blocks.keys().cloned().collect();
+        // **Sorted**, and load-bearing. `self.blocks` is a `HashMap`, and each
+        // instance gets its own hash seed, so iterating it directly emits the
+        // exit stubs in a different order on every lift - which renumbers the
+        // blocks, and, since `link_cell_for` hands out indices in emission
+        // order, permutes the link-cell array. Neither is a correctness bug (a
+        // host reads `LiftedCode::link_sites` to learn what cell `i` is for),
+        // but it costs reproducibility, which an artifact cached on disk needs.
+        // Address order is the same order the sweep found them in.
+        let mut all_offsets: Vec<u64> = self.blocks.keys().cloned().collect();
+        all_offsets.sort_unstable();
 
         for offset in all_offsets {
             let block = self.blocks[&offset];
@@ -2718,8 +3285,10 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                     // Every stub here is a transfer *to* `offset` - a direct jump, a taken
                     // conditional edge, a direct call whose return address is pushed. All
                     // three are answered by entering a region at `offset`, which is what a
-                    // link does.
-                    self.emit_exit(None);
+                    // link does - and `offset` is known *now*, which is what lets it be a
+                    // cell rather than a hash of a runtime PC. The largest population of
+                    // static edges in any region.
+                    self.emit_static_exit(offset, None, crate::core::link::LinkSiteKind::StaticEdge);
                 }
                 processed_blocks.insert(block);
             }

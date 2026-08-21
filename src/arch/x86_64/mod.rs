@@ -66,6 +66,13 @@ impl GuestArch for X86_64 {
         })
     }
 
+    fn call_return_offsets() -> Option<crate::core::callret::CallRetOffsets> {
+        Some(crate::core::callret::CallRetOffsets {
+            base: std::mem::offset_of!(RegisterContext, callret_base) as i32,
+            offset: std::mem::offset_of!(RegisterContext, callret_off) as i32,
+        })
+    }
+
     /// x86-64 pins a GPR as an `I64` and an XMM register as an `I64X2`.
     ///
     /// The XMM answer is `None` without
@@ -203,6 +210,10 @@ impl GuestArch for X86_64 {
             fields.push((offsets.table, "link_table"));
             fields.push((offsets.hit, "link_hit"));
         }
+        if let Some(offsets) = Self::call_return_offsets() {
+            fields.push((offsets.base, "callret_base"));
+            fields.push((offsets.offset, "callret_off"));
+        }
 
         fields
     }
@@ -251,10 +262,19 @@ impl GuestArch for X86_64 {
         bytes: &[u8],
         base: u64,
         segments: &[crate::context::MemorySegment],
-    ) -> std::collections::HashMap<u64, Vec<u64>> {
+    ) -> std::collections::HashMap<u64, crate::core::JumpTableInfo> {
         jumptable::analyze_jump_tables(bytes, base, segments)
             .into_iter()
-            .map(|(ip, table)| (ip, table.targets))
+            .map(|(ip, table)| {
+                let extent = table.extent();
+                (
+                    ip,
+                    crate::core::JumpTableInfo {
+                        targets: table.targets,
+                        extent,
+                    },
+                )
+            })
             .collect()
     }
 
