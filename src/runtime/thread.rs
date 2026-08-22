@@ -127,6 +127,11 @@ impl ThreadRuntime {
         self.links.publish(translation);
     }
 
+    /// Publish the row for `pc` alone. See [`ThreadLinks::publish_at`].
+    pub fn publish_at(&mut self, translation: &Translation, pc: u64) -> bool {
+        self.links.publish_at(translation, pc)
+    }
+
     /// Run one turn: enter the translation for the current guest PC, then
     /// follow as many links as the region resolves for itself.
     ///

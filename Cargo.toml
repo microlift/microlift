@@ -263,6 +263,10 @@ name = "invalidation_tests"
 required-features = ["testkit"]
 
 [[test]]
+name = "publish_granularity_tests"
+required-features = ["testkit"]
+
+[[test]]
 name = "runtime_tests"
 required-features = ["testkit"]
 

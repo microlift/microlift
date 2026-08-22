@@ -126,6 +126,34 @@ impl ThreadLinks {
         }
     }
 
+    /// Make `translation` linkable from this thread at `pc` **alone**, reporting
+    /// whether a row was written.
+    ///
+    /// The narrow half of [`publish`](Self::publish), for a host that knows which
+    /// address it is about to link on and would rather not spend the rest of the
+    /// table saying so. The two are the same trade seen from opposite ends: the
+    /// broad form wins the links it could not have predicted, and pays for them in
+    /// evictions - one region with many resume points can rewrite a large share of
+    /// a direct-mapped table, and every row it displaces belonged to something the
+    /// thread was already using.
+    ///
+    /// Which way that trade falls is a property of the guest, not of this crate,
+    /// so both are offered and neither is the default here. A host with a
+    /// **declining** probe and a **hitting** entry cache of the same geometry is
+    /// looking at the eviction end of it.
+    ///
+    /// `covers` is checked rather than assumed, because the invariant
+    /// [`publish`](Self::publish) gets for free from walking the resume points has
+    /// to be paid for here: a row offering an address that is not a resume point
+    /// either runs the region from the top or exits having made no progress.
+    pub fn publish_at(&mut self, translation: &Translation, pc: u64) -> bool {
+        if !translation.covers(pc) {
+            return false;
+        }
+        self.table.publish(translation.row(pc));
+        true
+    }
+
     /// Drop the rows for `addresses`, returning how many this thread actually
     /// held.
     ///
