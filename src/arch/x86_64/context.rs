@@ -172,6 +172,16 @@ pub struct RegisterContext {
     /// is what lets the emitted push and pop carry no bounds check. See
     /// [`crate::core::callret`].
     pub callret_off: u64,
+    /// How many guest calls are currently live as **host** frames
+    /// ([`crate::core::hostframe`]).
+    ///
+    /// Maintained entirely by lifted code - incremented before a nested call and
+    /// restored after it, so it is right however that call ends. A host sets it
+    /// to zero once and never touches it again.
+    pub host_frame_depth: u32,
+    /// Padding, so the struct's size does not depend on what follows
+    /// `host_frame_depth`. Never read.
+    pub _pad_host_frame: u32,
 }
 
 impl Default for RegisterContext {
@@ -234,6 +244,8 @@ impl Default for RegisterContext {
             link_hit: 0,
             callret_base: std::ptr::null_mut(),
             callret_off: 0,
+            host_frame_depth: 0,
+            _pad_host_frame: 0,
         }
     }
 }
@@ -353,5 +365,6 @@ mod tests {
         assert!(ctx.link_table.is_null());
         assert_eq!(ctx.link_hit, 0);
         assert!(ctx.callret_base.is_null());
+        assert_eq!(ctx.host_frame_depth, 0);
     }
 }

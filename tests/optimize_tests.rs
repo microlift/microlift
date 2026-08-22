@@ -82,6 +82,88 @@ fn unsafe_imprecise_nan_sheds_the_fixup() {
     }
 }
 
+/// `div bl ; ret` - AL = AX / BL, AH = AX % BL.
+const DIV_BL: &[u8] = &[0xF6, 0xF3, 0xC3];
+/// `div rcx ; ret` - RDX:RAX / RCX, the 128-bit software-loop width.
+const DIV_RCX: &[u8] = &[0x48, 0xF7, 0xF1, 0xC3];
+
+fn no_de() -> Optimizations {
+    Optimizations::none().with(Optimization::UnsafeImpreciseDivisionExceptions)
+}
+
+#[test]
+fn a_valid_division_is_unaffected_by_dropping_the_de_guards() {
+    // The guards only ever *reject*, so removing them must leave every division
+    // that would not have faulted computing exactly what it computed before.
+    for opts in [Optimizations::none(), no_de()] {
+        let out = LiftTest::new(DIV_RCX)
+            .optimizations(opts)
+            .reg(|c| {
+                c.rax = 43;
+                c.rdx = 0;
+                c.rcx = 7;
+            })
+            .run();
+        assert_eq!(out.ctx.rax, 6, "{opts:?}");
+        assert_eq!(out.ctx.rdx, 1, "{opts:?}");
+        assert_eq!(out.ctx.exit_reason, ExitReason::Return as u32, "{opts:?}");
+    }
+}
+
+#[test]
+fn a_quotient_overflow_faults_by_default_and_wraps_with_the_optimization() {
+    // AX/BL = 0x2000, which does not fit in AL. This is the guard-2 case, and
+    // the only #DE that is safe to actually execute with the guards gone (a
+    // zero divisor has no result at all - see `Optimization`'s doc comment).
+    let seed = |c: &mut RegisterContext| {
+        c.rax = 0x2000;
+        c.rbx = 1;
+    };
+
+    let faulted = LiftTest::new(DIV_BL)
+        .optimizations(Optimizations::none())
+        .no_unicorn()
+        .reg(seed)
+        .run();
+    assert_eq!(
+        faulted.ctx.exit_reason,
+        ExitReason::DivideError as u32,
+        "the overflow guard should exit with #DE"
+    );
+    assert_eq!(faulted.ctx.rax, 0x2000, "a fault commits no result");
+
+    let wrapped = LiftTest::new(DIV_BL)
+        .optimizations(no_de())
+        .no_unicorn()
+        .reg(seed)
+        .run();
+    assert_eq!(
+        wrapped.ctx.exit_reason,
+        ExitReason::Return as u32,
+        "with the guards gone the same division must not fault"
+    );
+    // AL = the truncated quotient, AH = the remainder; the rest of RAX is
+    // untouched, exactly as an 8-bit destination write behaves.
+    assert_eq!(wrapped.ctx.rax & 0xFFFF, 0x0000);
+}
+
+/// The half a behavioural test cannot reach: an implementation that ignored the
+/// optimization would still pass both cases above.
+#[test]
+fn unsafe_imprecise_division_exceptions_sheds_the_guards() {
+    for triple in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+        for (name, bytes) in [("div bl", DIV_BL), ("div rcx", DIV_RCX)] {
+            let off = code_len(bytes, Optimizations::none(), triple);
+            let on = code_len(bytes, no_de(), triple);
+            assert!(
+                on < off,
+                "{name} on {triple}: UnsafeImpreciseDivisionExceptions ({on} bytes) \
+                 should be smaller than disabled ({off} bytes)"
+            );
+        }
+    }
+}
+
 #[test]
 fn without_undoes_with() {
     let opts = Optimizations::none()

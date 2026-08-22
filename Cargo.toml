@@ -247,6 +247,10 @@ name = "opt_in_inertness_tests"
 required-features = ["testkit"]
 
 [[test]]
+name = "host_frame_tests"
+required-features = ["testkit"]
+
+[[test]]
 name = "callret_tests"
 required-features = ["testkit"]
 

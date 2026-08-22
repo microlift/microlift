@@ -303,6 +303,13 @@ impl<'a> Lifter<'a> {
     /// [`ExitReason::DivideError`] VM exit whose PC points at the faulting
     /// instruction. Because the guards run first, the division itself never sees
     /// a zero divisor, so the emitted `udiv`/`urem` (or the I128 loop) can't trap.
+    ///
+    /// [`Optimization::UnsafeImpreciseDivisionExceptions`] drops both guards, the
+    /// fault block and its `sync_to_context` - see [`Lifter::divide_error_checks`]
+    /// for what a guest gives up by asking for that.
+    ///
+    /// [`Optimization::UnsafeImpreciseDivisionExceptions`]:
+    ///     crate::core::optimize::Optimization::UnsafeImpreciseDivisionExceptions
     fn emit_division(&mut self, instruction: &Instruction, signed: bool) -> crate::Result<()> {
         let size = self.operand_size(instruction, 0)?;
         let (low, high, work_ty) =
@@ -315,19 +322,28 @@ impl<'a> Lifter<'a> {
         let divisor_n = self.read_operand(instruction, 0, size)?;
         let dividend = self.assemble_dividend(low, high, work_ty)?;
 
+        let checked = self.divide_error_checks();
+
         // Fault path, shared by the divide-by-zero and overflow guards.
-        let de_block = self.builder.create_block();
+        let de_block = if checked {
+            Some(self.builder.create_block())
+        } else {
+            None
+        };
 
         // Guard 1: divide by zero.
-        let div0 = self.builder.ins().icmp_imm_s(IntCC::Equal, divisor_n, 0);
-        let after_div0 = self.builder.create_block();
-        self.builder
-            .ins()
-            .brif(div0, de_block, &[], after_div0, &[]);
-        self.builder.switch_to_block(after_div0);
-        self.builder.seal_block(after_div0);
+        if let Some(de_block) = de_block {
+            let div0 = self.builder.ins().icmp_imm_s(IntCC::Equal, divisor_n, 0);
+            let after_div0 = self.builder.create_block();
+            self.builder
+                .ins()
+                .brif(div0, de_block, &[], after_div0, &[]);
+            self.builder.switch_to_block(after_div0);
+            self.builder.seal_block(after_div0);
+        }
 
-        // Divisor is now known non-zero; compute the full-width quotient/remainder.
+        // Divisor is non-zero (either guarded above, or promised by the caller
+        // through the optimization); compute the full-width quotient/remainder.
         let (quot, rem) = if signed {
             let divisor_w = self.builder.ins().sextend(work_ty, divisor_n);
             let zero = self.wide_zero(work_ty);
@@ -363,29 +379,31 @@ impl<'a> Lifter<'a> {
         // Guard 2: quotient overflow.
         //   signed:   the low N bits, sign-extended, must reproduce the quotient.
         //   unsigned: the bits above N must all be zero.
-        let overflow = if signed {
-            let q_trunc = self.builder.ins().ireduce(ty, quot);
-            let q_back = self.builder.ins().sextend(work_ty, q_trunc);
-            self.builder.ins().icmp(IntCC::NotEqual, q_back, quot)
-        } else {
-            let hi = self.builder.ins().ushr_imm_u(quot, n);
-            self.builder.ins().icmp_imm_s(IntCC::NotEqual, hi, 0)
-        };
-        let after_ovf = self.builder.create_block();
-        self.builder
-            .ins()
-            .brif(overflow, de_block, &[], after_ovf, &[]);
+        if let Some(de_block) = de_block {
+            let overflow = if signed {
+                let q_trunc = self.builder.ins().ireduce(ty, quot);
+                let q_back = self.builder.ins().sextend(work_ty, q_trunc);
+                self.builder.ins().icmp(IntCC::NotEqual, q_back, quot)
+            } else {
+                let hi = self.builder.ins().ushr_imm_u(quot, n);
+                self.builder.ins().icmp_imm_s(IntCC::NotEqual, hi, 0)
+            };
+            let after_ovf = self.builder.create_block();
+            self.builder
+                .ins()
+                .brif(overflow, de_block, &[], after_ovf, &[]);
 
-        // Fault path first, so `de_block` is terminated before we switch away (the
-        // frontend forbids leaving an unfilled block).
-        self.builder.switch_to_block(de_block);
-        self.builder.seal_block(de_block);
-        self.emit_divide_error(instruction)?;
+            // Fault path first, so `de_block` is terminated before we switch away (the
+            // frontend forbids leaving an unfilled block).
+            self.builder.switch_to_block(de_block);
+            self.builder.seal_block(de_block);
+            self.emit_divide_error(instruction)?;
 
-        // Non-faulting path: commit quotient and remainder, and leave the builder
-        // here so the engine keeps lifting from the continuation.
-        self.builder.switch_to_block(after_ovf);
-        self.builder.seal_block(after_ovf);
+            // Non-faulting path: commit quotient and remainder, and leave the builder
+            // here so the engine keeps lifting from the continuation.
+            self.builder.switch_to_block(after_ovf);
+            self.builder.seal_block(after_ovf);
+        }
         let quot_n = self.builder.ins().ireduce(ty, quot);
         let rem_n = self.builder.ins().ireduce(ty, rem);
         self.set_reg_val(low, quot_n)?;
@@ -393,6 +411,30 @@ impl<'a> Lifter<'a> {
         // DIV/IDIV leave the arithmetic flags undefined per the x86 manual.
         self.block_terminated = false;
         Ok(())
+    }
+
+    /// Whether `DIV`/`IDIV` still emit their architectural #DE guards.
+    ///
+    /// [`Optimization::UnsafeImpreciseDivisionExceptions`] turns them off. What a
+    /// guest gives up is the whole fault protocol, not its precision: a division
+    /// that *would* have raised #DE no longer exits with
+    /// [`ExitReason::DivideError`], and instead writes a result. For a divisor
+    /// whose quotient merely overflows the destination, that result is the
+    /// truncated quotient. For a **zero** divisor there is no result at all, and
+    /// what happens depends on the width: the native `udiv`/`urem` Cranelift emits
+    /// traps (the host takes an integer-divide-by-zero trap, not a guest #DE),
+    /// while the 128-bit software loop in [`Lifter::emit_udivmod128`] terminates -
+    /// it is bounded by the dividend's significant bits, not by the divisor - and
+    /// yields a garbage quotient and remainder. So this is only ever safe for a
+    /// guest that provably never divides by zero and never overflows a quotient.
+    ///
+    /// [`Optimization::UnsafeImpreciseDivisionExceptions`]:
+    ///     crate::core::optimize::Optimization::UnsafeImpreciseDivisionExceptions
+    fn divide_error_checks(&self) -> bool {
+        !self
+            .config
+            .optimizations
+            .allows(crate::core::optimize::Optimization::UnsafeImpreciseDivisionExceptions)
     }
 
     /// Emit a divide-error (#DE) VM exit: sync guest state with the PC pointing

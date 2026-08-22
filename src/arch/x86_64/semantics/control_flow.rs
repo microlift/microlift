@@ -194,11 +194,19 @@ impl<'a> Lifter<'a> {
         self.builder.switch_to_block(unknown_block);
         self.sync_to_context(Some(target_ip), ExitReason::UnknownJump)?;
         self.write_exit_code(TransferKind::Return as u32);
-        // After the trampoline test, so a `RET` to the host's sentinel stays
-        // deliberately unlinkable - and after the sync, so a miss leaves the
-        // context exactly as the host has always seen it.
-        self.emit_callret_pop(target_ip);
-        self.emit_exit(Some(target_ip));
+        if self.returns_through_host_frames() {
+            // A caller may be waiting on the host stack for exactly this, and
+            // linking instead would strand its frame - see
+            // `LiftEngine::returns_through_host_frames`. Whoever catches the
+            // return decides whether it was the one they wanted.
+            self.emit_host_return();
+        } else {
+            // After the trampoline test, so a `RET` to the host's sentinel stays
+            // deliberately unlinkable - and after the sync, so a miss leaves the
+            // context exactly as the host has always seen it.
+            self.emit_callret_pop(target_ip);
+            self.emit_exit(Some(target_ip));
+        }
 
         self.block_terminated = true;
         Ok(())
@@ -247,6 +255,25 @@ impl<'a> Lifter<'a> {
 
                     self.sync_to_context(None, ExitReason::UnknownJump)?;
                     self.write_exit_code(TransferKind::DirectCall as u32);
+
+                    // First choice: make it a real host call, so the callee's `RET`
+                    // is a `ret` the return-address stack predicts and lands at the
+                    // instruction after this one rather than back through this
+                    // region's entry dispatch. Emits nothing and returns `false`
+                    // when that is off, leaving the exit below as it was.
+                    if self.emit_host_frame_call(target, rebased_callee, self.current_ip)? {
+                        // The builder is in the arm where the call could not be
+                        // made - no cell yet, or the host stack is as deep as it
+                        // may go - which takes the ordinary exit.
+                        self.emit_static_exit(
+                            target,
+                            Some(rebased_callee),
+                            crate::core::link::LinkSiteKind::StaticEdge,
+                        );
+                        self.block_terminated = true;
+                        return Ok(());
+                    }
+
                     // Linkable, and *statically* linkable: the return address is pushed and
                     // `rip` is the callee, so the host has nothing left to do but enter it -
                     // and the callee is a lift-time constant, which is what earns it a cell.

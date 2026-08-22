@@ -227,14 +227,27 @@ fn alias_regions_let_cranelift_reach_the_same_answer() {
     }
 }
 
+/// At `speed` the prune is never *worse* than leaving it to the alias regions,
+/// and since the block-parameter pass it is sometimes better.
+///
+/// This used to assert the two were exactly equal, on the grounds that neither
+/// should leave traffic the other removes. That stopped being true when
+/// [`crate::core::dce`] arrived: deleting a sync store can leave a block
+/// parameter with no reader, and nothing in Cranelift removes one - so the prune
+/// now sheds a little that the alias analysis structurally cannot, and the
+/// numbers legitimately differ by a few bytes.
+///
+/// The property worth keeping is the direction. If the prune ever came out
+/// *larger* than the eager path, something it deleted was being paid for twice.
 #[test]
-fn the_two_mechanisms_agree() {
+fn the_prune_is_never_worse_than_the_alias_regions() {
     for triple in TRIPLES {
         let lean = code_len(&MOV_RET, true, "speed", triple);
         let eager = code_len(&MOV_RET, false, "speed", triple);
-        assert_eq!(
-            lean, eager,
-            "{triple}: the prune and the alias regions should agree at `speed`"
+        assert!(
+            lean <= eager,
+            "{triple}: the prune came out larger than leaving it to the alias \
+             regions at `speed` ({lean} vs {eager})"
         );
     }
 }
@@ -255,4 +268,101 @@ fn two_lifts_of_the_same_bytes_compile_to_the_same_bytes() {
 #[test]
 fn the_default_is_on() {
     assert!(LifterConfig::default().lazy_register_sync);
+}
+
+// ---------------------------------------------------------------------------
+// Dead block parameters (`microlift::core::dce`)
+// ---------------------------------------------------------------------------
+
+/// How many block parameters a lift of `bytes` emits, across every block but the
+/// entry - whose parameters are the function's signature.
+fn block_params(bytes: &[u8], lazy: bool) -> usize {
+    let code = lift_to_code::<X86_64>(bytes, DEFAULT_LIFT_BASE, config(lazy)).expect("lift");
+    let entry = code.func.layout.entry_block();
+    code.func
+        .layout
+        .blocks()
+        .filter(|b| Some(*b) != entry)
+        .map(|b| code.func.dfg.block_params(b).len())
+        .sum()
+}
+
+/// **The pass, and why it had to exist.**
+///
+/// A region's `RET` dispatch has an in-region arm back to its earlier blocks, so
+/// the SSA builder gives those blocks a parameter per guest register. The prune
+/// deletes the sync stores that were their only readers and stops there, which
+/// left the entry loads alive as arguments to parameters feeding nothing.
+///
+/// Checked on the IR rather than on compiled size, because the point is the
+/// parameters themselves: at `speed` Cranelift's register allocator hides much of
+/// the cost, and at `none` it does not, and neither number says whether the
+/// parameters are gone.
+#[test]
+fn the_prune_takes_the_block_parameters_with_it() {
+    let lean = block_params(&MOV_RET, true);
+    let eager = block_params(&MOV_RET, false);
+    assert!(
+        lean < eager,
+        "deleting the sync stores should leave block parameters with no reader, \
+         and those should go too ({lean} vs {eager})"
+    );
+}
+
+/// The control: a parameter something *does* read must survive.
+///
+/// Without this, a pass that removed every parameter it could reach would pass
+/// the test above - and would be a miscompile rather than an optimisation.
+#[test]
+fn a_parameter_something_reads_is_kept() {
+    // A loop, so the register carrying the counter is genuinely a block
+    // parameter that the loop body reads:
+    //   mov rcx, 3
+    // top:
+    //   dec rcx
+    //   jnz top
+    //   ret
+    #[rustfmt::skip]
+    let loop_bytes: &[u8] = &[
+        0x48, 0xC7, 0xC1, 0x03, 0x00, 0x00, 0x00, // mov rcx, 3
+        0x48, 0xFF, 0xC9,                         // dec rcx
+        0x75, 0xFB,                               // jnz -5
+        0xC3,                                     // ret
+    ];
+    assert!(
+        block_params(loop_bytes, true) > 0,
+        "a loop-carried register must still be a block parameter"
+    );
+
+    // And the program still computes what it should, which is the assertion that
+    // would catch a parameter removed out from under a real reader.
+    let out = LiftTest::new(loop_bytes).run();
+    assert_eq!(out.ctx.rcx, 0);
+}
+
+/// A parameter that only ever feeds *itself* around a loop is dead, and the
+/// fixpoint is what sees that.
+///
+/// This is the case a one-pass "does any instruction name this value?" scan gets
+/// wrong: the value is named - by the branch that passes it back to its own
+/// parameter - so a naive scan keeps it, and every register a lifted loop carries
+/// stays alive forever. Asserted as a size claim on a region that loops, since
+/// the parameters in question are exactly the ones the loop carries and does not
+/// read.
+#[test]
+fn a_parameter_that_only_feeds_itself_is_not_kept_alive_by_that() {
+    #[rustfmt::skip]
+    let loop_bytes: &[u8] = &[
+        0x48, 0xC7, 0xC1, 0x03, 0x00, 0x00, 0x00, // mov rcx, 3
+        0x48, 0xFF, 0xC9,                         // dec rcx
+        0x75, 0xFB,                               // jnz -5
+        0xC3,                                     // ret
+    ];
+    let lean = block_params(loop_bytes, true);
+    let eager = block_params(loop_bytes, false);
+    assert!(
+        lean < eager,
+        "the loop's untouched registers are passed around it and read by nothing; \
+         a fixpoint should see that ({lean} vs {eager})"
+    );
 }

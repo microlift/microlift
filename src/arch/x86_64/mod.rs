@@ -66,6 +66,12 @@ impl GuestArch for X86_64 {
         })
     }
 
+    fn host_frame_offsets() -> Option<crate::core::hostframe::HostFrameOffsets> {
+        Some(crate::core::hostframe::HostFrameOffsets {
+            depth: std::mem::offset_of!(RegisterContext, host_frame_depth) as i32,
+        })
+    }
+
     fn call_return_offsets() -> Option<crate::core::callret::CallRetOffsets> {
         Some(crate::core::callret::CallRetOffsets {
             base: std::mem::offset_of!(RegisterContext, callret_base) as i32,
@@ -213,6 +219,9 @@ impl GuestArch for X86_64 {
         if let Some(offsets) = Self::call_return_offsets() {
             fields.push((offsets.base, "callret_base"));
             fields.push((offsets.offset, "callret_off"));
+        }
+        if let Some(offsets) = Self::host_frame_offsets() {
+            fields.push((offsets.depth, "host_frame_depth"));
         }
 
         fields

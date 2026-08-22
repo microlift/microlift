@@ -10,6 +10,8 @@ pub mod bridge;
 pub mod exit;
 pub mod flags;
 pub mod callret;
+pub mod dce;
+pub mod hostframe;
 pub mod link;
 pub mod optimize;
 pub mod pin;
@@ -30,6 +32,7 @@ use crate::core::optimize::Optimizations;
 use crate::core::pin::{PinnedAbi, PinnedReg};
 use crate::core::specialize::Specialization;
 use crate::core::callret::{CallRetConfig, CallRetOffsets};
+use crate::core::hostframe::{HostFrameConfig, HostFrameOffsets};
 use crate::core::srcloc::SourceLocMap;
 use crate::function_traits::{DynamicSymbol, FunctionArgumentType};
 use crate::os::get_host_calling_conv;
@@ -82,6 +85,14 @@ pub trait GuestArch: Sized {
     /// [`LifterConfig::call_return_stack`] inert, exactly as
     /// [`Self::block_link_offsets`] makes [`LifterConfig::block_link`] inert.
     fn call_return_offsets() -> Option<crate::core::callret::CallRetOffsets> {
+        None
+    }
+
+    /// Where this guest's context keeps the host-frame depth, or `None` for a
+    /// guest that has not made room for it - which makes
+    /// [`LifterConfig::host_call_frames`] inert, exactly as
+    /// [`Self::block_link_offsets`] makes [`LifterConfig::block_link`] inert.
+    fn host_frame_offsets() -> Option<crate::core::hostframe::HostFrameOffsets> {
         None
     }
 
@@ -1037,6 +1048,21 @@ pub struct LifterConfig {
     /// [`GuestArch::call_return_offsets`] - all three asked in
     /// `LiftEngine::call_return`.
     pub call_return_stack: Option<crate::core::callret::CallRetConfig>,
+    /// Nest a guest `CALL`/`RET` pair as a real **host** call and return, instead
+    /// of leaving both to the link machinery. Off by default.
+    ///
+    /// The alternative to [`call_return_stack`](Self::call_return_stack) and not a
+    /// companion to it: that one predicts a return out of a software ring, this
+    /// one makes the return a `ret` the CPU's return-address stack predicts. They
+    /// can be enabled together - nothing breaks, the ring simply never gets to
+    /// answer a `RET` the host frame already did - but the point of having both
+    /// compiled in is to measure one against the other.
+    ///
+    /// Requires [`link_cells`](Self::link_cells), because the callee's address
+    /// comes from a cell. Also inert unless the guest supplies
+    /// [`GuestArch::host_frame_offsets`] - all three asked in
+    /// `LiftEngine::host_call_frames`.
+    pub host_call_frames: Option<crate::core::hostframe::HostFrameConfig>,
     /// Optimizations for the emitted code. Some optimizations can trade off semantic accuracy
     /// of not commonly relied upon behavior, such as NAN accuracy.
     pub optimizations: Optimizations,
@@ -1079,6 +1105,7 @@ impl Default for LifterConfig {
             inline_link_probes: false,
             link_cells: false,
             call_return_stack: None,
+            host_call_frames: None,
             optimizations: Optimizations::none(),
         }
     }
@@ -1317,6 +1344,9 @@ pub struct LiftEngine<'a, A: GuestArch = crate::arch::x86_64::X86_64> {
     /// `return_call_indirect` and the tail-call sites share it. `None` until
     /// first use, and forever when nothing is pinned.
     pinned_sig: Option<SigRef>,
+    /// This region's own signature, imported once so a nested host call
+    /// ([`crate::core::hostframe`]) can name what it is calling.
+    region_sig: Option<SigRef>,
 
     /// Memflags for each `RegisterContext` field, keyed by its byte offset -
     /// one alias region apiece, interned once in [`Self::with_config`] from
@@ -1358,6 +1388,9 @@ pub struct LiftEngine<'a, A: GuestArch = crate::arch::x86_64::X86_64> {
     /// **never cleared**, because the question it answers is "anywhere in the
     /// region", not "before this point".
     written_slots: HashSet<regsync::RegSlot>,
+    /// Set by [`Self::keep_all_sync`] when a path has reloaded the whole
+    /// register file out of the context, after which no store may be pruned.
+    sync_prune_disabled: bool,
     /// Full-sync stores, with the register each writes back, in emission order.
     /// Candidates for the prune in [`Self::finish`].
     ctx_stores: Vec<(Inst, regsync::RegSlot)>,
@@ -1504,6 +1537,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             link_block: None,
             pinned_slots,
             pinned_sig: None,
+            region_sig: None,
             ctx_flags,
             x87_flags,
             guest_flags,
@@ -1515,6 +1549,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             link_cell_by_target: HashMap::new(),
             link_cell_base: None,
             written_slots: HashSet::new(),
+            sync_prune_disabled: false,
             ctx_stores: Vec::new(),
             ctx_loads: Vec::new(),
         }
@@ -1561,6 +1596,22 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
     /// prunable in the first place.
     pub fn mark_written(&mut self, slot: regsync::RegSlot) {
         self.written_slots.insert(slot);
+    }
+
+    /// Give up on the lazy-sync prune ([`crate::core::regsync`]) for the rest of
+    /// this region.
+    ///
+    /// For a path that **redefines the whole register file at once out of the
+    /// context** - the reload after a runtime-assisted syscall handler returns,
+    /// and the reload after a nested host call ([`crate::core::hostframe`]).
+    /// Past one of those no register provably still holds its entry-loaded
+    /// value, so every store the region goes on to emit has to stay.
+    ///
+    /// Guest-agnostic on purpose: naming every slot instead would need a
+    /// frontend to enumerate its own register file correctly, and a slot it
+    /// forgot would be a store silently pruned and a stale register at run time.
+    pub fn keep_all_sync(&mut self) {
+        self.sync_prune_disabled = true;
     }
 
     /// Whether anything in this region defined `slot`.
@@ -1622,7 +1673,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
     /// See [`crate::core::regsync`] for why "written nowhere in the region" is
     /// the right question and why it is only answerable here.
     fn prune_untouched_sync(&mut self) {
-        if !self.lazy_register_sync() {
+        if !self.lazy_register_sync() || self.sync_prune_disabled {
             return;
         }
         let stores = std::mem::take(&mut self.ctx_stores);
@@ -1637,9 +1688,31 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             }
         }
 
-        // With those gone, an entry load may have no consumer left. Ask the IR
-        // rather than a read set: a value no instruction names cannot be needed
-        // by one, whatever the frontend believes it did.
+        // With those gone, an entry load may have no consumer left, and a block
+        // parameter carrying one may have no reader. The two unlock each other:
+        // deleting a store can leave a parameter dead, deleting the parameter
+        // drops the branch argument that was the load's last use, and deleting
+        // the load drops *its* arguments. So this runs to a fixpoint rather than
+        // once - a single pass removes the stores and almost none of the traffic
+        // behind them.
+        let mut loads = loads;
+        loop {
+            let dropped = self.drop_unused_ctx_loads(&mut loads);
+            let unhooked = dce::remove_dead_block_params(&mut self.builder.func);
+            if !dropped && !unhooked {
+                break;
+            }
+        }
+    }
+
+    /// Remove every load in `loads` whose results nothing reads, and forget it.
+    ///
+    /// Only loads this engine recorded, which are the entry state load and the
+    /// full sync's - both `notrap`, which is what makes deleting one safe
+    /// whatever the address turns out to be. Asks the IR rather than a read set:
+    /// a value no instruction names cannot be needed by one, whatever the
+    /// frontend believes it did.
+    fn drop_unused_ctx_loads(&mut self, loads: &mut Vec<Inst>) -> bool {
         let func = &mut *self.builder.func;
         let mut used: HashSet<Value> = HashSet::new();
         for block in func.layout.blocks() {
@@ -1649,9 +1722,10 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                 }
             }
         }
-        for inst in loads {
+        let mut dropped = false;
+        loads.retain(|&inst| {
             if func.layout.inst_block(inst).is_none() {
-                continue;
+                return false;
             }
             let dead = func
                 .dfg
@@ -1661,8 +1735,11 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             if dead {
                 func.dfg.clear_results(inst);
                 func.layout.remove_inst(inst);
+                dropped = true;
             }
-        }
+            !dead
+        });
+        dropped
     }
 
     fn ctx_field_flags(&self, offset: i32) -> MemFlagsData {
@@ -2382,6 +2459,258 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             }
         };
         self.builder.ins().symbol_value(types::I64, gv)
+    }
+
+    /// The host-frame configuration and offsets, if this lift nests guest calls
+    /// as host calls.
+    ///
+    /// All three conditions in one place, mirroring [`Self::block_link`] and
+    /// [`Self::call_return`]: the host asked, cells are on (the callee's address
+    /// comes from one), and this guest's context has somewhere to keep the depth.
+    fn host_call_frames(&self) -> Option<(HostFrameConfig, HostFrameOffsets)> {
+        if !self.link_cells() {
+            return None;
+        }
+        let config = self.config.host_call_frames?;
+        Some((config, A::host_frame_offsets()?))
+    }
+
+    /// The arguments to enter a region with: the context pointer, then one per
+    /// pinned slot.
+    ///
+    /// **Not [`Self::pinned_call_args`]**, which is empty when nothing is pinned
+    /// because its callers are `return_` sites and an unpinned region returns
+    /// nothing. A *call* still has to pass the context pointer, so the two differ
+    /// in exactly the unpinned case - which is the one where getting it wrong
+    /// gives a call with no arguments to a signature that takes one.
+    fn region_call_args(&mut self) -> Vec<Value> {
+        match self.pinned_slots.is_empty() {
+            true => vec![self.builder.use_var(A::context_ptr_var(&self.state))],
+            false => self.pinned_call_args(),
+        }
+    }
+
+    /// This region's own signature, imported so a nested call can name it.
+    ///
+    /// The region calls something with *its own* shape - every lifted region has
+    /// the same one, pinned or not - so this is `func.signature` re-imported
+    /// rather than a signature built a second time and kept in agreement by hand.
+    fn region_signature_ref(&mut self) -> SigRef {
+        match self.region_sig {
+            Some(sig) => sig,
+            None => {
+                let signature = self.builder.func.signature.clone();
+                let sig = self.builder.import_signature(signature);
+                self.region_sig = Some(sig);
+                sig
+            }
+        }
+    }
+
+    /// Whether an out-of-region `RET` should **return** rather than link.
+    ///
+    /// The other half of [`Self::emit_host_frame_call`], and the half without
+    /// which that one is worse than useless: a caller that made a host call is
+    /// waiting on the stack, and a callee that links instead of returning leaves
+    /// that frame stranded. In a loop the host stack then grows by a frame per
+    /// iteration until the depth ceiling stops it, after which every call takes
+    /// the fallback - paying for the mechanism and using none of it.
+    ///
+    /// So under host frames a `RET` leaving the region always returns, and the
+    /// question of whether anyone wanted it is answered by whoever catches it.
+    /// A region with no frame waiting - entered by the host, or at the bottom of
+    /// a chain of jump links from one that was called - returns to the entry
+    /// thunk, which costs exactly the host dispatch a link *miss* would have.
+    pub fn returns_through_host_frames(&self) -> bool {
+        self.host_call_frames().is_some()
+    }
+
+    /// Nest an out-of-region direct `CALL` as a real host call, falling back to
+    /// `fallback` when it cannot be.
+    ///
+    /// ```text
+    ///   call(k, callee, resume):
+    ///     cell  = &cells[k]
+    ///     code  = cell.code;                 if code == 0     goto slow
+    ///     depth = ctx.host_frame_depth;      if depth >= max  goto slow
+    ///     ctx.host_frame_depth = depth + 1
+    ///     ctx.pc = callee;  ctx.image_base = cell.image_base
+    ///     r = call_indirect code(ctx, slots...)      ; a real `bl`
+    ///     ctx.host_frame_depth = depth
+    ///     <slots from r>;  <reload the rest from the context>
+    ///     if ctx.exit_reason == UnknownJump/Return && ctx.pc == resume:
+    ///         ctx.exit_reason = None;  goto resume       ; the common case
+    ///     return r                                       ; unwind one frame
+    ///   slow:  <the ordinary linked exit>
+    /// ```
+    ///
+    /// The callee needs no cooperation and gets none: its `RET` does exactly what
+    /// an unlinked `RET` always did - sync, and return with the guest's target in
+    /// the PC - and the caller, where that target is a lift-time *constant*, is
+    /// what decides whether it was the expected one. This is the whole reason
+    /// there is no shadow stack here; see [`crate::core::hostframe`].
+    ///
+    /// A mismatch returns again rather than handling anything, so a `longjmp` or a
+    /// computed return unwinds one host frame per level until a caller recognises
+    /// the address or the entry thunk hands it to the host. Correct by the same
+    /// argument at every level, and paid in proportion to how far the guest jumped.
+    ///
+    /// Returns `true` when the nested call was emitted. `false` means nothing was
+    /// emitted and the caller must produce its ordinary exit; the builder is left
+    /// where it was found.
+    pub fn emit_host_frame_call(
+        &mut self,
+        target: u64,
+        callee: Value,
+        resume: u64,
+    ) -> crate::Result<bool> {
+        let Some((config, offsets)) = self.host_call_frames() else {
+            return Ok(false);
+        };
+        // The call has to come back *somewhere this region can continue*. When the
+        // resume point is past the end of the region there is no block to return
+        // into - `finish` turns it into an exit stub, which would sync the
+        // pre-call register file over everything the callee wrote. Nesting is an
+        // optimisation, so it declines rather than working around it.
+        if !self.in_region(resume) {
+            return Ok(false);
+        }
+        let index = self.link_cell_for(target, crate::core::link::LinkSiteKind::StaticEdge);
+        let cell_offset = index as i64 * crate::core::link::ENTRY_SIZE as i64;
+
+        let nest = self.builder.create_block();
+        let taken = self.builder.create_block();
+        let unwind = self.builder.create_block();
+        let slow = self.builder.create_block();
+        let resume_block = self.get_block(resume);
+
+        let flags = self.link_cell_flags;
+        let base = self.link_cell_base();
+        let cell = self.builder.ins().iadd_imm_s(base, cell_offset);
+        let code = self
+            .builder
+            .ins()
+            .load(types::I64, flags, cell, crate::core::link::CODE_OFFSET);
+        // Not installed yet: the target has not been translated, so there is
+        // nothing to call. Exactly the fallback every other cell has.
+        self.builder.ins().brif(code, nest, &[], slow, &[]);
+
+        self.builder.switch_to_block(nest);
+        let ctx_ptr = self.builder.use_var(A::context_ptr_var(&self.state));
+        let depth = self.ctx_load(types::I32, ctx_ptr, offsets.depth);
+        let room = self.builder.ins().icmp_imm_u(
+            IntCC::UnsignedLessThan,
+            depth,
+            config.max_depth as i64,
+        );
+        // The host stack is finite and every live guest call is a frame of it.
+        // Past the ceiling a call takes the ordinary exit, which costs a host
+        // dispatch and nothing else.
+        self.builder.ins().brif(room, taken, &[], slow, &[]);
+
+        self.builder.switch_to_block(taken);
+        // Captured before the callee's is written over it. Every address this
+        // region forms is relative to *its* image base under
+        // `AddressMode::ImageBaseRelative`, so leaving the callee's behind would
+        // make the resume comparison below - and everything after it - arithmetic
+        // on the wrong base.
+        let my_image_base = self.builder.use_var(A::image_base_var(&self.state));
+        let deeper = self.builder.ins().iadd_imm_s(depth, 1);
+        self.ctx_store(deeper, ctx_ptr, offsets.depth);
+        // The callee enters through its own PC dispatch, so it has to be told
+        // where to start - and given the `image_base` that translation wants,
+        // which under `ImageBaseRelative` is not this region's.
+        self.ctx_store(callee, ctx_ptr, A::pc_offset());
+        let image_base = self.builder.ins().load(
+            types::I64,
+            flags,
+            cell,
+            crate::core::link::IMAGE_BASE_OFFSET,
+        );
+        self.ctx_store(image_base, ctx_ptr, A::image_base_offset());
+
+        let sig = self.region_signature_ref();
+        let args = self.region_call_args();
+        let call = self.builder.ins().call_indirect(sig, code, &args);
+        let results: Vec<Value> = self.builder.inst_results(call).to_vec();
+
+        // Restored rather than decremented: `depth` is this frame's own value, and
+        // reading it back would cost a load to learn something already in a
+        // register.
+        self.ctx_store(depth, ctx_ptr, offsets.depth);
+        // Put this region's image base back *before* the reload below, so the
+        // reload takes it and every address formed after the call is this
+        // region's again.
+        self.ctx_store(my_image_base, ctx_ptr, A::image_base_offset());
+        // The pinned half comes back in the results, in the order it went out;
+        // result 0 is the context pointer, which has not moved.
+        for (i, &(_, var, _)) in self.pinned_slots.clone().iter().enumerate() {
+            self.builder.def_var(var, results[i + 1]);
+        }
+        // Everything else the callee may have touched is in the context, so it is
+        // read back - **here**, on the path out of the call and nowhere else.
+        //
+        // Putting it at the top of the resume block instead is tempting, because
+        // there it would be the single definition reaching everything below and
+        // the ~55 loads a nested call costs would be plainly dead once the prune
+        // deletes the stores that consume them. It is also **wrong**: the resume
+        // point is an ordinary in-region address, so this region's own `RET`
+        // dispatch - and any branch to it - can reach that block without having
+        // synced anything, and a reload there would overwrite live register
+        // values with whatever the context last happened to hold.
+        A::load_state_from_context(self)?;
+        // **No `keep_all_sync` here, deliberately**, and the argument is worth
+        // spelling out because the syscall handler's reload - which looks like
+        // this one - does call it.
+        //
+        // The prune deletes the sync store of a register nothing in the region
+        // wrote, on the grounds that it writes back what the context already
+        // holds. A nested call does not break that: a register this region never
+        // writes has, at every point after this reload, exactly the value the
+        // reload took *out* of the context, so its store is still idempotent. A
+        // register the region writes anywhere - before the call or after it - is
+        // in the write set and keeps its stores as usual.
+        //
+        // That matters rather than being a nicety: disabling the prune here
+        // measured at +237% against +89% on a recursive fixture, because a region
+        // containing a call is exactly the kind that is hot.
+        //
+        // `host_frame_tests::a_callee_s_writes_survive_a_caller_that_touches_nothing`
+        // is what holds this, since being wrong about it is a stale register and
+        // not a crash.
+
+        let reason = self.ctx_load(types::I32, ctx_ptr, A::exit_reason_offset());
+        let is_transfer = self.builder.ins().icmp_imm_u(
+            IntCC::Equal,
+            reason,
+            ExitReason::UnknownJump as i64,
+        );
+        let code_field = self.ctx_load(types::I32, ctx_ptr, A::exit_code_offset());
+        let is_return = self.builder.ins().icmp_imm_u(
+            IntCC::Equal,
+            code_field,
+            TransferKind::Return as i64,
+        );
+        let pc = self.ctx_load(types::I64, ctx_ptr, A::pc_offset());
+        let want = self.runtime_addr(resume);
+        let here = self.builder.ins().icmp(IntCC::Equal, pc, want);
+        let ok = self.builder.ins().band(is_transfer, is_return);
+        let ok = self.builder.ins().band(ok, here);
+        self.builder.ins().brif(ok, resume_block, &[], unwind, &[]);
+
+        self.builder.switch_to_block(unwind);
+        // Not our return. Hand it straight back up: the frame below may be the
+        // one that wants it, and if none is, the entry thunk gives it to the host
+        // with the reason and PC the callee already wrote. Nothing is cleared,
+        // because nothing here has been serviced.
+        self.builder.ins().return_(&results);
+
+        self.builder.switch_to_block(slow);
+        self.builder.seal_block(nest);
+        self.builder.seal_block(taken);
+        self.builder.seal_block(unwind);
+        self.builder.seal_block(slow);
+        Ok(true)
     }
 
     /// Terminate a linkable exit whose destination is known at **lift time**,

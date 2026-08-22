@@ -147,18 +147,11 @@ impl<'a> Lifter<'a> {
     /// register still provably holds its entry-loaded value, so every store the
     /// region goes on to emit has to stay.
     pub fn mark_all_written(&mut self) {
-        for i in 0..GPR_ORDER.len() as u8 {
-            self.mark_written(RegSlot::Gpr(i));
-        }
-        for i in 0..FLAG_ORDER.len() as u8 {
-            self.mark_written(RegSlot::Flag(i));
-        }
-        for i in 0u8..16 {
-            self.mark_written(RegSlot::Vec(i));
-            self.mark_written(RegSlot::VecHi(i));
-        }
-        self.mark_written(FS_BASE_SLOT);
-        self.mark_written(GS_BASE_SLOT);
+        // Delegated rather than enumerated. Naming every slot here was the same
+        // answer by a longer route, and it was a list this frontend had to keep
+        // in agreement with its own register file - a slot left off would be a
+        // store silently pruned and a stale register at run time.
+        self.keep_all_sync();
     }
 
     /// Whether `reg` is carried out of the region in a machine register rather than

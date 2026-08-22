@@ -15,6 +15,7 @@
 use microlift::arch::aarch64::Aarch64;
 use microlift::arch::x86_64::X86_64;
 use microlift::core::callret::CallRetConfig;
+use microlift::core::hostframe::HostFrameConfig;
 use microlift::core::link::BlockLinkConfig;
 use microlift::core::pin::{PinnedAbi, PinnedReg};
 use microlift::core::{LifterConfig, lift_to_code};
@@ -31,6 +32,7 @@ fn everything_on() -> LifterConfig {
         block_link: Some(BlockLinkConfig::new(256).pinned(abi)),
         link_cells: true,
         call_return_stack: Some(CallRetConfig::new(16)),
+        host_call_frames: Some(HostFrameConfig::new(64)),
         ..LifterConfig::default()
     }
 }
@@ -102,6 +104,14 @@ fn each_switch_is_inert_on_its_own_without_block_linking() {
                 ..LifterConfig::default()
             },
         ),
+        (
+            "host frames without cells",
+            LifterConfig {
+                block_link: Some(BlockLinkConfig::new(256)),
+                host_call_frames: Some(HostFrameConfig::new(64)),
+                ..LifterConfig::default()
+            },
+        ),
     ] {
         let code = lift_to_code::<X86_64>(program, BASE, config).unwrap();
         assert!(
@@ -137,6 +147,7 @@ fn analysis_mode_emits_none_of_it() {
     assert!(code.entry_thunk.is_none());
     let ir = code.func.display().to_string();
     assert!(!ir.contains("symbol_value"), "no cell array is referenced");
+    assert!(!ir.contains("call_indirect"), "and nothing nests");
 }
 
 /// Two lifts of the same bytes under the same config must produce the same IR

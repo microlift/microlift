@@ -10,10 +10,24 @@ pub enum Optimization {
     /// it just generated - which is most guest code, since every operation on a NaN
     /// agrees regardless of its bit pattern.
     UnsafeImpreciseNaN,
+    /// Skip the divide-error (#DE) guards `DIV`/`IDIV` emit - the divisor-is-zero
+    /// test, the quotient-overflow test, and the fault block with its
+    /// `sync_to_context` - so a division is just the division.
+    ///
+    /// Safe only for a guest that never causes an invalid division. This is not a
+    /// loss of precision: a division that would have raised #DE no longer exits
+    /// with `ExitReason::DivideError` at all. An overflowing quotient is written
+    /// back truncated; a zero divisor either traps on the host (the native
+    /// `udiv`/`urem`) or produces a garbage quotient and remainder (the 128-bit
+    /// software loop), and neither is a guest-visible fault.
+    UnsafeImpreciseDivisionExceptions,
 }
 
 impl Optimization {
-    pub const ALL: &'static [Optimization] = &[Optimization::UnsafeImpreciseNaN];
+    pub const ALL: &'static [Optimization] = &[
+        Optimization::UnsafeImpreciseNaN,
+        Optimization::UnsafeImpreciseDivisionExceptions,
+    ];
 
     fn bit(self) -> u32 {
         1 << (Optimization::ALL
@@ -25,6 +39,9 @@ impl Optimization {
     pub fn name(self) -> &'static str {
         match self {
             Optimization::UnsafeImpreciseNaN => "unsafe-imprecise-nan",
+            Optimization::UnsafeImpreciseDivisionExceptions => {
+                "unsafe-imprecise-division-exceptions"
+            }
         }
     }
 }
