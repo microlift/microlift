@@ -68,8 +68,6 @@ pub struct RegisterContext {
     pub zf: u8,
     pub sf: u8,
     pub of: u8,
-    /// Direction flag (DF, RFLAGS bit 10). Controls whether string operations
-    /// advance their pointers upward (`DF=0`) or downward (`DF=1`).
     pub df: u8,
     pub control: ControlHeader,
     /// Padding, so that [`xmm`](Self::xmm) begins at a 16-byte-aligned
@@ -77,13 +75,7 @@ pub struct RegisterContext {
     pub _align_xmm: u64,
     /// XMM0–XMM15, each stored as [lo_64, hi_64].
     pub xmm: [[u64; 2]; 16],
-    /// FS segment base address. In x86-64 user mode this is set via
-    /// `arch_prctl(ARCH_SET_FS)` or `wrfsbase` and used for thread-local
-    /// storage. Reads/writes through `fs:` prefixed addresses add this base.
     pub fs_base: u64,
-    /// GS segment base address. On Windows this points to the TEB; on Linux
-    /// it is often used for kernel->user communication via `swapgs`.
-    /// Reads/writes through `gs:` prefixed addresses add this base.
     pub gs_base: u64,
 
     /// x87 data registers in true 80-bit extended precision, one physical register
@@ -103,40 +95,15 @@ pub struct RegisterContext {
     pub fpu_sw: u16,
     /// x87 control word (used by `FLDCW`/`FNSTCW`).
     pub fpu_cw: u16,
-    /// x87 tag word, in the *abridged* (`FXSAVE`) encoding: bit `i` is set when
+    /// x87 tag word, in the abridged (`FXSAVE`) encoding: bit `i` is set when
     /// physical register `i` holds a value and clear when it is empty. The full
     /// two-bits-per-register architectural tag word that `FNSTENV`/`FLDENV`
     /// exchange with memory is expanded from / collapsed into this on the fly.
     pub fpu_tag: u16,
 
     /// SSE control and status register, read by `STMXCSR` and written by `LDMXCSR`.
-    ///
-    /// Architecturally faithful *as storage* - whatever `LDMXCSR` writes,
-    /// `STMXCSR` reads back - but it does not influence SSE arithmetic: rounding is
-    /// always nearest-even, FZ/DAZ are not applied, and the exception flags are
-    /// never set by a lifted instruction. Code that saves, modifies and restores
-    /// `MXCSR` behaves correctly; code that changes the rounding mode and expects
-    /// arithmetic to follow, or polls the sticky flags, does not.
     pub mxcsr: u32,
 
-    /// The six segment *selectors*, as read by `MOV r/m16, Sreg` and
-    /// `PUSH FS`/`PUSH GS`.
-    ///
-    /// **Selectors, not bases**: a `fs:`/`gs:`-prefixed access forms its address
-    /// from [`fs_base`](Self::fs_base)/[`gs_base`](Self::gs_base), which are
-    /// independent fields. That mirrors 64-bit hardware, where `WRFSBASE` moves a
-    /// base without touching the selector - but the reverse does *not* hold here:
-    /// writing `fs` or `gs` stores the selector and leaves the base alone, where
-    /// hardware would reload it from the descriptor. A guest that retargets its TLS
-    /// by loading a selector is out of scope; one that reads its selectors for a
-    /// diagnostic record is the case this exists for.
-    ///
-    /// Like `MXCSR`, faithful storage rather than a control input: nothing
-    /// interprets them, and a segment override other than `FS`/`GS` is ignored when
-    /// forming an address.
-    ///
-    /// The host is expected to seed them, since the correct values are a property
-    /// of the guest OS ([`CS_USER64_DARWIN`]/[`CS_USER64_LINUX`] and friends).
     pub cs: u16,
     pub ss: u16,
     pub ds: u16,
@@ -149,12 +116,8 @@ pub struct RegisterContext {
 
     /// Where the region that just exited says to go next: the address of a
     /// [`BlockLinkEntry`](crate::core::link::BlockLinkEntry) in
-    /// [`link_table`](Self::link_table), or **zero for "no link - service this exit
-    /// yourself"**.
-    ///
-    /// The host clears it before every entry and reads it after; lifted code writes
-    /// it only on a table hit, which is why zero is the answer for an exit with no
-    /// probe at all.
+    /// [`link_table`](Self::link_table), or zero for "no link - service this exit
+    /// yourself".
     pub link_hit: u64,
     /// Base of this thread's call-return ring
     /// ([`CallRetEntry`](crate::core::callret::CallRetEntry)), or null.
@@ -172,7 +135,7 @@ pub struct RegisterContext {
     /// is what lets the emitted push and pop carry no bounds check. See
     /// [`crate::core::callret`].
     pub callret_off: u64,
-    /// How many guest calls are currently live as **host** frames
+    /// How many guest calls are currently live as host frames
     /// ([`crate::core::hostframe`]).
     ///
     /// Maintained entirely by lifted code - incremented before a nested call and
@@ -279,9 +242,6 @@ impl std::ops::DerefMut for RegisterContext {
 /// for zero and for normals in the `f64` exponent range (and round-trips with
 /// [`f64_bits_to_f80`]), but it truncates the significand and flushes denormals
 /// to zero rather than rounding.
-///
-/// So it is *not* the narrowing the lifter emits for `FST m32/m64`, which uses
-/// the precise softfloat path. Use this for interop and inspection only.
 #[inline]
 pub fn f80_to_f64_bits(mantissa: u64, sign_exp: u16) -> u64 {
     let sign = ((sign_exp >> 15) & 1) as u64;
@@ -299,17 +259,12 @@ pub fn f80_to_f64_bits(mantissa: u64, sign_exp: u16) -> u64 {
 
 /// Convert the raw bits of an `f64` to an 80-bit x87 value, returning
 /// `(mantissa, sign_exp)` in the layout [`f80_to_f64_bits`] consumes.
-///
-/// `f64` is a strict subset of the 80-bit format, so this is **exact** for every
-/// finite `f64` except denormals, which are flushed to zero. Used at lift time
-/// by `FLDZ`/`FLD1`/`FLDPI` for their in-range constants.
 #[inline]
 pub fn f64_bits_to_f80(bits: u64) -> (u64, u16) {
     let sign = (bits >> 63) & 1;
     let exp64 = (bits >> 52) & 0x7FF;
     let frac = bits & 0x000F_FFFF_FFFF_FFFF;
     if exp64 == 0 && frac == 0 {
-        // ±0 (denormals are flushed to zero, matching the lifter).
         return (0, (sign as u16) << 15);
     }
     // Explicit integer bit set + fraction shifted up by 11.
@@ -327,7 +282,7 @@ mod tests {
     use super::*;
 
     /// `xmm`'s alignment is worth twenty-two instructions per region entry and
-    /// is a property of every field declared *before* it. This is the assertion
+    /// is a property of every field declared before it. This is the assertion
     /// that says so, rather than the comment on `_align_xmm` alone.
     #[test]
     fn the_vector_save_area_stays_sixteen_byte_aligned() {
