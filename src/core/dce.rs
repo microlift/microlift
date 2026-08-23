@@ -3,45 +3,8 @@
 //! Cranelift's own optimizer does not remove a block parameter nothing reads,
 //! and the SSA builder produces a great many of them here: a lifted region's
 //! `RET` dispatch has an in-region arm back to the region's earlier blocks, so
-//! **every guest register is a parameter of those blocks**. That is harmless
+//! every guest register is a parameter of those blocks. That is harmless
 //! while something consumes them, and the register file's exit sync did.
-//!
-//! Then [`crate::core::regsync`]'s prune started deleting those stores. It
-//! deletes the *load* half too, but only for a load whose value has no remaining
-//! use - and a value passed to a block parameter still has one, whether or not
-//! the parameter is read. So the loads survive as arguments to parameters that
-//! feed nothing, and the register traffic the prune exists to remove comes back
-//! in through the branches.
-//!
-//! This closes that. It is ordinary dead-code elimination with one wrinkle worth
-//! stating, because getting it wrong is the difference between removing a loop's
-//! dead parameters and removing none of them:
-//!
-//! **A block-call argument is not a use on its own.** Whether it is one depends
-//! on whether the parameter it feeds is live, so the fixpoint below starts with
-//! every parameter assumed dead and only promotes one when something *other than
-//! a branch argument* reads it, or when it feeds an already-live parameter. Ask
-//! the question the other way round - "does any instruction name this value?" -
-//! and a parameter that only ever passes itself around a loop keeps itself alive
-//! forever, which is exactly the shape a lifted region's back edges produce.
-//!
-//! Failure here is loud rather than silent: a mismatch between a block's
-//! parameters and a predecessor's arguments is a verifier error, not a wrong
-//! answer at run time. That is the reason this is an IR pass and not a read set
-//! maintained by each frontend.
-//!
-//! # What it is worth
-//!
-//! On ordinary regions, modestly: **~8% off compile time** and ~1% off `.text`
-//! over 300 lifts of a region with a loop and a couple of branches. The machine
-//! code barely moves because the register allocator was already coping; the IR
-//! it has to cope with is four to five times smaller, and that is where the time
-//! goes.
-//!
-//! On a region containing a nested host call ([`crate::core::hostframe`]) it is
-//! the difference between the mechanism being usable and not: 114 loads and
-//! 1640 bytes become 22 and 768, and the recursive fixture that ran **+101%**
-//! against a plain linked call runs +9.5%.
 
 use std::collections::{HashMap, HashSet};
 
