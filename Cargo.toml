@@ -191,6 +191,10 @@ name = "fuzz_vsa"
 required-features = ["fuzzing"]
 
 [[test]]
+name = "aes_tests"
+required-features = ["testkit"]
+
+[[test]]
 name = "sse42_tests"
 required-features = ["testkit"]
 

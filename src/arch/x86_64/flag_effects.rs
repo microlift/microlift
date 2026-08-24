@@ -182,6 +182,12 @@ fn is_flag_free(m: Mnemonic) -> bool {
             | Mnemonic::Addss
             | Mnemonic::Addsubpd
             | Mnemonic::Addsubps
+            | Mnemonic::Aesdec
+            | Mnemonic::Aesdeclast
+            | Mnemonic::Aesenc
+            | Mnemonic::Aesenclast
+            | Mnemonic::Aesimc
+            | Mnemonic::Aeskeygenassist
             | Mnemonic::Andnpd
             | Mnemonic::Andnps
             | Mnemonic::Andpd

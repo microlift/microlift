@@ -3,6 +3,7 @@
 //! This module is the dispatch hub. The actual implementations live in the
 //! sub-modules below, each focused on a specific instruction category.
 
+pub mod aes;
 pub mod arith_spec;
 pub mod arithmetic;
 pub mod atomics;
@@ -25,6 +26,7 @@ pub mod syscall;
 pub mod unimplemented;
 
 use crate::MicroliftError;
+use crate::arch::x86_64::semantics::aes::AesKernel;
 use crate::arch::x86_64::semantics::cond::Cond;
 use crate::arch::x86_64::semantics::fpu::FpuOp;
 use crate::arch::x86_64::semantics::sse::{PackedLaneOp, PackedShiftOp, PackedWidth};
@@ -336,6 +338,15 @@ impl<'a> Lifter<'a> {
                 PackedLaneOp::CmpGt,
                 PackedWidth::Qword,
             ),
+
+            // AES-NI. The four round instructions differ only in direction and in
+            // whether MixColumns runs; all six share one bitsliced kernel family.
+            Mnemonic::Aesenc => self.handle_aes_round(instruction, AesKernel::Enc),
+            Mnemonic::Aesenclast => self.handle_aes_round(instruction, AesKernel::EncLast),
+            Mnemonic::Aesdec => self.handle_aes_round(instruction, AesKernel::Dec),
+            Mnemonic::Aesdeclast => self.handle_aes_round(instruction, AesKernel::DecLast),
+            Mnemonic::Aesimc => self.handle_aesimc(instruction),
+            Mnemonic::Aeskeygenassist => self.handle_aeskeygenassist(instruction),
 
             // SSE4.2 packed string compares. All four share one handler; which it is
             // decides only where the lengths come from and where the result goes. The
