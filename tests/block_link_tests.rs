@@ -275,3 +275,156 @@ fn without_the_config_nothing_probes() {
     assert_eq!(caller.enter(), ExitReason::UnknownJump);
     assert_eq!(caller.ctx.link_hit, 0xDEAD);
 }
+
+/// `mov rax, CALLEE` followed by `insn` - a transfer through a register whose
+/// target is a run-time value the lifter never sees.
+fn through_rax(insn: &[u8]) -> Harness {
+    let mut bytes = vec![0x48, 0xB8];
+    bytes.extend_from_slice(&CALLEE.to_le_bytes());
+    bytes.extend_from_slice(insn);
+    // A `nop`, so the return address of a `call` is an address in the region.
+    bytes.push(0x90);
+    LiftTest::new(&bytes)
+        .with_config(|c| {
+            c.block_link = Some(link_config());
+        })
+        .compile()
+        .expect("the region compiles")
+}
+
+/// `call rax` - the instruction after `mov rax, imm64`.
+const CALL_RAX: &[u8] = &[0xFF, 0xD0];
+/// `jmp rax`, same place.
+const JMP_RAX: &[u8] = &[0xFF, 0xE0];
+
+/// The address after the `call`: ten bytes of `mov` and two of `call`.
+const AFTER_CALL: u64 = DEFAULT_LIFT_BASE + 12;
+
+/// An indirect call is the one exit whose servicing is a *decision* - native
+/// function or guest code - so it cannot push the return address before it knows
+/// the answer. A matching row is the answer, and the push belongs there.
+#[test]
+fn an_indirect_call_links_on_the_resolved_callee_and_pushes_the_return_address() {
+    let mut caller = through_rax(CALL_RAX);
+    let callee = callee();
+    let mut table = table();
+    publish(&mut table, CALLEE, callee.code_ptr, CALLEE);
+
+    caller.ctx.link_table = table.as_mut_ptr();
+    caller.ctx.link_hit = 0;
+    let entry_rsp = caller.ctx.rsp;
+    let exit = caller.enter();
+
+    assert_eq!(exit, ExitReason::UnknownJump);
+    assert_eq!(
+        TransferKind::try_from(caller.ctx.exit_code),
+        Ok(TransferKind::IndirectCall)
+    );
+    assert_ne!(caller.ctx.link_hit, 0, "a resolved callee links");
+    assert_eq!(
+        caller.ctx.rip, CALLEE,
+        "the link must commit the callee as the PC, not the return address"
+    );
+    assert_eq!(caller.ctx.imported_function_va, CALLEE);
+    assert_eq!(caller.ctx.rsp, entry_rsp - 8, "the link performed the push");
+    // SAFETY: `rsp` points into the caller harness's own stack.
+    assert_eq!(unsafe { *(caller.ctx.rsp as *const u64) }, AFTER_CALL);
+
+    follow(&mut caller.ctx);
+    assert_eq!(caller.ctx.rbx, 7);
+    assert_eq!(
+        caller.ctx.rip, AFTER_CALL,
+        "the callee's own `ret` finds the address the link pushed"
+    );
+    assert_eq!(caller.ctx.rsp, entry_rsp, "and pops it");
+}
+
+/// The miss keeps the contract the host has always been given: nothing is
+/// pushed, the PC is the resume point, and the reason is the one that asks the
+/// host to dispatch. A row that is not there cannot change what an exit means.
+#[test]
+fn an_indirect_call_that_does_not_link_leaves_the_stack_alone() {
+    let mut caller = through_rax(CALL_RAX);
+    let mut table = table();
+
+    caller.ctx.link_table = table.as_mut_ptr();
+    caller.ctx.link_hit = 0;
+    let entry_rsp = caller.ctx.rsp;
+    let exit = caller.enter();
+
+    assert_eq!(exit, ExitReason::IndirectCall);
+    assert_eq!(caller.ctx.imported_function_va, CALLEE);
+    assert_eq!(caller.ctx.rip, AFTER_CALL, "the PC is the resume point");
+    assert_eq!(caller.ctx.rsp, entry_rsp, "the stack pointer is unchanged");
+    assert_eq!(caller.ctx.link_hit, 0);
+}
+
+/// A lift that never asked to link emits none of this: the same program is the
+/// exit it has always been, with a matching table in place.
+#[test]
+fn an_indirect_call_without_linking_is_unchanged() {
+    let mut bytes = vec![0x48, 0xB8];
+    bytes.extend_from_slice(&CALLEE.to_le_bytes());
+    bytes.extend_from_slice(CALL_RAX);
+    bytes.push(0x90);
+    let mut caller = LiftTest::new(&bytes).compile().expect("compiles");
+    let callee = callee();
+    let mut table = table();
+    publish(&mut table, CALLEE, callee.code_ptr, CALLEE);
+
+    caller.ctx.link_table = table.as_mut_ptr();
+    // A sentinel a host would never write, to prove nothing wrote over it.
+    caller.ctx.link_hit = 0xDEAD;
+    let entry_rsp = caller.ctx.rsp;
+
+    assert_eq!(caller.enter(), ExitReason::IndirectCall);
+    assert_eq!(caller.ctx.link_hit, 0xDEAD);
+    assert_eq!(caller.ctx.rsp, entry_rsp);
+}
+
+/// An indirect `JMP` has nothing to decide: the exit already means "continue at
+/// this address", so it links through the ordinary probe like any other.
+#[test]
+fn an_indirect_jump_links_to_the_region_that_covers_it() {
+    let mut caller = through_rax(JMP_RAX);
+    let callee = callee();
+    let mut table = table();
+    publish(&mut table, CALLEE, callee.code_ptr, CALLEE);
+
+    caller.ctx.link_table = table.as_mut_ptr();
+    caller.ctx.link_hit = 0;
+    let exit = caller.enter();
+
+    assert_eq!(exit, ExitReason::UnknownJump);
+    assert_eq!(
+        TransferKind::try_from(caller.ctx.exit_code),
+        Ok(TransferKind::IndirectJump)
+    );
+    assert_ne!(caller.ctx.link_hit, 0, "an indirect jump links");
+    assert_eq!(caller.ctx.rip, CALLEE);
+
+    // The jump is a tail transfer: the callee's `ret` pops what the harness
+    // seeded, which is the trampoline, and the program is done.
+    assert_eq!(follow(&mut caller.ctx), ExitReason::Return);
+    assert_eq!(caller.ctx.rbx, 7);
+}
+
+/// A row for an address the guest never jumps to is not a row for this one: the
+/// indirect call falls back rather than entering the wrong translation.
+#[test]
+fn an_indirect_call_does_not_take_a_row_about_another_address() {
+    let mut caller = through_rax(CALL_RAX);
+    let callee = callee();
+    let mut table = table();
+    // The same slot the callee would occupy, but about an address sixteen bytes
+    // away - the collision case, which must be a miss.
+    publish(&mut table, CALLEE + 1, callee.code_ptr, CALLEE);
+
+    caller.ctx.link_table = table.as_mut_ptr();
+    caller.ctx.link_hit = 0;
+    let entry_rsp = caller.ctx.rsp;
+
+    assert_eq!(caller.enter(), ExitReason::IndirectCall);
+    assert_eq!(caller.ctx.link_hit, 0);
+    assert_eq!(caller.ctx.rsp, entry_rsp);
+}

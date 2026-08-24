@@ -2941,7 +2941,9 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
     /// Every caller is an exit whose whole servicing is "enter whatever is at
     /// `ctx.rip`". An exit the host must *do* something about first (an import
     /// call, a syscall, `CPUID`, a refused resume point) must return the
-    /// ordinary way, or the host would never see it.
+    /// ordinary way, or the host would never see it - or, where finding a row
+    /// is itself the thing the host would have decided, link through
+    /// [`Self::emit_dynamic_link`] instead.
     ///
     /// With linking off this is exactly `return_`, which is what makes it safe
     /// to use at every such site unconditionally.
@@ -3018,6 +3020,29 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
     /// Emit one probe, terminating the current block and leaving the builder in
     /// the probe's `out` arm.
     fn emit_link_probe(&mut self, pc: Value) {
+        let (entry, out) = self.emit_link_lookup(pc);
+
+        // A hit *commits* the PC as well as naming the successor, which lets one
+        // probe serve an exit whose `rip` is not where it continues: the
+        // out-of-region direct `CALL` leaves `rip` at the return address and the
+        // callee in `imported_function_va`, and a host services it by swapping the
+        // two. Redundant at every other site.
+        let ctx_ptr = self.builder.use_var(A::context_ptr_var(&self.state));
+        self.ctx_store(pc, ctx_ptr, A::pc_offset());
+        self.emit_link_taken(entry);
+
+        self.builder.switch_to_block(out);
+        self.emit_host_return();
+    }
+
+    /// Emit the probe as far as the address compare, leaving the builder in the
+    /// arm a row for `pc` was found in.
+    ///
+    /// Returns that row's address and the block the misses land in, which the
+    /// caller finishes. Separating the lookup from what follows it is what lets
+    /// an exit commit to the transfer *inside* the hit arm - see
+    /// [`Self::emit_dynamic_link`].
+    fn emit_link_lookup(&mut self, pc: Value) -> (Value, Block) {
         let (link, offsets) = self
             .block_link()
             .expect("a probe is only emitted when linking is on");
@@ -3046,13 +3071,23 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         let matches = self.builder.ins().icmp(IntCC::Equal, key, pc);
         self.builder.ins().brif(matches, hit, &[], out, &[]);
 
-        // A hit *commits* the PC as well as naming the successor, which lets one
-        // probe serve an exit whose `rip` is not where it continues: the
-        // out-of-region direct `CALL` leaves `rip` at the return address and the
-        // callee in `imported_function_va`, and a host services it by swapping the
-        // two. Redundant at every other site.
+        for block in [probe, hit, out] {
+            self.visited_blocks.insert(block);
+        }
         self.builder.switch_to_block(hit);
-        self.ctx_store(pc, ctx_ptr, A::pc_offset());
+        (entry, out)
+    }
+
+    /// Terminate the current block by taking the link `entry` names: branch to
+    /// it, or publish it and return.
+    ///
+    /// Everything the two dispatch modes share is above this; this is the three
+    /// instructions where they differ.
+    fn emit_link_taken(&mut self, entry: Value) {
+        let (_, offsets) = self
+            .block_link()
+            .expect("a link is only taken when linking is on");
+        let ctx_ptr = self.builder.use_var(A::context_ptr_var(&self.state));
         if self.pinned() {
             // The branch, rather than the answer: the successor is entered with the
             // pinned registers still in place, so nothing is published for a host
@@ -3083,13 +3118,45 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             self.ctx_store(entry, ctx_ptr, offsets.hit);
             self.emit_host_return();
         }
+    }
 
-        self.builder.switch_to_block(out);
-        self.emit_host_return();
-
-        for block in [probe, hit, out] {
-            self.visited_blocks.insert(block);
+    /// Give an exit whose destination is only known at run time a chance to
+    /// link, committing to the transfer only in the arm where it does.
+    ///
+    /// ```text
+    ///   dynamic(pc):  <exactly the probe, up to the address compare>
+    ///   hit:          <commit>            ; the caller's, emitted here
+    ///                 ctx.link_hit = ent  ; or the pinned tail call
+    ///                 return
+    ///   miss:         <the caller's existing exit, unchanged>
+    /// ```
+    ///
+    /// [`Self::emit_exit`] is the other shape and the common one: there the exit
+    /// has already put the context in the state the host reads, and a link only
+    /// saves the host the lookup. Some exits cannot do that, because part of
+    /// servicing them is a *decision* the host makes - an indirect `CALL` is
+    /// dispatched as a native call or as guest code, and the return address is
+    /// pushed only in the second case. A row that matches settles that decision:
+    /// it says the callee is translated guest code. So the commit belongs where
+    /// the answer is, and the miss path keeps the contract the host has always
+    /// been given.
+    ///
+    /// Leaves the builder in the miss arm, and emits nothing at all - not even a
+    /// block - when this lift is not linking. `commit` must terminate nothing:
+    /// the take is appended to it.
+    pub fn emit_dynamic_link(
+        &mut self,
+        pc: Value,
+        commit: impl FnOnce(&mut Self) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        if self.block_link().is_none() {
+            return Ok(());
         }
+        let (entry, miss) = self.emit_link_lookup(pc);
+        commit(self)?;
+        self.emit_link_taken(entry);
+        self.builder.switch_to_block(miss);
+        Ok(())
     }
 
     pub fn lift(&mut self, bytes: &[u8], ip: u64) -> crate::Result<()> {

@@ -381,3 +381,41 @@ fn the_context_pointer_survives_the_round_trip() {
     assert_eq!(&first.ctx as *const RegisterContext as u64, before);
     assert_eq!(first.ctx.rax, 1);
 }
+
+/// An indirect `CALL` under a pinned ABI: the push, the branch to the callee and
+/// the branch back into the caller all happen with the register file in
+/// registers, and the host is entered once for the whole thing.
+///
+/// `mov rax, SECOND ; call rax ; ret` - `rax` is pinned, so the callee's own
+/// `ret` linking back to the instruction after the `call` is the only way the
+/// value asserted below can still be there.
+#[test]
+fn an_indirect_call_links_both_ways_without_the_host() {
+    let mut bytes = vec![0x48, 0xB8];
+    bytes.extend_from_slice(&SECOND.to_le_bytes());
+    bytes.extend_from_slice(&[0xFF, 0xD0, 0xC3]);
+    let mut first = region(&bytes, DEFAULT_LIFT_BASE);
+    let second = region(SET_RBX, SECOND);
+    let after_call = DEFAULT_LIFT_BASE + 12;
+
+    let mut table = table();
+    publish(&mut table, SECOND, &second, SECOND);
+    publish(&mut table, after_call, &first, DEFAULT_LIFT_BASE);
+
+    first.ctx.link_table = table.as_mut_ptr();
+    first.ctx.link_hit = 0;
+    let entry_rsp = first.ctx.rsp;
+    let exit = first.enter();
+
+    assert_eq!(exit, ExitReason::Return, "the whole chain ran in one entry");
+    assert_eq!(first.ctx.rax, SECOND, "the pinned file survived the call");
+    assert_eq!(first.ctx.rbx, 7, "the callee ran");
+    assert_eq!(first.ctx.link_hit, 0);
+    // Down eight for the call, up eight when the callee returned, and up eight
+    // again for the final `ret` popping the trampoline.
+    assert_eq!(
+        first.ctx.rsp,
+        entry_rsp + 8,
+        "the return address the link pushed is the one the callee popped"
+    );
+}

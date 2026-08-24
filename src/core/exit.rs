@@ -82,6 +82,11 @@ pub enum ExitReason {
     /// target, call it via C and resume at the PC with no stack adjustment; for
     /// **guest code**, push the return address before re-entering so the callee's
     /// `RET` finds it.
+    ///
+    /// A linking region reports this only when nothing linked. A callee the
+    /// host's table already names is guest code by construction, so that case
+    /// answers itself and exits as `UnknownJump` /
+    /// [`TransferKind::IndirectCall`] with the push already done.
     IndirectCall = 7,
 
     /// A `UD2`/equivalent invalid-opcode trap was executed intentionally (e.g.
@@ -257,6 +262,20 @@ pub enum TransferKind {
     ///
     /// [`LifterConfig::strict_resume`]: crate::core::LifterConfig::strict_resume
     NoResumePoint = 7,
+    /// A `CALL` through a register or memory operand whose callee resolved, at
+    /// run time, to code the host has already translated.
+    ///
+    /// Only a **linked** indirect call reports this, and only on the hit - the
+    /// row that matched is what proves the callee is guest code rather than a
+    /// native function, which is the decision [`ExitReason::IndirectCall`]
+    /// otherwise leaves to the host. So the state is the one a
+    /// [`DirectCall`](Self::DirectCall) leaves, resolved rather than static: the
+    /// return address is pushed, `imported_function_va` holds the callee, and
+    /// the PC **is** the callee. `link_hit` names the row to enter.
+    ///
+    /// An unlinked indirect call is unchanged - it still exits as
+    /// [`ExitReason::IndirectCall`] with the stack untouched.
+    IndirectCall = 8,
 }
 
 impl TryFrom<u32> for TransferKind {
@@ -279,6 +298,8 @@ impl TryFrom<u32> for TransferKind {
             Ok(Self::RegionTail)
         } else if value == Self::NoResumePoint as u32 {
             Ok(Self::NoResumePoint)
+        } else if value == Self::IndirectCall as u32 {
+            Ok(Self::IndirectCall)
         } else {
             Err(())
         }
@@ -296,6 +317,7 @@ impl std::fmt::Display for TransferKind {
             TransferKind::DirectCall => "direct-call",
             TransferKind::RegionTail => "region-tail",
             TransferKind::NoResumePoint => "no-resume-point",
+            TransferKind::IndirectCall => "indirect-call",
         })
     }
 }
@@ -368,6 +390,11 @@ mod tests {
     #[test]
     fn transfer_kind_display() {
         assert_eq!(TransferKind::DirectCall.to_string(), "direct-call");
+        assert_eq!(TransferKind::IndirectCall.to_string(), "indirect-call");
+        assert_eq!(
+            TransferKind::try_from(TransferKind::IndirectCall as u32),
+            Ok(TransferKind::IndirectCall)
+        );
         assert_eq!(
             TransferKind::try_from(TransferKind::IndirectJump as u32),
             Ok(TransferKind::IndirectJump)

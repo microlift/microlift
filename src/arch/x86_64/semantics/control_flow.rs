@@ -469,6 +469,15 @@ impl<'a> Lifter<'a> {
     ///
     /// RSP is intentionally left unchanged. See `ExitReason::IndirectCall` for
     /// the contract the host must uphold when dispatching the callee.
+    ///
+    /// Unless the callee links. The host's decision - native function or guest
+    /// code - is what keeps the push out of this exit, and a matching row makes
+    /// it for us: it is guest code, and it has been translated. So a hit does
+    /// the push here and continues at the callee, exactly as an out-of-region
+    /// direct `CALL` does; see [`LiftEngine::emit_dynamic_link`] for why the
+    /// commit is in the hit arm rather than before the probe.
+    ///
+    /// [`LiftEngine::emit_dynamic_link`]: crate::core::LiftEngine::emit_dynamic_link
     fn emit_indirect_call_exit(&mut self, target_val: Value) -> crate::Result<()> {
         self.get_block(self.current_ip);
 
@@ -483,6 +492,24 @@ impl<'a> Lifter<'a> {
         let va_offset = <X86_64 as GuestArch>::imported_function_va_offset();
         self.ctx_store(target_val, ctx_ptr, va_offset);
 
+        let ret_addr = self.runtime_current_ip();
+        let resume = self.current_ip;
+        self.emit_dynamic_link(target_val, |lifter| {
+            let rsp = lifter.get_reg_val(Register::RSP)?;
+            let new_rsp = lifter.builder.ins().iadd_imm_s(rsp, -8);
+            lifter.set_reg_val(Register::RSP, new_rsp)?;
+            lifter
+                .builder
+                .ins()
+                .store(lifter.guest_flags, ret_addr, new_rsp, 0);
+            lifter.emit_callret_push(resume, ret_addr);
+            lifter.sync_to_context(Some(target_val), ExitReason::UnknownJump)?;
+            lifter.write_exit_code(TransferKind::IndirectCall as u32);
+            Ok(())
+        })?;
+
+        // Reached when nothing links, which is every lift that is not linking at
+        // all: the exit the host has always been given, stack untouched.
         self.sync_to_context(None, ExitReason::IndirectCall)?;
         self.emit_host_return();
         self.block_terminated = true;
