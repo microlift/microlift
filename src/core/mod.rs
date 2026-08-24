@@ -1126,7 +1126,7 @@ impl LifterConfig {
     /// Demoted to a slow `ImportedFunctionCall` exit when variadic, or when
     /// `abi` cannot place all the arguments.
     ///
-    /// **The callee must not touch the `RegisterContext`**, directly or by
+    /// The callee must not touch the `RegisterContext`, directly or by
     /// re-entering guest code against it: a fast call runs inline with the
     /// region's state in machine registers, so nothing is published before it
     /// and nothing is reloaded after. Doing so is undefined behaviour. Register
@@ -1557,14 +1557,6 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
 
     /// Store `val` into the `RegisterContext` field at `offset`, tagged with
     /// that field's alias region.
-    ///
-    /// **The only way to write the context.** A store carrying no region is a
-    /// fence that wipes Cranelift's last-store state for every region, so a
-    /// hand-rolled `builder.ins().store(MemFlagsData::trusted(), ..)` at a
-    /// context address does not merely miss an optimisation - it disables the
-    /// analysis for everything after it. Panics on an offset
-    /// [`GuestArch::context_fields`] does not list, which is the diagnostic
-    /// that keeps the list complete.
     pub fn ctx_store(&mut self, val: Value, ctx_ptr: Value, offset: i32) -> Inst {
         let flags = self.ctx_field_flags(offset);
         self.builder.ins().store(flags, val, ctx_ptr, offset)
@@ -1584,32 +1576,12 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
     }
 
     /// Record that something defined `slot`'s SSA variable in this region.
-    ///
-    /// **Every definition of a guest register must reach this**, and this is
-    /// the whole audit: what the prune in [`crate::core::regsync`] concludes
-    /// about a register is only as good as the frontend's honesty here. The
-    /// safe direction is to over-report - a slot marked written merely keeps
-    /// its stores, which is today's behaviour.
-    ///
-    /// Not needed for a pinned slot: those are function parameters and results,
-    /// the full sync skips them, and so nothing about them is ever recorded as
-    /// prunable in the first place.
     pub fn mark_written(&mut self, slot: regsync::RegSlot) {
         self.written_slots.insert(slot);
     }
 
     /// Give up on the lazy-sync prune ([`crate::core::regsync`]) for the rest of
     /// this region.
-    ///
-    /// For a path that **redefines the whole register file at once out of the
-    /// context** - the reload after a runtime-assisted syscall handler returns,
-    /// and the reload after a nested host call ([`crate::core::hostframe`]).
-    /// Past one of those no register provably still holds its entry-loaded
-    /// value, so every store the region goes on to emit has to stay.
-    ///
-    /// Guest-agnostic on purpose: naming every slot instead would need a
-    /// frontend to enumerate its own register file correctly, and a slot it
-    /// forgot would be a store silently pruned and a stale register at run time.
     pub fn keep_all_sync(&mut self) {
         self.sync_prune_disabled = true;
     }
@@ -1660,18 +1632,6 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
     }
 
     /// Drop the context traffic the region turned out not to need.
-    ///
-    /// Runs at the very end of [`Self::finish`], and the position is
-    /// load-bearing in both directions. It must be after `fill_link_probe`,
-    /// which is still emitting `use_var`s under a pinned ABI; and after
-    /// `seal_all_blocks`, both because sealing appends branch arguments and
-    /// aliases away the block params it turns out not to need - so the use scan
-    /// wants a final layout - and because before sealing every unfilled block
-    /// still holds a pending block-param demand, which would make "no remaining
-    /// uses" mean nothing.
-    ///
-    /// See [`crate::core::regsync`] for why "written nowhere in the region" is
-    /// the right question and why it is only answerable here.
     fn prune_untouched_sync(&mut self) {
         if !self.lazy_register_sync() || self.sync_prune_disabled {
             return;
