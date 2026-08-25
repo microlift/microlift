@@ -206,6 +206,22 @@ pub struct HelperFunction {
     pub func: Function,
 }
 
+/// A read-only constant table emitted alongside the lifted region - see
+/// [`LiftEngine::data_constant`].
+///
+/// Backends must define it as data in [`LiftedCode::data_objects`] order,
+/// after the link-cell array, so its `DataId` matches the
+/// `ExternalName::user(1, i)` the IR names it by.
+#[derive(Debug, Clone)]
+pub struct DataObject {
+    /// Symbol the table is declared under. Unique per contents.
+    pub name: &'static str,
+    /// The table's bytes, in target byte order.
+    pub bytes: Vec<u8>,
+    /// Alignment the region's loads assume.
+    pub align: u64,
+}
+
 /// Everything one lift produces: the region's function plus the externals it
 /// references.
 ///
@@ -286,6 +302,10 @@ pub struct LiftedCode {
     /// [`CompiledRegion::link_cells`](crate::backend::CompiledRegion::link_cells)
     /// for where the array itself is.
     pub link_sites: Vec<crate::core::link::LinkSite>,
+    /// Read-only tables the code loads from, in `ExternalName::user(1, i)`
+    /// order - continuing the namespace the link-cell array starts, so `i`
+    /// counts from 1 when the region has cells and from 0 when it does not.
+    pub data_objects: Vec<DataObject>,
 }
 
 impl LiftedCode {
@@ -310,6 +330,7 @@ impl LiftedCode {
             covered: Vec::new(),
             data_dependencies: Vec::new(),
             link_sites: Vec::new(),
+            data_objects: Vec::new(),
         }
     }
 
@@ -459,6 +480,7 @@ pub fn lift_to_code<A: GuestArch>(
     let resume_points = std::mem::take(&mut engine.emitted_resume_points);
     let covered = std::mem::take(&mut engine.covered);
     let link_sites = std::mem::take(&mut engine.link_sites);
+    let data_objects = engine.take_data_objects();
     let data_dependencies = engine.jump_table_extents();
     let helpers = engine.take_helpers();
 
@@ -483,6 +505,7 @@ pub fn lift_to_code<A: GuestArch>(
         covered,
         data_dependencies,
         link_sites,
+        data_objects,
     })
 }
 
@@ -1376,6 +1399,16 @@ pub struct LiftEngine<'a, A: GuestArch = crate::arch::x86_64::X86_64> {
     /// Cell index by target address, so two branches to one address share a
     /// cell and the second links the moment the first does.
     link_cell_by_target: HashMap<u64, usize>,
+    /// Read-only tables this region loads from, in the order they were first
+    /// asked for. Their namespace-1 indices are provisional until
+    /// [`Self::finish`] renumbers them past the link-cell array.
+    data_objects: Vec<DataEntry>,
+    /// One `GlobalValue` per table symbol, so every site in the region shares
+    /// one base address.
+    data_refs: HashMap<&'static str, cranelift_codegen::ir::GlobalValue>,
+    /// Memflags for a load out of one of those tables.
+    pub const_data_flags: MemFlagsData,
+
     /// The `GlobalValue` naming the cell array's base, created on first use.
     ///
     /// One per function, so Cranelift materializes the symbol's address once
@@ -1399,6 +1432,14 @@ pub struct LiftEngine<'a, A: GuestArch = crate::arch::x86_64::X86_64> {
     ctx_loads: Vec<Inst>,
 }
 
+/// A constant table under construction: its bytes plus the `UserExternalName`
+/// slot whose index [`LiftEngine::finish`] rewrites once it is known whether the
+/// region has a link-cell array in front of it.
+struct DataEntry {
+    object: DataObject,
+    name_ref: UserExternalNameRef,
+}
+
 /// A helper under construction: its body plus the `UserExternalName` slot whose
 /// index [`LiftEngine::finish`] rewrites once the import count is final.
 struct HelperEntry {
@@ -1414,6 +1455,13 @@ struct HelperEntry {
 /// collide (which would make `declare_imported_user_function` de-duplicate
 /// two distinct callees onto one name).
 const PROVISIONAL_HELPER_INDEX: u32 = 0x8000_0000;
+
+/// Namespace-1 index constant tables are declared with before
+/// [`LiftEngine::finish`] renumbers them. Same reason as
+/// [`PROVISIONAL_HELPER_INDEX`]: index 0 is the link-cell array's, and whether
+/// the region ends up with one is not known until the last exit stub is
+/// emitted.
+const PROVISIONAL_DATA_INDEX: u32 = 0x8000_0000;
 
 /// Namespace used for the external functions referenced by analysis-mode
 /// `call`s. Distinct from namespace `0` (AOT imports) so the
@@ -1494,6 +1542,9 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             alias::region_flags(builder.func, alias::LINK_CELL_ID, "link cells");
         let callret_flags =
             alias::region_flags(builder.func, alias::CALLRET_ID, "call-return ring");
+        let const_data_flags =
+            alias::region_flags(builder.func, alias::CONST_DATA_ID, "constant tables")
+                .with_readonly();
         let guest_flags = alias::guest_memory_flags(builder.func);
 
         // Built lazily by `fast_call_for` when a call site is actually lifted.
@@ -1548,6 +1599,9 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             link_sites: Vec::new(),
             link_cell_by_target: HashMap::new(),
             link_cell_base: None,
+            data_objects: Vec::new(),
+            data_refs: HashMap::new(),
+            const_data_flags,
             written_slots: HashSet::new(),
             sync_prune_disabled: false,
             ctx_stores: Vec::new(),
@@ -1906,6 +1960,87 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         });
         self.helper_refs.insert(name, func_ref);
         func_ref
+    }
+
+    /// The base address of the read-only table `name`, emitting the table into
+    /// [`LiftedCode::data_objects`] the first time it is asked for.
+    ///
+    /// `build` is called once per lift, so a table nothing references costs
+    /// nothing and one referenced from twenty sites is emitted once - `name`
+    /// therefore identifies the contents, like a helper's symbol does.
+    /// Loads out of the returned base belong in
+    /// [`const_data_flags`](Self::const_data_flags).
+    ///
+    /// A relocated symbol rather than a baked address, for the reason spelled
+    /// out on [`Self::link_cell_base`]: the artifact must survive being cached
+    /// and mapped somewhere else.
+    pub fn data_constant(
+        &mut self,
+        name: &'static str,
+        align: u64,
+        build: impl FnOnce() -> Vec<u8>,
+    ) -> Value {
+        let gv = match self.data_refs.get(name) {
+            Some(&gv) => gv,
+            None => {
+                let name_ref = self
+                    .builder
+                    .func
+                    .declare_imported_user_function(UserExternalName {
+                        namespace: 1,
+                        index: PROVISIONAL_DATA_INDEX + self.data_objects.len() as u32,
+                    });
+                let gv = self
+                    .builder
+                    .func
+                    .create_global_value(cranelift_codegen::ir::GlobalValueData::Symbol {
+                        name: ExternalName::user(name_ref),
+                        offset: 0.into(),
+                        // Far, for the same `adrp` range reason as the cell array.
+                        colocated: false,
+                        tls: false,
+                    });
+                self.data_objects.push(DataEntry {
+                    object: DataObject {
+                        name,
+                        bytes: build(),
+                        align,
+                    },
+                    name_ref,
+                });
+                self.data_refs.insert(name, gv);
+                gv
+            }
+        };
+        self.builder.ins().symbol_value(types::I64, gv)
+    }
+
+    /// Take the finished constant tables out of the engine. Valid only after
+    /// [`Self::finish`] has assigned their final indices.
+    pub fn take_data_objects(&mut self) -> Vec<DataObject> {
+        std::mem::take(&mut self.data_objects)
+            .into_iter()
+            .map(|d| d.object)
+            .collect()
+    }
+
+    /// Give each constant table its final namespace-1 index and rewrite the
+    /// `UserExternalName` its sites reach it through.
+    ///
+    /// Index 0 belongs to the link-cell array whenever the region has one, and
+    /// whether it does is only settled once [`Self::finish`] has emitted the
+    /// exit stubs - each of which may take a cell.
+    fn finalize_data_indices(&mut self) {
+        let base = !self.link_sites.is_empty() as u32;
+        for (ordinal, data) in self.data_objects.iter().enumerate() {
+            self.builder.func.params.reset_user_func_name(
+                data.name_ref,
+                UserExternalName {
+                    namespace: 1,
+                    index: base + ordinal as u32,
+                },
+            );
+        }
     }
 
     /// Whether outlined helpers are in use for this lift. Analysis IR always
@@ -3659,6 +3794,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         // After sealing: the use scan reads the finished layout.
         self.prune_untouched_sync();
         self.finalize_helper_indices();
+        self.finalize_data_indices();
         Ok(())
     }
 }

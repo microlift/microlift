@@ -1,7 +1,7 @@
 use crate::Result;
 use crate::core::srcloc::{GuestCodeMap, SourceLocMap};
 use crate::core::link::{BlockLinkEntry, CELL_SYMBOL, ENTRY_SIZE};
-use crate::core::{HelperFunction, LiftedCode};
+use crate::core::{DataObject, HelperFunction, LiftedCode};
 use cranelift::prelude::*;
 use cranelift_codegen::ir::Function;
 use cranelift_codegen::settings::Configurable;
@@ -120,6 +120,43 @@ fn define_cell_array<M: Module>(module: &mut M, sites: usize) -> Result<Option<D
         .define_data(id, &description)
         .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
     Ok(Some(id))
+}
+
+/// Declare and define this region's namespace-1 data: the link-cell array, then
+/// its read-only constant tables.
+///
+/// One function because the two share an index space - the IR names a table by
+/// the `DataId` it will get, which depends on whether the cell array took index
+/// 0 in front of it. The module must be fresh, and this must run before any
+/// other data is declared in it; both are asserted rather than assumed, since
+/// the failure mode is a relocation pointing at the wrong object.
+fn define_module_data<M: Module>(
+    module: &mut M,
+    sites: usize,
+    tables: &[DataObject],
+) -> Result<Option<DataId>> {
+    let cells = define_cell_array(module, sites)?;
+    let mut next = cells.is_some() as u32;
+    for table in tables {
+        let id = module
+            .declare_data(table.name, Linkage::Local, false, false)
+            .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
+        assert_eq!(
+            id.as_u32(),
+            next,
+            "constant table `{}` must be DataId({next}); `compile_lifted*` was given a module \
+             that already held data",
+            table.name
+        );
+        let mut description = DataDescription::new();
+        description.define(table.bytes.clone().into_boxed_slice());
+        description.set_align(table.align);
+        module
+            .define_data(id, &description)
+            .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
+        next += 1;
+    }
+    Ok(cells)
 }
 
 /// Define a [`LiftedCode`]'s region body and, when it has one, the entry thunk
@@ -323,7 +360,11 @@ impl CraneliftBackend {
         let source_map = code.source_map;
         // Before anything else in this module, so it is `DataId(0)` - the index
         // the IR's `ExternalName::user(1, 0)` names.
-        let cells = define_cell_array(&mut self.module, code.link_sites.len())?;
+        let cells = define_module_data(
+            &mut self.module,
+            code.link_sites.len(),
+            &code.data_objects,
+        )?;
         let pending = declare_externals(&mut self.module, &[], code.helpers)?;
 
         // The map is read out of the body's compiled buffer inside
@@ -405,6 +446,7 @@ impl CraneliftBackend {
         }
         let mut module = JITModule::new(jit_builder);
 
+        define_module_data(&mut module, code.link_sites.len(), &code.data_objects)?;
         let pending = declare_externals(&mut module, &code.imports, code.helpers)?;
 
         let (ids, map) = define_region(&mut module, code.func, code.entry_thunk, source_map)?;
@@ -544,7 +586,7 @@ impl ArtifactBackend {
         // As in the JIT path: first, so it is `DataId(0)`. In an object it
         // lands in `.bss`, which is exactly the uninstalled state a cached
         // artifact must load in.
-        define_cell_array(&mut module, code.link_sites.len())?;
+        define_module_data(&mut module, code.link_sites.len(), &code.data_objects)?;
         let pending = declare_externals(&mut module, &code.imports, code.helpers)?;
 
         let (_id, map) = define_region(&mut module, code.func, code.entry_thunk, source_map)?;
@@ -587,9 +629,11 @@ impl ArtifactBackend {
     ///
     /// The extracted `.text` holds the outlined helper bodies as well as the lifted
     /// function, and raw extraction throws away the symbol table that says where
-    /// each begins. Prefer
+    /// each begins. It also leaves behind everything that is not code - a region
+    /// carrying [`data_objects`](LiftedCode::data_objects) loses the tables it
+    /// loads from, and the relocations that reach them. Prefer
     /// [`compile_lifted_to_object`](Self::compile_lifted_to_object) when the region
-    /// has helpers.
+    /// has helpers or data.
     pub fn compile_lifted_to_raw(
         code: LiftedCode,
         triple: Option<&str>,

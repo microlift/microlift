@@ -135,6 +135,77 @@ fn crc32_memory_source_and_inline_expansion_agree() {
     }
 }
 
+/// The table is a build-time constant emitted into the artifact once, however
+/// many `CRC32`s reference it - and it is the CRC-32C table, not merely 1 KiB of
+/// something.
+#[test]
+fn the_crc32_table_is_emitted_once_as_data() {
+    use microlift::arch::x86_64::X86_64;
+    use microlift::core::{LifterConfig, lift_to_code};
+
+    // crc32 eax, cl ; crc32 eax, ecx ; crc32 rax, rcx ; ret
+    let code = [
+        0xF2, 0x0F, 0x38, 0xF0, 0xC1,
+        0xF2, 0x0F, 0x38, 0xF1, 0xC1,
+        0xF2, 0x48, 0x0F, 0x38, 0xF1, 0xC1,
+        0xC3,
+    ];
+    let lifted = lift_to_code::<X86_64>(
+        &code,
+        microlift::testkit::DEFAULT_LIFT_BASE,
+        LifterConfig::default(),
+    )
+    .unwrap();
+
+    assert_eq!(lifted.data_objects.len(), 1);
+    let table = &lifted.data_objects[0];
+    assert_eq!(table.bytes.len(), 256 * 4);
+
+    // Recomputed here bit-serially, so the table and its consumer do not share
+    // an implementation to be wrong together.
+    for (index, entry) in table.bytes.chunks_exact(4).enumerate() {
+        let mut expected = index as u32;
+        for _ in 0..8 {
+            expected = (expected >> 1) ^ (0x82F6_3B78 & (0u32.wrapping_sub(expected & 1)));
+        }
+        assert_eq!(u32::from_le_bytes(entry.try_into().unwrap()), expected);
+    }
+}
+
+/// A region that has both a link-cell array and the table: the two share one
+/// `DataId` space, and the cells take index 0.
+#[test]
+fn the_crc32_table_sits_after_the_link_cell_array() {
+    use microlift::arch::x86_64::X86_64;
+    use microlift::core::link::BlockLinkConfig;
+    use microlift::core::{LifterConfig, lift_to_code};
+
+    // crc32 eax, cl ; jmp +0x1000 - the jump leaves the region, so it takes a cell.
+    let code = [
+        0xF2, 0x0F, 0x38, 0xF0, 0xC1,
+        0xE9, 0x00, 0x10, 0x00, 0x00,
+    ];
+    let config = || LifterConfig {
+        block_link: Some(BlockLinkConfig::new(256)),
+        link_cells: true,
+        ..LifterConfig::default()
+    };
+
+    let lifted = lift_to_code::<X86_64>(
+        &code,
+        microlift::testkit::DEFAULT_LIFT_BASE,
+        config(),
+    )
+    .unwrap();
+    assert_eq!(lifted.link_sites.len(), 1);
+    assert_eq!(lifted.data_objects.len(), 1);
+
+    LiftTest::new(&code)
+        .with_config(|c| *c = config())
+        .translation()
+        .expect("compiles");
+}
+
 /// `CRC32` touches no flag - including under the dead-flag pass, where it is
 /// classified as transparent and so must not be allowed to shadow an earlier
 /// write.

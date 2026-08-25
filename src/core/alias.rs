@@ -44,3 +44,10 @@ pub fn guest_memory_flags(func: &mut Function) -> MemFlagsData {
     });
     MemFlagsData::new().with_alias_region(Some(region))
 }
+
+/// Read-only data emitted alongside the region ([`crate::core::DataObject`]),
+/// e.g. the CRC-32C table.
+///
+/// Nothing in a lifted region writes here, so its own region lets a load out of
+/// a table float past any store.
+pub const CONST_DATA_ID: u32 = 0x8000_0006;
