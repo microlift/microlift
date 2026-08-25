@@ -6,8 +6,7 @@
 //! every guest register is a parameter of those blocks. That is harmless
 //! while something consumes them, and the register file's exit sync did.
 
-use std::collections::{HashMap, HashSet};
-
+use cranelift_codegen::entity::{EntitySet, SecondaryMap};
 use cranelift_codegen::ir::{Block, Function, Inst, Value};
 
 /// Remove every block parameter nothing reads, and the branch arguments that
@@ -31,7 +30,7 @@ pub fn remove_dead_block_params(func: &mut Function) -> bool {
             .block_params(block)
             .iter()
             .enumerate()
-            .filter(|&(_, &param)| !live.contains(&func.dfg.resolve_aliases(param)))
+            .filter(|&(_, &param)| !live.contains(func.dfg.resolve_aliases(param)))
             .map(|(i, _)| i)
             .collect();
         if !dead.is_empty() {
@@ -46,7 +45,7 @@ pub fn remove_dead_block_params(func: &mut Function) -> bool {
     for (block, dead) in doomed {
         let params: Vec<Value> = func.dfg.block_params(block).to_vec();
         for &index in dead.iter().rev() {
-            for &inst in preds.get(&block).map_or(&[][..], Vec::as_slice) {
+            for &inst in preds[block].as_slice() {
                 remove_argument(func, inst, block, index);
             }
             func.dfg.remove_block_param(params[index]);
@@ -57,41 +56,50 @@ pub fn remove_dead_block_params(func: &mut Function) -> bool {
 
 /// Every value something actually reads.
 ///
-/// Seeded with the *direct* operands of every instruction - a `brif`'s condition
-/// counts, its block arguments do not - and then grown by the rule that an
-/// argument feeding a live parameter is itself live. See the module doc for why
-/// it is built in that direction.
-fn live_values(func: &Function) -> HashSet<Value> {
-    let mut live: HashSet<Value> = HashSet::new();
+/// Seeded with the direct operands of every instruction - a `brif`'s condition
+/// counts, its block arguments do not.
+fn live_values(func: &Function) -> EntitySet<Value> {
+    let mut live: EntitySet<Value> = EntitySet::with_capacity(func.dfg.num_values());
+
+    // `(parameter, argument)`, both resolved: the argument is live as soon as
+    // the parameter is. Collected in the same walk that seeds the direct
+    // operands, so the IR is traversed exactly once however many rounds the
+    // fixpoint below takes.
+    let mut edges: Vec<(Value, Value)> = Vec::new();
     for block in func.layout.blocks() {
         for inst in func.layout.block_insts(block) {
             for &arg in func.dfg.inst_args(inst) {
                 live.insert(func.dfg.resolve_aliases(arg));
             }
+            let calls = func.dfg.insts[inst]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
+            for call in calls {
+                let target = call.block(&func.dfg.value_lists);
+                let params = func.dfg.block_params(target);
+                for (i, arg) in call.args(&func.dfg.value_lists).enumerate() {
+                    let Some(&param) = params.get(i) else {
+                        continue;
+                    };
+                    let Some(value) = arg.as_value() else {
+                        continue;
+                    };
+                    edges.push((
+                        func.dfg.resolve_aliases(param),
+                        func.dfg.resolve_aliases(value),
+                    ));
+                }
+            }
         }
     }
 
+    // A round is now a scan of a flat vector against a bitset. Converges in as
+    // many rounds as the longest chain of parameters feeding parameters, which
+    // in this lifter's output is short.
     loop {
         let mut grew = false;
-        for block in func.layout.blocks() {
-            for inst in func.layout.block_insts(block) {
-                let calls = func.dfg.insts[inst]
-                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
-                for call in calls {
-                    let target = call.block(&func.dfg.value_lists);
-                    let params = func.dfg.block_params(target);
-                    for (i, arg) in call.args(&func.dfg.value_lists).enumerate() {
-                        let Some(&param) = params.get(i) else {
-                            continue;
-                        };
-                        if !live.contains(&func.dfg.resolve_aliases(param)) {
-                            continue;
-                        }
-                        if let Some(value) = arg.as_value() {
-                            grew |= live.insert(func.dfg.resolve_aliases(value));
-                        }
-                    }
-                }
+        for &(param, value) in &edges {
+            if live.contains(param) {
+                grew |= live.insert(value);
             }
         }
         if !grew {
@@ -105,15 +113,15 @@ fn live_values(func: &Function) -> HashSet<Value> {
 /// De-duplicated because one instruction may name a block twice - a `brif` whose
 /// arms both go to the same place is common in this lifter's output - and
 /// [`remove_argument`] already visits every call of an instruction.
-fn predecessors(func: &Function) -> HashMap<Block, Vec<Inst>> {
-    let mut preds: HashMap<Block, Vec<Inst>> = HashMap::new();
+fn predecessors(func: &Function) -> SecondaryMap<Block, Vec<Inst>> {
+    let mut preds: SecondaryMap<Block, Vec<Inst>> = SecondaryMap::new();
     for block in func.layout.blocks() {
         for inst in func.layout.block_insts(block) {
             let calls = func.dfg.insts[inst]
                 .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
             for call in calls {
                 let target = call.block(&func.dfg.value_lists);
-                let entry = preds.entry(target).or_default();
+                let entry = &mut preds[target];
                 if !entry.contains(&inst) {
                     entry.push(inst);
                 }

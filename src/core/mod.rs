@@ -41,6 +41,7 @@ use cranelift_codegen::ir::{
     ExtFuncData, ExternalName, FuncRef, Function, Inst, SigRef, SourceLoc, UserExternalName,
     UserExternalNameRef, UserFuncName,
 };
+use cranelift_codegen::entity::EntitySet;
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch, Variable};
 use std::collections::{HashMap, HashSet};
@@ -1728,7 +1729,11 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
     /// frontend believes it did.
     fn drop_unused_ctx_loads(&mut self, loads: &mut Vec<Inst>) -> bool {
         let func = &mut *self.builder.func;
-        let mut used: HashSet<Value> = HashSet::new();
+        // A bitset over dense indices rather than a `HashSet`, for the reason
+        // [`crate::core::dce`] gives: this runs on every region, its caller runs
+        // it to a fixpoint, and hashing `Value` through `RandomState` was
+        // measured at a double-digit share of the whole runtime's time.
+        let mut used: EntitySet<Value> = EntitySet::with_capacity(func.dfg.num_values());
         for block in func.layout.blocks() {
             for inst in func.layout.block_insts(block) {
                 for arg in func.dfg.inst_values(inst) {
@@ -1745,7 +1750,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                 .dfg
                 .inst_results(inst)
                 .iter()
-                .all(|&v| !used.contains(&func.dfg.resolve_aliases(v)));
+                .all(|&v| !used.contains(func.dfg.resolve_aliases(v)));
             if dead {
                 func.dfg.clear_results(inst);
                 func.layout.remove_inst(inst);
