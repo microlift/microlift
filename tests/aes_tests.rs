@@ -330,3 +330,74 @@ fn each_instruction_outlines_exactly_one_shared_kernel() {
         "nine AESENCs share one body, got {names:?}"
     );
 }
+
+/// The tables are a build-time constant emitted into the artifact once, however
+/// many AES instructions reference them.
+#[test]
+fn the_aes_tables_are_emitted_once_as_data() {
+    use microlift::arch::x86_64::X86_64;
+    use microlift::arch::x86_64::semantics::aes::{AES_TABLE_LEN, AES_TABLE_SYMBOL};
+    use microlift::core::{LifterConfig, lift_to_code};
+    use microlift::testkit::DEFAULT_LIFT_BASE;
+
+    let mut bytes = Vec::new();
+    bytes.extend(aesenc(0, 1));
+    bytes.extend(aesdec(0, 1));
+    bytes.extend(aesimc(0, 1));
+    bytes.extend(aeskeygenassist(0, 1, 1));
+    bytes.push(0xC3);
+
+    let code =
+        lift_to_code::<X86_64>(&bytes, DEFAULT_LIFT_BASE, LifterConfig::default()).expect("lift");
+    assert_eq!(code.data_objects.len(), 1);
+    let tables = &code.data_objects[0];
+    assert_eq!(tables.name, AES_TABLE_SYMBOL);
+    assert_eq!(tables.bytes.len(), AES_TABLE_LEN);
+
+    let (sbox, rest) = tables.bytes.split_at(256);
+    let (inv_sbox, xtime) = rest.split_at(256);
+
+    // FIPS-197's own S-box entries, at the corners and either side of the
+    // affine constant.
+    assert_eq!(sbox[0x00], 0x63);
+    assert_eq!(sbox[0x01], 0x7c);
+    assert_eq!(sbox[0x53], 0xed);
+    assert_eq!(sbox[0xff], 0x16);
+
+    for i in 0..256 {
+        assert_eq!(inv_sbox[sbox[i] as usize] as usize, i);
+        // xtime is a shift with the reduction folded in, which is the one thing
+        // it may not be derived from here.
+        let expected = ((i as u8) << 1) ^ if i & 0x80 != 0 { 0x1B } else { 0 };
+        assert_eq!(xtime[i], expected, "xtime[{i:#04x}]");
+    }
+}
+
+/// A region using both AES and `CRC32` carries two tables, and each site must
+/// reach its own: they share one `DataId` space and are told apart only by the
+/// index the backend assigns.
+#[test]
+fn aes_and_crc32_tables_coexist_in_one_region() {
+    use microlift::arch::x86_64::X86_64;
+    use microlift::core::{LifterConfig, lift_to_code};
+    use microlift::testkit::DEFAULT_LIFT_BASE;
+
+    let mut bytes = aesenc(0, 1);
+    // crc32 eax, cl
+    bytes.extend_from_slice(&[0xF2, 0x0F, 0x38, 0xF0, 0xC1]);
+    bytes.push(0xC3);
+
+    let code =
+        lift_to_code::<X86_64>(&bytes, DEFAULT_LIFT_BASE, LifterConfig::default()).expect("lift");
+    assert_eq!(code.data_objects.len(), 2);
+
+    let out = run(&bytes, |c| {
+        c.xmm[0] = A;
+        c.xmm[1] = B;
+        c.rax = 0;
+        c.rcx = 0x61;
+    });
+    assert_eq!(out.ctx.xmm[0], [0x0be8672d9204d843, 0x81a2d95024f450f7]);
+    assert_eq!(out.ctx.rax, 0x93AD_1061);
+}
+
