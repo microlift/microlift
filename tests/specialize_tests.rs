@@ -264,7 +264,7 @@ fn assert_same(name: &str, seed: u64, what: &str, a: &RegisterContext, b: &Regis
         gprs(b),
         "{name}: GPRs diverged {what} (seed {seed})"
     );
-    let flags = |c: &RegisterContext| (c.cf, c.pf, c.af, c.zf, c.sf, c.of);
+    let flags = |c: &RegisterContext| (c.cf, u8::from(c.pf()), u8::from(c.af()), c.zf, c.sf, c.of);
     assert_eq!(
         flags(a),
         flags(b),

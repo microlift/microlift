@@ -215,8 +215,8 @@ impl RegisterState {
     pub fn get_flag_offset(flag: X86Flag) -> crate::Result<i32> {
         match flag {
             X86Flag::Carry => Ok(std::mem::offset_of!(RegisterContext, cf) as i32),
-            X86Flag::Parity => Ok(std::mem::offset_of!(RegisterContext, pf) as i32),
-            X86Flag::Auxiliary => Ok(std::mem::offset_of!(RegisterContext, af) as i32),
+            X86Flag::Parity => Ok(std::mem::offset_of!(RegisterContext, pf_src) as i32),
+            X86Flag::Auxiliary => Ok(std::mem::offset_of!(RegisterContext, af_src) as i32),
             X86Flag::Zero => Ok(std::mem::offset_of!(RegisterContext, zf) as i32),
             X86Flag::Sign => Ok(std::mem::offset_of!(RegisterContext, sf) as i32),
             X86Flag::Overflow => Ok(std::mem::offset_of!(RegisterContext, of) as i32),

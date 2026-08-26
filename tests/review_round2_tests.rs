@@ -251,7 +251,7 @@ fn shl_by_one_clears_of_when_no_sign_change() {
 fn shr_updates_pf() {
     let mut ctx = RegisterContext::default();
     ctx.rax = 0xF3;
-    ctx.pf = 0; // stale PF a correct shift overwrites
+    ctx.set_pf(0 != 0); // stale PF a correct shift overwrites
     // shr al, 4 ; setp bl ; ret  (result 0x0F -> 4 set bits -> PF=1)
     let out = run(&[0xC0, 0xE8, 0x04, 0x0F, 0x9A, 0xC3, 0xC3], ctx);
     assert_eq!(out.rbx & 0xFF, 1, "shr must set PF from the result");
@@ -262,7 +262,7 @@ fn shift_count_zero_preserves_flags() {
     let mut ctx = RegisterContext::default();
     ctx.rax = 0xFF;
     ctx.of = 1;
-    ctx.pf = 1;
+    ctx.set_pf(1 != 0);
     ctx.cf = 1;
     // shl al, cl with cl=0 -> no flags change
     ctx.rcx = 0;

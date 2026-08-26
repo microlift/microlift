@@ -244,8 +244,8 @@ fn popcnt_counts_and_sets_flags() {
                 c.rcx = src;
                 // Seed every flag set so the clears are observable.
                 c.cf = 1;
-                c.pf = 1;
-                c.af = 1;
+                c.set_pf(1 != 0);
+                c.set_af(1 != 0);
                 c.sf = 1;
                 c.of = 1;
             })
@@ -254,7 +254,7 @@ fn popcnt_counts_and_sets_flags() {
         assert_eq!(out.ctx.zf, u8::from(src == 0));
         // POPCNT *clears* the other five rather than leaving them undefined.
         assert_eq!(
-            (out.ctx.cf, out.ctx.pf, out.ctx.af, out.ctx.sf, out.ctx.of),
+            (out.ctx.cf, u8::from(out.ctx.pf()), u8::from(out.ctx.af()), out.ctx.sf, out.ctx.of),
             (0, 0, 0, 0, 0)
         );
     }
@@ -350,7 +350,7 @@ fn strcmp_run_inner(
             out.ctx.rcx,
             out.ctx.xmm[0],
             (
-                out.ctx.cf, out.ctx.zf, out.ctx.sf, out.ctx.of, out.ctx.af, out.ctx.pf,
+                out.ctx.cf, out.ctx.zf, out.ctx.sf, out.ctx.of, u8::from(out.ctx.af()), u8::from(out.ctx.pf()),
             ),
         );
         match &first {
@@ -698,10 +698,10 @@ fn pcmpistri_negation_polarities_differ_past_the_end() {
 #[test]
 fn pcmpistri_clears_af_and_pf() {
     let out = strcmp_run(&istri(0x00), b"a", b"zza", |c| {
-        c.af = 1;
-        c.pf = 1;
+        c.set_af(1 != 0);
+        c.set_pf(1 != 0);
     });
-    assert_eq!((out.ctx.af, out.ctx.pf), (0, 0));
+    assert_eq!((u8::from(out.ctx.af()), u8::from(out.ctx.pf())), (0, 0));
 }
 
 /// The dead-flag pass must not elide any of them: the string compares are

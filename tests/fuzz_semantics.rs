@@ -40,10 +40,10 @@ proptest! {
         prop_assert_eq!(out.ctx.zf, want.zf, "{:?} {:#x},{:#x} ZF", op, a, b);
         prop_assert_eq!(out.ctx.sf, want.sf, "{:?} {:#x},{:#x} SF", op, a, b);
         prop_assert_eq!(out.ctx.of, want.of, "{:?} {:#x},{:#x} OF", op, a, b);
-        prop_assert_eq!(out.ctx.pf, want.pf, "{:?} {:#x},{:#x} PF", op, a, b);
+        prop_assert_eq!(u8::from(out.ctx.pf()), want.pf, "{:?} {:#x},{:#x} PF", op, a, b);
         // AF is architecturally defined for ADD/SUB; undefined for logic ops.
         if matches!(op, AluOp::Add | AluOp::Sub) {
-            prop_assert_eq!(out.ctx.af, want.af, "{:?} {:#x},{:#x} AF", op, a, b);
+            prop_assert_eq!(u8::from(out.ctx.af()), want.af, "{:?} {:#x},{:#x} AF", op, a, b);
         }
     }
 }

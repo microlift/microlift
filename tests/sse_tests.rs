@@ -1311,7 +1311,7 @@ fn test_ucomisd_less() {
     let ctx = run_test(&bytes, ctx);
     assert_eq!(ctx.cf, 1, "1 < 2 -> CF set");
     assert_eq!(ctx.zf, 0);
-    assert_eq!(ctx.pf, 0, "ordered -> PF clear");
+    assert_eq!(u8::from(ctx.pf()), 0, "ordered -> PF clear");
 }
 
 #[test]
@@ -1323,7 +1323,7 @@ fn test_ucomisd_equal() {
     let ctx = run_test(&bytes, ctx);
     assert_eq!(ctx.zf, 1, "equal -> ZF set");
     assert_eq!(ctx.cf, 0);
-    assert_eq!(ctx.pf, 0);
+    assert_eq!(u8::from(ctx.pf()), 0);
 }
 
 #[test]
@@ -1335,7 +1335,7 @@ fn test_ucomisd_greater() {
     let ctx = run_test(&bytes, ctx);
     assert_eq!(ctx.cf, 0);
     assert_eq!(ctx.zf, 0);
-    assert_eq!(ctx.pf, 0);
+    assert_eq!(u8::from(ctx.pf()), 0);
 }
 
 #[test]
@@ -1348,7 +1348,7 @@ fn test_ucomisd_unordered() {
     let ctx = run_test(&bytes, ctx);
     assert_eq!(ctx.cf, 1);
     assert_eq!(ctx.zf, 1);
-    assert_eq!(ctx.pf, 1, "unordered -> PF set");
+    assert_eq!(u8::from(ctx.pf()), 1, "unordered -> PF set");
 }
 
 //  MOVAPD (already dispatched via handle_movaps)
@@ -2867,13 +2867,13 @@ fn test_ucomiss_flags() {
     };
 
     let ctx = run_test(&bytes, seed(1.0, 2.0));
-    assert_eq!((ctx.cf, ctx.zf, ctx.pf), (1, 0, 0), "less");
+    assert_eq!((ctx.cf, ctx.zf, u8::from(ctx.pf())), (1, 0, 0), "less");
     let ctx = run_test(&bytes, seed(5.0, 5.0));
-    assert_eq!((ctx.cf, ctx.zf, ctx.pf), (0, 1, 0), "equal");
+    assert_eq!((ctx.cf, ctx.zf, u8::from(ctx.pf())), (0, 1, 0), "equal");
     let ctx = run_test(&bytes, seed(9.0, 4.0));
-    assert_eq!((ctx.cf, ctx.zf, ctx.pf), (0, 0, 0), "greater");
+    assert_eq!((ctx.cf, ctx.zf, u8::from(ctx.pf())), (0, 0, 0), "greater");
     let ctx = run_test(&bytes, seed(f32::NAN, 1.0));
-    assert_eq!((ctx.cf, ctx.zf, ctx.pf), (1, 1, 1), "unordered");
+    assert_eq!((ctx.cf, ctx.zf, u8::from(ctx.pf())), (1, 1, 1), "unordered");
 }
 
 #[test]
@@ -2884,7 +2884,7 @@ fn test_comiss_matches_ucomiss() {
     ctx.xmm[0] = [pack_f32(1.0, 0.0), 0];
     ctx.xmm[1] = [pack_f32(2.0, 0.0), 0];
     let ctx = run_test(&bytes, ctx);
-    assert_eq!((ctx.cf, ctx.zf, ctx.pf), (1, 0, 0));
+    assert_eq!((ctx.cf, ctx.zf, u8::from(ctx.pf())), (1, 0, 0));
 }
 
 //  SSE2 conversions
@@ -4153,12 +4153,12 @@ fn test_ptest_sets_zf_and_cf() {
         // Seed the flags PTEST must clear.
         ctx.sf = 1;
         ctx.of = 1;
-        ctx.pf = 1;
-        ctx.af = 1;
+        ctx.set_pf(1 != 0);
+        ctx.set_af(1 != 0);
         let ctx = run_test(&bytes, ctx);
         assert_eq!(ctx.zf, zf, "ZF for {dst:#x?} & {src:#x?}");
         assert_eq!(ctx.cf, cf, "CF for {dst:#x?} & ~{src:#x?}");
-        assert_eq!((ctx.sf, ctx.of, ctx.pf, ctx.af), (0, 0, 0, 0), "cleared");
+        assert_eq!((ctx.sf, ctx.of, u8::from(ctx.pf()), u8::from(ctx.af())), (0, 0, 0, 0), "cleared");
         assert_eq!(ctx.xmm[0], dst, "ptest must not write its operand");
     }
 }

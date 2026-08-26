@@ -73,10 +73,10 @@ impl CpuState {
         if c.cf != 0 {
             rflags |= CF;
         }
-        if c.pf != 0 {
+        if c.pf() {
             rflags |= PF;
         }
-        if c.af != 0 {
+        if c.af() {
             rflags |= AF;
         }
         if c.zf != 0 {
@@ -125,8 +125,8 @@ impl CpuState {
         c.r15 = g[15];
         c.rip = self.rip;
         c.cf = (self.rflags & CF != 0) as u8;
-        c.pf = (self.rflags & PF != 0) as u8;
-        c.af = (self.rflags & AF != 0) as u8;
+        c.set_pf(self.rflags & PF != 0);
+        c.set_af(self.rflags & AF != 0);
         c.zf = (self.rflags & ZF != 0) as u8;
         c.sf = (self.rflags & SF != 0) as u8;
         c.of = (self.rflags & OF != 0) as u8;

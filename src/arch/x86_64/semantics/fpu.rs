@@ -1079,7 +1079,7 @@ impl<'a> Lifter<'a> {
     }
 
     fn fpu_flag(&mut self, flag: X86Flag) -> Value {
-        self.builder.use_var(self.state.flags[&flag])
+        self.get_flag(flag)
     }
 
     /// FCMOVB - move if CF=1 (below).

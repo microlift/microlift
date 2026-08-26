@@ -229,12 +229,12 @@ fn test_sahf() {
     ];
     let mut ctx_in = RegisterContext::default();
     ctx_in.sf = 1;
-    ctx_in.pf = 1;
+    ctx_in.set_pf(1 != 0);
     let ctx = run_test(&bytes, ctx_in);
     assert_eq!(ctx.cf, 1);
     assert_eq!(ctx.zf, 1);
     assert_eq!(ctx.sf, 0, "SAHF clears a flag whose bit is 0");
-    assert_eq!(ctx.pf, 0, "SAHF clears a flag whose bit is 0");
+    assert_eq!(u8::from(ctx.pf()), 0, "SAHF clears a flag whose bit is 0");
 
     // Overflow is not in the byte, so SAHF leaves it exactly as it found it -
     // the property that makes this the inverse of LAHF rather than of POPFQ.

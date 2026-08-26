@@ -478,7 +478,7 @@ fn test_setp_true() {
         0xC3,
     ];
     let mut ctx = RegisterContext::default();
-    ctx.pf = 1;
+    ctx.set_pf(1 != 0);
     let ctx = run_test(&bytes, ctx);
     assert_eq!(al(&ctx), 1);
 }
@@ -491,7 +491,7 @@ fn test_setp_false() {
         0xC3,
     ];
     let mut ctx = RegisterContext::default();
-    ctx.pf = 0;
+    ctx.set_pf(0 != 0);
     let ctx = run_test(&bytes, ctx);
     assert_eq!(al(&ctx), 0);
 }
@@ -504,7 +504,7 @@ fn test_setnp_true() {
         0xC3,
     ];
     let mut ctx = RegisterContext::default();
-    ctx.pf = 0;
+    ctx.set_pf(0 != 0);
     let ctx = run_test(&bytes, ctx);
     assert_eq!(al(&ctx), 1);
 }
@@ -517,7 +517,7 @@ fn test_setnp_false() {
         0xC3,
     ];
     let mut ctx = RegisterContext::default();
-    ctx.pf = 1;
+    ctx.set_pf(1 != 0);
     let ctx = run_test(&bytes, ctx);
     assert_eq!(al(&ctx), 0);
 }

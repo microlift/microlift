@@ -94,7 +94,10 @@ enum Base {
 impl<'a> Lifter<'a> {
     /// Read one flag as its `I8` boolean (0 or 1).
     fn flag(&mut self, flag: X86Flag) -> Value {
-        self.builder.use_var(self.state.flags[&flag])
+        // `get_flag`, not the variable: PF and AF are stored as the values they
+        // are derived from, and a condition code is exactly the place that
+        // derivation is meant to happen.
+        self.get_flag(flag)
     }
 
     /// Invert an `I8` boolean (0 -> 1, 1 -> 0) with an equality compare.

@@ -255,7 +255,7 @@ fn test_jno() {
 fn test_jp() {
     // PF=1 pre-seeded -> jp taken -> rax stays 0
     let mut ctx = RegisterContext::default();
-    ctx.pf = 1;
+    ctx.set_pf(1 != 0);
     #[rustfmt::skip]
     let bytes = [
         0x7A, 0x07,                                // jp +7
@@ -292,7 +292,7 @@ fn test_jnp() {
 
     // PF=1 -> jnp NOT taken -> rax = 99
     let mut ctx = RegisterContext::default();
-    ctx.pf = 1;
+    ctx.set_pf(1 != 0);
     #[rustfmt::skip]
     let bytes = [
         0x7B, 0x07,

@@ -225,12 +225,20 @@ impl RegisterBudget {
     pub fn for_arch(arch: Architecture) -> Option<Self> {
         match arch {
             // `x0` is reserved for the return-area pointer and `x1` for the
-            // indirect callee, for arguments *and* results, leaving `x2`-`x7`
-            // and `v0`-`v7` under a shared cap of sixteen values.
+            // indirect callee, for arguments *and* results; `x8` is the
+            // indirect-result register and is skipped. That leaves `x2`-`x7` and
+            // `x9`-`x15` - thirteen - plus `v0`-`v7`, under a shared cap of
+            // twenty-four values.
+            //
+            // Past AAPCS64's eight because the `tail` convention in microlift's
+            // Cranelift fork was widened to `x15` for exactly this: `tail`
+            // clobbers every register, so there is no callee-saved contract to
+            // respect, and every integer slot that does not fit here is a store
+            // and a reload of a guest register at every region boundary.
             Architecture::Aarch64(_) => Some(Self {
-                gpr: 6,
+                gpr: 13,
                 vector: 8,
-                total: 16,
+                total: 24,
             }),
             // `rax`, `rcx`, `rdx`, `rsi`, `rdi`, `r8`-`r10`, and `xmm0`-`xmm7`;
             // `r11` and `r15` are reserved as scratch.
@@ -321,11 +329,14 @@ mod tests {
     #[test]
     fn the_context_pointer_counts_against_the_budget() {
         let arch = Architecture::Aarch64(target_lexicon::Aarch64Architecture::Aarch64);
-        // Five slots plus the context pointer is exactly aarch64's six.
-        let five = PinnedAbi::new().with_all((0..5).map(PinnedReg::gpr));
-        assert!(five.check_budget(arch).is_ok());
-        let six = five.with(PinnedReg::gpr(5));
-        assert!(six.check_budget(arch).is_err());
+        // The budget counts the context pointer, so one fewer guest register
+        // fits than the figure suggests - which is the whole point of the test
+        // and is what stays true as the budget moves.
+        let gpr = RegisterBudget::for_arch(arch).expect("aarch64 has a budget").gpr;
+        let full = PinnedAbi::new().with_all((0..u16::from(gpr) - 1).map(PinnedReg::gpr));
+        assert!(full.check_budget(arch).is_ok(), "{gpr} slots counting the context pointer");
+        let one_too_many = full.with(PinnedReg::gpr(u16::from(gpr) - 1));
+        assert!(one_too_many.check_budget(arch).is_err());
     }
 
     #[test]

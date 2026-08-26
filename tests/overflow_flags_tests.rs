@@ -132,7 +132,7 @@ type State = ([u64; 6], [u8; 6], u32);
 fn state(c: &RegisterContext) -> State {
     (
         [c.rax, c.rbx, c.rcx, c.rdx, c.rsi, c.rdi],
-        [c.cf, c.pf, c.af, c.zf, c.sf, c.of],
+        [c.cf, u8::from(c.pf()), u8::from(c.af()), c.zf, c.sf, c.of],
         c.exit_reason,
     )
 }

@@ -17,31 +17,37 @@ use cranelift::prelude::*;
 use iced_x86::Instruction;
 
 impl<'a> Lifter<'a> {
-    /// PF: set when the low byte of `res` has an even population count.
+    /// The byte PF is the parity of: the low byte of `res`, unchanged.
     ///
-    /// Four IR instructions, emitted once per arithmetic instruction by five
-    /// different callers, which is why it is worth both factoring out and
-    /// skipping.
-    fn parity_of(&mut self, res: Value) -> Value {
-        let res_lo = if self.builder.func.dfg.value_type(res) == types::I8 {
+    /// This is the whole of the deferral. PF is defined as the even parity of
+    /// the result's low byte, so the *result* is already a valid stored form and
+    /// the fold that turns it into a bit belongs at the reader - see
+    /// [`Lifter::get_flag`]. What this replaces cost a `popcnt`, a `band` and a
+    /// `bxor` on every arithmetic instruction in the program, for a flag that
+    /// only `jp`/`jnp`/`setp`/`pushfq`/`lahf` ever read, and which the dead-flag
+    /// analysis cannot drop at a region exit because every flag is live there.
+    fn parity_source(&mut self, res: Value) -> Value {
+        if self.builder.func.dfg.value_type(res) == types::I8 {
             res
         } else {
             self.builder.ins().ireduce(types::I8, res)
-        };
-        let pop = self.builder.ins().popcnt(res_lo);
-        let pop_lsb = self.builder.ins().band_imm_u(pop, 1);
-        self.builder.ins().bxor_imm_u(pop_lsb, 1)
+        }
     }
 
-    /// AF: the carry out of bit 3, which is `((lhs ^ rhs ^ res) >> 4) & 1` for
-    /// every add- and subtract-shaped operation, carry-in included - the carry
-    /// only reaches bit 0, and the three-way xor still captures bit 3's carry
-    /// into bit 4.
-    fn auxiliary_of(&mut self, lhs: Value, rhs: Value, res: Value) -> Value {
+    /// The byte AF is bit 4 of: `lhs ^ rhs ^ res`.
+    ///
+    /// AF is the carry out of bit 3, which that three-way xor captures for every
+    /// add- and subtract-shaped operation, carry-in included - the carry only
+    /// reaches bit 0, and the xor still captures bit 3's carry into bit 4. The
+    /// shift and mask that used to follow are the reader's, as for parity.
+    fn auxiliary_source(&mut self, lhs: Value, rhs: Value, res: Value) -> Value {
         let lhs_xor_rhs = self.builder.ins().bxor(lhs, rhs);
         let af_xor = self.builder.ins().bxor(lhs_xor_rhs, res);
-        let af_shifted = self.builder.ins().ushr_imm_u(af_xor, 4);
-        self.builder.ins().band_imm_u(af_shifted, 1)
+        if self.builder.func.dfg.value_type(af_xor) == types::I8 {
+            af_xor
+        } else {
+            self.builder.ins().ireduce(types::I8, af_xor)
+        }
     }
 
     /// ZF, SF, AF and PF - the four flags every add- and subtract-shaped operation
@@ -79,14 +85,14 @@ impl<'a> Lifter<'a> {
         // bit 0, and bit-3's carry into bit 4 is still captured by the xor of
         // the three operands.
         if self.flag_needed(X86Flag::Auxiliary) {
-            let af = self.auxiliary_of(lhs, rhs, res);
-            self.set_flag(X86Flag::Auxiliary, af)?;
+            let af = self.auxiliary_source(lhs, rhs, res);
+            self.set_flag_source(X86Flag::Auxiliary, af)?;
         }
 
         // Parity Flag (PF): 1 if low 8 bits of result have even popcount
         if self.flag_needed(X86Flag::Parity) {
-            let pf = self.parity_of(res);
-            self.set_flag(X86Flag::Parity, pf)?;
+            let pf = self.parity_source(res);
+            self.set_flag_source(X86Flag::Parity, pf)?;
         }
 
         Ok(())
@@ -404,8 +410,8 @@ impl<'a> Lifter<'a> {
 
         // Parity Flag (PF): 1 if low 8 bits of result have even popcount
         if self.flag_needed(X86Flag::Parity) {
-            let pf = self.parity_of(res);
-            self.set_flag(X86Flag::Parity, pf)?;
+            let pf = self.parity_source(res);
+            self.set_flag_source(X86Flag::Parity, pf)?;
         }
 
         // AF is undefined for logical ops per Intel SDM; leave unchanged. Which
@@ -560,11 +566,14 @@ impl<'a> Lifter<'a> {
         }
 
         if pf {
-            // PF: even popcount of the low 8 bits of the result.
+            // Both arms are parity *sources*, in the same encoding, so the
+            // select happens before the fold rather than after it - a shift by
+            // zero leaves the stored byte alone, which is what "PF unchanged"
+            // means once PF is deferred.
             let old_pf = self.builder.use_var(self.state.flags[&X86Flag::Parity]);
-            let new_pf = self.parity_of(res);
+            let new_pf = self.parity_source(res);
             let final_pf = self.builder.ins().select(is_zero, old_pf, new_pf);
-            self.set_flag(X86Flag::Parity, final_pf)?;
+            self.set_flag_source(X86Flag::Parity, final_pf)?;
         }
 
         Ok(())

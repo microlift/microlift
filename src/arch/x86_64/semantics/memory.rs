@@ -570,7 +570,7 @@ impl<'a> Lifter<'a> {
         // Bit 1 of RFLAGS is reserved and always reads as 1.
         let mut rflags = self.builder.ins().iconst(types::I64, 0x2);
         for (flag, bit) in RFLAGS_FLAG_BITS {
-            let raw = self.builder.use_var(self.state.flags[&flag]);
+            let raw = self.get_flag(flag);
             let wide = self.builder.ins().uextend(types::I64, raw);
             // Flags are logically 1-bit; mask defensively before positioning.
             let one_bit = self.builder.ins().band_imm_u(wide, 1);
@@ -618,7 +618,7 @@ impl<'a> Lifter<'a> {
     pub(super) fn handle_lahf(&mut self, _instruction: &Instruction) -> crate::Result<()> {
         let mut ah = self.builder.ins().iconst(types::I8, 0x2);
         for (flag, bit) in LOW_BYTE_FLAG_BITS {
-            let raw = self.builder.use_var(self.state.flags[&flag]);
+            let raw = self.get_flag(flag);
             // Flags are logically 1-bit; mask defensively before positioning.
             let one_bit = self.builder.ins().band_imm_u(raw, 1);
             let positioned = self.builder.ins().ishl_imm_u(one_bit, bit as i64);

@@ -37,7 +37,7 @@ fn state(ctx: &RegisterContext) -> State {
             ctx.rax, ctx.rcx, ctx.rdx, ctx.rbx, ctx.rbp, ctx.rsi, ctx.rdi, ctx.r8, ctx.r9, ctx.r10,
             ctx.r11, ctx.r12, ctx.r13, ctx.r14, ctx.r15,
         ],
-        [ctx.cf, ctx.pf, ctx.af, ctx.zf, ctx.sf, ctx.of, ctx.df],
+        [ctx.cf, u8::from(ctx.pf()), u8::from(ctx.af()), ctx.zf, ctx.sf, ctx.of, ctx.df],
         ctx.exit_reason,
     )
 }
@@ -52,8 +52,8 @@ fn seed(ctx: &mut RegisterContext) {
     ctx.rsi = 0x7FFF_FFFF_FFFF_FFFF;
     ctx.rdi = 1;
     ctx.cf = 1;
-    ctx.pf = 1;
-    ctx.af = 1;
+    ctx.set_pf(1 != 0);
+    ctx.set_af(1 != 0);
     ctx.zf = 1;
     ctx.sf = 1;
     ctx.of = 1;

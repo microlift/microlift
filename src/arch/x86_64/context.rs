@@ -63,8 +63,17 @@ pub struct RegisterContext {
     pub link_table: *mut crate::core::link::BlockLinkEntry,
     // Flags as individual bytes for simpler IR load/store
     pub cf: u8,
-    pub pf: u8,
-    pub af: u8,
+    /// **A byte whose parity is PF**, not PF itself. See [`Self::pf`].
+    ///
+    /// PF is defined as the even parity of an operation's low result byte, so
+    /// the result is already a valid stored form and lifted code keeps it
+    /// without folding: the fold happens at the few instructions that read PF.
+    /// A host reading or writing the flag must go through [`Self::pf`] /
+    /// [`Self::set_pf`].
+    pub pf_src: u8,
+    /// **A byte whose bit 4 is AF**, not AF itself - `lhs ^ rhs ^ res` for the
+    /// operation that last wrote it. See [`Self::af`] and [`Self::pf_src`].
+    pub af_src: u8,
     pub zf: u8,
     pub sf: u8,
     pub of: u8,
@@ -181,8 +190,11 @@ impl Default for RegisterContext {
             syscall_handler: None,
             link_table: std::ptr::null_mut(),
             cf: 0,
-            pf: 0,
-            af: 0,
+            // An *odd*-parity byte, because the flag it stands for is 0 and a
+            // byte of zero would mean PF=1. `RFLAGS` after a reset is `0x2`,
+            // which has PF clear.
+            pf_src: 1,
+            af_src: 0,
             zf: 0,
             sf: 0,
             of: 0,
@@ -214,6 +226,26 @@ impl Default for RegisterContext {
 }
 
 impl RegisterContext {
+    /// The parity flag, folded out of [`pf_src`](Self::pf_src).
+    pub fn pf(&self) -> bool {
+        self.pf_src.count_ones().is_multiple_of(2)
+    }
+
+    /// Set the parity flag, choosing a byte of the right parity to stand for it.
+    pub fn set_pf(&mut self, pf: bool) {
+        self.pf_src = u8::from(!pf);
+    }
+
+    /// The auxiliary-carry flag, which is bit 4 of [`af_src`](Self::af_src).
+    pub fn af(&self) -> bool {
+        self.af_src & 0x10 != 0
+    }
+
+    /// Set the auxiliary-carry flag.
+    pub fn set_af(&mut self, af: bool) {
+        self.af_src = u8::from(af) << 4;
+    }
+
     pub fn new() -> Self {
         Self::default()
     }

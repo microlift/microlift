@@ -350,7 +350,7 @@ fn test_fucomi_less() {
     // ST0=1.0, ST1=2.0 -> 1 < 2
     assert_eq!(ctx.cf, 1, "1 < 2 -> CF set");
     assert_eq!(ctx.zf, 0, "not equal -> ZF clear");
-    assert_eq!(ctx.pf, 0, "ordered -> PF clear");
+    assert_eq!(u8::from(ctx.pf()), 0, "ordered -> PF clear");
 }
 
 #[test]
@@ -363,7 +363,7 @@ fn test_fucomi_equal() {
     let ctx = run_test(&bytes, ctx);
     assert_eq!(ctx.zf, 1, "equal -> ZF set");
     assert_eq!(ctx.cf, 0, "equal -> CF clear");
-    assert_eq!(ctx.pf, 0, "ordered -> PF clear");
+    assert_eq!(u8::from(ctx.pf()), 0, "ordered -> PF clear");
 }
 
 #[test]
@@ -378,7 +378,7 @@ fn test_fucomi_greater() {
     let ctx = run_test(&bytes, ctx);
     assert_eq!(ctx.cf, 0);
     assert_eq!(ctx.zf, 0);
-    assert_eq!(ctx.pf, 0);
+    assert_eq!(u8::from(ctx.pf()), 0);
 }
 
 #[test]

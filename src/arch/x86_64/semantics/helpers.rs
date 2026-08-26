@@ -234,13 +234,96 @@ impl<'a> Lifter<'a> {
         self.flag_live(flag as u8)
     }
 
-    /// Assign `flag`, unless nothing goes on to read it.
+    /// Whether `flag` is stored as a *source* to derive it from, rather than as
+    /// the 0/1 boolean it logically is. See [`Self::get_flag`].
     ///
-    /// The backstop for the guards in `semantics/flags.rs`: those skip the
-    /// *computation*, where the cost is, and this skips the assignment whether or
-    /// not a handler remembered to guard. A handler that computes a dead flag
-    /// anyway is still correct and merely wasteful.
+    /// Only the two flags whose computation costs more than their storage.
+    pub(super) fn deferred(flag: X86Flag) -> bool {
+        matches!(flag, X86Flag::Parity | X86Flag::Auxiliary)
+    }
+
+    /// Read `flag` as the logical 0/1 `I8` it is defined to be.
+    pub fn get_flag(&mut self, flag: X86Flag) -> Value {
+        let raw = self.builder.use_var(self.state.flags[&flag]);
+        match flag {
+            // PF is the even parity of the low byte: fold the byte down to its
+            // parity in bit 0, then invert. A xor-fold rather than a `popcnt`
+            // because aarch64 lowers a narrow `popcnt` through the vector unit,
+            // and the two cross-unit transfers cost more than the count.
+            X86Flag::Parity => {
+                let mut folded = raw;
+                for shift in [4, 2, 1] {
+                    let shifted = self.builder.ins().ushr_imm_u(folded, shift);
+                    folded = self.builder.ins().bxor(folded, shifted);
+                }
+                let odd = self.builder.ins().band_imm_u(folded, 1);
+                self.builder.ins().bxor_imm_u(odd, 1)
+            }
+            X86Flag::Auxiliary => {
+                let shifted = self.builder.ins().ushr_imm_u(raw, 4);
+                self.builder.ins().band_imm_u(shifted, 1)
+            }
+            _ => raw,
+        }
+    }
+
+    /// Assign a [deferred](Self::deferred) flag's *source* directly.
+    ///
+    /// The point of the whole scheme: a writer that already holds the value the
+    /// flag is derived from stores it as-is and computes nothing. For `Parity`
+    /// that is the low byte of the result; for `Auxiliary`, `lhs ^ rhs ^ res`,
+    /// whose bit 4 is the carry out of bit 3.
+    ///
+    /// # Panics
+    ///
+    /// If `flag` is not deferred - passing a boolean flag here would store it
+    /// under an encoding [`Self::get_flag`] does not apply, which is a silent
+    /// wrong answer rather than a failure.
+    pub fn set_flag_source(&mut self, flag: X86Flag, src: Value) -> crate::Result<()> {
+        assert!(
+            Self::deferred(flag),
+            "{flag:?} is stored as a boolean; use set_flag"
+        );
+        self.store_flag(flag, src)
+    }
+
+    /// Assign `flag` from the logical 0/1 value it is defined to be, encoding it
+    /// for the two flags that are stored as a source.
+    ///
+    /// The encodings are chosen so that a constant stays a constant: parity of
+    /// `0` is even, so `val ^ 1` maps PF=1 to a byte of even parity and PF=0 to
+    /// one of odd; and `val << 4` puts AF straight into the bit
+    /// [`Self::get_flag`] reads.
     pub fn set_flag(&mut self, flag: X86Flag, val: Value) -> crate::Result<()> {
+        if !self.flag_needed(flag) {
+            return Ok(());
+        }
+        let encoded = match flag {
+            X86Flag::Parity | X86Flag::Auxiliary
+                if self.state.flags.contains_key(&flag) =>
+            {
+                let val_i8 = if self.builder.func.dfg.value_type(val) == types::I8 {
+                    val
+                } else {
+                    self.builder.ins().ireduce(types::I8, val)
+                };
+                // Mask first: callers pass "any nonzero is true" values in
+                // places, and an encoding is only reversible from a clean bit.
+                let bit = self.builder.ins().band_imm_u(val_i8, 1);
+                match flag {
+                    X86Flag::Parity => self.builder.ins().bxor_imm_u(bit, 1),
+                    _ => self.builder.ins().ishl_imm_u(bit, 4),
+                }
+            }
+            _ => val,
+        };
+        self.store_flag(flag, encoded)
+    }
+
+    /// Write `val` into `flag`'s variable verbatim, in whatever encoding that
+    /// flag uses. The common tail of [`Self::set_flag`] and
+    /// [`Self::set_flag_source`].
+    fn store_flag(&mut self, flag: X86Flag, val: Value) -> crate::Result<()> {
         if !self.flag_needed(flag) {
             // Deliberately not an error even for a flag this guest has no
             // variable for: the check below is what reports that, and it still

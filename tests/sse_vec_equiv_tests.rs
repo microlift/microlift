@@ -48,7 +48,7 @@ fn assert_modes_agree_n(name: &str, bytes: &[u8], seeds: u64) {
         assert_eq!(s.rax, v.rax, "{name}: rax diverged (seed {seed})");
         assert_eq!(s.rcx, v.rcx, "{name}: rcx diverged (seed {seed})");
         assert_eq!(s.rdx, v.rdx, "{name}: rdx diverged (seed {seed})");
-        let flags = |c: &RegisterContext| (c.cf, c.pf, c.af, c.zf, c.sf, c.of);
+        let flags = |c: &RegisterContext| (c.cf, u8::from(c.pf()), u8::from(c.af()), c.zf, c.sf, c.of);
         assert_eq!(flags(&s), flags(&v), "{name}: flags diverged (seed {seed})");
     }
 }

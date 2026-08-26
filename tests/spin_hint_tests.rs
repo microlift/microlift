@@ -193,7 +193,7 @@ fn changes_no_architectural_state() {
 
     assert_eq!(hinted.rax, 11);
     assert_eq!(plain.rax, hinted.rax);
-    let flags = |c: &RegisterContext| (c.cf, c.pf, c.af, c.zf, c.sf, c.of);
+    let flags = |c: &RegisterContext| (c.cf, u8::from(c.pf()), u8::from(c.af()), c.zf, c.sf, c.of);
     assert_eq!(flags(&plain), flags(&hinted));
 }
 

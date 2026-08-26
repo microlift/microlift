@@ -497,7 +497,7 @@ fn test_cmovno_false() {
 fn test_cmovp_true() {
     let mut ctx = RegisterContext::default();
     ctx.rcx = 42;
-    ctx.pf = 1;
+    ctx.set_pf(1 != 0);
     #[rustfmt::skip]
     let bytes = [
         0x48, 0x0F, 0x4A, 0xC1, // cmovp rax, rcx
@@ -541,7 +541,7 @@ fn test_cmovnp_true() {
 fn test_cmovnp_false() {
     let mut ctx = RegisterContext::default();
     ctx.rcx = 42;
-    ctx.pf = 1;
+    ctx.set_pf(1 != 0);
     #[rustfmt::skip]
     let bytes = [
         0x48, 0x0F, 0x4B, 0xC1, // cmovnp rax, rcx
