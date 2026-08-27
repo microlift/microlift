@@ -198,7 +198,6 @@ fn test_compile_runtime_assisted_syscall_object() {
         builder,
         LifterConfig {
             execution_mode: ExecutionMode::RuntimeAssisted,
-            syscall_handler_call_conv: CallConv::SystemV,
             ..Default::default()
         },
     );

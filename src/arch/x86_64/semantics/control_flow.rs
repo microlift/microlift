@@ -51,26 +51,6 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Emit a switch-based indirect jump dispatch for a runtime target value.
-    /// Jumps to any known block whose offset matches; otherwise exits the VM.
-    pub fn emit_runtime_indirect_jump(&mut self, target_val: Value) -> crate::Result<()> {
-        // Back into lift-time VA space, which is what the block map is keyed on.
-        let target_offset = self.to_lift_va(target_val);
-
-        let external_block = self.builder.create_block();
-        self.emit_region_switch(target_offset, external_block);
-
-        self.builder.switch_to_block(external_block);
-        self.builder.seal_block(external_block);
-        self.sync_to_context(Some(target_val), ExitReason::UnknownJump)?;
-        self.write_exit_code(TransferKind::IndirectJump as u32);
-        // Linkable: a `jmp` through a register to an address this region does
-        // not contain is answered by entering whatever covers it.
-        self.emit_exit(Some(target_val));
-        self.block_terminated = true;
-        Ok(())
-    }
-
     pub(super) fn handle_ret(&mut self, instruction: &Instruction) -> crate::Result<()> {
         // Near return: pop a full 64-bit return address off the stack.
         self.emit_return(instruction, 8, false)

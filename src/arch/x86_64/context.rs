@@ -31,7 +31,45 @@ pub const CS_USER64_LINUX: u16 = 0x33;
 /// `SS` in 64-bit user mode on Linux (`__USER_DS`, RPL 3).
 pub const SS_USER64_LINUX: u16 = 0x2B;
 
+use crate::core::align::Align16;
 use crate::core::exit::ControlHeader;
+
+/// The host routines lifted x86-64 code calls **inline**, in place of a VM
+/// exit. See [`crate::core::callback`] for the contract both sides keep.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct X86_64Callbacks {
+    /// Services one `SYSCALL`. The context's `rip` is the return address.
+    pub handle_syscall: unsafe extern "C" fn(ctx: *mut RegisterContext),
+    /// Runs `num_instructions` guest instructions from the context's `rip`, for
+    /// an instruction this frontend does not lift.
+    pub interpreter_fallback:
+        unsafe extern "C" fn(ctx: *mut RegisterContext, num_instructions: u64),
+}
+
+/// Aborts rather than returns: a guest that ran on past an unserviced syscall
+/// would corrupt itself somewhere else entirely, and the host installing no
+/// handler is a host that never meant to run guest code with one.
+unsafe extern "C" fn default_syscall_handler(_ctx: *mut RegisterContext) {
+    panic!("no syscall callback registered");
+}
+
+/// Aborts, for the same reason as [`default_syscall_handler`].
+unsafe extern "C" fn default_interpreter_fallback(
+    _ctx: *mut RegisterContext,
+    _num_instructions: u64,
+) {
+    panic!("no interpreter-fallback callback registered");
+}
+
+impl Default for X86_64Callbacks {
+    fn default() -> Self {
+        Self {
+            handle_syscall: default_syscall_handler,
+            interpreter_fallback: default_interpreter_fallback,
+        }
+    }
+}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -53,8 +91,8 @@ pub struct RegisterContext {
     pub r14: u64,
     pub r15: u64,
     pub rip: u64,
-    /// A syscall handler intended for the RuntimeAssisted execution mode.
-    pub syscall_handler: Option<unsafe extern "C" fn(ctx: *mut RegisterContext)>,
+    /// Host routines called inline; see [`X86_64Callbacks`].
+    pub callbacks: X86_64Callbacks,
     /// The host's block-link table for the thread running this context, or null
     /// when it has none. See [`crate::core::link`].
     ///
@@ -79,11 +117,9 @@ pub struct RegisterContext {
     pub of: u8,
     pub df: u8,
     pub control: ControlHeader,
-    /// Padding, so that [`xmm`](Self::xmm) begins at a 16-byte-aligned
-    /// offset.
-    pub _align_xmm: u64,
-    /// XMM0–XMM15, each stored as [lo_64, hi_64].
-    pub xmm: [[u64; 2]; 16],
+    /// XMM0–XMM15, each stored as [lo_64, hi_64]. 16-byte aligned by its own
+    /// type, which is what lets a whole register move in one aligned access.
+    pub xmm: Align16<[[u64; 2]; 16]>,
     pub fs_base: u64,
     pub gs_base: u64,
 
@@ -187,7 +223,7 @@ impl Default for RegisterContext {
             r14: 0,
             r15: 0,
             rip: 0,
-            syscall_handler: None,
+            callbacks: X86_64Callbacks::default(),
             link_table: std::ptr::null_mut(),
             cf: 0,
             // An *odd*-parity byte, because the flag it stands for is 0 and a
@@ -200,8 +236,7 @@ impl Default for RegisterContext {
             of: 0,
             df: 0,
             control: ControlHeader::ZERO,
-            _align_xmm: 0,
-            xmm: [[0; 2]; 16],
+            xmm: Align16([[0; 2]; 16]),
             fs_base: 0,
             gs_base: 0,
             fpr: [[0; 2]; 8],
@@ -314,8 +349,8 @@ mod tests {
     use super::*;
 
     /// `xmm`'s alignment is worth twenty-two instructions per region entry and
-    /// is a property of every field declared before it. This is the assertion
-    /// that says so, rather than the comment on `_align_xmm` alone.
+    /// is a property of every field declared before it - add or remove one and
+    /// this is what says whether the padding above it still adds up.
     #[test]
     fn the_vector_save_area_stays_sixteen_byte_aligned() {
         assert_eq!(std::mem::offset_of!(RegisterContext, xmm) % 16, 0);
@@ -338,7 +373,7 @@ mod tests {
     /// notice a field slipped in among the flags.
     #[test]
     fn appending_a_field_does_not_move_the_ones_below_it() {
-        assert_eq!(std::mem::offset_of!(RegisterContext, link_table), 144);
+        assert_eq!(std::mem::offset_of!(RegisterContext, link_table), 152);
         assert_eq!(std::mem::offset_of!(RegisterContext, xmm), 192);
         assert_eq!(std::mem::offset_of!(RegisterContext, link_hit), 616);
     }

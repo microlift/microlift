@@ -1,31 +1,24 @@
-use cranelift_codegen::isa::CallConv;
-use microlift::core::{ExecutionMode, LifterConfig};
-use microlift::testkit::EXIT_TRAMPOLINE;
+use microlift::arch::x86_64::context::X86_64Callbacks;
 use microlift::testkit::prelude::*;
 
 fn run_stack_test(bytes: &[u8], ctx: RegisterContext) -> RegisterContext {
     LiftTest::new(bytes).ctx(ctx).run().ctx
 }
 
-fn run_stack_test_with_config(
-    bytes: &[u8],
-    ctx: RegisterContext,
-    config: LifterConfig,
-) -> RegisterContext {
-    // A whole config replaces the harness default, so re-declare the sentinel
-    // the harness pushes - these programs end in a `RET` to it.
-    LiftTest::new(bytes)
-        .config(config)
-        .exit_trampoline(Some(EXIT_TRAMPOLINE))
-        .ctx(ctx)
-        .run()
-        .ctx
-}
-
 unsafe extern "C" fn test_syscall_handler(ctx: *mut RegisterContext) {
     unsafe {
         let ctx = &mut *ctx;
         ctx.rax = ctx.rax.wrapping_add(5);
+    }
+}
+
+/// A syscall callback that moves the guest somewhere else entirely, the way a
+/// `sigreturn` or a thread exit would.
+unsafe extern "C" fn diverting_syscall_handler(ctx: *mut RegisterContext) {
+    unsafe {
+        let ctx = &mut *ctx;
+        ctx.rax = 0xD1;
+        ctx.rip = 0x1234_0000;
     }
 }
 
@@ -59,21 +52,7 @@ fn test_call_ret_nested_jit() {
 }
 
 #[test]
-fn test_syscall_jit() {
-    // mov rax, 0x60; syscall
-    let bytes = [
-        0x48, 0xC7, 0xC0, 0x60, 0x00, 0x00, 0x00, // mov rax, 0x60 (96)
-        0x0F, 0x05, // syscall
-    ];
-    let ctx = run_stack_test(&bytes, RegisterContext::default());
-    assert_eq!(ctx.rax, 0x60);
-    assert_eq!(ctx.exit_reason, ExitReason::Syscall as u32);
-    // RIP should point correctly after syscall (0x1000 + 7 + 2 = 0x1009)
-    assert_eq!(ctx.rip, 0x1009);
-}
-
-#[test]
-fn test_syscall_runtime_assisted_continues() {
+fn test_syscall_calls_back_and_runs_on() {
     // mov rax, 7; syscall; add rax, 3; ret
     let bytes = [
         0x48, 0xC7, 0xC0, 0x07, 0x00, 0x00, 0x00, // mov rax, 7
@@ -82,43 +61,48 @@ fn test_syscall_runtime_assisted_continues() {
         0xC3, // ret
     ];
 
-    let config = LifterConfig {
-        execution_mode: ExecutionMode::RuntimeAssisted,
-        syscall_handler_call_conv: CallConv::SystemV,
-        ..Default::default()
-    };
-    let ctx = run_stack_test_with_config(
+    let ctx = run_stack_test(
         &bytes,
         RegisterContext {
-            syscall_handler: Some(test_syscall_handler),
+            callbacks: X86_64Callbacks {
+                handle_syscall: test_syscall_handler,
+                ..X86_64Callbacks::default()
+            },
             ..RegisterContext::default()
         },
-        config,
     );
 
-    assert_eq!(ctx.rax, 15);
+    assert_eq!(ctx.rax, 15, "7, +5 in the callback, +3 after it returned");
     assert_eq!(ctx.exit_reason, ExitReason::Return as u32);
 }
 
+/// The PC the callback leaves behind is what the guest resumes at, so a
+/// callback that redirects control leaves the region instead of falling
+/// through to the instruction after the `syscall`.
 #[test]
-fn test_syscall_runtime_assisted_falls_back_to_exit_without_handler() {
-    // mov rax, 0x60; syscall; add rax, 1
+fn test_syscall_callback_can_redirect_the_guest() {
+    // mov rax, 0x60; syscall; add rax, 1; ret
     let bytes = [
         0x48, 0xC7, 0xC0, 0x60, 0x00, 0x00, 0x00, // mov rax, 0x60
         0x0F, 0x05, // syscall
         0x48, 0x83, 0xC0, 0x01, // add rax, 1
+        0xC3, // ret
     ];
 
-    let config = LifterConfig {
-        execution_mode: ExecutionMode::RuntimeAssisted,
-        syscall_handler_call_conv: CallConv::SystemV,
-        ..Default::default()
-    };
-    let ctx = run_stack_test_with_config(&bytes, RegisterContext::default(), config);
+    let ctx = run_stack_test(
+        &bytes,
+        RegisterContext {
+            callbacks: X86_64Callbacks {
+                handle_syscall: diverting_syscall_handler,
+                ..X86_64Callbacks::default()
+            },
+            ..RegisterContext::default()
+        },
+    );
 
-    assert_eq!(ctx.rax, 0x60);
-    assert_eq!(ctx.exit_reason, ExitReason::Syscall as u32);
-    assert_eq!(ctx.rip, 0x1009);
+    assert_eq!(ctx.exit_reason, ExitReason::UnknownJump as u32);
+    assert_eq!(ctx.rip, 0x1234_0000);
+    assert_eq!(ctx.rax, 0xD1, "the `add` after the syscall did not run");
 }
 
 #[test]

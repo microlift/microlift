@@ -4,24 +4,19 @@ use cranelift::prelude::*;
 use iced_x86::Instruction;
 
 impl<'a> Lifter<'a> {
-    /// Handle an unimplemented instruction by exiting with a fallback exit.
-    /// The host can then shim the instruction and either:
-    /// 1. (JIT mode) Call lifter again to generate a resume block
-    /// 2. (RuntimeAssisted) Resume via pre-generated resume_function
+    /// Hand an instruction this frontend does not lift to the host's
+    /// interpreter, inline; see [`crate::core::callback`]. The PC published to
+    /// it points *at* the instruction, which is where the interpreter starts.
+    ///
+    /// One instruction, not the run the callback could do: the region's own
+    /// code for everything after it is already compiled.
     pub(super) fn handle_unimplemented_instruction(
         &mut self,
         instruction: &Instruction,
     ) -> crate::Result<()> {
-        // Sync full state to RegisterContext - we're exiting to the host
-        self.sync_to_context(None, ExitReason::UnimplementedInstruction)?;
-        self.resumes_at(instruction.next_ip());
-
-        // Store the instruction code for the host to identify what failed.
-        self.write_exit_code(instruction.code() as u32);
-
-        self.emit_host_return();
-        self.block_terminated = true;
-        Ok(())
+        let rip_at = self.rip_at(instruction);
+        let rip_after = self.rip_after(instruction);
+        self.emit_interpreter_callback(Some(rip_at), Some(rip_after), 1)
     }
 
     /// Handle a `UD2` instruction - emit a `Ud2` VM exit with RIP pointing at

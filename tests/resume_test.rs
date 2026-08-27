@@ -1,9 +1,11 @@
-//! Resumable VM exits: an instruction the lifter does not implement exits to
-//! the host with `UnimplementedInstruction`, the host shims it, and re-entering
-//! the same compiled region resumes at the following instruction.
+//! The interpreter fallback: an instruction the lifter does not implement is
+//! handed to the host's callback *inline*, and the region carries on with the
+//! next instruction rather than exiting and being re-entered.
 
+use microlift::arch::x86_64::context::X86_64Callbacks;
 use microlift::testkit::DEFAULT_LIFT_BASE;
 use microlift::testkit::prelude::*;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// `WBINVD` (`0F 09`) stands in for "an instruction the lifter will never
 /// implement": it is ring-0 only, so it cannot appear in the usermode guest code
@@ -11,47 +13,55 @@ use microlift::testkit::prelude::*;
 /// interpreter-fallback path.
 const WBINVD: [u8; 2] = [0x0F, 0x09];
 
-/// Offset of `inc rax` in the test program below: 7 bytes of `mov rax, 42` plus
-/// the 2-byte `WBINVD`. The fallback exit reports this as the resume point.
-const RESUME_OFFSET: u64 = 9;
+/// Offset of the `WBINVD`: 7 bytes of `mov rax, 42`.
+const WBINVD_OFFSET: u64 = 7;
+
+static CALLS: AtomicU64 = AtomicU64::new(0);
+static SEEN_RIP: AtomicU64 = AtomicU64::new(0);
+static SEEN_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Interprets the `WBINVD` - a cache flush is a no-op here - and advances the
+/// PC past it, which is all the region needs to resume inline.
+unsafe extern "C" fn interpret(ctx: *mut RegisterContext, num_instructions: u64) {
+    let ctx = unsafe { &mut *ctx };
+    CALLS.fetch_add(1, Ordering::SeqCst);
+    SEEN_RIP.store(ctx.rip, Ordering::SeqCst);
+    SEEN_COUNT.store(num_instructions, Ordering::SeqCst);
+    ctx.rip += WBINVD.len() as u64;
+}
 
 #[test]
-fn test_resumable_unimplemented_fallback() {
+fn test_unimplemented_instruction_runs_through_the_callback() {
     let mut bytes = vec![0x48, 0xC7, 0xC0, 0x2A, 0x00, 0x00, 0x00]; // mov rax, 42
     bytes.extend_from_slice(&WBINVD); // unimplemented
     bytes.extend_from_slice(&[0x48, 0xFF, 0xC0]); // inc rax
     bytes.push(0xC3); // ret
 
-    // First entry: runs `mov`, then exits at the unimplemented instruction with
-    // the guest state synced out.
-    let out = LiftTest::new(&bytes).resumable().run();
-    assert_eq!(
-        out.exit,
-        ExitReason::UnimplementedInstruction,
-        "wbinvd must produce a resumable fallback exit"
-    );
-    assert_eq!(out.ctx.rax, 42, "state before the exit must be synced out");
-    assert_eq!(
-        out.ctx.rip,
-        DEFAULT_LIFT_BASE + RESUME_OFFSET,
-        "rip must be the resume point: the instruction after the wbinvd"
-    );
-    assert_ne!(
-        out.ctx.exit_code, 0,
-        "exit_code must carry the instruction code so the host can shim it"
-    );
+    let out = LiftTest::new(&bytes)
+        .no_unicorn()
+        .with_config(|c| c.interpreter_fallback = true)
+        .reg(|c| {
+            c.callbacks = X86_64Callbacks {
+                interpreter_fallback: interpret,
+                ..X86_64Callbacks::default()
+            }
+        })
+        .run();
 
-    // The host shims the instruction (a cache flush is a no-op here) and
-    // re-enters: execution must resume at `inc rax` and run through to the
-    // `RET`, which returns to the exit trampoline.
-    let out = out.resume();
-    assert!(
-        matches!(out.exit, ExitReason::Return | ExitReason::None),
-        "resumed region should run to the RET, got {:?}",
-        out.exit
-    );
+    assert_eq!(out.exit, ExitReason::Return, "the region ran to its RET");
     assert_eq!(
         out.ctx.rax, 43,
-        "the instruction after the exit must execute"
+        "state before the callback reached it, and the instruction after it ran"
+    );
+    assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        SEEN_RIP.load(Ordering::SeqCst),
+        DEFAULT_LIFT_BASE + WBINVD_OFFSET,
+        "the PC points *at* the instruction the interpreter is asked to run"
+    );
+    assert_eq!(
+        SEEN_COUNT.load(Ordering::SeqCst),
+        1,
+        "one instruction - the rest of the region is already compiled"
     );
 }

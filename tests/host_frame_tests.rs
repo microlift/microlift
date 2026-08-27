@@ -266,7 +266,11 @@ fn chain(frames: bool, max_depth: u32) -> (Arc<RwLock<CodeCache>>, Guest) {
     let mut guest = Guest::new(&cache);
 
     for i in 0..DEPTH {
-        let at = if i == 0 { DEFAULT_LIFT_BASE } else { (i + 1) * 0x1000 };
+        let at = if i == 0 {
+            DEFAULT_LIFT_BASE
+        } else {
+            (i + 1) * 0x1000
+        };
         let bytes: Vec<u8> = if i + 1 == DEPTH {
             // `add rax, 1 ; ret`
             vec![0x48, 0x83, 0xC0, 0x01, 0xC3]
@@ -369,7 +373,7 @@ fn the_answer_is_the_same_with_nesting_off() {
     );
 }
 
-/// **An exit from a nested frame.** A syscall four calls deep cannot return to
+/// **An exit from a nested frame.** A `CPUID` four calls deep cannot return to
 /// the host directly - there are four host frames between it and the thunk - so
 /// it unwinds through all of them, each restoring its own depth on the way past.
 ///
@@ -382,10 +386,14 @@ fn an_exit_from_a_nested_frame_unwinds_to_the_host_and_resumes() {
     let mut guest = Guest::new(&cache);
 
     for i in 0..DEPTH {
-        let at = if i == 0 { DEFAULT_LIFT_BASE } else { (i + 1) * 0x1000 };
+        let at = if i == 0 {
+            DEFAULT_LIFT_BASE
+        } else {
+            (i + 1) * 0x1000
+        };
         let bytes: Vec<u8> = if i + 1 == DEPTH {
-            // `syscall ; add rax, 1 ; ret` - the exit happens at the bottom.
-            vec![0x0F, 0x05, 0x48, 0x83, 0xC0, 0x01, 0xC3]
+            // `cpuid ; add rax, 1 ; ret` - the exit happens at the bottom.
+            vec![0x0F, 0xA2, 0x48, 0x83, 0xC0, 0x01, 0xC3]
         } else {
             let next = (i + 2) * 0x1000;
             let disp = (next as i64 - (at as i64 + 5)) as i32;
@@ -413,8 +421,8 @@ fn an_exit_from_a_nested_frame_unwinds_to_the_host_and_resumes() {
 
     assert_eq!(
         first,
-        Step::Exit(ExitReason::Syscall),
-        "the syscall must reach the host, four frames or not"
+        Step::Exit(ExitReason::Cpuid),
+        "the exit must reach the host, four frames or not"
     );
     assert_eq!(
         guest.runtime.ctx.host_frame_depth, 0,
@@ -423,7 +431,7 @@ fn an_exit_from_a_nested_frame_unwinds_to_the_host_and_resumes() {
     assert_eq!(
         guest.runtime.ctx.rip,
         DEPTH * 0x1000 + 2,
-        "and it resumes after the syscall, inside the innermost region"
+        "and it resumes after the cpuid, inside the innermost region"
     );
 
     // Servicing it is the host's business; here it is a no-op. Resuming from the
@@ -466,10 +474,12 @@ fn a_nested_call_carries_a_pinned_register_file() {
         "the fixture must actually be pinned"
     );
     cache.write().unwrap().insert(callee);
-    let caller = cache
-        .write()
-        .unwrap()
-        .insert(LiftTest::new(CALLER).with_config(pinned).translation().unwrap());
+    let caller = cache.write().unwrap().insert(
+        LiftTest::new(CALLER)
+            .with_config(pinned)
+            .translation()
+            .unwrap(),
+    );
     guest.runtime.publish(&caller);
     guest.runtime.detach_table();
 
@@ -523,10 +533,12 @@ fn a_callee_s_writes_survive_a_caller_that_touches_nothing() {
         .translation()
         .expect("compiles");
     cache.write().unwrap().insert(callee);
-    let caller = cache
-        .write()
-        .unwrap()
-        .insert(LiftTest::new(caller_bytes).with_config(config(true)).translation().unwrap());
+    let caller = cache.write().unwrap().insert(
+        LiftTest::new(caller_bytes)
+            .with_config(config(true))
+            .translation()
+            .unwrap(),
+    );
     guest.runtime.publish(&caller);
     guest.runtime.detach_table();
 

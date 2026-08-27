@@ -19,8 +19,8 @@
 //! indirect branch, truncated encoding, or edge leaving the region - each of
 //! which lifts to a `sync_to_context` that publishes every flag); an instruction
 //! the frontend does not classify ("reads everything, writes nothing", which is
-//! what makes an `UnimplementedInstruction` exit safe without the analysis
-//! knowing which those are); and an address never analysed.
+//! what makes the interpreter-fallback callback safe without the analysis
+//! knowing which instructions take it); and an address never analysed.
 
 use std::collections::{HashMap, HashSet};
 

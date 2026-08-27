@@ -1,24 +1,6 @@
-//! [`VmResumptionPoints::ExitOnly`], exit by exit.
-//!
-//! The default mode's whole claim is that it offers an arm for *every* address a
-//! region can leave from and come back to, and nothing else. The "nothing else"
-//! half is cheap to believe. The other half is a per-instruction obligation:
-//! every semantics that emits a resumable VM exit has to register its resume
-//! point with [`LiftEngine::resumes_at`], and one that forgets produces a region
-//! that exits fine and then cannot be re-entered - silently restarting from the
-//! top, or (under [`LifterConfig::strict_resume`]) bouncing straight back out
-//! with no progress. `SYSCALL` in `RuntimeAssisted` mode was exactly that: the
-//! JIT path registered its resume point and the assisted path's exit did not.
-//!
-//! So each exit gets the same two-part check - the address is in
-//! [`LiftedCode::resume_points`], and re-entering there actually runs the
-//! instruction after the exit - and `strict_resume` is on throughout so a
-//! missing arm fails loudly instead of looking like a passing test that
-//! re-executed the region.
-
 use microlift::arch::x86_64::X86_64;
 use microlift::core::exit::TransferKind;
-use microlift::core::{ExecutionMode, LifterConfig, lift_to_code};
+use microlift::core::{LifterConfig, lift_to_code};
 use microlift::testkit::EXIT_TRAMPOLINE;
 use microlift::testkit::prelude::*;
 
@@ -51,14 +33,10 @@ fn assert_exit_resumes(exit_insn: &[u8], expect: ExitReason, rip: ExitRip) {
     bytes.push(0xC3);
     let resume = BASE + exit_insn.len() as u64;
 
-    // `interpreter_fallback` so an instruction with no semantics becomes the
-    // resumable fallback exit rather than a hard lift error; every other case
-    // here is unaffected by it. The trampoline sentinel is the harness default,
-    // but a whole config passed to `.config()` replaces it, and the closing
-    // `RET` has to exit with `Return` for the resumed-region check to mean
-    // anything.
+    // The trampoline sentinel is the harness default, but a whole config passed
+    // to `.config()` replaces it, and the closing `RET` has to exit with
+    // `Return` for the resumed-region check to mean anything.
     let config = LifterConfig {
-        interpreter_fallback: true,
         exit_trampoline_address: Some(EXIT_TRAMPOLINE),
         ..Default::default()
     };
@@ -109,11 +87,6 @@ fn assert_exit_resumes(exit_insn: &[u8], expect: ExitReason, rip: ExitRip) {
 }
 
 #[test]
-fn syscall_resumes() {
-    assert_exit_resumes(&[0x0F, 0x05], ExitReason::Syscall, ExitRip::Past);
-}
-
-#[test]
 fn cpuid_resumes() {
     assert_exit_resumes(&[0x0F, 0xA2], ExitReason::Cpuid, ExitRip::Past);
 }
@@ -149,62 +122,6 @@ fn port_input_resumes() {
 fn port_output_resumes() {
     // outsb
     assert_exit_resumes(&[0x6E], ExitReason::PortOutput, ExitRip::AtInstruction);
-}
-
-#[test]
-fn an_unimplemented_instruction_resumes() {
-    // WBINVD: ring-0 only, so it will keep falling through to the fallback.
-    assert_exit_resumes(
-        &[0x0F, 0x09],
-        ExitReason::UnimplementedInstruction,
-        ExitRip::Past,
-    );
-}
-
-/// The bug this file was written for.
-///
-/// `RuntimeAssisted` gives `SYSCALL` two ways out: the in-process handler, and -
-/// when the context carries none - the same `Syscall` VM exit the JIT mode
-/// always takes. Only the JIT path registered its resume point, so an assisted
-/// region that fell back to the exit could not be re-entered where the exit said
-/// to. `strict_resume` turns that into the `NoResumePoint` refusal below rather
-/// than a silent restart, which is the only reason it is visible at all.
-#[test]
-fn a_runtime_assisted_syscall_resumes_through_its_exit() {
-    let mut bytes = vec![0x0F, 0x05]; // syscall
-    bytes.extend_from_slice(&INC_R15);
-    bytes.push(0xC3); // ret
-    let resume = BASE + 2;
-
-    let config = LifterConfig {
-        execution_mode: ExecutionMode::RuntimeAssisted,
-        ..Default::default()
-    };
-    let lifted = lift_to_code::<X86_64>(&bytes, BASE, config).unwrap();
-    assert!(
-        lifted.resume_points.contains(&resume),
-        "{:#x?} does not offer {resume:#x}",
-        lifted.resume_points
-    );
-
-    // No `syscall_handler` in the context, so the assisted path is not taken and
-    // the region leaves through the exit.
-    let out = LiftTest::new(&bytes)
-        .at(BASE)
-        .image_base(BASE)
-        .execution_mode(ExecutionMode::RuntimeAssisted)
-        .with_config(|c| c.strict_resume = true)
-        .reg(|c| {
-            c.rip = BASE;
-            c.r15 = 0;
-        })
-        .run();
-    assert_eq!(out.exit, ExitReason::Syscall);
-    assert_eq!(out.ctx.rip, resume);
-
-    let out = out.resume();
-    assert_eq!(out.exit, ExitReason::Return);
-    assert_eq!(out.ctx.r15, 1, "the instruction after the syscall must run");
 }
 
 /// A call that leaves the region is the other kind of departure the host cannot
@@ -254,8 +171,8 @@ fn a_call_out_of_region_resumes_at_its_return_address() {
 /// than it is built.
 #[test]
 fn a_region_resumes_through_every_exit_in_turn() {
-    // syscall ; inc r15 ; cpuid ; inc r15 ; int3 ; inc r15 ; ret
-    let mut bytes = vec![0x0F, 0x05];
+    // rdtsc ; inc r15 ; cpuid ; inc r15 ; int3 ; inc r15 ; ret
+    let mut bytes = vec![0x0F, 0x31];
     bytes.extend_from_slice(&INC_R15);
     bytes.extend_from_slice(&[0x0F, 0xA2]);
     bytes.extend_from_slice(&INC_R15);
@@ -279,7 +196,7 @@ fn a_region_resumes_through_every_exit_in_turn() {
             c.r15 = 0;
         })
         .run();
-    assert_eq!(out.exit, ExitReason::Syscall);
+    assert_eq!(out.exit, ExitReason::Rdtsc);
     assert_eq!(out.ctx.rip, BASE + 2);
 
     let out = out.resume();

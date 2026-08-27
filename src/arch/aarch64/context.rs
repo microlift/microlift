@@ -7,6 +7,45 @@
 
 use crate::core::exit::ControlHeader;
 
+/// The host routines lifted aarch64 code calls **inline**, in place of a VM
+/// exit. The aarch64 twin of
+/// [`X86_64Callbacks`](crate::arch::x86_64::context::X86_64Callbacks); see
+/// [`crate::core::callback`] for the contract both sides keep.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Aarch64Callbacks {
+    /// Services one `SVC`. The context's `pc` is the return address.
+    pub handle_syscall: unsafe extern "C" fn(ctx: *mut Aarch64RegisterContext),
+    /// Runs `num_instructions` guest instructions from the context's `pc`, for
+    /// an instruction this frontend does not lift.
+    pub interpreter_fallback:
+        unsafe extern "C" fn(ctx: *mut Aarch64RegisterContext, num_instructions: u64),
+}
+
+/// Aborts rather than returns: a guest that ran on past an unserviced syscall
+/// would corrupt itself somewhere else entirely, and the host installing no
+/// handler is a host that never meant to run guest code with one.
+unsafe extern "C" fn default_syscall_handler(_ctx: *mut Aarch64RegisterContext) {
+    panic!("no syscall callback registered");
+}
+
+/// Aborts, for the same reason as [`default_syscall_handler`].
+unsafe extern "C" fn default_interpreter_fallback(
+    _ctx: *mut Aarch64RegisterContext,
+    _num_instructions: u64,
+) {
+    panic!("no interpreter-fallback callback registered");
+}
+
+impl Default for Aarch64Callbacks {
+    fn default() -> Self {
+        Self {
+            handle_syscall: default_syscall_handler,
+            interpreter_fallback: default_interpreter_fallback,
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Aarch64RegisterContext {
@@ -17,8 +56,8 @@ pub struct Aarch64RegisterContext {
     pub sp: u64,
     /// Program counter.
     pub pc: u64,
-    /// A syscall handler intended for the RuntimeAssisted execution mode.
-    pub syscall_handler: Option<unsafe extern "C" fn(ctx: *mut Aarch64RegisterContext)>,
+    /// Host routines called inline; see [`Aarch64Callbacks`].
+    pub callbacks: Aarch64Callbacks,
     /// Resume function pointer for AOT block dispatch (placeholder, unused).
     pub resume_function: Option<unsafe extern "C" fn(ctx: *mut Aarch64RegisterContext)>,
     // NZCV condition flags, each stored as an individual byte (0 or 1) for
@@ -46,7 +85,7 @@ impl Default for Aarch64RegisterContext {
             x: [0; 31],
             sp: 0,
             pc: 0,
-            syscall_handler: None,
+            callbacks: Aarch64Callbacks::default(),
             resume_function: None,
             n: 0,
             z: 0,

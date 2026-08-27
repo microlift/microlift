@@ -37,6 +37,10 @@ TAINT = (
     "write_exit_code",
     "resumes_at",
     "handle_unimplemented",
+    # A host callback is a full sync and a full reload around a call
+    # (`core::callback`), so it publishes every flag exactly as an exit does.
+    "emit_syscall_callback",
+    "emit_interpreter_callback",
 )
 
 FN = r"\n    (?:pub(?:\(super\))?\s+)?fn (\w+)\s*[(<]"

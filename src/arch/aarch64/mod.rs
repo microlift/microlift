@@ -107,7 +107,23 @@ impl GuestArch for Aarch64 {
         fields.push((Self::exit_reason_offset(), "exit_reason"));
         fields.push((Self::exit_code_offset(), "exit_code"));
         fields.push((Self::imported_function_va_offset(), "imported_function_va"));
+        let callbacks = Self::callback_offsets();
+        fields.push((callbacks.syscall, "callbacks.handle_syscall"));
+        fields.push((
+            callbacks.interpreter_fallback,
+            "callbacks.interpreter_fallback",
+        ));
         fields
+    }
+
+    fn callback_offsets() -> crate::core::callback::CallbackOffsets {
+        crate::core::callback::CallbackOffsets {
+            syscall: std::mem::offset_of!(Aarch64RegisterContext, callbacks.handle_syscall) as i32,
+            interpreter_fallback: std::mem::offset_of!(
+                Aarch64RegisterContext,
+                callbacks.interpreter_fallback
+            ) as i32,
+        }
     }
 
     fn lift_instruction(lifter: &mut LiftEngine<'_, Self>, i: &Self::Instr) -> crate::Result<()> {

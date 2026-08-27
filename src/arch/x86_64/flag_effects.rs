@@ -656,8 +656,9 @@ mod tests {
         assert!(flag_effects(&decode(&[0x0F, 0xFC, 0xC1])).is_none());
     }
 
-    /// The instructions that exit to the host must stay unclassified, because
-    /// their sync publishes every flag and the analysis only knows that by
+    /// The instructions that hand control to the host - by a VM exit, or by a
+    /// callback that syncs and reloads around a call - must stay unclassified,
+    /// because that sync publishes every flag and the analysis only knows it by
     /// their absence.
     #[test]
     fn everything_that_exits_is_unclassified() {

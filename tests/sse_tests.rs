@@ -4158,7 +4158,11 @@ fn test_ptest_sets_zf_and_cf() {
         let ctx = run_test(&bytes, ctx);
         assert_eq!(ctx.zf, zf, "ZF for {dst:#x?} & {src:#x?}");
         assert_eq!(ctx.cf, cf, "CF for {dst:#x?} & ~{src:#x?}");
-        assert_eq!((ctx.sf, ctx.of, u8::from(ctx.pf()), u8::from(ctx.af())), (0, 0, 0, 0), "cleared");
+        assert_eq!(
+            (ctx.sf, ctx.of, u8::from(ctx.pf()), u8::from(ctx.af())),
+            (0, 0, 0, 0),
+            "cleared"
+        );
         assert_eq!(ctx.xmm[0], dst, "ptest must not write its operand");
     }
 }
@@ -4256,21 +4260,43 @@ fn test_new_packed_ops_match_in_vector_mode() {
 
 /// The MMX encodings of the SSE integer opcodes (same mnemonic, no 0x66
 /// prefix) operate on `MM0..MM7`, which this frontend does not model. They must
-/// exit to the host as unimplemented - a resumable, shimmable exit - rather
+/// reach the host's interpreter callback - and let the region carry on - rather
 /// than failing the lift of the whole region.
 #[test]
-fn test_mmx_encodings_exit_to_host() {
-    // pshufb mm0, mm1 ; ret  ->  0F 38 00 C1  C3
-    let out = LiftTest::new(&[0x0F, 0x38, 0x00, 0xC1, 0xC3])
-        .try_run()
-        .expect("mmx forms must lift, not error");
-    assert_eq!(out.exit, ExitReason::UnimplementedInstruction);
+fn test_mmx_encodings_reach_the_interpreter_callback() {
+    use microlift::arch::x86_64::context::X86_64Callbacks;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    // pmuludq mm0, mm1 ; ret  ->  0F F4 C1  C3
-    let out = LiftTest::new(&[0x0F, 0xF4, 0xC1, 0xC3])
-        .try_run()
-        .expect("mmx forms must lift, not error");
-    assert_eq!(out.exit, ExitReason::UnimplementedInstruction);
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+
+    /// Steps over whatever it was handed; the operands are MMX state no test
+    /// here inspects.
+    unsafe extern "C" fn skip(ctx: *mut RegisterContext, _n: u64) {
+        let ctx = unsafe { &mut *ctx };
+        CALLS.fetch_add(1, Ordering::SeqCst);
+        ctx.rip += LENGTH.load(Ordering::SeqCst);
+    }
+    static LENGTH: AtomicU64 = AtomicU64::new(0);
+
+    for (bytes, length) in [
+        (&[0x0F, 0x38, 0x00, 0xC1, 0xC3][..], 4), // pshufb mm0, mm1 ; ret
+        (&[0x0F, 0xF4, 0xC1, 0xC3][..], 3),       // pmuludq mm0, mm1 ; ret
+    ] {
+        CALLS.store(0, Ordering::SeqCst);
+        LENGTH.store(length, Ordering::SeqCst);
+        let out = LiftTest::new(bytes)
+            .no_unicorn()
+            .reg(|c| {
+                c.callbacks = X86_64Callbacks {
+                    interpreter_fallback: skip,
+                    ..X86_64Callbacks::default()
+                }
+            })
+            .try_run()
+            .expect("mmx forms must lift, not error");
+        assert_eq!(out.exit, ExitReason::Return);
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+    }
 }
 
 //  EXTRACTPS - SSE4.1 single-precision lane extract into a GPR or m32. Despite

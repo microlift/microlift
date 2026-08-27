@@ -97,9 +97,9 @@ fn run(code: &[u8], seed: impl Fn(&mut RegisterContext) + Copy) -> RunOutcome {
             .reg(seed)
             .run();
         match &first {
-            None => first = Some(out.ctx.xmm),
+            None => first = Some(*out.ctx.xmm),
             Some(f) => assert_eq!(
-                *f, out.ctx.xmm,
+                *f, *out.ctx.xmm,
                 "vector_xmm = {vector}, outline_helpers = {outline} disagreed"
             ),
         }
@@ -400,4 +400,3 @@ fn aes_and_crc32_tables_coexist_in_one_region() {
     assert_eq!(out.ctx.xmm[0], [0x0be8672d9204d843, 0x81a2d95024f450f7]);
     assert_eq!(out.ctx.rax, 0x93AD_1061);
 }
-

@@ -22,7 +22,7 @@ pub struct ControlHeader {
     /// Why the lifted region exited. Holds an [`ExitReason`] discriminant.
     pub exit_reason: u32,
     /// Secondary exit detail. For `UnknownJump` this is a [`TransferKind`]; for
-    /// `UnimplementedInstruction` it is the raw guest opcode, etc.
+    /// `Interrupt` the vector, for port I/O the element size, etc.
     pub exit_code: u32,
     /// On import/indirect-call exits, the resolved callee virtual address.
     pub imported_function_va: u64,
@@ -47,18 +47,17 @@ impl ControlHeader {
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+/// Discriminants 2 and 4 are retired: they were `Syscall` and
+/// `UnimplementedInstruction`, both of which are now serviced inline through
+/// [`crate::core::callback`] rather than by leaving the region. The remaining
+/// values keep their numbers, because a host reads them across an FFI boundary.
 pub enum ExitReason {
     None = 0,
     /// A terminating block was reached. The code has executed successfully up to its VM return trampoline.
     Return = 1,
-    /// A system call was issued by the guest.
-    Syscall = 2,
     /// The code would have branched out to an unresolvable address in memory.
     /// It is up to the runtime to decide what to do with this.
     UnknownJump = 3,
-    /// The instruction that was about to be executed is not implemented in Microlift.
-    /// This becomes a resumable VM exit in RuntimeAssisted mode when ran with `interpreter_fallback`.
-    UnimplementedInstruction = 4,
     /// The code that was about to be executed did not decode as a
     /// valid guest instruction.
     InvalidInstruction = 5,
@@ -157,12 +156,8 @@ impl TryFrom<u32> for ExitReason {
             Ok(Self::None)
         } else if value == Self::Return as u32 {
             Ok(Self::Return)
-        } else if value == Self::Syscall as u32 {
-            Ok(Self::Syscall)
         } else if value == Self::UnknownJump as u32 {
             Ok(Self::UnknownJump)
-        } else if value == Self::UnimplementedInstruction as u32 {
-            Ok(Self::UnimplementedInstruction)
         } else if value == Self::InvalidInstruction as u32 {
             Ok(Self::InvalidInstruction)
         } else if value == Self::ImportedFunctionCall as u32 {
@@ -198,9 +193,7 @@ impl std::fmt::Display for ExitReason {
         f.write_str(match self {
             ExitReason::None => "none",
             ExitReason::Return => "return",
-            ExitReason::Syscall => "syscall",
             ExitReason::UnknownJump => "unknown-jump",
-            ExitReason::UnimplementedInstruction => "unimplemented-instruction",
             ExitReason::InvalidInstruction => "invalid-instruction",
             ExitReason::ImportedFunctionCall => "imported-function-call",
             ExitReason::IndirectCall => "indirect-call",

@@ -2,7 +2,7 @@
 //! Only deterministic, self-contained instructions: reg/reg and reg/imm
 //! arithmetic, logic, shifts, `setcc`, `cmov`, `lea`, `mov`, and loads/stores
 //! confined to the shared arena. Anything that produces a Microlift *VM exit*
-//! (syscall, port I/O, cpuid, xgetbv, rdtsc, imported/indirect call, ud2, int3)
+//! (port I/O, cpuid, xgetbv, rdtsc, imported/indirect call, ud2, int3)
 //! or is host-specific (rdtsc/rdrand) is **not** diffable and surfaces as
 //! [`OracleOutcome::Exit`] rather than a comparable [`CpuOracle`] halt.
 
@@ -98,7 +98,7 @@ impl CpuState {
             ],
             rip: c.rip,
             rflags,
-            xmm: c.xmm,
+            xmm: *c.xmm,
             fs_base: c.fs_base,
             gs_base: c.gs_base,
         }
@@ -131,7 +131,7 @@ impl CpuState {
         c.sf = (self.rflags & SF != 0) as u8;
         c.of = (self.rflags & OF != 0) as u8;
         c.df = (self.rflags & DF != 0) as u8;
-        c.xmm = self.xmm;
+        c.xmm = self.xmm.into();
         c.fs_base = self.fs_base;
         c.gs_base = self.gs_base;
     }
@@ -154,7 +154,7 @@ pub enum OracleExit {
     NonDiffable(ExitReason),
     /// The external emulator (Unicorn) stopped with an error/exception rather
     /// than reaching the exit trampoline: an invalid opcode, an unmapped
-    /// fetch/access it could not satisfy, a `syscall`/`int` with no handler,
+    /// fetch/access it could not satisfy, an `int` with no handler,
     /// etc. The payload is the raw `uc_error` discriminant, kept only for
     /// diagnostics. Like [`OracleExit::NonDiffable`], nothing past this point
     /// is comparable, so [`differential`] declines the comparison.

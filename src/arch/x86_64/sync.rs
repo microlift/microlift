@@ -139,21 +139,6 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Declare the whole guest register file written, which disables the
-    /// lazy-sync prune ([`crate::core::regsync`]) for the rest of this region.
-    ///
-    /// For the one path that redefines everything at once out of the context:
-    /// the reload after a runtime-assisted syscall handler returns. Past it no
-    /// register still provably holds its entry-loaded value, so every store the
-    /// region goes on to emit has to stay.
-    pub fn mark_all_written(&mut self) {
-        // Delegated rather than enumerated. Naming every slot here was the same
-        // answer by a longer route, and it was a list this frontend had to keep
-        // in agreement with its own register file - a slot left off would be a
-        // store silently pruned and a stale register at run time.
-        self.keep_all_sync();
-    }
-
     /// Whether `reg` is carried out of the region in a machine register rather than
     /// through the `RegisterContext`, and so must be skipped by the full sync and
     /// the entry load.

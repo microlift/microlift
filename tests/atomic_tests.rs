@@ -1,5 +1,7 @@
+use microlift::arch::x86_64::context::X86_64Callbacks;
 use microlift::testkit::DEFAULT_LIFT_BASE;
 use microlift::testkit::prelude::*;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[test]
 fn test_mfence() {
@@ -526,7 +528,7 @@ fn test_cmpxchg16b_leaves_other_flags_alone() {
 /// on an x64 host (no other Cranelift backend lowers `atomic_cas.i128`), which
 /// is exactly why the mode is opt-in.
 #[test]
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn test_cmpxchg16b_native_mode() {
     let mut mem = Aligned128 { lo: 1, hi: 2 };
     let mut ctx = RegisterContext::default();
@@ -560,9 +562,32 @@ fn test_cmpxchg16b_native_mode() {
     assert_eq!((out.ctx.rax, out.ctx.rdx), (11, 22));
 }
 
-/// `Atomic128Mode::Exit` hands the instruction to the host as an ordinary
-/// unimplemented-instruction exit: memory is untouched, and the PC is already
-/// past the CMPXCHG16B so the host emulates it and resumes.
+/// `Atomic128Mode::Interpret` hands the instruction to the host's interpreter
+/// callback instead of lowering it: the region never sees the memory, and it
+/// carries on at the `RET` once the callback has advanced the PC.
+static EXIT_MODE_RIP: AtomicU64 = AtomicU64::new(0);
+static EXIT_MODE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Performs the CMPXCHG16B the lifter declined to lower, then steps the PC over
+/// its five bytes.
+unsafe extern "C" fn interpret_cmpxchg16b(ctx: *mut RegisterContext, num_instructions: u64) {
+    let ctx = unsafe { &mut *ctx };
+    EXIT_MODE_RIP.store(ctx.rip, Ordering::SeqCst);
+    EXIT_MODE_COUNT.store(num_instructions, Ordering::SeqCst);
+
+    let mem = unsafe { &mut *(ctx.rdi as *mut Aligned128) };
+    if (mem.lo, mem.hi) == (ctx.rax, ctx.rdx) {
+        mem.lo = ctx.rbx;
+        mem.hi = ctx.rcx;
+        ctx.zf = 1;
+    } else {
+        ctx.rax = mem.lo;
+        ctx.rdx = mem.hi;
+        ctx.zf = 0;
+    }
+    ctx.rip += 5;
+}
+
 #[test]
 fn test_cmpxchg16b_exit_mode() {
     let mut mem = Aligned128 { lo: 1, hi: 2 };
@@ -572,28 +597,32 @@ fn test_cmpxchg16b_exit_mode() {
     ctx.rdx = 2;
     ctx.rbx = 9;
     ctx.rcx = 9;
+    ctx.callbacks = X86_64Callbacks {
+        interpreter_fallback: interpret_cmpxchg16b,
+        ..X86_64Callbacks::default()
+    };
 
-    // 90: nop (so the exit PC is distinguishable from the region entry)
+    // 90: nop (so the callback's PC is distinguishable from the region entry)
     let bytes = [0x90, 0xF0, 0x48, 0x0F, 0xC7, 0x0F, 0xC3];
     let out = LiftTest::new(&bytes)
+        .no_unicorn()
         .ctx(ctx)
-        .atomic128(Atomic128Mode::Exit)
+        .atomic128(Atomic128Mode::Interpret)
         .run();
 
+    assert_eq!(out.exit, ExitReason::Return, "the region ran on to its RET");
     assert_eq!(
-        out.ctx.exit_reason,
-        ExitReason::UnimplementedInstruction as u32
+        EXIT_MODE_RIP.load(Ordering::SeqCst),
+        DEFAULT_LIFT_BASE + 1,
+        "the PC points at the CMPXCHG16B, not past it"
     );
-    assert_eq!(
-        out.ctx.rip,
-        DEFAULT_LIFT_BASE + 6,
-        "PC is past the CMPXCHG16B (nop + 5-byte instruction)"
-    );
+    assert_eq!(EXIT_MODE_COUNT.load(Ordering::SeqCst), 1);
     assert_eq!(
         (mem.lo, mem.hi),
-        (1, 2),
-        "memory untouched - the host runs it"
+        (9, 9),
+        "the callback performed the exchange"
     );
+    assert_eq!(out.ctx.zf, 1);
 }
 
 /// The shape a compiler emits for a 128-bit compare-exchange loop: save RBX,

@@ -59,6 +59,16 @@ impl GuestArch for X86_64 {
         std::mem::offset_of!(RegisterContext, control.imported_function_va) as i32
     }
 
+    fn callback_offsets() -> crate::core::callback::CallbackOffsets {
+        crate::core::callback::CallbackOffsets {
+            syscall: std::mem::offset_of!(RegisterContext, callbacks.handle_syscall) as i32,
+            interpreter_fallback: std::mem::offset_of!(
+                RegisterContext,
+                callbacks.interpreter_fallback
+            ) as i32,
+        }
+    }
+
     fn block_link_offsets() -> Option<crate::core::link::BlockLinkOffsets> {
         Some(crate::core::link::BlockLinkOffsets {
             table: std::mem::offset_of!(RegisterContext, link_table) as i32,
@@ -140,8 +150,7 @@ impl GuestArch for X86_64 {
     /// same bytes are reached through a computed pointer and through the
     /// context at a constant offset (`fpu_expand_tag_word`), and both must share
     /// the one whole-array region. The segment selectors are absent because they
-    /// are read and written in place with no SSA variable, and `_align_xmm` is
-    /// padding nothing touches.
+    /// are read and written in place with no SSA variable.
     fn context_fields(config: &LifterConfig) -> Vec<(i32, &'static str)> {
         let mut fields: Vec<(i32, &'static str)> = Vec::with_capacity(64);
 
@@ -191,9 +200,11 @@ impl GuestArch for X86_64 {
         fields.push((Self::exit_reason_offset(), "exit_reason"));
         fields.push((Self::exit_code_offset(), "exit_code"));
         fields.push((Self::imported_function_va_offset(), "imported_function_va"));
+        let callbacks = Self::callback_offsets();
+        fields.push((callbacks.syscall, "callbacks.handle_syscall"));
         fields.push((
-            std::mem::offset_of!(RegisterContext, syscall_handler) as i32,
-            "syscall_handler",
+            callbacks.interpreter_fallback,
+            "callbacks.interpreter_fallback",
         ));
         fields.push((std::mem::offset_of!(RegisterContext, mxcsr) as i32, "mxcsr"));
         fields.push((

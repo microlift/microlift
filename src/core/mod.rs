@@ -6,11 +6,13 @@
 
 pub mod abi;
 pub mod alias;
+pub mod align;
 pub mod bridge;
-pub mod exit;
-pub mod flags;
+pub mod callback;
 pub mod callret;
 pub mod dce;
+pub mod exit;
+pub mod flags;
 pub mod hostframe;
 pub mod link;
 pub mod optimize;
@@ -25,23 +27,24 @@ use std::ops::Range;
 use crate::arch::{ControlFlow, ControlFlowKind, InstructionEffects};
 use crate::core::abi::CallAbi;
 use crate::core::bridge::{BridgeImport, ImportKind, ImportRegistry};
+use crate::core::callback::CallbackOffsets;
+use crate::core::callret::{CallRetConfig, CallRetOffsets};
 use crate::core::exit::{ExitReason, MemorySegment, TransferKind};
 use crate::core::flags::{FlagEffects, FlagLiveness, FlagSet};
+use crate::core::hostframe::{HostFrameConfig, HostFrameOffsets};
 use crate::core::link::{BlockLinkConfig, BlockLinkOffsets};
 use crate::core::optimize::Optimizations;
 use crate::core::pin::{PinnedAbi, PinnedReg};
 use crate::core::specialize::Specialization;
-use crate::core::callret::{CallRetConfig, CallRetOffsets};
-use crate::core::hostframe::{HostFrameConfig, HostFrameOffsets};
 use crate::core::srcloc::SourceLocMap;
 use crate::function_traits::{DynamicSymbol, FunctionArgumentType};
 use crate::os::get_host_calling_conv;
 use cranelift::prelude::*;
+use cranelift_codegen::entity::EntitySet;
 use cranelift_codegen::ir::{
     ExtFuncData, ExternalName, FuncRef, Function, Inst, SigRef, SourceLoc, UserExternalName,
     UserExternalNameRef, UserFuncName,
 };
-use cranelift_codegen::entity::EntitySet;
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch, Variable};
 use std::collections::{HashMap, HashSet};
@@ -74,6 +77,11 @@ pub trait GuestArch: Sized {
     fn image_base_offset() -> i32;
     /// Byte offset of the `imported_function_va` control field.
     fn imported_function_va_offset() -> i32;
+
+    /// Where this guest's context keeps its host callbacks. See
+    /// [`crate::core::callback`]; every guest has them, because a syscall and
+    /// an unlifted instruction have nowhere else to go.
+    fn callback_offsets() -> CallbackOffsets;
 
     /// Where this guest's context keeps the two block-linking fields, or `None`,
     /// which makes [`LifterConfig::block_link`] inert for this guest.
@@ -754,17 +762,15 @@ pub enum Atomic128Mode {
     /// backend that cannot lower it (aarch64, riscv64, s390x) or on an x64 ISA
     /// built without `has_cmpxchg16b`.
     Native,
-    /// Do not lower it: exit with [`ExitReason::UnimplementedInstruction`] so the
+    /// Do not lower it: hand it to the host's interpreter callback so the
     /// runtime performs the operation itself, e.g. under a host-side lock. The
     /// only portable option that is also correct under concurrency, at the cost
-    /// of a VM exit per execution.
+    /// of a call per execution.
     ///
-    /// Follows the ordinary unimplemented-instruction contract: state fully
-    /// synced, `exit_code` holds the iced `Code`, and the PC is already past
-    /// the `CMPXCHG16B`, so the host emulates and resumes without adjusting it.
-    ///
-    /// [`ExitReason::UnimplementedInstruction`]: crate::context::ExitReason::UnimplementedInstruction
-    Exit,
+    /// Follows the ordinary unimplemented-instruction contract of
+    /// [`crate::core::callback`]: state fully synced, and the PC pointing *at*
+    /// the `CMPXCHG16B` for the interpreter to run and step over.
+    Interpret,
 }
 
 /// What bit pattern a *generated* NaN gets.
@@ -850,7 +856,6 @@ pub struct LifterConfig {
     /// defaults to [`AddressMode::ImageBaseRelative`], which is required for
     /// relocatable/cacheable artifacts.
     pub address_mode: AddressMode,
-    pub syscall_handler_call_conv: CallConv,
     /// The layout of immutable segments in memory at lift time, letting VSA
     /// promote memory values to lift-time constants.
     ///
@@ -1102,7 +1107,6 @@ impl Default for LifterConfig {
         Self {
             execution_mode: ExecutionMode::Jit,
             address_mode: AddressMode::ImageBaseRelative,
-            syscall_handler_call_conv: CallConv::SystemV,
             segments: Arc::new(Vec::new()),
             interpreter_fallback: false,
             resumption: VmResumptionPoints::default(),
@@ -1298,7 +1302,9 @@ pub struct LiftEngine<'a, A: GuestArch = crate::arch::x86_64::X86_64> {
     /// Latched just before each handler runs, because `current_ip` has by then
     /// been advanced to the *next* instruction.
     live_flags: FlagSet,
-    pub syscall_handler_sig: Option<SigRef>,
+    /// Imported signatures for the host callbacks, built on first use. See
+    /// [`Self::callback_sig`].
+    callback_sigs: HashMap<usize, SigRef>,
     /// Fast-call data for registered non-variadic imports, keyed by import VA.
     /// The execution mode decides whether the target is absolute (`Jit`) or
     /// relocatable (`RuntimeAssisted`). Filled in lazily and cached here.
@@ -1508,15 +1514,6 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                     .collect()
             })
             .unwrap_or_default();
-        let syscall_handler_sig = match config.execution_mode {
-            ExecutionMode::Jit => None,
-            ExecutionMode::RuntimeAssisted => {
-                let mut sig = Signature::new(config.syscall_handler_call_conv);
-                sig.params.push(AbiParam::new(types::I64));
-                Some(builder.import_signature(sig))
-            }
-        };
-
         // One alias region per context field, plus the three whole-object ones.
         // Interned up front rather than on demand: `MemFlagsData` is `Copy`, so
         // a field read borrows disjointly from `self.builder` and an access
@@ -1539,8 +1536,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             alias::region_flags(builder.func, alias::HOST_SLOT_ID, "host bridge slot");
         let link_table_flags =
             alias::region_flags(builder.func, alias::LINK_TABLE_ID, "block-link table");
-        let link_cell_flags =
-            alias::region_flags(builder.func, alias::LINK_CELL_ID, "link cells");
+        let link_cell_flags = alias::region_flags(builder.func, alias::LINK_CELL_ID, "link cells");
         let callret_flags =
             alias::region_flags(builder.func, alias::CALLRET_ID, "call-return ring");
         let const_data_flags =
@@ -1572,7 +1568,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             // Nothing has been analysed yet, and the IR the engine emits before
             // phase 2 - the entry block's state load - must not be elided.
             live_flags: FlagSet::ALL,
-            syscall_handler_sig,
+            callback_sigs: HashMap::new(),
             fast_calls,
             fast_call_by_name,
             bridge_sig: None,
@@ -1995,16 +1991,15 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                         namespace: 1,
                         index: PROVISIONAL_DATA_INDEX + self.data_objects.len() as u32,
                     });
-                let gv = self
-                    .builder
-                    .func
-                    .create_global_value(cranelift_codegen::ir::GlobalValueData::Symbol {
+                let gv = self.builder.func.create_global_value(
+                    cranelift_codegen::ir::GlobalValueData::Symbol {
                         name: ExternalName::user(name_ref),
                         offset: 0.into(),
                         // Far, for the same `adrp` range reason as the cell array.
                         colocated: false,
                         tls: false,
-                    });
+                    },
+                );
                 self.data_objects.push(DataEntry {
                     object: DataObject {
                         name,
@@ -2063,8 +2058,11 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
     /// Reported as [`LiftedCode::data_dependencies`]. Empty unless
     /// [`LifterConfig::analyze_jump_tables`] ran.
     pub fn jump_table_extents(&self) -> Vec<Range<u64>> {
-        let mut extents: Vec<Range<u64>> =
-            self.jump_tables.values().map(|t| t.extent.clone()).collect();
+        let mut extents: Vec<Range<u64>> = self
+            .jump_tables
+            .values()
+            .map(|t| t.extent.clone())
+            .collect();
         extents.sort_by_key(|r| r.start);
         let mut merged: Vec<Range<u64>> = Vec::with_capacity(extents.len());
         for range in extents {
@@ -2190,6 +2188,131 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         )?;
         self.fast_calls.insert(va, fast_call.clone());
         Some(fast_call)
+    }
+
+    /// Emit a switch-based indirect jump dispatch for a runtime target value.
+    /// Jumps to any known block whose offset matches; otherwise exits the VM.
+    pub fn emit_runtime_indirect_jump(&mut self, target_val: Value) -> crate::Result<()> {
+        // Back into lift-time VA space, which is what the block map is keyed on.
+        let target_offset = self.to_lift_va(target_val);
+
+        let external_block = self.builder.create_block();
+        self.emit_region_switch(target_offset, external_block);
+
+        self.builder.switch_to_block(external_block);
+        self.builder.seal_block(external_block);
+        A::sync_to_context(self, Some(target_val), ExitReason::UnknownJump)?;
+        self.write_exit_code(TransferKind::IndirectJump as u32);
+        // Linkable: a `jmp` through a register to an address this region does
+        // not contain is answered by entering whatever covers it.
+        self.emit_exit(Some(target_val));
+        self.block_terminated = true;
+        Ok(())
+    }
+
+    /// The signature of a callback taking the context pointer plus `extra`
+    /// further `u64` arguments and returning nothing. Created on first use.
+    fn callback_sig(&mut self, extra: usize) -> SigRef {
+        if let Some(&sig) = self.callback_sigs.get(&extra) {
+            return sig;
+        }
+        let mut sig = Signature::new(get_host_calling_conv());
+        for _ in 0..=extra {
+            sig.params.push(AbiParam::new(types::I64));
+        }
+        let sig_ref = self.builder.import_signature(sig);
+        self.callback_sigs.insert(extra, sig_ref);
+        sig_ref
+    }
+
+    /// Call the host's syscall callback inline and resume the guest. A syscall
+    /// is published at its own return address, so `pc` is both what the callback
+    /// sees and what it is expected to come back to. See
+    /// [`crate::core::callback`].
+    pub fn emit_syscall_callback(&mut self, pc: Option<Value>) -> crate::Result<()> {
+        let offset = A::callback_offsets().syscall;
+        self.emit_callback(offset, pc, pc, &[])
+    }
+
+    /// Call the host's interpreter fallback inline to run `instructions` guest
+    /// instructions starting at `pc`, then resume at `resume`.
+    ///
+    /// The two differ here where they coincide for a syscall: the interpreter is
+    /// pointed *at* the instruction it is to run, and comes back from the far
+    /// side of it. See [`crate::core::callback`].
+    pub fn emit_interpreter_callback(
+        &mut self,
+        pc: Option<Value>,
+        resume: Option<Value>,
+        instructions: u64,
+    ) -> crate::Result<()> {
+        let offset = A::callback_offsets().interpreter_fallback;
+        self.emit_callback(offset, pc, resume, &[instructions])
+    }
+
+    /// Publish the guest state, call the callback at context `offset`, take the
+    /// state back, and dispatch on the PC the callback left behind.
+    ///
+    /// On return the builder sits in the continuation the callback fell through
+    /// to, and the block is **not** terminated - the caller keeps emitting the
+    /// rest of the region inline.
+    fn emit_callback(
+        &mut self,
+        offset: i32,
+        pc: Option<Value>,
+        resume: Option<Value>,
+        extra: &[u64],
+    ) -> crate::Result<()> {
+        let ctx_ptr = self.builder.use_var(A::context_ptr_var(&self.state));
+        A::sync_to_context(self, pc, ExitReason::None)?;
+        self.publish_pinned()?;
+
+        let target = self.ctx_load(types::I64, ctx_ptr, offset);
+        let sig = self.callback_sig(extra.len());
+        let mut args = vec![ctx_ptr];
+        for &value in extra {
+            args.push(self.builder.ins().iconst(types::I64, value as i64));
+        }
+        self.builder.ins().call_indirect(sig, target, &args);
+
+        A::load_state_from_context(self)?;
+        self.reload_pinned()?;
+        // The callback may have written any field, so past here nothing still
+        // provably holds its entry value and every sync store has to stay.
+        self.keep_all_sync();
+
+        self.resume_after_callback(resume)
+    }
+
+    /// Branch on where the callback left the PC: the `resume` address it was
+    /// expected to come back to falls through inline, anything else is
+    /// dispatched like an indirect jump, which may leave the region entirely.
+    fn resume_after_callback(&mut self, resume: Option<Value>) -> crate::Result<()> {
+        if self.config.analysis_mode {
+            return Ok(());
+        }
+        let ctx_ptr = self.builder.use_var(A::context_ptr_var(&self.state));
+        let landed = self.ctx_load(types::I64, ctx_ptr, A::pc_offset());
+        let expected = match resume {
+            Some(value) => value,
+            None => self.runtime_current_ip(),
+        };
+        let resumed = self.builder.ins().icmp(IntCC::Equal, landed, expected);
+
+        let continue_block = self.builder.create_block();
+        let divert_block = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(resumed, continue_block, &[], divert_block, &[]);
+
+        self.builder.switch_to_block(divert_block);
+        self.builder.seal_block(divert_block);
+        self.emit_runtime_indirect_jump(landed)?;
+
+        self.builder.switch_to_block(continue_block);
+        self.builder.seal_block(continue_block);
+        self.block_terminated = false;
+        Ok(())
     }
 
     /// The signature every bridge is called through:
@@ -2533,10 +2656,8 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                         namespace: 1,
                         index: 0,
                     });
-                let gv = self
-                    .builder
-                    .func
-                    .create_global_value(cranelift_codegen::ir::GlobalValueData::Symbol {
+                let gv = self.builder.func.create_global_value(
+                    cranelift_codegen::ir::GlobalValueData::Symbol {
                         name: ExternalName::user(name),
                         offset: 0.into(),
                         // **Far, though the array is defined in the same object as
@@ -2553,7 +2674,8 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                         // range.
                         colocated: false,
                         tls: false,
-                    });
+                    },
+                );
                 self.link_cell_base = Some(gv);
                 gv
             }
@@ -2698,11 +2820,10 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         self.builder.switch_to_block(nest);
         let ctx_ptr = self.builder.use_var(A::context_ptr_var(&self.state));
         let depth = self.ctx_load(types::I32, ctx_ptr, offsets.depth);
-        let room = self.builder.ins().icmp_imm_u(
-            IntCC::UnsignedLessThan,
-            depth,
-            config.max_depth as i64,
-        );
+        let room =
+            self.builder
+                .ins()
+                .icmp_imm_u(IntCC::UnsignedLessThan, depth, config.max_depth as i64);
         // The host stack is finite and every live guest call is a frame of it.
         // Past the ceiling a call takes the ordinary exit, which costs a host
         // dispatch and nothing else.
@@ -2780,17 +2901,15 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         // not a crash.
 
         let reason = self.ctx_load(types::I32, ctx_ptr, A::exit_reason_offset());
-        let is_transfer = self.builder.ins().icmp_imm_u(
-            IntCC::Equal,
-            reason,
-            ExitReason::UnknownJump as i64,
-        );
+        let is_transfer =
+            self.builder
+                .ins()
+                .icmp_imm_u(IntCC::Equal, reason, ExitReason::UnknownJump as i64);
         let code_field = self.ctx_load(types::I32, ctx_ptr, A::exit_code_offset());
-        let is_return = self.builder.ins().icmp_imm_u(
-            IntCC::Equal,
-            code_field,
-            TransferKind::Return as i64,
-        );
+        let is_return =
+            self.builder
+                .ins()
+                .icmp_imm_u(IntCC::Equal, code_field, TransferKind::Return as i64);
         let pc = self.ctx_load(types::I64, ctx_ptr, A::pc_offset());
         let want = self.runtime_addr(resume);
         let here = self.builder.ins().icmp(IntCC::Equal, pc, want);
@@ -3600,7 +3719,11 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                             self.current_ip = cur;
                             self.set_source_loc(cur);
                             A::sync_to_context(self, None, ExitReason::None)?;
-                            self.emit_static_exit(cur, None, crate::core::link::LinkSiteKind::StaticEdge);
+                            self.emit_static_exit(
+                                cur,
+                                None,
+                                crate::core::link::LinkSiteKind::StaticEdge,
+                            );
                             self.block_terminated = true;
                             break;
                         }
@@ -3784,7 +3907,11 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                     // link does - and `offset` is known *now*, which is what lets it be a
                     // cell rather than a hash of a runtime PC. The largest population of
                     // static edges in any region.
-                    self.emit_static_exit(offset, None, crate::core::link::LinkSiteKind::StaticEdge);
+                    self.emit_static_exit(
+                        offset,
+                        None,
+                        crate::core::link::LinkSiteKind::StaticEdge,
+                    );
                 }
                 processed_blocks.insert(block);
             }

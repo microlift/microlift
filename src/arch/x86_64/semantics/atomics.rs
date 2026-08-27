@@ -174,9 +174,8 @@ impl<'a> Lifter<'a> {
             });
         }
 
-        if self.config.atomic128 == Atomic128Mode::Exit {
-            // The host performs the whole operation and resumes; the PC the
-            // exit records is already past this instruction, per the ordinary
+        if self.config.atomic128 == Atomic128Mode::Interpret {
+            // The host performs the whole operation inline, per the ordinary
             // unimplemented-instruction contract.
             return self.handle_unimplemented_instruction(instruction);
         }

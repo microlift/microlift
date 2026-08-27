@@ -103,7 +103,7 @@ impl<'a> Lifter64<'a> {
             Opcode::PACIASP | Opcode::AUTIASP => Ok(()),
             other => {
                 if self.config.interpreter_fallback {
-                    self.exit_unimplemented()
+                    self.interpret_unimplemented(instr)
                 } else {
                     Err(MicroliftError::UnsupportedInstruction {
                         mnemonic: format!("{other:?}"),
@@ -843,18 +843,19 @@ impl<'a> Lifter64<'a> {
         Ok(())
     }
 
+    /// `SVC` calls the host's syscall callback inline; see
+    /// [`crate::core::callback`]. `current_ip` is already the next instruction,
+    /// which is the address the callback returns to.
     fn handle_svc(&mut self) -> crate::Result<()> {
-        self.sync_to_context(None, ExitReason::Syscall)?;
-        self.emit_host_return();
-        self.block_terminated = true;
-        Ok(())
+        self.emit_syscall_callback(None)
     }
 
-    fn exit_unimplemented(&mut self) -> crate::Result<()> {
-        self.sync_to_context(None, ExitReason::UnimplementedInstruction)?;
-        self.emit_host_return();
-        self.block_terminated = true;
-        Ok(())
+    /// Hand an instruction this frontend does not lift to the host's
+    /// interpreter, inline; see [`crate::core::callback`].
+    fn interpret_unimplemented(&mut self, instr: &A64Instr) -> crate::Result<()> {
+        let pc = self.runtime_addr(instr.ip);
+        let resume = self.runtime_addr(instr.ip + 4);
+        self.emit_interpreter_callback(Some(pc), Some(resume), 1)
     }
 
     /// Resolve an instruction's PC-relative branch target.

@@ -72,7 +72,7 @@ fn direct_bridge_handles_call_inline() {
 /// Refuses to handle the call: writes its own exit state and returns non-zero.
 unsafe extern "C" fn bridge_bail(ctx: *mut RegisterContext, _va: u64) -> u32 {
     let ctx = unsafe { &mut *ctx };
-    ctx.exit_reason = ExitReason::Syscall as u32;
+    ctx.exit_reason = ExitReason::Interrupt as u32;
     ctx.exit_code = 0x1234;
     ctx.rax = 0xDEAD;
     1
@@ -90,7 +90,7 @@ fn nonzero_return_exits_with_the_bridges_own_exit_state() {
 
     // `exit_reason`/`exit_code` are exactly what the bridge wrote - the lifted
     // code does not overwrite them on the way out.
-    assert_eq!(out.exit, ExitReason::Syscall);
+    assert_eq!(out.exit, ExitReason::Interrupt);
     assert_eq!(out.ctx.exit_code, 0x1234);
     assert_eq!(out.ctx.rax, 0xDEAD);
     // The PC published before the call is the resume point after the `CALL`.
@@ -197,7 +197,7 @@ fn undeclared_state_survives_an_exiting_bridge() {
         .with_config(|c| c.register_bridge_import(IMPORT_VA, bridge))
         .run();
 
-    assert_eq!(out.exit, ExitReason::Syscall);
+    assert_eq!(out.exit, ExitReason::Interrupt);
     assert_eq!(out.ctx.rax, 0xDEAD); // declared clobber: the bridge's value wins
     assert_eq!(out.ctx.rbx, 0x5555);
     assert_eq!(out.ctx.r12, 0x7777);
