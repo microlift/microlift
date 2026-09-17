@@ -5,13 +5,14 @@
 //! [`GuestCodeMap`] is the post-compilation product, sorted host code ranges
 //! tagged with the guest VA they implement.
 //!
-//! A `SourceLoc` is a `u32` and `u32::MAX` is reserved as "no location", so a VA
-//! is stored as a *signed* displacement from the lift base, biased into the
-//! unsigned range: within ±2 GiB it round-trips exactly, further away it encodes
-//! as no location rather than a wrong one. Signed because out-of-region branch
-//! targets go backwards as often as forwards.
+//! A `SourceLoc` is 31 bits - Cranelift reserves the high bit to tag a location
+//! as relative - and `0x7fff_ffff` is reserved as "no location", so a VA is
+//! stored as a signed displacement from the lift base, biased into that range:
+//! within ~1 GiB it round-trips exactly, further away it encodes as no location
+//! rather than a wrong one. Signed because out-of-region branch targets go
+//! backwards as often as forwards.
 //!
-//! The VA is a *lift-time* address, so under
+//! The VA is a lift-time address, so under
 //! [`AddressMode::ImageBaseRelative`](crate::core::AddressMode::ImageBaseRelative)
 //! a consumer comparing against a live PC must map it as
 //! [`LiftEngine::to_lift_va`](crate::core::LiftEngine::to_lift_va) does.
@@ -19,11 +20,12 @@
 use cranelift_codegen::CompiledCode;
 use cranelift_codegen::ir::SourceLoc;
 
-/// The bias applied to the signed displacement so it fills the `u32` range with
-/// its ordering intact. `delta == i32::MIN` maps to `0`, `delta == 0` maps to
-/// `0x8000_0000`, and `delta == i32::MAX` maps to `u32::MAX` - which collides
-/// with Cranelift's reserved "no location" value and is therefore rejected.
-const SIGN_BIAS: u32 = 0x8000_0000;
+/// The bias applied to the signed displacement so it fills the 31-bit source
+/// location range with its ordering intact. `delta == -2^30` maps to `0`,
+/// `delta == 0` maps to `0x4000_0000`, and `delta == 2^30 - 1` maps to
+/// `0x7fff_ffff` - which collides with Cranelift's reserved "no location" value
+/// and is therefore rejected.
+const SIGN_BIAS: i64 = 0x4000_0000;
 
 /// Converts between guest virtual addresses and Cranelift [`SourceLoc`]s for
 /// one lifted region. Cheap to copy: the whole mapping is the lift base plus
@@ -44,7 +46,7 @@ impl SourceLocMap {
 
     /// Encode guest VA `va` as a `SourceLoc`.
     ///
-    /// [`SourceLoc::default`] ("no location") when `va` is more than ~2 GiB from
+    /// [`SourceLoc::default`] ("no location") when `va` is more than ~1 GiB from
     /// [`lift_base`](Self::lift_base). Never returns a *wrong* location.
     pub fn encode(&self, va: u64) -> SourceLoc {
         self.try_encode(va).unwrap_or_default()
@@ -54,10 +56,9 @@ impl SourceLocMap {
     /// location.
     pub fn try_encode(&self, va: u64) -> Option<SourceLoc> {
         let delta = va.wrapping_sub(self.lift_base) as i64;
-        let delta = i32::try_from(delta).ok()?;
-        let bits = (delta as u32) ^ SIGN_BIAS;
-        // `i32::MAX` biases to the reserved "no location" encoding.
-        if bits == u32::MAX {
+        let bits = u32::try_from(delta + SIGN_BIAS).ok()?;
+        // The top of the range is the reserved "no location" encoding.
+        if bits >= SourceLoc::default().bits() {
             return None;
         }
         Some(SourceLoc::new(bits))
@@ -69,8 +70,8 @@ impl SourceLocMap {
         if loc.is_default() {
             return None;
         }
-        let delta = (loc.bits() ^ SIGN_BIAS) as i32;
-        Some(self.lift_base.wrapping_add(delta as i64 as u64))
+        let delta = i64::from(loc.bits()) - SIGN_BIAS;
+        Some(self.lift_base.wrapping_add(delta as u64))
     }
 }
 
@@ -126,7 +127,7 @@ impl GuestCodeMap {
                 Some(GuestCodeRange {
                     start: srcloc.start,
                     end: srcloc.end,
-                    guest_va: map.decode(srcloc.loc)?,
+                    guest_va: map.decode(srcloc.loc.as_abs())?,
                 })
             })
             .collect();
@@ -210,15 +211,25 @@ mod tests {
     #[test]
     fn out_of_range_yields_no_location() {
         let map = SourceLocMap::new(0x1000);
-        assert!(map.try_encode(0x1000 + (1 << 31)).is_none());
-        assert!(
-            map.try_encode(0x1000u64.wrapping_sub(1 << 31) - 1)
-                .is_none()
-        );
-        // `i32::MAX` collides with the reserved encoding and is rejected.
-        assert!(map.try_encode(0x1000 + i32::MAX as u64).is_none());
-        assert!(map.try_encode(0x1000 + i32::MAX as u64 - 1).is_some());
+        assert!(map.try_encode(0x1000 + (1 << 30)).is_none());
+        assert!(map.try_encode(0x1000u64.wrapping_sub(1 << 30) - 1).is_none());
+        // The most positive displacement collides with the reserved encoding.
+        assert!(map.try_encode(0x1000 + (1 << 30) - 1).is_none());
+        assert!(map.try_encode(0x1000 + (1 << 30) - 2).is_some());
+        assert!(map.try_encode(0x1000u64.wrapping_sub(1 << 30)).is_some());
         assert_eq!(map.decode(SourceLoc::default()), None);
+    }
+
+    #[test]
+    fn encodings_stay_inside_cranelifts_31_bit_range() {
+        let map = SourceLocMap::new(0x1000);
+        for delta in [-(1i64 << 30), -1, 0, 1, (1 << 30) - 2] {
+            let va = 0x1000u64.wrapping_add(delta as u64);
+            let loc = map.try_encode(va).unwrap();
+            assert!(loc.bits() < 0x8000_0000, "delta {delta}");
+            assert!(!loc.is_default(), "delta {delta}");
+            assert_eq!(map.decode(loc), Some(va), "delta {delta}");
+        }
     }
 
     #[test]
