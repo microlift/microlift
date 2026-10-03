@@ -1,15 +1,3 @@
-//! The call-return ring: predicting where a guest `RET` goes.
-//!
-//! A port of FEX's call-return shadow stack, with a link cell where FEX keeps a
-//! raw host PC - see [`microlift::core::callret`] for why Cranelift forces that
-//! substitution and what it costs.
-//!
-//! Two properties carry this file, and neither is a happy path.
-//! [`a_return_is_predicted_with_no_table_at_all`] removes every other mechanism,
-//! so a `RET` that lands must have landed through the ring; and
-//! [`an_unbalanced_guest_gets_correct_answers_with_a_worse_hit_rate`] is the
-//! property the whole no-guard-page argument rests on.
-
 use std::sync::{Arc, RwLock};
 
 use microlift::core::callret::CallRetConfig;

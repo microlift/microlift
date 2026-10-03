@@ -1,11 +1,3 @@
-//! Link cells: exits whose destination is known at lift time linking through a
-//! dedicated row instead of hashing a PC into the shared table.
-//!
-//! Microlift's answer to FEX's backpatched `b`/`bl`. The control that carries
-//! this whole file is [`a_static_edge_links_with_no_table_at_all`]: it removes
-//! the *only* other mechanism, so a region that reaches its successor there
-//! reached it through a cell and nothing else.
-
 use std::sync::{Arc, RwLock};
 
 use microlift::arch::x86_64::X86_64;
@@ -96,20 +88,6 @@ fn a_direct_jump_out_of_the_region_gets_a_cell() {
     assert_eq!(code.link_sites[0].kind, LinkSiteKind::StaticEdge);
 }
 
-/// The cell array is referenced as a **far** symbol, and that is not a tuning
-/// choice.
-///
-/// `colocated` reads like "is it in the same object", and the array is - but what
-/// the aarch64 backend does with it is pick `adrp`/`add` over an absolute literal,
-/// and `adrp` reaches ±4 GiB. A JIT does not honour that: `cranelift-jit` serves
-/// executable and writable allocations from two separate `mmap`s, and in a
-/// long-running host those drift apart without bound. Rosetta 3 found this the
-/// expensive way - half a minute into a real game, with the two allocations 6 GiB
-/// apart and `compiled_blob.rs` panicking on the relocation rather than veneering
-/// it the way it would a far `bl`.
-///
-/// So the property is asserted on the IR rather than on the emitted bytes: this is
-/// the field whose value decides it, and it regressed silently once.
 #[test]
 fn the_cell_array_is_reached_by_an_absolute_address() {
     use cranelift_codegen::ir::GlobalValueData;
@@ -298,9 +276,6 @@ fn a_cell_names_the_link_target_and_the_image_base() {
 
 #[test]
 fn invalidating_the_target_clears_the_cell_that_named_it() {
-    // FEX's `DirectBlockDelinker`, and the reason invalidation needs no epoch on
-    // the hot path - behavioural, because asserting the row went to zero would
-    // pass against an implementation that zeroed everything.
     let cache = Arc::new(RwLock::new(CodeCache::new()));
     let mut guest = Guest::new(&cache);
     cache.write().unwrap().insert(callee(true));

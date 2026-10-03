@@ -99,15 +99,6 @@ pub const IMAGE_BASE_OFFSET: i32 = 16;
 ///   same reason zero is not a guest PC, so a freshly zeroed array is a valid
 ///   uninstalled state and clearing a cell is how a link is retracted.
 ///
-/// This is Microlift's answer to FEX's backpatched `b`/`bl`. FEX rewrites the
-/// call site because the host address of a static target is not known until
-/// first execution and a stub is its only way to learn it; a Microlift host
-/// knows at cache-insert time, so the first execution of a static edge is
-/// already a load and a branch rather than a callback into the runtime. A cell
-/// is also data: no instruction encoder in the lifter, no I-cache
-/// maintenance, no cross-modifying-code rules, and it survives being cached to
-/// disk as an AOT artifact.
-///
 /// Reported as [`LiftedCode::link_sites`], in cell order.
 ///
 /// [`LiftedCode::link_sites`]: crate::core::LiftedCode::link_sites

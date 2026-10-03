@@ -1,61 +1,8 @@
-//! The call-return stack: predicting where a guest `RET` goes.
-//!
-//! A guest `RET` is the most common linkable exit in a real program, and it is
-//! the one the [table probe](crate::core::link) serves worst: the return address
-//! is a runtime value, so there is nothing to specialize, and every return pays
-//! a shift, a mask, a scale, an add, a load and a compare. FEX answers this with
-//! a shadow stack of `<GuestReturnRIP, HostReturnPC>` pairs pushed at each call
-//! and popped at each return (`BranchOps.cpp:164-196`). This is the same idea,
-//! with the one substitution Cranelift forces.
-//!
-//! FEX pushes `adr TMP1, &l_CallReturn` - the address of a label inside the
-//! function being emitted - and returns with `ret(TMP2)`, an indirect branch
-//! the CPU's return-address-stack predictor accepts because the matching `bl`
-//! trained it. None of that is expressible here. Cranelift can materialize the
-//! address of a function or a data symbol and nothing finer; it has no
-//! `ret`-flavoured indirect branch, and no way to reach an arbitrary host
-//! address except a call or a tail call.
-//!
-//! So the second word is a [link cell](crate::core::link::LinkSite) instead
-//! of a host PC: the row naming the region that contains the return address,
-//! installed by the host like any other. The region's entry dispatch makes up
-//! the difference, which works because a return address is always a *call resume
-//! point* and therefore already an arm of that dispatch - see
-//! [`VmResumptionPoints::ExitOnly`](crate::core::VmResumptionPoints).
-//!
-//! What this saves us is the lookup: one load and one compare instead of the probe's
-//! six, and no collisions. What it does not do is FEX's branch prediction.
-//! Do not read a FEX benchmark and expect it here.
-//!
-//! Storing a cell rather than a raw host PC has a second consequence, and it is
-//! the reason there is nothing here resembling FEX's `Core.cpp:992`: FEX must
-//! wipe its entire shadow stack on any successful invalidation, because the
-//! stack holds addresses of code that may have just been freed. A cell is
-//! retracted by the same reverse map as every other link, so this stack is never
-//! wiped.
-//!
-//! # Imbalance design
-//!
-//! 1. Overflow is a miss. Wrapping overwrites the oldest frame. When that
-//!    frame's `RET` eventually arrives it reads whatever is there, fails the
-//!    `guest_pc` compare, and falls through to the probe.
-//! 2. Underflow cannot happen. [`CallRetEntry::guest_pc`] advances the
-//!    pointer only on a match, and an untouched frame holds zero, which no
-//!    guest returns to - the same argument [`crate::core::link`] makes for an
-//!    empty row.
-//! 3. A mispaired pop is still correct. A frame is used only when its
-//!    `guest_pc` matches, and a cell for a guest PC names a translation
-//!    enterable there. That is the interchangeability invariant again, applied
-//!    to a second table.
-//!
-//! So a guest that unbalances its calls and returns - `longjmp`, a hand-rolled
-//! coroutine, a `push`/`ret` thunk - costs hit rate and nothing else.
-
 /// One frame: *"if the guest returns to `guest_pc`, the row naming where to go
 /// is `cell`."*
 ///
 /// `#[repr(C)]` and exactly 16 bytes because lifted code indexes the ring with a
-/// mask - the layout is ABI, not an implementation detail.
+/// mask.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CallRetEntry {

@@ -288,11 +288,6 @@ fn bump(counter: &AtomicU64, by: u64) {
 }
 
 /// The shared guest-address -> translation map.
-///
-/// FEX's `LookupCache` L3 plus its `CodePages`; the L1 equivalent is
-/// [`LinkTable`](super::LinkTable), which lives per thread. Shared between
-/// threads behind whatever lock the host prefers - the hot path does not touch
-/// this at all, so an `RwLock` is enough.
 #[derive(Default)]
 pub struct CodeCache {
     /// Every address any translation can be entered at. One translation appears
@@ -302,13 +297,6 @@ pub struct CodeCache {
     /// `BTreeMap` because invalidation asks for a *range* of pages.
     pages: BTreeMap<u64, Vec<u64>>,
     /// Every installed link cell, keyed by the guest address it names.
-    ///
-    /// FEX's `GuestToHostMap::BlockLinks`, and the reason invalidation needs no
-    /// epoch on the row: a cell is found and cleared in the rare event rather
-    /// than checked on every exit forever. Table rows need no equivalent - the
-    /// table is direct-mapped, so `slot(pc)` finds a row in O(1). FEX needs a
-    /// reverse map for its rows only because its L1 is a *cache* of a general
-    /// map; here the table is the map.
     links: HashMap<u64, Vec<CellRef>>,
     /// Cells whose target had no translation when the region was inserted, so
     /// they can be filled the moment one appears.

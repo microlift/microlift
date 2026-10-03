@@ -1007,7 +1007,7 @@ pub struct LifterConfig {
     /// Exit rather than guess when the entry PC matches no resume point.
     ///
     /// The dispatch needs a default arm, and historically that arm is the
-    /// region's **first block** - so a host resuming at an address the region
+    /// region's first block - so a host resuming at an address the region
     /// cannot start at silently executes from the top, with no fault and no
     /// diagnostic.
     ///
@@ -1029,47 +1029,13 @@ pub struct LifterConfig {
     /// Disabled by default in the name of preventing emitted code size from bloating
     /// to an extreme degree.
     pub inline_link_probes: bool,
-    /// Give every exit whose destination is known at **lift time** a
+    /// Give every exit whose destination is known at lift time a
     /// [`LinkSite`] of its own, so it links through a dedicated cell instead of
     /// hashing a PC into the shared table. Off by default.
-    ///
-    /// Microlift's answer to FEX's backpatched direct branches; see
-    /// [`LinkSite`] for why it is a data cell rather than a rewritten call site,
-    /// and for what it buys over the probe. Inert unless [`block_link`] is on -
-    /// a cell is a [`BlockLinkEntry`] and the whole mechanism is part of block
-    /// linking, not an alternative to it.
-    ///
-    /// **This makes the compiled region bigger, and is meant to.** The probe
-    /// stays as the fallback - a cell is empty until its target is compiled, and
-    /// empty again after an invalidation - so a cell is a fast path bolted in
-    /// front of the slow one rather than a replacement for it. Measured over
-    /// reachable out-of-region conditional branches: **+42 bytes of `.text` per
-    /// exit on x86-64 and +28 on aarch64**, plus 32 bytes of zero-initialised
-    /// data per *distinct* target.
-    ///
-    /// So the case for it is never code size. It is what the exit *executes*: a
-    /// load and a branch instead of a shift, mask, scale, add, load and compare
-    /// - and, mattering more, a lookup that cannot collide, where the table
-    /// aliases two hot targets sixteen bytes apart into one row and turns a link
-    /// into a permanent miss. That is not visible in a size measurement, which
-    /// is why this is opt-in and why the tests that prove it works are
-    /// behavioural (`link_cell_tests`, which reaches a successor with the table
-    /// detached) rather than a size delta.
-    ///
-    /// Budget accordingly: on a page-bounded region of branch-dense code, cells
-    /// can rival the code itself.
-    ///
-    /// [`LinkSite`]: crate::core::link::LinkSite
-    /// [`block_link`]: Self::block_link
-    /// [`BlockLinkEntry`]: crate::core::link::BlockLinkEntry
     pub link_cells: bool,
     /// Predict a guest `RET` out of a ring of `<return address, link cell>`
     /// frames pushed at each call, instead of hashing the popped address into
     /// the shared table. Off by default.
-    ///
-    /// A port of FEX's call-return shadow stack, with the one substitution
-    /// Cranelift forces on it - see [`crate::core::callret`] for what that is,
-    /// what it buys, and why the ring needs no guard pages.
     ///
     /// Requires [`link_cells`](Self::link_cells): a hit hands back a cell, so
     /// there is nothing for one to name without them. Also inert unless
