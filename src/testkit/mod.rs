@@ -488,6 +488,7 @@ impl<'a> LiftTest<'a> {
 /// - **No persistent data-memory writes.** Microlift runs first and mutates the
 ///   shared memory, so a program writing to non-stack memory would feed Unicorn
 ///   already-mutated inputs. Stack writes are exempt.
+/// - **No syscalls.** Unicorn does not run Microlift's host syscall callback.
 /// - **x86-undefined flags masked.** `MUL`/`IMUL` (SF/ZF) and variable-count
 ///   shifts/rotates/`BT*` (OF) leave flags architecturally undefined, so the two
 ///   engines may pick different bits without either being wrong.
@@ -507,7 +508,12 @@ fn cross_check_unicorn(bytes: &[u8], ip: u64, init: &oracle::CpuState, outcome: 
     let ProgramFacts {
         undefined_rflags,
         writes_data_mem,
+        has_syscall,
     } = analyze_program(bytes, ip);
+
+    if has_syscall {
+        return;
+    }
 
     // A program that persists writes to non-stack memory cannot be diffed by
     // sequential re-execution on shared host memory (Microlift already ran and
@@ -551,6 +557,7 @@ struct ProgramFacts {
     undefined_rflags: u64,
     /// Whether any instruction writes to memory that is not `RSP`-relative.
     writes_data_mem: bool,
+    has_syscall: bool,
 }
 
 /// Decode `bytes` (linear sweep from `ip`) and derive the [`ProgramFacts`] the
@@ -558,7 +565,7 @@ struct ProgramFacts {
 /// the facts only need to cover the instructions that actually executed.
 #[cfg(feature = "unicorn-oracle")]
 fn analyze_program(bytes: &[u8], ip: u64) -> ProgramFacts {
-    use iced_x86::{Decoder, DecoderOptions, InstructionInfoFactory, OpAccess, Register};
+    use iced_x86::{Decoder, DecoderOptions, InstructionInfoFactory, Mnemonic, OpAccess, Register};
 
     // iced's `RflagsBits` uses its own bit layout; translate to the packed
     // EFLAGS positions `CpuState::rflags` uses.
@@ -593,12 +600,14 @@ fn analyze_program(bytes: &[u8], ip: u64) -> ProgramFacts {
     let mut factory = InstructionInfoFactory::new();
     let mut undefined = 0u32;
     let mut writes_data_mem = false;
+    let mut has_syscall = false;
 
     while decoder.can_decode() {
         let insn = decoder.decode();
         if insn.is_invalid() {
             break;
         }
+        has_syscall |= insn.mnemonic() == Mnemonic::Syscall;
 
         // Last-writer-wins: flags this instruction gives a defined value become
         // defined again; flags it leaves undefined become undefined.
@@ -624,6 +633,7 @@ fn analyze_program(bytes: &[u8], ip: u64) -> ProgramFacts {
     ProgramFacts {
         undefined_rflags: iced_to_eflags(undefined),
         writes_data_mem,
+        has_syscall,
     }
 }
 
