@@ -2,3 +2,4 @@
 test-artifacts/
 .cargo/config.toml
 .vscode
+.DS_Store
