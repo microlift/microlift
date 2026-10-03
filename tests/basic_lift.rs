@@ -1,5 +1,3 @@
-//! Minimal smoke test and canonical template for the shared testkit harness.
-
 use microlift::testkit::prelude::*;
 
 #[test]
