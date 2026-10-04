@@ -221,15 +221,8 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Whether the instruction being lifted has to compute `flag`.
-    ///
-    /// The x86-64 spelling of [`LiftEngine::flag_live`], and the only place the
-    /// `X86Flag` discriminant is used as a flag *index* - the numbering
-    /// [`crate::arch::x86_64::flag_effects`] classifies in. Always true unless
-    /// [`LifterConfig::eliminate_dead_flags`] is on.
-    ///
-    /// [`LiftEngine::flag_live`]: crate::core::LiftEngine::flag_live
-    /// [`LifterConfig::eliminate_dead_flags`]: crate::core::LifterConfig::eliminate_dead_flags
+    /// Flag math is always emitted. The finished SSA pass removes computations
+    /// whose results have no observable use.
     pub fn flag_needed(&self, flag: X86Flag) -> bool {
         self.flag_live(flag as u8)
     }
@@ -295,13 +288,8 @@ impl<'a> Lifter<'a> {
     /// one of odd; and `val << 4` puts AF straight into the bit
     /// [`Self::get_flag`] reads.
     pub fn set_flag(&mut self, flag: X86Flag, val: Value) -> crate::Result<()> {
-        if !self.flag_needed(flag) {
-            return Ok(());
-        }
         let encoded = match flag {
-            X86Flag::Parity | X86Flag::Auxiliary
-                if self.state.flags.contains_key(&flag) =>
-            {
+            X86Flag::Parity | X86Flag::Auxiliary if self.state.flags.contains_key(&flag) => {
                 let val_i8 = if self.builder.func.dfg.value_type(val) == types::I8 {
                     val
                 } else {
@@ -324,12 +312,6 @@ impl<'a> Lifter<'a> {
     /// flag uses. The common tail of [`Self::set_flag`] and
     /// [`Self::set_flag_source`].
     fn store_flag(&mut self, flag: X86Flag, val: Value) -> crate::Result<()> {
-        if !self.flag_needed(flag) {
-            // Deliberately not an error even for a flag this guest has no
-            // variable for: the check below is what reports that, and it still
-            // runs on every path a live flag takes.
-            return Ok(());
-        }
         if let Some(&var) = self.state.flags.get(&flag) {
             // Ensure flag is I8
             let val_i8 = if self.builder.func.dfg.value_type(val) == types::I8 {
@@ -337,6 +319,7 @@ impl<'a> Lifter<'a> {
             } else {
                 self.builder.ins().ireduce(types::I8, val)
             };
+            self.record_flag_value(val_i8);
             self.builder.def_var(var, val_i8);
             let idx = FLAG_ORDER
                 .iter()

@@ -148,8 +148,16 @@ pub fn fingerprint(ctx: &RegisterContext) -> StateFingerprint {
             ctx.rax, ctx.rcx, ctx.rdx, ctx.rbx, ctx.rbp, ctx.rsi, ctx.rdi, ctx.r8, ctx.r9, ctx.r10,
             ctx.r11, ctx.r12, ctx.r13, ctx.r14, ctx.r15,
         ],
-        flags: [ctx.cf, ctx.pf, ctx.af, ctx.zf, ctx.sf, ctx.of, ctx.df],
-        xmm: ctx.xmm,
+        flags: [
+            ctx.cf,
+            u8::from(ctx.pf()),
+            u8::from(ctx.af()),
+            ctx.zf,
+            ctx.sf,
+            ctx.of,
+            ctx.df,
+        ],
+        xmm: *ctx.xmm,
         exit: ctx.exit_reason,
     }
 }

@@ -16,13 +16,9 @@ use crate::core::specialize::{Spec, SpecTarget};
 use crate::lifter::{Lifter, X86Flag};
 use cranelift::prelude::*;
 
-/// Which of the two hardware-backed flags this site has to produce.
-///
-/// Both dead is the interesting case: it is why these functions can decline,
-/// and why the answer depends on
-/// [`FlagLiveness`](crate::core::flags::FlagLiveness) rather than the mnemonic.
-/// It is *this site's* needs that matter, not the mnemonic's architectural
-/// effects - `ADD` writes both, and at most sites neither is read.
+/// Hardware-backed flag outputs to emit. Both are initially needed; the
+/// finished SSA pass removes unused outputs and rewrites an overflow op to
+/// ordinary arithmetic when its condition result has no reader.
 #[derive(Clone, Copy)]
 struct Wanted {
     carry: bool,

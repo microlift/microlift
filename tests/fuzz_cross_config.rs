@@ -80,9 +80,8 @@ proptest! {
         }
     }
 
-    /// Skipping the flag writes nothing reads may not change a single bit of
-    /// state - flags very much included, since a mistake in the classification
-    /// shows up there and nowhere else.
+    /// Removing unused flag computations may not change any architectural
+    /// state, including the flags published at exits.
     ///
     /// The dedicated suite (`dead_flag_tests`) covers the seams by hand; this
     /// is the half that tries operands nobody thought of.
@@ -103,6 +102,56 @@ proptest! {
             "dead-flag divergence for {:?} {:#x},{:#x}",
             op, a, b
         );
+    }
+
+    /// A single ALU followed by RET leaves all its flags live. Mixed programs
+    /// exercise overwritten flags, carry chains, conditional writes and joins.
+    #[test]
+    fn dead_flags_agree_over_mixed_programs(
+        instructions in prop::collection::vec(0usize..18, 2..32),
+        a in any::<u64>(), b in any::<u64>(), count in any::<u8>(), bits in any::<u8>(),
+    ) {
+        const OPS: &[&[u8]] = &[
+            &[0x48, 0x01, 0xD8], // add rax, rbx
+            &[0x48, 0x29, 0xD8], // sub rax, rbx
+            &[0x48, 0x11, 0xD8], // adc rax, rbx
+            &[0x48, 0x19, 0xD8], // sbb rax, rbx
+            &[0x48, 0xFF, 0xC0], // inc rax
+            &[0x48, 0xFF, 0xC8], // dec rax
+            &[0x48, 0x31, 0xD8], // xor rax, rbx
+            &[0x48, 0x85, 0xC0], // test rax, rax
+            &[0x48, 0xD3, 0xE0], // shl rax, cl
+            &[0x48, 0xD3, 0xE8], // shr rax, cl
+            &[0x48, 0x0F, 0xAF, 0xC3], // imul rax, rbx
+            &[0x9F], // lahf
+            &[0x9E], // sahf
+            &[0xF9], // stc
+            &[0xF5], // cmc
+            &[0x0F, 0x94, 0xC2], // sete dl
+            &[0x48, 0x0F, 0x43, 0xFB], // cmovae rdi, rbx
+            &[0x74, 0x03, 0x48, 0x31, 0xF6], // je over xor rsi, rsi
+        ];
+        let mut bytes = Vec::new();
+        for index in instructions { bytes.extend_from_slice(OPS[index]); }
+        bytes.push(0xC3);
+        let run = |lean, opt, lazy, spec| {
+            LiftTest::new(&bytes).opt(opt).specialize(spec)
+                .reg(|c| {
+                    c.rax = a; c.rbx = b; c.rcx = u64::from(count);
+                    c.cf = bits & 1; c.set_pf(bits & 2 != 0); c.set_af(bits & 4 != 0);
+                    c.zf = (bits >> 3) & 1; c.sf = (bits >> 4) & 1; c.of = (bits >> 5) & 1;
+                })
+                .with_config(|c| { c.eliminate_dead_flags = lean; c.lazy_register_sync = lazy; })
+                .run()
+        };
+        let baseline = fingerprint(&run(false, Opt::None, false, Specialization::generic()).ctx);
+        for opt in [Opt::None, Opt::Speed] {
+            for lazy in [false, true] {
+                for spec in [Specialization::generic(), Specialization::host()] {
+                    prop_assert_eq!(&fingerprint(&run(true, opt, lazy, spec).ctx), &baseline);
+                }
+            }
+        }
     }
 
     /// Taking CF and OF from the machine's own arithmetic may not change a

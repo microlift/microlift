@@ -107,9 +107,9 @@ pub enum Spec {
     /// and is inert without it. Unlike the vector specializations this one is not
     /// an improvement wherever it applies: the portable flag arithmetic is dataflow
     /// over the sum and dies to DCE when nothing reads it, while an overflow op's
-    /// condition bit is welded to the instruction producing the result and
-    /// survives. Without liveness every site looks live and it is a measured
-    /// regression. See `arch/x86_64/semantics/arith_spec.rs`.
+    /// condition bit needs an explicit rewrite to ordinary arithmetic when it
+    /// is unused. The finished dead-flag pass performs that rewrite.
+    /// See `arch/x86_64/semantics/arith_spec.rs`.
     IntegerOverflowFlags,
     /// Emit `PAUSE` instructions as the host's equivalent mechanism via
     /// the `spin_hint` CLIF opcode.

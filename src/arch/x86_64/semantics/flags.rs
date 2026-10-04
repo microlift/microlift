@@ -1,16 +1,7 @@
-//! The eager flag updates, and the guards that stop them being eager.
+//! Eager condition-flag updates. The finished SSA pass removes unused pure
+//! computations; no instruction classification suppresses writes during lifting.
 //!
-//! Every `update_flags_*` assigns a fixed set of flags, and that set is what
-//! [`crate::arch::x86_64::flag_effects`] classifies each mnemonic as writing -
-//! the two must agree, and the table is written against *this file*.
-//!
-//! Each flag's computation is wrapped in [`Lifter::flag_needed`], a constant
-//! `true` unless [`LifterConfig::eliminate_dead_flags`] is on. Parity is what
-//! motivated it: a `popcnt`, an `ireduce`, a `band` and a `bxor` on every
-//! arithmetic instruction in the program, for a flag almost nothing reads.
-//!
-//! [`LifterConfig::eliminate_dead_flags`]: crate::core::LifterConfig::eliminate_dead_flags
-//! [`Spec::IntegerOverflowFlags`]: crate::core::specialize::Spec::IntegerOverflowFlags
+//! PF and AF are stored as source bytes and folded into booleans at their readers.
 
 use crate::lifter::{Lifter, X86Flag};
 use cranelift::prelude::*;
@@ -415,7 +406,7 @@ impl<'a> Lifter<'a> {
         }
 
         // AF is undefined for logical ops per Intel SDM; leave unchanged. Which
-        // is why `flag_effects` does not list AF among this op's writes: a
+        // preserves its previous SSA definition: a
         // reader downstream sees whatever set it last, so that write has to stay
         // live across an `AND`.
 
@@ -499,9 +490,8 @@ impl<'a> Lifter<'a> {
     ) -> crate::Result<()> {
         let bit_width = (size * 8) as i64;
 
-        // Every flag here is a read-modify-write, so a dead one skips its old value,
-        // its new value *and* the select between them. `flag_effects` classifies a
-        // shift as reading exactly this set, so the `use_var`s below are covered.
+        // The old flag sources are real SSA dependencies of the selects. A
+        // zero count preserves them; the finished pass follows those uses.
         let (zf, sf, cf, of, pf) = (
             self.flag_needed(X86Flag::Zero),
             self.flag_needed(X86Flag::Sign),

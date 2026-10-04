@@ -30,7 +30,7 @@ use crate::core::bridge::{BridgeImport, ImportKind, ImportRegistry};
 use crate::core::callback::CallbackOffsets;
 use crate::core::callret::{CallRetConfig, CallRetOffsets};
 use crate::core::exit::{ExitReason, MemorySegment, TransferKind};
-use crate::core::flags::{FlagEffects, FlagLiveness, FlagSet};
+use crate::core::flags::FlagEffects;
 use crate::core::hostframe::{HostFrameConfig, HostFrameOffsets};
 use crate::core::link::{BlockLinkConfig, BlockLinkOffsets};
 use crate::core::optimize::Optimizations;
@@ -158,14 +158,8 @@ pub trait GuestArch: Sized {
         None
     }
 
-    /// What lifting `i` does to the guest's condition flags, in this guest's own
-    /// flag numbering, or `None` when this frontend cannot say.
-    ///
-    /// Drives [`LifterConfig::eliminate_dead_flags`]; `None` is read as
-    /// [`FlagEffects::CONSERVATIVE`]. **This describes the lift, not the
-    /// architecture** - read [`FlagEffects`] before adding an entry, since a
-    /// wrong direction is a miscompile with no diagnostic. Bit indices are the
-    /// same ones the frontend passes to [`LiftEngine::flag_live`].
+    /// Legacy instruction flag metadata. Dead flag elimination does not use
+    /// this prediction: it follows the actual SSA graph instead.
     fn flag_effects(_i: &Self::Instr) -> Option<FlagEffects> {
         None
     }
@@ -991,18 +985,13 @@ pub struct LifterConfig {
     /// Addresses outside the region are ignored, and nothing here is offered
     /// under [`VmResumptionPoints::None`], which emits no dispatch.
     pub resume_points: Vec<u64>,
-    /// Do not emit the IR for a condition-flag write nothing goes on to read.
+    /// Remove unused condition-flag computations from the finished SSA graph
+    /// before handing IR to the compiler. Every flag write is emitted first;
+    /// actual readers, context stores, callbacks and branch arguments decide
+    /// which computations survive. Instruction classifications are not used.
     ///
-    /// Guest flags are eager: an `ADD` emits all six whether or not anything
-    /// reads them, and PF alone is a `popcnt`/`ireduce`/`band`/`bxor`. Being SSA
-    /// the dead ones are deleted at compile time, so this changes no *machine
-    /// code* - it changes how much IR the compiler is handed to get there,
-    /// which is where a recompiler's time goes.
-    ///
-    /// Off by default because soundness rests on the per-instruction
-    /// classifications in [`GuestArch::flag_effects`] matching what the handlers
-    /// do, and a wrong entry there is a wrong answer rather than an error. Inert
-    /// on a frontend that does not implement it.
+    /// Off by default. Frontends opt in by recording flag values through
+    /// [`LiftEngine::record_flag_value`].
     pub eliminate_dead_flags: bool,
     /// Exit rather than guess when the entry PC matches no resume point.
     ///
@@ -1259,15 +1248,9 @@ pub struct LiftEngine<'a, A: GuestArch = crate::arch::x86_64::X86_64> {
     pub visited_blocks: HashSet<Block>,
     /// Whether the current block has been terminated (jmp, ret, etc.).
     pub block_terminated: bool,
-    /// Per-address condition-flag liveness, when
-    /// [`LifterConfig::eliminate_dead_flags`] asked for it. `None` means the
-    /// optimisation is off, which [`Self::flag_live`] reads as "all live".
-    flag_liveness: Option<FlagLiveness>,
-    /// The flags live after the instruction currently being lifted.
-    ///
-    /// Latched just before each handler runs, because `current_ip` has by then
-    /// been advanced to the *next* instruction.
-    live_flags: FlagSet,
+    /// Values assigned to condition flags, before any SSA dead-code removal.
+    /// These seed the candidate graph; actual IR uses determine liveness.
+    flag_values: Vec<Value>,
     /// Imported signatures for the host callbacks, built on first use. See
     /// [`Self::callback_sig`].
     callback_sigs: HashMap<usize, SigRef>,
@@ -1530,10 +1513,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             current_ip: 0,
             visited_blocks: HashSet::new(),
             block_terminated: false,
-            flag_liveness: None,
-            // Nothing has been analysed yet, and the IR the engine emits before
-            // phase 2 - the entry block's state load - must not be elided.
-            live_flags: FlagSet::ALL,
+            flag_values: Vec::new(),
             callback_sigs: HashMap::new(),
             fast_calls,
             fast_call_by_name,
@@ -2424,23 +2404,20 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         self.covering(va).is_some()
     }
 
-    /// Whether the instruction being lifted has to compute flag `bit`.
+    /// Flag writes must always be emitted. Dead flag computations are removed
+    /// from the finished SSA graph, after all readers and exits exist.
     ///
-    /// `bit` is the frontend's own flag index, the same numbering as
-    /// [`GuestArch::flag_effects`]. A handler guards each flag with it:
-    ///
-    /// ```ignore
-    /// if self.flag_live(X86Flag::Parity as u8) {
-    ///     // emit the popcount
-    /// }
-    /// ```
-    ///
-    /// **Always true unless [`LifterConfig::eliminate_dead_flags`] is on.**
-    /// Skipping a write leaves the flag's SSA variable holding its previous
-    /// value rather than an undefined one, so a downstream sync publishes
-    /// something well-formed even if the analysis were wrong.
-    pub fn flag_live(&self, bit: u8) -> bool {
-        self.live_flags.contains(bit)
+    /// Kept for frontends that guard their flag math through this API.
+    pub fn flag_live(&self, _bit: u8) -> bool {
+        true
+    }
+
+    /// Record the raw SSA value assigned to a condition flag. Frontends call
+    /// this for each write, including source-encoded flags such as x86 PF/AF.
+    pub fn record_flag_value(&mut self, value: Value) {
+        if self.config.eliminate_dead_flags {
+            self.flag_values.push(value);
+        }
     }
 
     /// The value the `image_base` variable is defined to at region entry.
@@ -3527,32 +3504,6 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             }
         }
 
-        // Between the phases, and only here: the decode map is complete enough
-        // to follow control flow, and no IR exists yet for the answer to be too
-        // late for. See [`crate::core::flags`].
-        if self.config.eliminate_dead_flags {
-            // Asked of the engine up front rather than from inside the
-            // analysis, so that the one definition of "this encoding is only
-            // partly here" - `runs_off_region`, which phase 2 also uses to
-            // decide the exit - is the one the analysis sees.
-            let truncated: HashSet<u64> = decoded
-                .iter()
-                .filter(|(addr, inst)| self.runs_off_region(**addr, inst))
-                .map(|(addr, _)| *addr)
-                .collect();
-            let covered = self.covered.clone();
-            let in_region = |va: u64| {
-                covered
-                    .partition_point(|r: &Range<u64>| r.start <= va)
-                    .checked_sub(1)
-                    .and_then(|i| covered.get(i))
-                    .is_some_and(|r| va < r.end)
-            };
-            self.flag_liveness = Some(flags::analyze::<A>(&decoded, &in_region, |addr, _| {
-                truncated.contains(&addr)
-            }));
-        }
-
         // Entry block receives the context pointer as its first parameter.
         let entry_block = self.builder.create_block();
         self.builder
@@ -3732,13 +3683,6 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                 // the pre-advance address.
                 let next_ip = A::instr_next_ip(inst);
                 self.set_source_loc(A::instr_ip(inst));
-                // Latched against the address of the instruction about to be
-                // lifted, which is why it happens here and not inside a handler:
-                // `current_ip` is the *next* address by the time one runs.
-                self.live_flags = match &self.flag_liveness {
-                    Some(liveness) => liveness.live_out(A::instr_ip(inst)),
-                    None => FlagSet::ALL,
-                };
                 self.current_ip = next_ip;
                 A::lift_instruction(self, inst)?;
                 if self.block_terminated {
@@ -3891,6 +3835,9 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         self.builder.seal_all_blocks();
         // After sealing: the use scan reads the finished layout.
         self.prune_untouched_sync();
+        if self.config.eliminate_dead_flags {
+            flags::eliminate(self.builder.func, &self.flag_values);
+        }
         self.finalize_helper_indices();
         self.finalize_data_indices();
         Ok(())

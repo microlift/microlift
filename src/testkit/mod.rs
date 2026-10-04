@@ -275,7 +275,7 @@ impl<'a> LiftTest<'a> {
         self
     }
 
-    /// Skip the IR for condition-flag writes nothing reads
+    /// Remove unused condition-flag computations from the lifted SSA graph
     /// ([`LifterConfig::eliminate_dead_flags`]).
     ///
     /// A metamorphic switch: turning it on may not change a single bit of

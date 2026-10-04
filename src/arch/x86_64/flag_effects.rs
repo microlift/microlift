@@ -1,25 +1,8 @@
-//! What each x86-64 instruction's *lift* does to the condition flags.
+//! Legacy x86 flag-effect metadata, retained for callers inspecting instructions.
 //!
-//! The classification behind [`LifterConfig::eliminate_dead_flags`]. Read
-//! [`crate::core::flags`] for what the analysis does with this, and
-//! [`FlagEffects`] for the contract - the two directions are asymmetric.
+//! Dead flag elimination does not consult this table. It follows actual SSA
+//! dependencies after lifting, so these predictions cannot suppress flag writes.
 //!
-//! **This table describes `semantics/`, not the Intel manual**, which is why it
-//! is hand-written rather than a call to iced's `rflags_written()`: AF is left
-//! *unchanged* after a logical op where the manual says undefined, the `IMUL`
-//! handlers assign only CF and OF, and `update_flags_shift` *reads* all five of
-//! CF/PF/ZF/SF/OF where the manual says a shift reads nothing.
-//!
-//! **Absence is the safe answer.** An unnamed mnemonic classifies as
-//! [`FlagEffects::CONSERVATIVE`], which is what makes the table safe without
-//! knowing which instructions microlift implements. **A mnemonic belongs here
-//! only once someone has read its handler.** A `LOCK` prefix, an MMX operand and
-//! a `REP`/`REPNE` prefix short-circuit to conservative before the mnemonic is
-//! consulted, each routing to a different handler than this table was audited
-//! against.
-//!
-//! [`LifterConfig::eliminate_dead_flags`]: crate::core::LifterConfig::eliminate_dead_flags
-
 use iced_x86::{Instruction, Mnemonic, Register, RflagsBits};
 
 use crate::arch::x86_64::regs::X86Flag;

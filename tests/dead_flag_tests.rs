@@ -9,9 +9,9 @@
 //! way no equivalence test would ever notice.
 //!
 //! So: [`the_state_is_identical_either_way`] is the correctness half, over a
-//! battery of snippets chosen for the places the classification differs from
-//! the Intel manual; [`a_dead_flag_costs_no_ir`] and its neighbours are the
-//! effectiveness half, counted in IR instructions rather than compiled bytes
+//! battery of snippets chosen for conditional flag writes, callbacks and exits;
+//! [`a_dead_flag_costs_no_ir`] and its neighbours are the effectiveness half,
+//! counted in IR instructions rather than compiled bytes
 //! because IR is the thing this exists to produce less of (and because compiled
 //! size carries hash-seed noise - see `specialize_tests::code_len`).
 //!
@@ -37,7 +37,15 @@ fn state(ctx: &RegisterContext) -> State {
             ctx.rax, ctx.rcx, ctx.rdx, ctx.rbx, ctx.rbp, ctx.rsi, ctx.rdi, ctx.r8, ctx.r9, ctx.r10,
             ctx.r11, ctx.r12, ctx.r13, ctx.r14, ctx.r15,
         ],
-        [ctx.cf, u8::from(ctx.pf()), u8::from(ctx.af()), ctx.zf, ctx.sf, ctx.of, ctx.df],
+        [
+            ctx.cf,
+            u8::from(ctx.pf()),
+            u8::from(ctx.af()),
+            ctx.zf,
+            ctx.sf,
+            ctx.of,
+            ctx.df,
+        ],
         ctx.exit_reason,
     )
 }
@@ -61,10 +69,8 @@ fn seed(ctx: &mut RegisterContext) {
 
 /// The snippets, each ending in `ret` so the harness gets its state back.
 ///
-/// Chosen for the seams rather than for coverage: the three places
-/// `flag_effects` deliberately disagrees with the architecture, the points where
-/// the analysis must give up, and the ordinary `cmp`/`jcc` shape the whole thing
-/// exists for.
+/// Includes partially preserved flags, conditional writes, context publication
+/// and ordinary `cmp`/`jcc` control flow.
 const SNIPPETS: &[(&str, &[u8])] = &[
     // The motivating case: five of the CMP's six flags have no reader, and the
     // sixth (ZF) does.
@@ -276,14 +282,157 @@ fn an_unclassified_instruction_keeps_every_flag() {
     );
 }
 
-/// Off by default, so an embedder that has not asked for this is not given it.
-///
-/// Worth an assertion rather than a glance: the safety argument for the whole
-/// feature ends with "and it is opt-in", so the default flipping is the one
-/// change that would invalidate it silently.
+/// Preserve the opt-in API: embedders choose when to enable the pass.
 #[test]
 fn the_default_is_off() {
     assert!(!LifterConfig::default().eliminate_dead_flags);
+}
+
+#[test]
+fn an_overlapping_tail_exit_cannot_kill_the_incoming_carry() {
+    // stc ; je BASE+5 ; mov eax, 0xC0814800 ; clc ; ret
+    // The taken edge decodes ADD RAX, imm32 at BASE+5, inside the MOV's
+    // immediate. That ADD runs past coverage, so it exits without executing.
+    // Only the fallthrough path clears CF. The old guest-CFG pass incorrectly
+    // counted the unexecuted ADD as killing CF on the taken path as well.
+    let bytes = [
+        0xF9, 0x74, 0x02, 0xB8, 0x00, 0x48, 0x81, 0xC0, 0xF8, 0xC3, 0x00, 0x00, 0xC3,
+    ];
+    for zf in [0, 1] {
+        let run = |lean| {
+            LiftTest::new(&bytes)
+                .reg(|c| {
+                    c.cf = 0;
+                    c.zf = zf;
+                })
+                .with_config(|c| {
+                    c.eliminate_dead_flags = lean;
+                    c.region_tail_exit = true;
+                    c.block_ranges = vec![DEFAULT_LIFT_BASE..DEFAULT_LIFT_BASE + 10];
+                })
+                .run()
+        };
+        let plain = run(false);
+        let lean = run(true);
+        if zf == 1 {
+            assert_eq!(plain.exit, ExitReason::UnknownJump);
+            assert_eq!(plain.ctx.rip, DEFAULT_LIFT_BASE + 5);
+            assert_eq!(plain.ctx.cf, 1);
+        } else {
+            assert_eq!(plain.exit, ExitReason::Return);
+            assert_eq!(plain.ctx.cf, 0);
+        }
+        assert_eq!(state(&plain.ctx), state(&lean.ctx));
+    }
+}
+
+// Record what the interpreter sees without shared globals, then change CF so
+// the ADC after the callback proves that the reload is live too.
+unsafe extern "C" fn observe_and_change_flags(ctx: *mut RegisterContext, count: u64) {
+    let c = unsafe { &mut *ctx };
+    c.r12 = u64::from(c.cf)
+        | (u64::from(c.pf()) << 1)
+        | (u64::from(c.af()) << 2)
+        | (u64::from(c.zf) << 3)
+        | (u64::from(c.sf) << 4)
+        | (u64::from(c.of) << 5)
+        | (u64::from(c.df) << 6);
+    c.cf = 1;
+    c.rip += 2 * count;
+}
+
+#[test]
+fn callbacks_observe_all_flags_and_their_updates_reach_the_guest() {
+    use microlift::arch::x86_64::context::X86_64Callbacks;
+    // add rax, rbx ; wbinvd (interpreted) ; adc rsi, rdi ; add rax, rcx ; ret
+    let bytes = [
+        0x48, 0x01, 0xD8, 0x0F, 0x09, 0x48, 0x11, 0xFE, 0x48, 0x01, 0xC8, 0xC3,
+    ];
+    let run = |lean| {
+        LiftTest::new(&bytes)
+            .no_unicorn()
+            .reg(|c| {
+                seed(c);
+                c.callbacks = X86_64Callbacks {
+                    interpreter_fallback: observe_and_change_flags,
+                    ..Default::default()
+                };
+            })
+            .with_config(|c| {
+                c.eliminate_dead_flags = lean;
+                c.interpreter_fallback = true;
+            })
+            .run()
+    };
+    let plain = run(false);
+    let lean = run(true);
+    assert_eq!(plain.ctx.rsi, 0x8000_0000_0000_0001);
+    assert_eq!(state(&plain.ctx), state(&lean.ctx));
+}
+
+#[test]
+fn a_conditional_fault_publishes_the_flags_before_the_faulting_instruction() {
+    // ADD's flags are overwritten on the successful DIV path, but must reach
+    // the divide-error exit when the divisor is zero or the quotient overflows.
+    let bytes = [
+        0x48, 0x01, 0xD8, // add rax, rbx
+        0x48, 0xF7, 0xF1, // div rcx
+        0x48, 0x01, 0xD8, // add rax, rbx
+        0xC3,
+    ];
+    for (high, divisor) in [(0, 0), (1, 1), (0, 7)] {
+        for lazy in [false, true] {
+            for spec in [Specialization::generic(), Specialization::host()] {
+                let run = |lean| {
+                    LiftTest::new(&bytes)
+                        .reg(|c| {
+                            seed(c);
+                            c.rax = 8;
+                            c.rbx = 1;
+                            c.rdx = high;
+                            c.rcx = divisor;
+                        })
+                        .specialize(spec)
+                        .with_config(|c| {
+                            c.eliminate_dead_flags = lean;
+                            c.lazy_register_sync = lazy;
+                        })
+                        .run()
+                };
+                let plain = run(false);
+                let lean = run(true);
+                assert_eq!(state(&plain.ctx), state(&lean.ctx));
+                assert_eq!(plain.exit, lean.exit);
+            }
+        }
+    }
+}
+
+#[test]
+fn conditional_flag_updates_and_partial_writes_agree_for_zero_counts() {
+    for count in [0, 1, 31, 32, 63, 64, 255] {
+        for lazy in [false, true] {
+            for &(name, bytes) in SNIPPETS {
+                let run = |lean| {
+                    LiftTest::new(bytes)
+                        .reg(|c| {
+                            seed(c);
+                            c.rcx = count;
+                        })
+                        .with_config(|c| {
+                            c.eliminate_dead_flags = lean;
+                            c.lazy_register_sync = lazy;
+                        })
+                        .run()
+                };
+                // The counted loop in SNIPPETS cannot terminate from zero.
+                if name == "loop on dec/jne" {
+                    continue;
+                }
+                assert_eq!(state(&run(false).ctx), state(&run(true).ctx));
+            }
+        }
+    }
 }
 
 /// Not an assertion - a printout, so the numbers behind the thresholds above
