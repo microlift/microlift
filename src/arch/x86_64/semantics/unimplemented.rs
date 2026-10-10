@@ -4,12 +4,8 @@ use cranelift::prelude::*;
 use iced_x86::Instruction;
 
 impl<'a> Lifter<'a> {
-    /// Hand an instruction this frontend does not lift to the host's
-    /// interpreter, inline; see [`crate::core::callback`]. The PC published to
-    /// it points *at* the instruction, which is where the interpreter starts.
-    ///
-    /// One instruction, not the run the callback could do: the region's own
-    /// code for everything after it is already compiled.
+    /// Hand an unlifted instruction to the host interpreter inline; the PC points *at* it.
+    /// Interprets that one instruction only.
     pub(super) fn handle_unimplemented_instruction(
         &mut self,
         instruction: &Instruction,
@@ -19,9 +15,7 @@ impl<'a> Lifter<'a> {
         self.emit_interpreter_callback(Some(rip_at), Some(rip_after), 1)
     }
 
-    /// Handle a `UD2` instruction - emit a `Ud2` VM exit with RIP pointing at
-    /// the `UD2` itself (matching real hardware behaviour where #UD points at
-    /// the faulting instruction).
+    /// `UD2`: `Ud2` VM exit with RIP at the `UD2`.
     pub(super) fn handle_ud2(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let rip_at = self.rip_at(instruction);
         self.sync_to_context(Some(rip_at), ExitReason::Ud2)?;
@@ -31,8 +25,7 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Handle an `INT3` breakpoint - emit a `Breakpoint` VM exit with RIP
-    /// pointing at the `INT3` itself so the host can inspect or skip it.
+    /// `INT3`: `Breakpoint` VM exit with RIP at the `INT3`.
     pub(super) fn handle_int3(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let rip_at = self.rip_at(instruction);
         self.sync_to_context(Some(rip_at), ExitReason::Breakpoint)?;
@@ -42,22 +35,17 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Compute the run-time address of `instruction` itself as a Cranelift
-    /// value, per the configured
-    /// [`AddressMode`](crate::core::AddressMode).
+    /// Run-time address of `instruction`, per [`AddressMode`](crate::core::AddressMode).
     fn rip_at(&mut self, instruction: &Instruction) -> Value {
         self.runtime_addr(instruction.ip())
     }
 
-    /// Compute the run-time address of the instruction *following*
-    /// `instruction`. This is the resume point a software interrupt would push
-    /// as its return address.
+    /// Run-time address of the instruction after `instruction`.
     fn rip_after(&mut self, instruction: &Instruction) -> Value {
         self.runtime_addr(instruction.next_ip())
     }
 
-    /// Emit an `Interrupt` VM exit for vector `vector`, syncing guest state and
-    /// pointing RIP at the instruction after `instruction` (the resume point).
+    /// `Interrupt` VM exit for `vector`, RIP at the next instruction.
     fn emit_interrupt_exit(&mut self, instruction: &Instruction, vector: u32) -> crate::Result<()> {
         let rip_after = self.rip_after(instruction);
         self.sync_to_context(Some(rip_after), ExitReason::Interrupt)?;
@@ -68,19 +56,14 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Handle `INT imm8` - raise a software interrupt for the immediate vector.
-    /// The vector is reported in `exit_code`; RIP points past the `INT` so the
-    /// host can service the vector and resume.
+    /// `INT imm8`: vector in `exit_code`, RIP past the `INT`.
     pub(super) fn handle_int(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let vector = instruction.immediate8() as u32;
         self.emit_interrupt_exit(instruction, vector)
     }
 
-    /// Handle `INT1`/`ICEBP` (`0xF1`) - raise the debug-exception vector (1).
-    ///
-    /// (`INTO`, the legacy `0xCE` overflow trap, is intentionally not handled:
-    /// it is not a valid instruction in 64-bit mode and the decoder rejects it
-    /// as `InvalidInstruction`.)
+    /// `INT1`/`ICEBP`: raises vector 1.
+    /// `INTO` is invalid in 64-bit mode; the decoder rejects it.
     pub(super) fn handle_int1(&mut self, instruction: &Instruction) -> crate::Result<()> {
         self.emit_interrupt_exit(instruction, 1)
     }
@@ -103,10 +86,7 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// RDTSC - read the timestamp counter. The lifted code can't read the host
-    /// TSC meaningfully, so this is a resumable VM exit: the PC points at the
-    /// instruction *after* `RDTSC` and the host populates `rax`/`rdx` with the
-    /// 64-bit counter (low 32 bits in `rax`, high 32 in `rdx`) before resuming.
+    /// `RDTSC`: resumable VM exit; the host fills `rdx:rax`, PC is the next instruction.
     pub(super) fn handle_rdtsc(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let rip_after = self.rip_after(instruction);
         self.sync_to_context(Some(rip_after), ExitReason::Rdtsc)?;

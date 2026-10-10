@@ -1,12 +1,5 @@
-//! `MXCSR` and x87 environment instructions: `STMXCSR`, `LDMXCSR` (plus their
-//! AVX spellings), `FNSTENV`, `FLDENV`, `FNCLEX`, `FNINIT` and `FWAIT`.
-//!
-//! These are the instructions a compiler emits around a floating-point control
-//! change - `fesetround`, `feholdexcept`, `fegetenv`/`fesetenv`,
-//! `_mm_setcsr`/`_mm_getcsr` - so the tests are written as much against those
-//! *sequences* as against the individual opcodes.
-//!
-//! Run: `cargo test --features testkit --test mxcsr_tests`
+//! `MXCSR` and x87 environment instructions (STMXCSR, LDMXCSR, FNSTENV, FLDENV, FNCLEX, FNINIT, FWAIT).
+//! Written against compiler sequences (`fesetround`, `feholdexcept`) rather than isolated opcodes.
 
 use microlift::context::{MXCSR_RESET, X87_CW_RESET};
 use microlift::testkit::prelude::*;
@@ -15,8 +8,7 @@ fn run_test(bytes: &[u8], ctx: RegisterContext) -> RegisterContext {
     LiftTest::new(bytes).ctx(ctx).run().ctx
 }
 
-/// A 64-byte host buffer the guest addresses through `RSI` (guest VA == host
-/// VA), returned along with its address.
+/// 64-byte host buffer addressed via `RSI` (guest VA == host VA).
 fn scratch() -> (Box<[u8; 64]>, u64) {
     let buf = Box::new([0u8; 64]);
     let va = buf.as_ptr() as u64;
@@ -33,8 +25,7 @@ fn rd16(buf: &[u8; 64], off: usize) -> u16 {
 
 // ---------------------------------------------------------------- STMXCSR --
 
-/// A fresh context must report the architectural reset `MXCSR` (0x1F80: all
-/// exceptions masked, round-to-nearest), not zero.
+/// Reset `MXCSR` is 0x1F80, not zero.
 #[test]
 fn test_stmxcsr_stores_reset_value() {
     let (buf, va) = scratch();
@@ -46,7 +37,7 @@ fn test_stmxcsr_stores_reset_value() {
     assert_eq!(rd32(&buf, 0), MXCSR_RESET);
 }
 
-/// `STMXCSR` writes exactly four bytes and nothing else.
+/// Writes exactly four bytes.
 #[test]
 fn test_stmxcsr_writes_four_bytes_only() {
     let (buf, va) = scratch();
@@ -62,8 +53,7 @@ fn test_stmxcsr_writes_four_bytes_only() {
     );
 }
 
-/// The context field is the authority: whatever the host puts there is what
-/// `STMXCSR` reports.
+/// The context field is authoritative.
 #[test]
 fn test_stmxcsr_reflects_context_field() {
     let (buf, va) = scratch();
@@ -79,7 +69,7 @@ fn test_stmxcsr_reflects_context_field() {
 
 // ---------------------------------------------------------------- LDMXCSR --
 
-/// Every defined bit round-trips through `LDMXCSR` into the context.
+/// Every defined bit round-trips.
 #[test]
 fn test_ldmxcsr_loads_all_defined_bits() {
     for value in [0x0000u32, 0x1F80, 0xFFFF, 0x6000, 0x8040, 0x003F] {
@@ -94,9 +84,7 @@ fn test_ldmxcsr_loads_all_defined_bits() {
     }
 }
 
-/// Bits 31:16 are reserved; hardware would `#GP(0)` on them and Microlift
-/// (which models no such fault) drops them, leaving the state a legal
-/// `LDMXCSR` would have produced.
+/// Reserved bits 31:16 are dropped (no #GP modelled).
 #[test]
 fn test_ldmxcsr_drops_reserved_bits() {
     let (mut buf, va) = scratch();
@@ -108,7 +96,7 @@ fn test_ldmxcsr_drops_reserved_bits() {
     assert_eq!(ctx.mxcsr, 0x1F80);
 }
 
-/// `LDMXCSR` then `STMXCSR` is the identity on the defined bits.
+/// LDMXCSR then STMXCSR is the identity on defined bits.
 #[test]
 fn test_ldmxcsr_stmxcsr_roundtrip() {
     let (mut buf, va) = scratch();
@@ -136,9 +124,7 @@ fn test_vldmxcsr_vstmxcsr() {
     assert_eq!(rd32(&buf, 4), 0x5F80);
 }
 
-/// The `fesetround(FE_DOWNWARD)` shape: read `MXCSR`, rewrite `RC`, write it
-/// back. Exercises `STMXCSR`/`LDMXCSR` against the GPR/memory instructions a
-/// compiler puts between them.
+/// The `fesetround(FE_DOWNWARD)` shape: read, rewrite RC, write back.
 #[test]
 fn test_fesetround_sequence() {
     let (buf, va) = scratch();
@@ -161,8 +147,7 @@ fn test_fesetround_sequence() {
 
 // ----------------------------------------------------------------- FNSTENV --
 
-/// The 28-byte (32-bit operand size) environment layout: control word at +0,
-/// status word at +4, tag word at +8, everything else zero.
+/// 32-bit layout: control +0, status +4, tag +8, rest zero.
 #[test]
 fn test_fnstenv_28byte_layout() {
     let (buf, va) = scratch();
@@ -193,8 +178,7 @@ fn test_fnstenv_28byte_layout() {
     );
 }
 
-/// The 14-byte (16-bit operand size) layout packs the same three words at +0,
-/// +2 and +4.
+/// 16-bit layout packs the three words at +0, +2, +4.
 #[test]
 fn test_fnstenv_14byte_layout() {
     let (buf, va) = scratch();
@@ -216,8 +200,7 @@ fn test_fnstenv_14byte_layout() {
     );
 }
 
-/// `FNSTENV` masks all six floating-point exceptions *after* saving - the
-/// property `feholdexcept` relies on.
+/// FNSTENV masks all exceptions after saving (`feholdexcept` relies on it).
 #[test]
 fn test_fnstenv_masks_exceptions_after_saving() {
     let (buf, va) = scratch();
@@ -233,20 +216,14 @@ fn test_fnstenv_masks_exceptions_after_saving() {
     );
 }
 
-/// The architectural tag word is recomputed from the register contents:
-/// `00` valid, `01` zero, `10` special, `11` empty.
+/// Tag word is recomputed from contents: 00 valid, 01 zero, 10 special, 11 empty.
 #[test]
 fn test_fnstenv_tag_word_encoding() {
     let (buf, va) = scratch();
     let bytes = [0xD9, 0x36, 0xC3];
     let mut ctx = RegisterContext::default();
     ctx.rsi = va;
-    // phys 0: 1.0            -> valid   (00)
-    // phys 1: +0.0           -> zero    (01)
-    // phys 2: QNaN           -> special (10)
-    // phys 3: denormal       -> special (10)
-    // phys 4: unnormal       -> special (10)
-    // phys 5-7: not live     -> empty   (11)
+    // phys 0 valid, 1 zero, 2-4 special (QNaN, denormal, unnormal), 5-7 empty
     ctx.fpr[0] = [0x8000_0000_0000_0000, 0x3FFF];
     ctx.fpr[1] = [0, 0];
     ctx.fpr[2] = [0xC000_0000_0000_0000, 0x7FFF];
@@ -260,8 +237,7 @@ fn test_fnstenv_tag_word_encoding() {
     assert_eq!(rd16(&buf, 8), expected, "got {:#06x}", rd16(&buf, 8));
 }
 
-/// A negative zero is still tagged `01`, and the sign bit does not leak into
-/// the exponent comparison.
+/// Negative zero is still tagged 01.
 #[test]
 fn test_fnstenv_negative_zero_tagged_zero() {
     let (buf, va) = scratch();
@@ -274,7 +250,7 @@ fn test_fnstenv_negative_zero_tagged_zero() {
     assert_eq!(rd16(&buf, 8) & 0b11, 0b01);
 }
 
-/// An `FLD` of a real value leaves a tag word `FNSTENV` reports as `valid`.
+/// FLD of a real value is tagged valid.
 #[test]
 fn test_fnstenv_after_fld1() {
     let (buf, va) = scratch();
@@ -296,8 +272,7 @@ fn test_fnstenv_after_fld1() {
 
 // ------------------------------------------------------------------ FLDENV --
 
-/// `FLDENV` restores the control word, the status word, `TOP` (out of the
-/// status word's bits 13-11) and the tag word.
+/// Restores control, status, TOP (status bits 13-11) and tag word.
 #[test]
 fn test_fldenv_restores_environment() {
     let (mut buf, va) = scratch();
@@ -313,12 +288,11 @@ fn test_fldenv_restores_environment() {
     assert_eq!(out.fpu_cw, 0x0272);
     assert_eq!(out.fpu_top, 6, "TOP comes from FSW bits 13-11");
     assert_eq!(out.fpu_sw & !0x3800, 0x4500, "condition codes restored");
-    // FTW 0xFF34 tags regs 0..3 as 00/01/11/00 and regs 4..7 as empty, so the
-    // abridged (live) mask is 0b0000_1011.
+    // FTW 0xFF34: regs 0..3 = 00/01/11/00, rest empty; abridged mask 0b0000_1011.
     assert_eq!(out.fpu_tag, 0b0000_1011);
 }
 
-/// The 14-byte form reads the same three words from the packed layout.
+/// The 14-byte form reads the packed layout.
 #[test]
 fn test_fldenv_14byte() {
     let (mut buf, va) = scratch();
@@ -335,8 +309,7 @@ fn test_fldenv_14byte() {
     assert_eq!(out.fpu_tag, 0b1100_0000, "only regs 6 and 7 are non-empty");
 }
 
-/// `FLDENV` leaves the data registers alone - it restores the environment, not
-/// the stack (that is `FRSTOR`).
+/// Data registers are untouched (that is FRSTOR).
 #[test]
 fn test_fldenv_preserves_data_registers() {
     let (mut buf, va) = scratch();
@@ -351,8 +324,7 @@ fn test_fldenv_preserves_data_registers() {
     assert_eq!(out.fpu_tag, 0, "but the tag word says they are empty");
 }
 
-/// The `feholdexcept` / `fesetenv` pair: save the environment, work under it,
-/// then restore. The restored state must equal the saved one exactly.
+/// `feholdexcept`/`fesetenv` pair: restored state equals saved.
 #[test]
 fn test_fnstenv_fldenv_roundtrip() {
     let (buf, va) = scratch();
@@ -372,17 +344,14 @@ fn test_fnstenv_fldenv_roundtrip() {
     assert_eq!(out.fpu_top, 4);
     assert_eq!(out.fpu_sw & !0x3800, 0x4200);
     assert_eq!(out.fpu_tag, 0b0011_0000, "live registers restored");
-    // The saved tag word: phys 4 = 1.0 (valid, 00), phys 5 = +0.0 (zero, 01),
-    // every other register empty (11).
-    // reg7..reg0 = 11 11 01 00 11 11 11 11
+    // phys 4 = 1.0 (00), phys 5 = +0.0 (01), rest empty (11)
     let expected: u16 = 0xF4FF;
     assert_eq!(rd16(&buf, 8), expected);
 }
 
 // ------------------------------------------------------------ FNCLEX/FNINIT --
 
-/// `FNCLEX` clears the exception flags (7:0) and the busy bit, keeping the
-/// condition codes and `TOP`.
+/// Clears exception flags and busy, keeps condition codes and TOP.
 #[test]
 fn test_fnclex_clears_exception_flags_only() {
     // fnclex ; ret
@@ -397,8 +366,7 @@ fn test_fnclex_clears_exception_flags_only() {
     assert_eq!(out.fpu_cw, 0x0300, "the control word is untouched");
 }
 
-/// `FNINIT` resets the control word, the status word and `TOP`, and tags every
-/// register empty - without clearing the register data.
+/// Resets control, status and TOP and tags all empty; data untouched.
 #[test]
 fn test_fninit_resets_control_state() {
     // fninit ; ret
@@ -417,8 +385,7 @@ fn test_fninit_resets_control_state() {
     assert_eq!(out.fpr[1], [0x1234_5678_9ABC_DEF0, 0x4000]);
 }
 
-/// A `9B`-prefixed `FSTENV`/`FCLEX` decodes as `WAIT` + the `FN` form; the
-/// `WAIT` must lift as a no-op rather than an unsupported instruction.
+/// `9B` prefix lifts as WAIT (a no-op) plus the FN form.
 #[test]
 fn test_wait_prefixed_forms() {
     let (buf, va) = scratch();
@@ -434,8 +401,7 @@ fn test_wait_prefixed_forms() {
     assert_eq!(out.fpu_sw, 0, "fclex cleared the exception flags");
 }
 
-/// The full `feholdexcept()` prologue as GCC/glibc emits it on x86-64: save and
-/// mask the x87 environment, then save and mask `MXCSR`.
+/// GCC/glibc `feholdexcept()` prologue: mask x87 env, then MXCSR.
 #[test]
 fn test_feholdexcept_shape() {
     let (buf, va) = scratch();
@@ -465,8 +431,7 @@ fn test_feholdexcept_shape() {
 
 // ------------------------------------------------------ Unicorn differential --
 
-/// `MXCSR` is not part of the oracle's [`CpuState`], so these cases move it
-/// through `EAX` to make it diffable.
+/// `MXCSR` is moved through EAX since `CpuState` lacks it.
 #[cfg(feature = "unicorn-oracle")]
 mod unicorn {
     use microlift::testkit::oracle::unicorn::differential_unicorn;
@@ -481,11 +446,10 @@ mod unicorn {
         assert!(diff.is_empty(), "microlift vs unicorn diverged: {diff:?}");
     }
 
-    /// Both engines must start from the same architectural `MXCSR` and report
-    /// it identically through `STMXCSR`.
+    /// Same reset `MXCSR` on both engines.
     #[test]
     fn stmxcsr_initial_value_agrees() {
-        // The red zone below the harness stack is scratch both engines share.
+        // Red zone below the harness stack is shared scratch.
         #[rustfmt::skip]
         let code = [
             0x0F, 0xAE, 0x5C, 0x24, 0xF8,   // stmxcsr [rsp-8]
@@ -495,7 +459,7 @@ mod unicorn {
         agree(&code, &CpuState::zeroed());
     }
 
-    /// A rounding-mode change round-trips identically on both engines.
+    /// Rounding-mode change round-trips identically.
     #[test]
     fn ldmxcsr_roundtrip_agrees() {
         #[rustfmt::skip]
@@ -513,10 +477,7 @@ mod unicorn {
         agree(&code, &CpuState::zeroed());
     }
 
-    /// The x87 environment `FNSTENV` writes - control word, status word (with
-    /// `TOP`) and the recomputed tag word - must match Unicorn's, both for a
-    /// loaded stack and after `FNINIT`. The pointer fields are not compared:
-    /// Unicorn fills in a real `FIP`/`FDP` and Microlift writes zeros.
+    /// FNSTENV output must match Unicorn's, except pointer fields (Unicorn fills FIP/FDP).
     #[test]
     fn fnstenv_environment_agrees() {
         #[rustfmt::skip]

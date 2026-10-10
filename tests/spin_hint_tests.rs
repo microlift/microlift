@@ -7,10 +7,10 @@ use microlift::testkit::prelude::*;
 /// `pause` ; `ret`
 const PAUSE_RET: &[u8] = &[0xF3, 0x90, 0xC3];
 
-/// `pause`, `F3 90` - a `rep nop`.
+/// `pause`, `F3 90` (`rep nop`).
 const X86_PAUSE: &[u8] = &[0xF3, 0x90];
 
-/// `yield`, `HINT #1` - `0xD503203F`, little-endian.
+/// `yield`, `HINT #1`, `0xD503203F` little-endian.
 const AARCH64_YIELD: &[u8] = &[0x3F, 0x20, 0x03, 0xD5];
 
 fn compile_for(bytes: &[u8], spec: Specialization, triple: &str) -> Vec<u8> {
@@ -19,9 +19,7 @@ fn compile_for(bytes: &[u8], spec: Specialization, triple: &str) -> Vec<u8> {
         ..Default::default()
     };
     let mut code = lift_to_code::<X86_64>(bytes, 0x1000, config).expect("lift");
-    // The lifter bakes in the *host* calling convention; override it so this
-    // measures instruction lowering rather than tripping the target's ABI code
-    // on a convention it does not accept.
+    // Override the host calling convention to measure lowering, not ABI.
     code.func.signature.call_conv = CallConv::SystemV;
     ArtifactBackend::compile_lifted_to_raw(code, Some(triple), None).expect("compile")
 }
@@ -33,7 +31,7 @@ fn occurrences(haystack: &[u8], needle: &[u8]) -> usize {
         .count()
 }
 
-/// Emitted IR instruction count, over every block.
+/// Emitted IR instruction count over every block.
 fn ir_len(bytes: &[u8], spec: Specialization) -> usize {
     let config = LifterConfig {
         specialization: spec,
@@ -47,7 +45,7 @@ fn ir_len(bytes: &[u8], spec: Specialization) -> usize {
         .sum()
 }
 
-/// The targets that claim the spec, with the encoding each is expected to emit.
+/// Targets claiming the spec, with the encoding each emits.
 const TARGETS: &[(SpecTarget, &str, &[u8])] = &[
     (SpecTarget::X86_64, "x86_64-unknown-linux-gnu", X86_PAUSE),
     (
@@ -57,12 +55,7 @@ const TARGETS: &[(SpecTarget, &str, &[u8])] = &[
     ),
 ];
 
-/// Each target emits its own hint instruction, and only with the spec enabled.
-///
-/// Counted rather than merely searched for: `F3 90` is two very ordinary bytes,
-/// and a displacement or an immediate elsewhere in the region could contain
-/// them by coincidence. What must hold is that enabling the spec adds exactly
-/// one more occurrence than the portable lowering has.
+/// Each target emits its hint only with the spec on. Counted, since `F3 90` could occur by coincidence: enabling must add exactly one occurrence.
 #[test]
 fn each_target_emits_its_own_hint() {
     for &(target, triple, needle) in TARGETS {
@@ -83,17 +76,12 @@ fn each_target_emits_its_own_hint() {
     }
 }
 
-/// A target that does not claim the spec, and the generic target, emit nothing.
-///
-/// The generic half is the one that matters: `Specialization::generic()` is the
-/// default, so this is the promise that a caller who never touches the knob
-/// gets byte-identical output to a lifter without it.
+/// Unclaimed targets and the generic target emit nothing; generic is the default, so unaware callers see identical output.
 #[test]
 fn inert_where_unclaimed() {
     let base = ir_len(PAUSE_RET, Specialization::generic());
 
-    // Enabling it on a target that has no lowering must stay inert rather than
-    // emit an opcode that target cannot lower.
+    // Enabling on a target with no lowering stays inert.
     assert_eq!(
         ir_len(
             PAUSE_RET,
@@ -103,7 +91,7 @@ fn inert_where_unclaimed() {
         "spin-loop-hint fired under the generic target"
     );
 
-    // And it is a true off switch on a target that does claim it.
+    // A true off switch where claimed.
     for &(target, _, _) in TARGETS {
         assert_eq!(
             ir_len(
@@ -117,12 +105,7 @@ fn inert_where_unclaimed() {
     }
 }
 
-/// Enabling it does change the IR on a target that claims it.
-///
-/// The mirror of [`inert_where_unclaimed`]: without this, a gate mistyped so
-/// that the spec never fires would pass every other test in this file except
-/// the machine-code one, and would pass that one too if the encoding search
-/// were ever loosened.
+/// Enabling changes the IR on a claiming target; mirror of [`inert_where_unclaimed`], catching a spec that never fires.
 #[test]
 fn fires_where_claimed() {
     let base = ir_len(PAUSE_RET, Specialization::generic());
@@ -139,12 +122,7 @@ fn fires_where_claimed() {
     }
 }
 
-/// The spec needs no `use_vector_xmm`, and must fire without it.
-///
-/// [`Spec::requires_vector_xmm`] declares this one exempt - it is a single
-/// operand-free instruction with no opinion about how XMM registers are stored
-/// - and `specialize_tests::inert_without_vector_xmm` checks the exemption for
-/// the other specs. This is the same check for this one.
+/// No `use_vector_xmm` needed (exempt via [`Spec::requires_vector_xmm`]); see `specialize_tests::inert_without_vector_xmm`.
 #[test]
 fn does_not_need_vector_xmm() {
     assert!(!Spec::SpinLoopHint.requires_vector_xmm());
@@ -169,11 +147,7 @@ fn does_not_need_vector_xmm() {
     );
 }
 
-/// The hint perturbs no architectural state, executed for real on the host.
-///
-/// A `PAUSE` between two ordinary instructions must leave the region's result
-/// exactly as it is without one - including the flags, which is the half a
-/// careless lowering would break.
+/// Executed for real: a `PAUSE` between instructions must leave the result and flags unchanged.
 #[test]
 fn changes_no_architectural_state() {
     // mov rax, 7 ; add rax, 5 ; pause ; sub rax, 1 ; ret
@@ -197,11 +171,7 @@ fn changes_no_architectural_state() {
     assert_eq!(flags(&plain), flags(&hinted));
 }
 
-/// Each target's specialized IR lowers for the machine it names.
-///
-/// `spin_hint` is a new CLIF opcode, so a backend with no rule for it fails to
-/// lower rather than producing wrong code - loudly, but only if something
-/// actually compiles for that backend.
+/// Each target's IR lowers for it; `spin_hint` is a new CLIF opcode, so a backend lacking a rule fails to lower.
 #[test]
 fn each_target_lowers_its_own_ir() {
     for &(target, triple, _) in TARGETS {

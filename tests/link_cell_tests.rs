@@ -10,7 +10,6 @@ use microlift::runtime::{CodeCache, Step, ThreadRuntime, Translation};
 use microlift::testkit::prelude::*;
 use microlift::testkit::DEFAULT_LIFT_BASE;
 
-/// Where the static edge lands.
 const TARGET: u64 = 0x200C;
 const ROWS: u32 = 256;
 
@@ -18,15 +17,13 @@ fn link_config() -> BlockLinkConfig {
     BlockLinkConfig::new(ROWS)
 }
 
-/// `mov rax, 1 ; jmp 0x200c` - a direct jump out of the region, which is a
-/// destination the lifter knows at lift time and so gets a cell.
+/// `mov rax, 1 ; jmp 0x200c`: a lift-time-known destination, so it gets a cell.
 #[rustfmt::skip]
 const STATIC_JUMP: &[u8] = &[
     0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00,  // mov rax, 1
     0xE9, 0x00, 0x10, 0x00, 0x00,              // jmp 0x200c
 ];
 
-/// `mov rbx, 7 ; ret` at [`TARGET`].
 const CALLEE: &[u8] = &[0x48, 0xC7, 0xC3, 0x07, 0x00, 0x00, 0x00, 0xC3];
 
 fn config(cells: bool) -> impl Fn(&mut LifterConfig) {
@@ -63,8 +60,7 @@ impl Guest {
         let top = stack.as_ptr() as u64 + (stack.len() as u64) * 8;
         let mut runtime = ThreadRuntime::new(link_config(), Arc::clone(cache));
         runtime.ctx.rsp = top - 8;
-        // SAFETY: inside `stack`, which this struct owns. The callee `ret`s to
-        // the trampoline and leaves for the host.
+        // SAFETY: inside `stack`, which this struct owns.
         unsafe { *(runtime.ctx.rsp as *mut u64) = microlift::testkit::EXIT_TRAMPOLINE };
         runtime.ctx.rip = DEFAULT_LIFT_BASE;
         Self {
@@ -118,9 +114,7 @@ fn the_cell_array_is_reached_by_an_absolute_address() {
 
 #[test]
 fn a_dynamic_target_gets_no_cell() {
-    // The control for the case above: `ret` leaves for an address popped off the
-    // guest stack, which no amount of lift-time knowledge can name. Without this,
-    // an implementation that handed out a cell per exit would pass.
+    // Control: a RET to a popped address has no lift-time name, so it must get no cell.
     let config = LifterConfig {
         block_link: Some(link_config()),
         link_cells: true,
@@ -150,8 +144,7 @@ fn the_switch_being_off_emits_nothing() {
 
 #[test]
 fn cells_need_block_linking_to_mean_anything() {
-    // A cell *is* a `BlockLinkEntry`; asking for cells without the rest of block
-    // linking is inert rather than an error, following `block_link_offsets`.
+    // Cells without block linking are inert, following `block_link_offsets`.
     let config = LifterConfig {
         block_link: None,
         link_cells: true,
@@ -164,11 +157,7 @@ fn cells_need_block_linking_to_mean_anything() {
 
 #[test]
 fn two_branches_to_one_address_share_a_cell() {
-    // `jz 0x200c ; jmp 0x200c` - two edges, one destination. De-duplication is
-    // what keeps a `switch` whose arms all leave the region from costing a cell
-    // per edge, and means the second edge links the instant the first does.
-    // Both displacements land on TARGET: `jz` is six bytes from 0x1000 and
-    // `jmp` is five from 0x1006, so they are not the same immediate.
+    // `jz 0x200c ; jmp 0x200c`: edges to one destination share one cell and link together.
     #[rustfmt::skip]
     let bytes: &[u8] = &[
         0x0F, 0x84, 0x06, 0x10, 0x00, 0x00,  // jz  0x200c
@@ -190,17 +179,15 @@ fn two_branches_to_one_address_share_a_cell() {
     assert_eq!(code.link_sites[0].target, TARGET);
 }
 
-/// **The control that carries this file.** With `link_table` null there is no
-/// table to hash into, so the only way the callee can run is a cell.
+/// With `link_table` null, only a cell can run the callee.
 #[test]
 fn a_static_edge_links_with_no_table_at_all() {
     let cache = Arc::new(RwLock::new(CodeCache::new()));
     let mut guest = Guest::new(&cache);
-    // Insert the callee first so the caller's cell is filled at insert time.
+    // Callee first so the caller's cell is filled at insert time.
     cache.write().unwrap().insert(callee(true));
     let caller = cache.write().unwrap().insert(caller(true));
     guest.runtime.publish(&caller);
-    // Everything the table could have done is now impossible.
     guest.runtime.detach_table();
 
     // SAFETY: both translations were compiled by this test for this context.
@@ -214,9 +201,7 @@ fn a_static_edge_links_with_no_table_at_all() {
 
 #[test]
 fn without_cells_the_same_program_needs_the_table() {
-    // The other half of the control above: identical fixture, cells off. The
-    // callee is unreachable with a null table, which is what proves the previous
-    // test measured the cell rather than something else.
+    // Cells off: the callee is unreachable with a null table.
     let cache = Arc::new(RwLock::new(CodeCache::new()));
     let mut guest = Guest::new(&cache);
     cache.write().unwrap().insert(callee(false));
@@ -235,19 +220,16 @@ fn without_cells_the_same_program_needs_the_table() {
 
 #[test]
 fn an_uninstalled_cell_falls_through_to_the_probe() {
-    // The fallback is not decorative: a cell is empty until its target is
-    // compiled, so the probe is what serves the edge until then.
+    // A cell is empty until its target compiles; the probe serves the edge until then.
     let cache = Arc::new(RwLock::new(CodeCache::new()));
     let mut guest = Guest::new(&cache);
-    // Caller first, so its cell has nothing to point at.
     let caller = cache.write().unwrap().insert(caller(true));
     guest.runtime.publish(&caller);
     assert_eq!(cache.read().unwrap().cell_counts(), (0, 1), "one pending");
 
     let callee = cache.write().unwrap().insert(callee(true));
     guest.runtime.publish(&callee);
-    // Inserting the target filled the waiting cell - the other direction of the
-    // installer.
+    // Inserting the target fills the waiting cell.
     assert_eq!(cache.read().unwrap().cell_counts(), (1, 0));
 
     // SAFETY: as above.
@@ -294,7 +276,6 @@ fn invalidating_the_target_clears_the_cell_that_named_it() {
     assert_eq!(cache.read().unwrap().stats().cells_retracted, 1);
     assert_eq!(caller.read_cell(0).code, 0, "the cell was cleared");
 
-    // And the edge now behaves as if it had never been installed.
     guest.runtime.ctx.rip = DEFAULT_LIFT_BASE;
     guest.runtime.ctx.rbx = 0;
     // SAFETY: as above.
@@ -308,8 +289,7 @@ fn invalidating_the_target_clears_the_cell_that_named_it() {
 
 #[test]
 fn a_retracted_cell_relinks_when_the_address_is_translated_again() {
-    // A retraction moves the cell back to pending rather than forgetting it, so
-    // the region does not have to be re-lifted to link again.
+    // Retraction returns the cell to pending, so no re-lift is needed to link again.
     let cache = Arc::new(RwLock::new(CodeCache::new()));
     let mut guest = Guest::new(&cache);
     cache.write().unwrap().insert(callee(true));
@@ -334,15 +314,12 @@ fn a_retracted_cell_relinks_when_the_address_is_translated_again() {
 
 #[test]
 fn a_dying_region_stops_owning_cells() {
-    // The other direction: cells *belonging to* an invalidated translation must
-    // be forgotten, or a later install writes into an array about to be unmapped
-    // - and the maps would pin the `Arc` so `reclaim` could never free anything.
+    // Cells owned by an invalidated translation must be forgotten, or an install writes into unmapped memory.
     let cache = Arc::new(RwLock::new(CodeCache::new()));
     cache.write().unwrap().insert(callee(true));
     cache.write().unwrap().insert(caller(true));
     assert_eq!(cache.read().unwrap().cell_counts(), (1, 0));
 
-    // Invalidate the *caller*, which owns the cell.
     cache
         .write()
         .unwrap()
@@ -356,13 +333,7 @@ fn a_dying_region_stops_owning_cells() {
     assert_eq!(cache.write().unwrap().reclaim(), 1, "and it can be freed");
 }
 
-/// The pinned arm of the cell probe: instead of naming the cell for the host, a
-/// hit loads `image_base` and `code` out of it and **tail-calls**, carrying the
-/// guest register file in machine registers.
-///
-/// The same code path as the table probe's pinned arm, reached through a cell -
-/// and worth its own test because it is the branch where a cell must supply
-/// `image_base` itself, there being no host on that path to set it.
+/// Pinned arm: a hit loads `image_base` and `code` from the cell and tail-calls; no host is there to set `image_base`.
 #[test]
 fn a_pinned_cell_tail_calls_its_successor() {
     fn abi() -> PinnedAbi {
@@ -390,8 +361,7 @@ fn a_pinned_cell_tail_calls_its_successor() {
         .translation()
         .expect("compiles");
 
-    // Under a pinned ABI the address to call and the address to link to are
-    // different functions, and a cell must name the latter.
+    // Under a pinned ABI the call address differs from the link address; the cell names the latter.
     assert_ne!(
         callee.entry, callee.link_target,
         "the fixture must actually be pinned"
@@ -402,7 +372,6 @@ fn a_pinned_cell_tail_calls_its_successor() {
     assert_eq!(caller.read_cell(0).code, callee.link_target as u64);
 
     guest.runtime.publish(&caller);
-    // No table: the chain can only run itself through the cell.
     guest.runtime.detach_table();
 
     // SAFETY: both translations were compiled by this test for this context.
@@ -422,11 +391,7 @@ fn a_pinned_cell_tail_calls_its_successor() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Cost
-// ---------------------------------------------------------------------------
 
-/// Compiled `.text` size of `bytes` under `cells`, cross-compiled for `triple`.
 fn text_len(bytes: &[u8], cells: bool, triple: &str) -> usize {
     let config = LifterConfig {
         block_link: Some(link_config()),
@@ -434,20 +399,15 @@ fn text_len(bytes: &[u8], cells: bool, triple: &str) -> usize {
         ..LifterConfig::default()
     };
     let mut code = lift_to_code::<X86_64>(bytes, DEFAULT_LIFT_BASE, config).expect("lift");
-    // As in `specialize_tests`: the lifter bakes in the *host* calling
-    // convention, so override it to measure lowering rather than trip the
-    // target's ABI code on a convention it does not accept.
+    // Override the baked host convention so this measures lowering.
     code.func.signature.call_conv = cranelift_codegen::isa::CallConv::SystemV;
     microlift::backend::ArtifactBackend::compile_lifted_to_raw(code, Some(triple), None)
         .expect("compile")
         .len()
 }
 
-/// `n` reachable out-of-region conditional branches, each to its own address.
 fn n_static_exits(n: usize) -> Vec<u8> {
-    // Conditional, not `jmp`: a run of unconditional jumps makes all but the
-    // first unreachable, Cranelift deletes them, and the measurement is of one
-    // exit however many were written.
+    // Conditional, not `jmp`: unconditional runs are deleted as unreachable.
     let mut bytes = Vec::new();
     for i in 0..n {
         bytes.extend_from_slice(&[0x0F, 0x84]);
@@ -457,24 +417,10 @@ fn n_static_exits(n: usize) -> Vec<u8> {
     bytes
 }
 
-/// **Cells make the compiled region bigger, and this is the budget.**
-///
-/// Unlike a `Spec`, this cannot prove itself by shrinking: the table probe stays
-/// as the fallback - a cell is empty until its target is compiled and empty
-/// again after an invalidation - so a cell is a fast path bolted in front of the
-/// slow one. What it buys is what the exit *executes* (a load and a branch
-/// instead of six instructions, and a lookup that cannot collide), and that is
-/// what the behavioural tests above measure by reaching a successor with the
-/// table detached.
-///
-/// So this test exists to keep the cost *bounded and known*, not to show a win.
-/// The bound matters: on a page-bounded region of branch-dense code, cells can
-/// rival the code itself, and a host budgeting for them needs a number rather
-/// than an adjective.
+/// Cell size budget: cells are a fast path bolted in front of the probe, so this bounds the cost rather than showing a win.
 #[test]
 fn cells_cost_a_bounded_amount_of_code_and_data_per_exit() {
-    // Measured; the assertion is a ceiling with room for codegen drift, not the
-    // observation itself.
+    // Ceiling with room for codegen drift.
     const CEILING_PER_EXIT: i64 = 64;
 
     for (triple, observed) in [
@@ -504,9 +450,7 @@ fn cells_cost_a_bounded_amount_of_code_and_data_per_exit() {
 
 #[test]
 fn the_cell_array_is_thirty_two_bytes_per_distinct_target() {
-    // The data half of the cost, and the reason it is per *distinct* target: a
-    // switch whose arms all leave the region pays once per destination, not once
-    // per edge.
+    // Data cost is per distinct target, not per edge.
     let config = LifterConfig {
         block_link: Some(link_config()),
         link_cells: true,

@@ -5,16 +5,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 #[test]
 fn test_mfence() {
-    // mfence; ret
     let bytes = [0x0F, 0xAE, 0xF0, 0xC3];
     let ctx = run_test(&bytes, RegisterContext::default());
-    // Just verifies no crash / correct exit
     assert_eq!(ctx.rax, 0);
 }
 
 #[test]
 fn test_sfence() {
-    // sfence; ret
     let bytes = [0x0F, 0xAE, 0xF8, 0xC3];
     let ctx = run_test(&bytes, RegisterContext::default());
     assert_eq!(ctx.rax, 0);
@@ -22,7 +19,6 @@ fn test_sfence() {
 
 #[test]
 fn test_lfence() {
-    // lfence; ret
     let bytes = [0x0F, 0xAE, 0xE8, 0xC3];
     let ctx = run_test(&bytes, RegisterContext::default());
     assert_eq!(ctx.rax, 0);
@@ -30,7 +26,6 @@ fn test_lfence() {
 
 #[test]
 fn test_pause() {
-    // pause; ret
     let bytes = [0xF3, 0x90, 0xC3];
     let ctx = run_test(&bytes, RegisterContext::default());
     assert_eq!(ctx.rax, 0);
@@ -38,12 +33,6 @@ fn test_pause() {
 
 #[test]
 fn test_cmpxchg_reg_equal() {
-    // mov rax, 10; mov rcx, 10; mov rbx, 99;
-    // cmpxchg rcx, rbx  (compare RAX==RCX -> equal, so RCX <- RBX=99)
-    // ret
-    //
-    // Encoding: 48 0F B1 D9  = CMPXCHG rcx, rbx (REX.W 0F B1 /r)
-    // ModRM for rcx (dst) / rbx (src): mod=11 reg=rbx(3) rm=rcx(1) -> 0xD9
     let bytes = [
         0x48, 0xC7, 0xC0, 10, 0, 0, 0, // mov rax, 10
         0x48, 0xC7, 0xC1, 10, 0, 0, 0, // mov rcx, 10
@@ -58,9 +47,6 @@ fn test_cmpxchg_reg_equal() {
 
 #[test]
 fn test_cmpxchg_reg_not_equal() {
-    // mov rax, 5; mov rcx, 10; mov rbx, 99;
-    // cmpxchg rcx, rbx  (compare RAX(5) != RCX(10) -> RAX <- RCX=10, ZF=0)
-    // ret
     let bytes = [
         0x48, 0xC7, 0xC0, 5, 0, 0, 0, // mov rax, 5
         0x48, 0xC7, 0xC1, 10, 0, 0, 0, // mov rcx, 10
@@ -79,12 +65,6 @@ fn test_cmpxchg_reg_not_equal() {
 
 #[test]
 fn test_cmpxchg_mem_equal() {
-    // RDI = pointer to mem_val = 42
-    // mov rax, 42; mov rbx, 99;
-    // cmpxchg [rdi], rbx   (42==42 -> [rdi]=99, ZF=1)
-    // ret
-    //
-    // CMPXCHG [RDI], RBX (REX.W 0F B1 1F): 48 0F B1 1F
     let mut mem_val: u64 = 42;
     let mut ctx = RegisterContext::default();
     ctx.rdi = &mut mem_val as *mut u64 as u64;
@@ -102,10 +82,6 @@ fn test_cmpxchg_mem_equal() {
 
 #[test]
 fn test_cmpxchg_mem_not_equal() {
-    // RDI = pointer to mem_val = 7
-    // mov rax, 42; mov rbx, 99;
-    // cmpxchg [rdi], rbx   (42 != 7 -> rax=7, ZF=0, [rdi] unchanged)
-    // ret
     let mut mem_val: u64 = 7;
     let mut ctx = RegisterContext::default();
     ctx.rdi = &mut mem_val as *mut u64 as u64;
@@ -124,11 +100,6 @@ fn test_cmpxchg_mem_not_equal() {
 
 #[test]
 fn test_cmpxchg8b_equal() {
-    // mem = 0x0000_0002_0000_0001  (EDX:EAX expected = 2:1)
-    // ECX:EBX replacement = 4:3  -> mem should become 0x0000_0004_0000_0003
-    // ZF = 1
-    //
-    // CMPXCHG8B [RDI]: 0F C7 0F
     let mut mem_val: u64 = (2u64 << 32) | 1u64;
     let mut ctx = RegisterContext::default();
     ctx.rdi = &mut mem_val as *mut u64 as u64;
@@ -148,8 +119,6 @@ fn test_cmpxchg8b_equal() {
 
 #[test]
 fn test_cmpxchg8b_not_equal() {
-    // mem = 0x0000_0099_0000_0088  (EDX:EAX expected mismatch)
-    // EDX:EAX = 2:1 (doesn't match), so ZF=0 and EDX:EAX <- mem
     let mut mem_val: u64 = (0x99u64 << 32) | 0x88u64;
     let mut ctx = RegisterContext::default();
     ctx.rdi = &mut mem_val as *mut u64 as u64;
@@ -175,12 +144,6 @@ fn test_cmpxchg8b_not_equal() {
 
 #[test]
 fn test_lock_add_mem() {
-    // RDI = pointer to mem_val = 10
-    // mov rsi, 5
-    // lock add [rdi], rsi    -> mem = 15, flags for 10+5
-    // ret
-    //
-    // F0 48 01 37: LOCK ADD [RDI], RSI
     let mut mem_val: u64 = 10;
     let mut ctx = RegisterContext::default();
     ctx.rdi = &mut mem_val as *mut u64 as u64;
@@ -198,7 +161,6 @@ fn test_lock_add_mem() {
 
 #[test]
 fn test_lock_add_mem_zero_result() {
-    // mem = u64::MAX, add 1 -> wraps to 0, ZF=1, CF=1
     let mut mem_val: u64 = u64::MAX;
     let mut ctx = RegisterContext::default();
     ctx.rdi = &mut mem_val as *mut u64 as u64;
@@ -216,11 +178,6 @@ fn test_lock_add_mem_zero_result() {
 
 #[test]
 fn test_lock_xadd() {
-    // RDI = pointer to mem_val = 100
-    // RSI = 5
-    // lock xadd [rdi], rsi  -> mem = 105, rsi = 100 (old value)
-    //
-    // F0 48 0F C1 37: LOCK XADD [RDI], RSI
     let mut mem_val: u64 = 100;
     let mut ctx = RegisterContext::default();
     ctx.rdi = &mut mem_val as *mut u64 as u64;
@@ -238,11 +195,6 @@ fn test_lock_xadd() {
 
 #[test]
 fn test_lock_xchg() {
-    // RDI = pointer to mem_val = 77
-    // RSI = 99
-    // lock xchg [rdi], rsi  -> mem = 99, rsi = 77
-    //
-    // F0 48 87 37: LOCK XCHG [RDI], RSI
     let mut mem_val: u64 = 77;
     let mut ctx = RegisterContext::default();
     ctx.rdi = &mut mem_val as *mut u64 as u64;
@@ -259,8 +211,6 @@ fn test_lock_xchg() {
 
 #[test]
 fn test_lock_sub() {
-    // mem = 20; lock sub [rdi], 7 -> mem = 13
-    // F0 48 83 2F 07: LOCK SUB QWORD [RDI], 7  (imm8 sign-extended)
     let mut mem_val: u64 = 20;
     let mut ctx = RegisterContext::default();
     ctx.rdi = &mut mem_val as *mut u64 as u64;
@@ -277,8 +227,6 @@ fn test_lock_sub() {
 
 #[test]
 fn test_lock_and() {
-    // mem = 0b1111; lock and [rdi], 0b1010 -> mem = 0b1010
-    // F0 48 83 27 0A: LOCK AND QWORD [RDI], 10
     let mut mem_val: u64 = 0b1111;
     let mut ctx = RegisterContext::default();
     ctx.rdi = &mut mem_val as *mut u64 as u64;
@@ -293,8 +241,6 @@ fn test_lock_and() {
 
 #[test]
 fn test_lock_or() {
-    // mem = 0b1010; lock or [rdi], 0b0101 -> mem = 0b1111
-    // F0 48 83 0F 05: LOCK OR QWORD [RDI], 5
     let mut mem_val: u64 = 0b1010;
     let mut ctx = RegisterContext::default();
     ctx.rdi = &mut mem_val as *mut u64 as u64;
@@ -309,8 +255,6 @@ fn test_lock_or() {
 
 #[test]
 fn test_lock_xor() {
-    // mem = 0xFF; lock xor [rdi], 0x0F -> mem = 0xF0
-    // F0 48 83 37 0F: LOCK XOR QWORD [RDI], 15
     let mut mem_val: u64 = 0xFF;
     let mut ctx = RegisterContext::default();
     ctx.rdi = &mut mem_val as *mut u64 as u64;
@@ -325,8 +269,6 @@ fn test_lock_xor() {
 
 #[test]
 fn test_lock_inc() {
-    // mem = 41; lock inc [rdi] -> mem = 42
-    // F0 48 FF 07: LOCK INC QWORD [RDI]
     let mut mem_val: u64 = 41;
     let mut ctx = RegisterContext::default();
     ctx.rdi = &mut mem_val as *mut u64 as u64;
@@ -339,8 +281,6 @@ fn test_lock_inc() {
 
 #[test]
 fn test_lock_dec() {
-    // mem = 1; lock dec [rdi] -> mem = 0, ZF=1
-    // F0 48 FF 0F: LOCK DEC QWORD [RDI]
     let mut mem_val: u64 = 1;
     let mut ctx = RegisterContext::default();
     ctx.rdi = &mut mem_val as *mut u64 as u64;
@@ -353,8 +293,6 @@ fn test_lock_dec() {
 
 #[test]
 fn test_lock_bts() {
-    // mem = 0b0101; lock bts [rdi], 1  -> sets bit 1 -> mem = 0b0111, CF = 0 (was 0)
-    // F0 48 0F AB 0F: LOCK BTS QWORD [RDI], RCX  (with RCX=1)
     let mut mem_val: u64 = 0b0101;
     let mut ctx = RegisterContext::default();
     ctx.rdi = &mut mem_val as *mut u64 as u64;
@@ -368,7 +306,6 @@ fn test_lock_bts() {
 
 #[test]
 fn test_lock_bts_already_set() {
-    // mem = 0b0111; lock bts [rdi], 1  -> bit 1 already set -> CF=1, mem unchanged
     let mut mem_val: u64 = 0b0111;
     let mut ctx = RegisterContext::default();
     ctx.rdi = &mut mem_val as *mut u64 as u64;
@@ -382,8 +319,6 @@ fn test_lock_bts_already_set() {
 
 #[test]
 fn test_lock_btr() {
-    // mem = 0b0111; lock btr [rdi], 1  -> clears bit 1 -> mem = 0b0101, CF=1 (was 1)
-    // F0 48 0F B3 0F: LOCK BTR QWORD [RDI], RCX  (with RCX=1)
     let mut mem_val: u64 = 0b0111;
     let mut ctx = RegisterContext::default();
     ctx.rdi = &mut mem_val as *mut u64 as u64;
@@ -397,8 +332,6 @@ fn test_lock_btr() {
 
 #[test]
 fn test_lock_btc() {
-    // mem = 0b0101; lock btc [rdi], 2  -> complements bit 2 -> mem = 0b0001, CF=1 (was 1)
-    // F0 48 0F BB 0F: LOCK BTC QWORD [RDI], RCX  (with RCX=2)
     let mut mem_val: u64 = 0b0101;
     let mut ctx = RegisterContext::default();
     ctx.rdi = &mut mem_val as *mut u64 as u64;
@@ -410,17 +343,13 @@ fn test_lock_btc() {
     assert_eq!(ctx.cf, 1, "CF=1: bit was originally set");
 }
 
-/// A 16-byte-aligned pair of qwords, standing in for the `__int128` a guest's
-/// `CMPXCHG16B` operates on. Real hardware raises `#GP` on a misaligned
-/// operand, so the tests use an operand the guest would actually be given.
+/// 16-byte-aligned pair of qwords; hardware faults #GP on a misaligned CMPXCHG16B.
 #[repr(C, align(16))]
 struct Aligned128 {
     lo: u64,
     hi: u64,
 }
 
-/// `lock cmpxchg16b [rdi]` where RDX:RAX matches: the memory takes RCX:RBX,
-/// ZF is set, and RDX:RAX keep the expected value.
 #[test]
 fn test_cmpxchg16b_success() {
     let mut mem = Aligned128 { lo: 1, hi: 2 };
@@ -431,7 +360,6 @@ fn test_cmpxchg16b_success() {
     ctx.rbx = 0xAAAA_BBBB_CCCC_DDDD;
     ctx.rcx = 0x1111_2222_3333_4444;
 
-    // F0 48 0F C7 0F: lock cmpxchg16b [rdi]
     let bytes = [0xF0, 0x48, 0x0F, 0xC7, 0x0F, 0xC3];
     let ctx = run_test(&bytes, ctx);
 
@@ -442,8 +370,7 @@ fn test_cmpxchg16b_success() {
     assert_eq!(ctx.rdx, 2, "RDX unchanged on success");
 }
 
-/// A mismatch in the *high* half alone must still fail the comparison - the
-/// case a lowering that only compares 64 bits would get wrong.
+/// A high-half-only mismatch must fail the compare.
 #[test]
 fn test_cmpxchg16b_failure_high_half() {
     let mut mem = Aligned128 { lo: 1, hi: 0xDEAD };
@@ -464,7 +391,7 @@ fn test_cmpxchg16b_failure_high_half() {
     assert_eq!(ctx.rdx, 0xDEAD, "RDX loaded with the observed high half");
 }
 
-/// The low half alone mismatching must fail too.
+/// A low-half-only mismatch must fail too.
 #[test]
 fn test_cmpxchg16b_failure_low_half() {
     let mut mem = Aligned128 { lo: 0xBEEF, hi: 2 };
@@ -485,8 +412,6 @@ fn test_cmpxchg16b_failure_low_half() {
     assert_eq!(ctx.rdx, 2);
 }
 
-/// Without the LOCK prefix the instruction is still valid (just not atomic) and
-/// must lift to the same architectural result.
 #[test]
 fn test_cmpxchg16b_without_lock_prefix() {
     let mut mem = Aligned128 { lo: 5, hi: 6 };
@@ -497,7 +422,6 @@ fn test_cmpxchg16b_without_lock_prefix() {
     ctx.rbx = 7;
     ctx.rcx = 8;
 
-    // 48 0F C7 0F: cmpxchg16b [rdi]
     let bytes = [0x48, 0x0F, 0xC7, 0x0F, 0xC3];
     let ctx = run_test(&bytes, ctx);
 
@@ -505,18 +429,15 @@ fn test_cmpxchg16b_without_lock_prefix() {
     assert_eq!(ctx.zf, 1);
 }
 
-/// CMPXCHG16B affects ZF only; CF/SF/OF/PF/AF must survive it untouched.
-/// (`CMPXCHG` differs here - it updates all of them as if a `CMP` had run.)
+/// CMPXCHG16B touches ZF only (unlike CMPXCHG, which updates all flags).
 #[test]
 fn test_cmpxchg16b_leaves_other_flags_alone() {
     let mut mem = Aligned128 { lo: 0, hi: 0 };
     let mut ctx = RegisterContext::default();
     ctx.rdi = &mut mem as *mut Aligned128 as u64;
-    // stc sets CF, then a failing cmpxchg16b must leave it set.
     ctx.rax = 1; // != mem.lo, so the CAS fails
     ctx.rdx = 0;
 
-    // F9: stc ; F0 48 0F C7 0F: lock cmpxchg16b [rdi] ; C3
     let bytes = [0xF9, 0xF0, 0x48, 0x0F, 0xC7, 0x0F, 0xC3];
     let ctx = run_test(&bytes, ctx);
 
@@ -524,9 +445,7 @@ fn test_cmpxchg16b_leaves_other_flags_alone() {
     assert_eq!(ctx.cf, 1, "CF must be untouched by CMPXCHG16B");
 }
 
-/// `Atomic128Mode::Native` lowers to a real `lock cmpxchg16b`. It only compiles
-/// on an x64 host (no other Cranelift backend lowers `atomic_cas.i128`), which
-/// is exactly why the mode is opt-in.
+/// `Native` needs an x64 host; no other backend lowers `atomic_cas.i128`.
 #[test]
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn test_cmpxchg16b_native_mode() {
@@ -547,7 +466,6 @@ fn test_cmpxchg16b_native_mode() {
     assert_eq!((mem.lo, mem.hi), (30, 40));
     assert_eq!(out.ctx.zf, 1);
 
-    // ...and the failing case leaves the observed value in RDX:RAX.
     let mut mem = Aligned128 { lo: 11, hi: 22 };
     let mut ctx = RegisterContext::default();
     ctx.rdi = &mut mem as *mut Aligned128 as u64;
@@ -562,14 +480,10 @@ fn test_cmpxchg16b_native_mode() {
     assert_eq!((out.ctx.rax, out.ctx.rdx), (11, 22));
 }
 
-/// `Atomic128Mode::Interpret` hands the instruction to the host's interpreter
-/// callback instead of lowering it: the region never sees the memory, and it
-/// carries on at the `RET` once the callback has advanced the PC.
+/// `Interpret` hands the instruction to the interpreter callback; the region resumes at the `RET`.
 static EXIT_MODE_RIP: AtomicU64 = AtomicU64::new(0);
 static EXIT_MODE_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// Performs the CMPXCHG16B the lifter declined to lower, then steps the PC over
-/// its five bytes.
 unsafe extern "C" fn interpret_cmpxchg16b(ctx: *mut RegisterContext, num_instructions: u64) {
     let ctx = unsafe { &mut *ctx };
     EXIT_MODE_RIP.store(ctx.rip, Ordering::SeqCst);
@@ -602,7 +516,7 @@ fn test_cmpxchg16b_exit_mode() {
         ..X86_64Callbacks::default()
     };
 
-    // 90: nop (so the callback's PC is distinguishable from the region entry)
+    // nop makes the callback PC distinguishable from region entry.
     let bytes = [0x90, 0xF0, 0x48, 0x0F, 0xC7, 0x0F, 0xC3];
     let out = LiftTest::new(&bytes)
         .no_unicorn()
@@ -625,9 +539,7 @@ fn test_cmpxchg16b_exit_mode() {
     assert_eq!(out.ctx.zf, 1);
 }
 
-/// The shape a compiler emits for a 128-bit compare-exchange loop: save RBX,
-/// load the expected pair, retry the CAS until it succeeds, restore RBX. This
-/// exercises CMPXCHG16B together with the PUSH/POP/JNE/MOV around it.
+/// Compiler-style 128-bit CAS loop: save RBX, retry CMPXCHG16B, restore RBX.
 #[test]
 fn test_cmpxchg16b_retry_loop() {
     let mut mem = Aligned128 { lo: 100, hi: 200 };
@@ -640,7 +552,6 @@ fn test_cmpxchg16b_retry_loop() {
         0x53,                                     // push rbx
         0x48, 0x8B, 0x07,                         // mov rax, [rdi]
         0x48, 0x8B, 0x57, 0x08,                   // mov rdx, [rdi+8]
-        // .retry:
         0x48, 0x8D, 0x58, 0x01,                   // lea rbx, [rax+1]
         0x48, 0x8D, 0x4A, 0x01,                   // lea rcx, [rdx+1]
         0xF0, 0x48, 0x0F, 0xC7, 0x0F,             // lock cmpxchg16b [rdi]
@@ -655,17 +566,14 @@ fn test_cmpxchg16b_retry_loop() {
     assert_eq!(ctx.rbx, 0xCAFE, "RBX restored by the pop");
 }
 
-/// LOCK ADC / LOCK SBB have no atomic-RMW opcode (the result depends on the
-/// incoming CF), so they lower to a CAS retry loop.
+/// LOCK ADC/SBB depend on incoming CF, so they lower to a CAS retry loop.
 #[test]
 fn test_lock_adc() {
-    // stc ; lock adc qword [rdi], rsi  ->  mem = 10 + 5 + 1
     let mut mem_val: u64 = 10;
     let mut ctx = RegisterContext::default();
     ctx.rdi = &mut mem_val as *mut u64 as u64;
     ctx.rsi = 5;
 
-    // F9: stc ; F0 48 11 37: lock adc [rdi], rsi
     let bytes = [0xF9, 0xF0, 0x48, 0x11, 0x37, 0xC3];
     let ctx = run_test(&bytes, ctx);
     assert_eq!(mem_val, 16, "10 + 5 + CF");
@@ -675,13 +583,11 @@ fn test_lock_adc() {
 
 #[test]
 fn test_lock_adc_carry_out() {
-    // lock adc [rdi], rsi with CF=0 and a sum that wraps: CF out = 1, result 0.
     let mut mem_val: u64 = u64::MAX;
     let mut ctx = RegisterContext::default();
     ctx.rdi = &mut mem_val as *mut u64 as u64;
     ctx.rsi = 1;
 
-    // F8: clc ; F0 48 11 37: lock adc [rdi], rsi
     let bytes = [0xF8, 0xF0, 0x48, 0x11, 0x37, 0xC3];
     let ctx = run_test(&bytes, ctx);
     assert_eq!(mem_val, 0);
@@ -691,13 +597,11 @@ fn test_lock_adc_carry_out() {
 
 #[test]
 fn test_lock_sbb() {
-    // stc ; lock sbb qword [rdi], rsi  ->  mem = 10 - 5 - 1
     let mut mem_val: u64 = 10;
     let mut ctx = RegisterContext::default();
     ctx.rdi = &mut mem_val as *mut u64 as u64;
     ctx.rsi = 5;
 
-    // F9: stc ; F0 48 19 37: lock sbb [rdi], rsi
     let bytes = [0xF9, 0xF0, 0x48, 0x19, 0x37, 0xC3];
     let ctx = run_test(&bytes, ctx);
     assert_eq!(mem_val, 4, "10 - 5 - CF");
@@ -706,7 +610,6 @@ fn test_lock_sbb() {
 
 #[test]
 fn test_lock_sbb_borrow_out() {
-    // clc ; lock sbb [rdi], rsi with mem < rsi: borrow out, result wraps.
     let mut mem_val: u64 = 1;
     let mut ctx = RegisterContext::default();
     ctx.rdi = &mut mem_val as *mut u64 as u64;
@@ -718,14 +621,12 @@ fn test_lock_sbb_borrow_out() {
     assert_eq!(ctx.cf, 1, "borrow out");
 }
 
-/// LOCK ADC with an immediate source, at a narrower width.
 #[test]
 fn test_lock_adc_imm_dword() {
     let mut mem_val: u64 = 0xFFFF_FFFF_0000_000A;
     let mut ctx = RegisterContext::default();
     ctx.rdi = &mut mem_val as *mut u64 as u64;
 
-    // F9: stc ; F0 83 17 05: lock adc dword [rdi], 5
     let bytes = [0xF9, 0xF0, 0x83, 0x17, 0x05, 0xC3];
     let ctx = run_test(&bytes, ctx);
     assert_eq!(
@@ -735,8 +636,7 @@ fn test_lock_adc_imm_dword() {
     assert_eq!(ctx.cf, 0);
 }
 
-/// Cache maintenance and prefetch hints have no architectural effect here, but
-/// they routinely appear next to atomics and must not abort the lift.
+/// Fences and prefetch hints must not abort the lift.
 #[test]
 fn test_cache_hints_are_transparent() {
     let mut mem_val: u64 = 7;

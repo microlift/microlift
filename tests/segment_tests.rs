@@ -1,17 +1,5 @@
-//! Segment *selector* register tests: `MOV r/m16, Sreg`, `MOV Sreg, r/m16`,
-//! and `PUSH`/`POP FS`/`GS`.
-//!
-//! Distinct from `tls_tests.rs`, which covers the segment *bases* - the two are
-//! independent state here exactly as they are on 64-bit hardware, and one of
-//! the tests below pins that down.
-//!
-//! There is no Unicorn differential for any of this: seeding `CS`/`SS` in
-//! Unicorn means writing a real descriptor selector into an emulated CPU that
-//! is already in long mode, and the values a guest sees are a property of the
-//! guest OS rather than of the code, so there is nothing an oracle could agree
-//! with us about. `CpuState` carries no selectors, so the oracle starts every
-//! one at zero and would report a divergence for every read below - hence the
-//! `no_unicorn()` on each of them.
+//! Segment selector registers: `MOV r/m16, Sreg`, `MOV Sreg, r/m16`, `PUSH`/`POP FS`/`GS`.
+//! Independent of the bases covered in `tls_tests.rs`. No Unicorn differential: `CpuState` has no selectors, so every read would diverge (`no_unicorn()`).
 
 use microlift::arch::x86_64::context::{
     CS_USER64_DARWIN, CS_USER64_LINUX, SS_USER64_DARWIN, SS_USER64_LINUX,
@@ -23,12 +11,11 @@ fn default_context_holds_user_mode_selectors() {
     let ctx = RegisterContext::default();
     assert_eq!(ctx.cs, CS_USER64_DARWIN);
     assert_eq!(ctx.ss, SS_USER64_DARWIN);
-    // A real 64-bit user process reports 0 for these, base or no base.
+    // A real 64-bit user process reports 0 for these.
     assert_eq!((ctx.ds, ctx.es, ctx.fs, ctx.gs), (0, 0, 0, 0));
 }
 
-/// The tail of Crashpad's `CaptureContext`, which is what motivated all of
-/// this: three selector reads straight into a diagnostic struct.
+/// Tail of Crashpad's `CaptureContext`: three selector reads into a diagnostic struct.
 #[test]
 fn crashpad_capture_context_tail() {
     // mov ax, cs   ; 66 8C C8
@@ -42,7 +29,7 @@ fn crashpad_capture_context_tail() {
             c.ss = SS_USER64_LINUX;
             c.fs = 0;
             c.gs = 0;
-            // Nonsense in the upper bits, to prove a 16-bit write preserves them.
+            // Junk in the upper bits proves a 16-bit write preserves them.
             c.rax = 0xAAAA_AAAA_AAAA_0000;
             c.rcx = 0xBBBB_BBBB_BBBB_1111;
             c.rdx = 0xCCCC_CCCC_CCCC_2222;
@@ -83,8 +70,7 @@ fn read_every_selector_16_bit() {
     assert_eq!(out.ctx.rdi, 0x66);
 }
 
-/// `MOV r32, Sreg` / `MOV r64, Sreg`: the selector is zero-extended into the
-/// destination, so the upper bits are *cleared* rather than preserved.
+/// 32/64-bit destinations zero-extend the selector.
 #[test]
 fn read_selector_into_wider_register_zero_extends() {
     // mov eax, cs ; 8C C8
@@ -140,9 +126,7 @@ fn write_selector_from_register() {
     assert_eq!(out.ctx.es, 0x5678);
 }
 
-/// Loading the `FS` selector does not move the `FS` *base*. Hardware would
-/// reload the base from the descriptor; the lifter models selectors as storage
-/// only, and a guest that changes its TLS this way is out of scope.
+/// Loading the `FS` selector does not move the base (selectors are storage only).
 #[test]
 fn selector_write_leaves_segment_base_alone() {
     // mov fs, ax ; 66 8E E0
@@ -160,11 +144,10 @@ fn selector_write_leaves_segment_base_alone() {
     assert_eq!(out.ctx.fs_base, 0x7FFF_0000_1234_5678);
 }
 
-/// `PUSH FS`/`PUSH GS` move `RSP` by 8, not by the 2 bytes the register is
-/// wide, and zero-extend the selector into the slot.
+/// `PUSH FS`/`GS` move `RSP` by 8 and zero-extend the selector.
 #[test]
 fn push_segment_uses_an_eight_byte_slot() {
-    // push rcx ; 51   - sentinel, as in the 16-bit case below
+    // push rcx ; 51   - sentinel
     // push gs  ; 0F A8
     // pop rax  ; 58
     // pop rcx  ; 59
@@ -188,18 +171,15 @@ fn push_segment_uses_an_eight_byte_slot() {
     );
 }
 
-/// The `0x66`-prefixed spelling is the 2-byte one.
+/// The `0x66` spelling is the 2-byte one.
 #[test]
 fn push_segment_16_bit_uses_a_two_byte_slot() {
-    // push rcx     ; 51        - sentinel, to catch a wrong slot width
+    // push rcx     ; 51        - sentinel for a wrong slot width
     // push fs      ; 66 0F A0
     // pop ax       ; 66 58
     // pop rcx      ; 59
     // ret          ; C3
-    //
-    // An 8-byte `push fs` here would leave `RSP` 6 bytes low after the 2-byte
-    // `pop ax`, and `pop rcx` would come back with something other than the
-    // sentinel.
+    // An 8-byte `push fs` would leave `RSP` 6 bytes low and corrupt the sentinel.
     let out = LiftTest::new(&[0x51, 0x66, 0x0F, 0xA0, 0x66, 0x58, 0x59, 0xC3])
         .no_unicorn()
         .reg(|c| {
@@ -234,10 +214,7 @@ fn pop_segment_loads_the_low_16_bits() {
     assert_eq!(out.ctx.fs_base, 0xAAAA_BBBB_CCCC_DDDD);
 }
 
-/// A selector read is a context read, so a value the host changes *between*
-/// two entries into the same compiled region is seen by the second one. (An
-/// SSA-variable-backed selector would be reloaded at entry too; this pins the
-/// behaviour either way.)
+/// A selector read is a context read, so a host change between entries is seen.
 #[test]
 fn selector_reads_track_the_host_between_entries() {
     // mov ax, cs ; 66 8C C8

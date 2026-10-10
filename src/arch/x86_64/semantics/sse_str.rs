@@ -1,21 +1,12 @@
-//! SSE4.2 packed string compare - `PCMPISTRI`, `PCMPISTRM`, `PCMPESTRI`,
-//! `PCMPESTRM`.
+//! SSE4.2 packed string compare: `PCMPISTRI`, `PCMPISTRM`, `PCMPESTRI`, `PCMPESTRM`.
 //!
-//! Four instructions, one operation: compare two 128-bit vectors of byte or word
-//! *elements* under one of four aggregation rules, fold the answers into a
-//! bitmask, and report it as an index (`...I`, into `ECX`) or a mask (`...M`,
-//! into `XMM0`), plus five flags. The families differ only in where the operand
-//! lengths come from: implicit forms scan for the first null, explicit forms take
-//! them from `EAX`/`EDX`.
-//!
-//! The control byte has no register form, so all four of its decisions are known
-//! at lift time and none becomes a runtime branch.
+//! Compares two 128-bit vectors of byte/word elements under one of four aggregation rules and reports a bitmask as an index
+//! (`...I`, `ECX`) or mask (`...M`, `XMM0`) plus five flags. Implicit forms scan for the first null for lengths; explicit forms use `EAX`/`EDX`.
+//! The control byte is an immediate, so every decision is known at lift time.
 //!
 //! ## Validity
 //!
-//! The aggregation covers all 8 or 16 element positions of both operands,
-//! including those past the operand's length. Those take a *forced* value, per
-//! the SDM's `PCMPxSTRx` operation section:
+//! Positions past an operand's length take a *forced* value (SDM `PCMPxSTRx`):
 //!
 //! | `xmm1[i]` | `xmm2[j]` | equal any | ranges | equal each | equal ordered |
 //! | --- | --- | --- | --- | --- | --- |
@@ -24,21 +15,11 @@
 //! | valid   | invalid | false | false | false | false |
 //! | valid   | valid   | compare | compare | compare | compare |
 //!
-//! Those `true`s are not don't-cares: they are what let a substring search match
-//! a needle running off the end, and two exhausted strings compare equal.
-//! Treating invalid positions as merely "not matching" gives the wrong answer for
-//! `strcmp` and `strstr`.
+//! The `true`s are not don't-cares: they make a substring search match a needle running off the end, and exhausted strings compare equal.
+//! In equal-ordered, needle element `i` pairs with haystack `j + i`, which past the register takes the same forced value
+//! (`PCMPESTRM` with a two-element first operand and a full second reports `0x7FFF`; checked against hardware).
 //!
-//! "Invalid" also covers a position that does not exist: in equal-ordered, needle
-//! element `i` pairs with haystack element `j + i`, which for a late `j` runs past
-//! the end of the register and takes the same forced value rather than being
-//! skipped. Observably, `PCMPESTRM` with a two-element first operand and a full
-//! second reports `0x7FFF`, not `0xFFFF`. The table was checked against hardware
-//! through the Unicorn oracle.
-//!
-//! The two exhaustive aggregations are **outlined**, one helper per
-//! aggregation-relevant nibble (`imm8[3:0]`) rather than per instruction; polarity
-//! and output select stay at the call site, which holds the helper count at 16.
+//! The exhaustive aggregations are **outlined**, one helper per `imm8[3:0]`; polarity and output select stay at the call site (16 helpers).
 
 use crate::arch::x86_64::regs::X86Flag;
 use crate::lifter::Lifter;
@@ -47,22 +28,18 @@ use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::FunctionBuilder;
 use iced_x86::{Code, Instruction, Register};
 
-/// Which of the four instructions is being lifted - i.e. where the lengths come
-/// from and where the result goes.
+/// Which of the four instructions: where lengths come from and where the result goes.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub(super) struct PcmpstrForm {
-    /// Explicit-length (`PCMPESTRx`): lengths from `rAX`/`rDX` rather than from
-    /// a scan for the first null element.
+    /// Explicit-length (`PCMPESTRx`): lengths from `rAX`/`rDX`, not a null scan.
     pub explicit: bool,
-    /// `REX.W`: the explicit lengths are read from `RAX`/`RDX` rather than
-    /// `EAX`/`EDX`. Meaningless for the implicit forms.
+    /// `REX.W`: explicit lengths from `RAX`/`RDX` rather than `EAX`/`EDX`.
     pub wide: bool,
     /// Index output into `ECX` (`PCMPxSTRI`) rather than a mask into `XMM0`.
     pub index: bool,
 }
 
 impl PcmpstrForm {
-    /// Classify an instruction, or `None` if it is not one of the four.
     pub(super) fn of(instruction: &Instruction) -> Option<PcmpstrForm> {
         let (explicit, wide, index) = match instruction.code() {
             Code::Pcmpistri_xmm_xmmm128_imm8 => (false, false, true),
@@ -96,14 +73,8 @@ fn signed(ctl: u8) -> bool {
     ctl & 2 != 0
 }
 
-// The aggregation kernel.
 
-/// The 16 helper symbols, indexed by `imm8[3:0]`.
-///
-/// Spelled out rather than formatted because
-/// [`outlined_helper`](crate::core::LiftEngine::outlined_helper) de-duplicates
-/// on a `&'static str`, and the nibble is exactly what distinguishes two
-/// bodies - a name that did not encode it would silently share one.
+/// The 16 helper symbols, indexed by `imm8[3:0]`; spelled out because [`outlined_helper`](crate::core::LiftEngine::outlined_helper) de-duplicates on a `&'static str`.
 const AGG_SYMBOLS: [&str; 16] = [
     "__microlift_pcmpstr_agg_0",
     "__microlift_pcmpstr_agg_1",
@@ -129,14 +100,11 @@ const AGG_SYMBOLS: [&str; 16] = [
 pub struct PcmpstrKernel(pub u8);
 
 impl PcmpstrKernel {
-    /// The symbol the helper function is declared under.
     pub fn symbol(self) -> &'static str {
         AGG_SYMBOLS[(self.0 & 0xF) as usize]
     }
 
-    /// `(lo1, hi1, lo2, hi2: I64, len1, len2: I32) -> I32`, the last being
-    /// `IntRes1`. `call_conv` should match the calling function's, so a call
-    /// needs no convention bridging.
+    /// `(lo1, hi1, lo2, hi2: I64, len1, len2: I32) -> I32`, the last being `IntRes1`.
     pub fn signature(self, call_conv: CallConv) -> Signature {
         let mut sig = Signature::new(call_conv);
         for _ in 0..4 {
@@ -148,8 +116,6 @@ impl PcmpstrKernel {
         sig
     }
 
-    /// Emit the kernel's body into `b`, whose function must already have been
-    /// given [`signature`](Self::signature).
     pub fn build_body(self, b: &mut FunctionBuilder) {
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
@@ -161,11 +127,8 @@ impl PcmpstrKernel {
     }
 }
 
-/// Extract the `128 / bits` elements of a `(lo, hi)` operand, each widened into
-/// a full `I64` and sign- or zero-extended per `signed`, lowest element first.
-///
-/// A free-function twin of [`Lifter::xmm_lanes`](super::sse_int) - the helper
-/// bodies have a `FunctionBuilder` and no `Lifter`.
+/// Extract the `128 / bits` elements of a `(lo, hi)` operand, each widened to `I64` (sign- or zero-extended per `signed`), lowest first.
+/// Free-function twin of [`Lifter::xmm_lanes`](super::sse_int).
 fn elements(b: &mut FunctionBuilder, lo: Value, hi: Value, bits: u32, signed: bool) -> Vec<Value> {
     let per_half = 64 / bits;
     let mut out = Vec::with_capacity((per_half * 2) as usize);
@@ -220,12 +183,8 @@ fn pack_bits(b: &mut FunctionBuilder, bits: &[Value]) -> Value {
     acc
 }
 
-/// Emit the aggregation for control nibble `ctl`, producing `IntRes1` as an
-/// `I32` with one bit per element position of the *second* operand.
-///
-/// `len1`/`len2` are element counts in `0..=n`, already saturated by the
-/// caller; everything at or above them is invalid and takes the forced value
-/// from the module's table.
+/// Emit the aggregation for control nibble `ctl`, producing `IntRes1` as an `I32` with one bit per element of the *second* operand.
+/// `len1`/`len2` are saturated element counts in `0..=n`; positions at or above them take the forced value.
 pub fn emit_pcmpstr_agg(
     b: &mut FunctionBuilder,
     ctl: u8,
@@ -240,19 +199,14 @@ pub fn emit_pcmpstr_agg(
     let n = element_count(ctl);
     let sign = signed(ctl);
 
-    // Both operands' elements are extended the same way, so a signed compare on
-    // the widened `I64`s is the right ordering for both formats: a zero-extended
-    // unsigned element can never look negative at 64 bits.
+    // Both operands extend the same way, so a signed compare on `I64`s orders both formats.
     let a = elements(b, lo1, hi1, bits, sign);
     let c = elements(b, lo2, hi2, bits, sign);
     let v1 = validity(b, len1, n);
     let v2 = validity(b, len2, n);
 
     let result: Vec<Value> = match (ctl >> 2) & 3 {
-        // Equal any: does element j of the second operand appear anywhere in the
-        // first? Every forced value is false, so an invalid position on either
-        // side simply contributes nothing - which is why the whole `v2[j]` term
-        // factors out of the OR.
+        // Equal any: does v2[j] appear in the first operand? Forced values are false, so invalid positions contribute nothing.
         0 => (0..n)
             .map(|j| {
                 let mut any = b.ins().iconst(types::I8, 0);
@@ -265,9 +219,7 @@ pub fn emit_pcmpstr_agg(
             })
             .collect(),
 
-        // Ranges: consecutive pairs of first-operand elements are `[lo, hi]`
-        // bounds, and element j is in range if it is within any of them. Forced
-        // values are false as above.
+        // Ranges: consecutive first-operand pairs are `[lo, hi]` bounds; element j is in range if within any. Forced values are false.
         1 => (0..n)
             .map(|j| {
                 let mut any = b.ins().iconst(types::I8, 0);
@@ -275,9 +227,7 @@ pub fn emit_pcmpstr_agg(
                     let ge = b.ins().icmp(IntCC::SignedGreaterThanOrEqual, c[j], a[k]);
                     let le = b.ins().icmp(IntCC::SignedLessThanOrEqual, c[j], a[k + 1]);
                     let within = b.ins().band(ge, le);
-                    // The upper bound being a valid element implies the lower one
-                    // is (validity is a prefix), but both are named so the
-                    // correspondence with the forcing table stays readable.
+                    // A valid upper bound implies a valid lower (validity is a prefix); both are named to match the forcing table.
                     let bounded = b.ins().band(v1[k], v1[k + 1]);
                     let live = b.ins().band(within, bounded);
                     any = b.ins().bor(any, live);
@@ -286,9 +236,7 @@ pub fn emit_pcmpstr_agg(
             })
             .collect(),
 
-        // Equal each: element-wise equality. Two positions that are *both* past
-        // their operand's end force true - this is what makes two strings of the
-        // same length compare equal all the way to element 15.
+        // Equal each: element-wise; two positions both past their end force true, so equal-length strings match to element 15.
         2 => (0..n)
             .map(|j| {
                 let eq = b.ins().icmp(IntCC::Equal, a[j], c[j]);
@@ -301,15 +249,9 @@ pub fn emit_pcmpstr_agg(
             })
             .collect(),
 
-        // Equal ordered: substring search. Bit j asks whether the first operand
-        // occurs in the second starting at j. Running off the *needle* forces true,
-        // so a short needle still matches; running off the *haystack* forces false.
-        //
-        // The pairing runs over all `n` needle positions, not the `n - j` that stay
-        // inside the register: a needle element whose haystack position would be
-        // element `n` or beyond compares against an invalid element and forces false
-        // unless the needle ran out first. Stopping at the register edge would report
-        // a match for a needle that demonstrably does not fit.
+        // Equal ordered: bit j asks whether the first operand occurs in the second at j. Running off the needle forces true, off the haystack false.
+        // The pairing runs over all `n` needle positions, not just those inside the register: a needle element whose
+        // haystack position is `n` or beyond forces false unless the needle ran out first.
         _ => (0..n)
             .map(|j| {
                 let mut all = b.ins().iconst(types::I8, 1);
@@ -321,9 +263,7 @@ pub fn emit_pcmpstr_agg(
                     all = b.ins().band(all, term);
                 }
                 if j > 0 {
-                    // The tail `i >= n - j`, whose every term is "the needle has
-                    // run out". Validity is a prefix, so all of them hold
-                    // exactly when the first of them does.
+                    // The tail `i >= n - j` is all "needle has run out"; validity is a prefix, so all hold when the first does.
                     let fits = not(b, v1[n - j]);
                     all = b.ins().band(all, fits);
                 }
@@ -378,9 +318,7 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// Emit the aggregation, as a call to the shared per-nibble helper or -
-    /// when outlining is off - inline at this site. Both paths run the identical
-    /// [`emit_pcmpstr_agg`] builder.
+    /// Emit the aggregation as a call to the shared per-nibble helper, or inline when outlining is off.
     fn pcmpstr_agg(
         &mut self,
         ctl: u8,
@@ -407,10 +345,7 @@ impl<'a> Lifter<'a> {
         self.builder.inst_results(call)[0]
     }
 
-    /// The implicit-length rule: the number of elements before the first null one,
-    /// or all `n` if there is none.
-    ///
-    /// Folded from the top so the *lowest* null wins, which is the C string rule.
+    /// The implicit-length rule: elements before the first null, or `n` if none; folded from the top so the lowest null wins.
     fn implicit_len(&mut self, lo: Value, hi: Value, bits: u32) -> Value {
         let lanes = self.xmm_lanes(lo, hi, bits, false);
         let n = lanes.len();
@@ -423,12 +358,7 @@ impl<'a> Lifter<'a> {
         len
     }
 
-    /// The explicit-length rule: `|reg|`, saturated to `n`.
-    ///
-    /// The comparison against `n` is *unsigned* on purpose: `iabs` of the most
-    /// negative value is itself, and reading that as unsigned makes it larger than
-    /// `n`, so the one input whose absolute value does not exist saturates instead
-    /// of passing through as a huge negative length.
+    /// The explicit-length rule: `|reg|` saturated to `n`; the compare is *unsigned* so `iabs` of the minimum (itself) saturates.
     fn explicit_len(&mut self, reg: Register, n: usize) -> crate::Result<Value> {
         let v = self.get_reg_val(reg)?;
         let wide = if self.builder.func.dfg.value_type(v) == types::I64 {
@@ -446,11 +376,8 @@ impl<'a> Lifter<'a> {
         Ok(self.builder.ins().ireduce(types::I32, clamped))
     }
 
-    /// `imm8[5:4]`: leave `IntRes1` alone, invert every element position, or
-    /// invert only the positions that are valid in the second operand.
-    ///
-    /// The masked form (`11`) is the one a `strcmp` uses: inverting the invalid
-    /// positions too would report a mismatch past the end of both strings.
+    /// `imm8[5:4]`: leave `IntRes1`, invert every position, or invert only positions valid in the second operand.
+    /// The masked form (`11`) is `strcmp`'s: inverting invalid positions would report a mismatch past both ends.
     fn apply_polarity(&mut self, imm: u8, int_res1: Value, len2: Value, n: usize) -> Value {
         let full = ((1u64 << n) - 1) as i64;
         match (imm >> 4) & 3 {
@@ -470,10 +397,7 @@ impl<'a> Lifter<'a> {
     }
 
     /// The five flags every `PCMPxSTRx` defines, plus the two it clears.
-    ///
-    /// `ZF` and `SF` report *operand exhaustion*, not anything about the
-    /// comparison: each is set when its operand held fewer than a full register of
-    /// elements, which for the implicit forms means it contained a null.
+    /// `ZF`/`SF` report operand exhaustion (fewer than a full register of elements; for implicit forms, a null), not the comparison.
     fn pcmpstr_flags(
         &mut self,
         int_res2: Value,
@@ -510,8 +434,7 @@ impl<'a> Lifter<'a> {
         let index = if imm & 0x40 == 0 {
             self.builder.ins().ctz(int_res2)
         } else {
-            // `clz` counts from bit 31 of the I32, so the set-bit index is its
-            // complement within the word.
+            // `clz` counts from bit 31, so the index is its complement.
             let lead = self.builder.ins().clz(int_res2);
             let top = self.builder.ins().iconst(types::I32, 31);
             self.builder.ins().isub(top, lead)
@@ -522,11 +445,8 @@ impl<'a> Lifter<'a> {
         self.set_reg_val(Register::ECX, ecx)
     }
 
-    /// `PCMPxSTRM`: `XMM0` gets `IntRes2` either as a bitmask in its low bits
-    /// (`imm8[6] == 0`) or expanded to one all-ones element per set bit.
-    ///
-    /// Both forms write the whole register - the bitmask form zeroes everything
-    /// above bit `n`.
+    /// `PCMPxSTRM`: `XMM0` gets `IntRes2` as a bitmask in the low bits (`imm8[6] == 0`) or one all-ones element per set bit;
+    /// the whole register is written.
     fn pcmpstr_mask_out(
         &mut self,
         imm: u8,
@@ -548,8 +468,7 @@ impl<'a> Lifter<'a> {
                     };
                     let bit = self.builder.ins().band_imm_u(shifted, 1);
                     let wide = self.builder.ins().uextend(types::I64, bit);
-                    // 0 or 1 negated is 0 or all-ones; `pack_xmm_lanes` keeps
-                    // only the low `bits` of each.
+                    // 0 or 1 negated is 0 or all-ones; `pack_xmm_lanes` keeps the low `bits`.
                     self.builder.ins().ineg(wide)
                 })
                 .collect();

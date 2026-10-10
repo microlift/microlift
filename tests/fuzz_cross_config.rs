@@ -1,9 +1,4 @@
-//! Cross-configuration equivalence - the "semantics must survive
-//! optimization" requirement expressed as a metamorphic relation: the same
-//! lifted bytes must produce the same architectural state regardless of
-//! Cranelift optimization level or XMM representation. Needs no oracle; any
-//! divergence is a miscompile.
-//!
+//! Metamorphic check: the same bytes give the same state under every opt level and XMM representation.
 //! Run: `cargo test --features fuzzing --test fuzz_cross_config`
 
 #![cfg(feature = "fuzzing")]
@@ -19,20 +14,15 @@ fn any_alu_op() -> impl Strategy<Value = AluOp> {
     prop::sample::select(AluOp::ALL.to_vec())
 }
 
-/// Run one snippet under a specific (opt, vector_xmm) configuration and return
-/// its config-invariant fingerprint.
 fn run_cfg(bytes: &[u8], opt: Opt, vector_xmm: bool) -> fuzz::StateFingerprint {
     let out = LiftTest::new(bytes).opt(opt).vector_xmm(vector_xmm).run();
     fingerprint(&out.ctx)
 }
 
 proptest! {
-    /// Every optimization level and XMM representation must agree on the final
-    /// state for the same bytes.
     #[test]
     fn opt_and_xmm_agree(op in any_alu_op(), a in any::<u64>(), b in any::<u64>()) {
         let bytes = alu_snippet(op, a, b);
-        // Baseline: unoptimized, scalar XMM.
         let base = run_cfg(&bytes, Opt::None, false);
 
         for (opt, vec) in [
@@ -50,8 +40,7 @@ proptest! {
         }
     }
 
-    /// Dropping the context traffic the region had no use for may not change a
-    /// single bit of state, at any optimization level.
+    /// Dropping unused context traffic may not change any state.
     #[test]
     fn lazy_register_sync_changes_nothing(
         op in any_alu_op(),
@@ -80,11 +69,7 @@ proptest! {
         }
     }
 
-    /// Removing unused flag computations may not change any architectural
-    /// state, including the flags published at exits.
-    ///
-    /// The dedicated suite (`dead_flag_tests`) covers the seams by hand; this
-    /// is the half that tries operands nobody thought of.
+    /// Dead flag removal may not change state, including flags published at exits.
     #[test]
     fn dead_flag_elimination_changes_nothing(
         op in any_alu_op(),
@@ -104,8 +89,7 @@ proptest! {
         );
     }
 
-    /// A single ALU followed by RET leaves all its flags live. Mixed programs
-    /// exercise overwritten flags, carry chains, conditional writes and joins.
+    /// A lone ALU+RET keeps all flags live; mixed programs cover overwrites, carry chains and joins.
     #[test]
     fn dead_flags_agree_over_mixed_programs(
         instructions in prop::collection::vec(0usize..18, 2..32),
@@ -154,18 +138,8 @@ proptest! {
         }
     }
 
-    /// Taking CF and OF from the machine's own arithmetic may not change a
-    /// single bit either.
-    ///
-    /// Both targets, on whatever host this runs on: the JIT compiles for the
-    /// host regardless, so this checks the IR each target's path *emits*, and a
-    /// divergence is a semantic error in the sequence rather than a
-    /// host-specific one.
-    ///
-    /// `eliminate_dead_flags` is on in every arm because the specialization is
-    /// inert without it - with it off this would compare the portable path to
-    /// itself. The snippet ends in `ret`, which publishes every flag, so CF and
-    /// OF are live and the specialization is genuinely reached.
+    /// Native CF/OF may not change state. `eliminate_dead_flags` is on in every arm, or the spec is inert.
+    /// Both targets run on any host; this checks the IR each path emits.
     #[test]
     fn native_overflow_flags_change_nothing(
         op in any_alu_op(),
@@ -194,10 +168,7 @@ proptest! {
         }
     }
 
-    /// `AddressMode::Direct` bakes lift-time VAs in as constants instead of
-    /// rebasing them onto `image_base`. When the image is loaded exactly where
-    /// it was lifted - which `LiftTest` does by default - the two must be
-    /// indistinguishable, PC included.
+    /// `Direct` and `ImageBaseRelative` must agree when the image sits at its lift base.
     #[test]
     fn address_modes_agree_at_lift_base(op in any_alu_op(), a in any::<u64>(), b in any::<u64>()) {
         let bytes = alu_snippet(op, a, b);

@@ -1,14 +1,5 @@
-//! Tests for the import interception feature.
-//!
-//! Both tests call into a host-side `strlen` reimplementation (no libc) from
-//! recompiled x86-64 code.  The same "call strlen at 0x2000" byte sequence is
-//! used in both tests; only the `LifterConfig` differs:
-//!
-//! - **Fast-call**: `strlen` is registered with full `DynamicSymbol` metadata.
-//!   The lifter emits an inline `call_indirect`; the test completes in one shot.
-//! - **Exit-based**: `strlen` is registered as a slow import.  The lifted code
-//!   exits with `ImportedFunctionCall`; the test reads the args from the context,
-//!   calls `strlen` manually, writes the result back, and resumes.
+//! Import interception: fast-call (inline `call_indirect`, one `Return` exit) vs slow import (`ImportedFunctionCall` exit, host services and resumes).
+//! Both call a host `strlen` from the same `call 0x2000` byte sequence; only `LifterConfig` differs.
 
 use cranelift::prelude::*;
 use cranelift_codegen::ir::{Function, UserFuncName};
@@ -19,8 +10,6 @@ use microlift::function_traits::{DynamicSymbol, trampoline_func};
 use microlift::lifter::{ExecutionMode, Lifter, LifterConfig};
 use microlift::os::get_host_calling_conv;
 
-/// Pure Rust reimplementation of C `strlen` - counts bytes until the NUL
-/// terminator.  No libc dependency.
 unsafe extern "C" fn host_strlen(s: *const u8) -> u64 {
     let mut n = 0u64;
     while unsafe { *s.add(n as usize) } != 0 {
@@ -29,53 +18,30 @@ unsafe extern "C" fn host_strlen(s: *const u8) -> u64 {
     n
 }
 
-/// VA of the first lifted instruction.
 const LIFT_BASE: u64 = 0x1000;
-/// VA used for the fake "strlen import" stub.
 const IMPORT_VA: u64 = 0x2000;
-/// The exit-trampoline sentinel this file declares in `lift_and_compile`.
 const EXIT_TRAMPOLINE: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 
-/// Builds the x86-64 byte sequence for:
-///
-/// ```asm
-/// 0x1000:  mov rdi, <string_ptr>  ; 10 bytes (REX.W + B8/BF + imm64)
-/// 0x100A:  call 0x2000            ;  5 bytes (E8 + rel32)
-/// 0x100F:  ret                    ;  1 byte
-/// ```
-///
-/// The `CALL` target is `IMPORT_VA` (`0x2000`); the relative displacement is
-/// computed from the known next-IP (`0x100F`).
+/// `mov rdi, <ptr> ; call 0x2000 ; ret`.
 fn strlen_call_bytes(string_ptr: u64) -> Vec<u8> {
     let mut b = Vec::new();
 
-    // mov rdi, imm64  (48 BF <8 bytes LE>)
     b.push(0x48);
     b.push(0xBF);
     b.extend_from_slice(&string_ptr.to_le_bytes());
 
-    // call rel32  - rel32 = target - next_ip
-    //   next_ip  = 0x1000 + 10 (mov) + 5 (call) = 0x100F
-    //   target   = 0x2000
-    //   rel32    = 0x2000 - 0x100F = 0xFF1
     let next_ip = LIFT_BASE + 10 + 5;
     let rel32 = (IMPORT_VA as i64 - next_ip as i64) as i32;
     b.push(0xE8);
     b.extend_from_slice(&rel32.to_le_bytes());
 
-    // ret
     b.push(0xC3);
 
     b
 }
 
-/// Lift `bytes` with the given config, compile with the JIT backend, and
-/// return the live backend (which keeps the code allocation alive) together
-/// with the raw code pointer.
 fn lift_and_compile(bytes: &[u8], mut config: LifterConfig) -> (CraneliftBackend, *const u8) {
-    // Every test here ends its region with a `RET` to the sentinel
-    // `make_ctx_and_stack` pushed, so the sentinel is declared here rather than
-    // in each caller's config literal.
+    // Sentinel declared here, not in each caller's config.
     config.exit_trampoline_address = Some(EXIT_TRAMPOLINE);
 
     let mut func = Function::with_name_signature(
@@ -96,14 +62,9 @@ fn lift_and_compile(bytes: &[u8], mut config: LifterConfig) -> (CraneliftBackend
     (backend, code_ptr)
 }
 
-/// Allocate a 512-byte guest stack, push the exit trampoline, and return a
-/// ready-to-use `RegisterContext` together with the backing allocation (the
-/// `Vec` must stay live for the duration of the test).
 fn make_ctx_and_stack() -> (RegisterContext, Vec<u64>) {
     let mut stack = vec![0u64; 64];
-    // Stack grows downward; point RSP at the topmost slot.
     let rsp = stack.as_mut_ptr() as u64 + (stack.len() as u64) * 8 - 8;
-    // Pre-push the exit trampoline so the first RET exits cleanly.
     unsafe { *(rsp as *mut u64) = EXIT_TRAMPOLINE };
 
     let mut ctx = RegisterContext::default();
@@ -114,15 +75,7 @@ fn make_ctx_and_stack() -> (RegisterContext, Vec<u64>) {
     (ctx, stack)
 }
 
-/// Fast-call path: `strlen` is registered with full `DynamicSymbol` metadata.
-///
-/// The lifter emits a Cranelift `call_indirect` inline (SysV AMD64 ABI):
-/// - Reads the string pointer from `RDI`.
-/// - Calls `host_strlen` directly.
-/// - Writes the result into `RAX`.
-///
-/// Execution reaches `ret` without any VM exit for the import, producing a
-/// single `Return` exit at the end.
+/// Fast-call: full `DynamicSymbol` metadata, so the import is an inline `call_indirect` with no VM exit.
 #[test]
 fn test_import_fast_call_strlen() {
     let test_string = b"hello, world!\0"; // strlen == 13
@@ -151,19 +104,7 @@ fn test_import_fast_call_strlen() {
     assert_eq!(ctx.rax, 13, "strlen(\"hello, world!\") should be 13");
 }
 
-/// Exit-based path: `strlen` is registered as a slow import (no ABI metadata).
-///
-/// Round 1: the lifter exits with `ImportedFunctionCall`.
-///   - `ctx.imported_function_va` == `IMPORT_VA`.
-///   - `ctx.rip` == 0x100F (the `ret` instruction - the resume point).
-///   - `ctx.rdi` holds the string pointer (published by the exit's `sync_to_context`).
-///
-/// The host reads `ctx.rdi`, calls `host_strlen` itself, writes the result
-/// into `ctx.rax`, and invokes the lifted function a second time.
-///
-/// Round 2: the dispatch switch routes to the `ret` block (RIP == 0x100F).
-///   `ret` pops the exit trampoline -> `Return` exit.  `ctx.rax` still holds
-///   the value the host wrote.
+/// Slow import: exits `ImportedFunctionCall` with `rip` at the `ret`; the host writes `rax` and re-enters.
 #[test]
 fn test_import_slow_call_strlen_with_resume() {
     let test_string = b"microlift\0"; // strlen == 9
@@ -189,13 +130,11 @@ fn test_import_slow_call_strlen_with_resume() {
         ctx.imported_function_va, IMPORT_VA,
         "imported_function_va should identify the callee"
     );
-    // RIP == 0x100F: the `ret` instruction, i.e. the resume point.
     assert_eq!(
         ctx.rip,
         LIFT_BASE + 15,
         "rip should point to the instruction after the CALL (the ret)"
     );
-    // RDI was published by the exit's full sync and holds the string ptr.
     assert_eq!(
         ctx.rdi, string_ptr,
         "rdi should hold the string pointer arg"
@@ -214,17 +153,7 @@ fn test_import_slow_call_strlen_with_resume() {
     assert_eq!(ctx.rax, 9, "strlen(\"microlift\") should be 9");
 }
 
-/// `RuntimeAssisted` fast-call path via `CraneliftBackend::compile_with_fast_imports`.
-///
-/// In `RuntimeAssisted` mode the lifter emits `call(func_ref, ...)` backed by
-/// `ExternalName::user(0, 0)` rather than `call_indirect` with a baked-in
-/// pointer.  `compile_with_fast_imports` creates a fresh JIT module that:
-///   1. Registers the host symbol address so the linker can patch the call site.
-///   2. Declares the import with the same `FuncId` order used in the IR.
-///
-/// The test asserts that execution completes with a single `Return` exit -
-/// no `ImportedFunctionCall` exits - and that `rax` holds the correct length,
-/// proving that the call went through `host_strlen` directly.
+/// `RuntimeAssisted` fast-call via `compile_with_fast_imports`: the call is an `ExternalName::user(0, i)` relocation.
 #[test]
 fn test_runtime_assisted_fast_call_strlen() {
     let test_string = b"hello, world!\0"; // strlen == 13
@@ -233,8 +162,6 @@ fn test_runtime_assisted_fast_call_strlen() {
 
     let mut config = LifterConfig {
         execution_mode: ExecutionMode::RuntimeAssisted,
-        // This test compiles the function itself rather than going through
-        // `lift_and_compile`, so it declares the sentinel too.
         exit_trampoline_address: Some(EXIT_TRAMPOLINE),
         ..LifterConfig::default()
     };
@@ -255,7 +182,6 @@ fn test_runtime_assisted_fast_call_strlen() {
     let mut lifter = Lifter::with_config(builder, config);
     lifter.lift(&bytes, LIFT_BASE).expect("lifting failed");
 
-    // Capture the ordered import list before dropping the lifter.
     let aot_imports: Vec<_> = lifter.aot_imports().to_vec();
     drop(lifter);
 
@@ -280,11 +206,7 @@ fn test_runtime_assisted_fast_call_strlen() {
     assert_eq!(ctx.rax, 13, "strlen(\"hello, world!\") should be 13");
 }
 
-/// Same as above but with two registered fast imports to verify that the
-/// `ExternalName::user(0, i)` index assignment correctly maps both symbols.
-///
-/// The lifted code calls `host_strlen` then immediately `host_strcmp`, and the
-/// final result in `rax` is the `strcmp` return value.
+/// Two fast imports check the `ExternalName::user(0, i)` index assignment.
 #[test]
 fn test_runtime_assisted_fast_call_two_imports() {
     unsafe extern "C" fn host_strcmp(s1: *const u8, s2: *const u8) -> i64 {
@@ -309,13 +231,6 @@ fn test_runtime_assisted_fast_call_two_imports() {
     let p1 = s1.as_ptr() as u64;
     let p2 = s2.as_ptr() as u64;
 
-    // Build:
-    //   mov rdi, p1
-    //   call IMPORT_VA     ; strlen(p1) -> rax (unused, just exercises the call)
-    //   mov rdi, p1
-    //   mov rsi, p2
-    //   call STRCMP_VA     ; strcmp(p1, p2) -> rax
-    //   ret
     let mut bytes: Vec<u8> = Vec::new();
     let encode_call = |target: u64, next_ip: u64| -> Vec<u8> {
         let rel = (target as i64 - next_ip as i64) as i32;
@@ -334,7 +249,6 @@ fn test_runtime_assisted_fast_call_two_imports() {
         v
     };
 
-    // ip=LIFT_BASE
     let mov1 = encode_mov_rdi(p1); // 10 bytes
     let call1_next = LIFT_BASE + 10 + 5;
     let call1 = encode_call(IMPORT_VA, call1_next); // 5 bytes
@@ -352,8 +266,6 @@ fn test_runtime_assisted_fast_call_two_imports() {
 
     let mut config = LifterConfig {
         execution_mode: ExecutionMode::RuntimeAssisted,
-        // This test compiles the function itself rather than going through
-        // `lift_and_compile`, so it declares the sentinel too.
         exit_trampoline_address: Some(EXIT_TRAMPOLINE),
         ..LifterConfig::default()
     };
@@ -404,32 +316,18 @@ fn test_runtime_assisted_fast_call_two_imports() {
         "expected a clean Return; got {}",
         ctx.exit_reason
     );
-    // strcmp("abc", "abc") == 0
     assert_eq!(ctx.rax as i64, 0, "strcmp(\"abc\", \"abc\") should be 0");
 }
 
-// Per-import calling conventions
-//
-// The guest ABI is a property of the code being lifted, not of the host running
-// the lifter. These tests register the *same* host function under different
-// `CallAbi` descriptors and check that the lifter reads each call's arguments
-// from where that convention puts them - on a host whose own convention is
-// something else entirely.
+// The guest ABI belongs to the lifted code, not the host: same function under different `CallAbi`s.
 
-/// `call rel32` from `next_ip` to `target`.
 fn call_bytes(target: u64, next_ip: u64) -> Vec<u8> {
     let mut b = vec![0xE8];
     b.extend_from_slice(&((target as i64 - next_ip as i64) as i32).to_le_bytes());
     b
 }
 
-/// Microsoft x64 guest: the first integer argument arrives in RCX, not RDI.
-///
-/// ```asm
-/// mov rcx, <string_ptr>   ; 48 B9 imm64
-/// call 0x2000
-/// ret
-/// ```
+/// Microsoft x64 guest: first integer argument in RCX.
 #[test]
 fn test_import_fast_call_win64_abi() {
     let test_string = b"hello, world!\0"; // strlen == 13
@@ -457,18 +355,7 @@ fn test_import_fast_call_win64_abi() {
     );
 }
 
-/// Two imports in one region, each with its own convention: RDI feeds the SysV
-/// one, RCX the Microsoft x64 one.
-///
-/// ```asm
-/// mov rdi, <"hello, world!">  ; 48 BF imm64
-/// call 0x2000                 ; sysv strlen  -> 13
-/// mov rbx, rax                ; 48 89 C3
-/// mov rcx, <"abc">            ; 48 B9 imm64
-/// call 0x3000                 ; win64 strlen -> 3
-/// add rax, rbx                ; 48 01 D8
-/// ret
-/// ```
+/// Two imports with different conventions in one region (RDI for SysV, RCX for Win64).
 #[test]
 fn test_import_fast_calls_with_mixed_abis() {
     const WIN64_VA: u64 = 0x3000;
@@ -506,16 +393,7 @@ fn test_import_fast_calls_with_mixed_abis() {
     assert_eq!(ctx.rax, 13 + 3, "each import must use its own convention");
 }
 
-/// A stack-based convention: no argument registers at all, every argument
-/// pushed by the caller (what a 32-bit `cdecl`/`stdcall` guest looks like).
-///
-/// ```asm
-/// mov rax, <string_ptr>   ; 48 B8 imm64
-/// push rax                ; 50
-/// call 0x2000             ; argument at [rsp]
-/// add rsp, 8              ; 48 83 C4 08
-/// ret
-/// ```
+/// Stack-based convention (32-bit cdecl style): every argument pushed by the caller.
 #[test]
 fn test_import_fast_call_stack_passed_argument() {
     let test_string = b"hello, world!\0"; // strlen == 13
@@ -550,9 +428,7 @@ fn test_import_fast_call_stack_passed_argument() {
     assert_eq!(ctx.rax, 13, "argument must be read from the guest stack");
 }
 
-/// An ABI with no stack rule cannot place an argument once its registers run
-/// out, so the import is demoted to an `ImportedFunctionCall` VM exit rather
-/// than miscompiled.
+/// An ABI with no stack rule cannot place spilled arguments, so the import demotes to a VM exit.
 #[test]
 fn test_import_without_stack_rule_is_demoted() {
     let test_string = b"hello, world!\0";

@@ -1,8 +1,4 @@
-//! Tests for `UD2` and `INT3` VM exits.
-//!
-//! Both instructions are block terminators that sync guest state and return
-//! to the host with a dedicated exit reason. RIP is set to point *at* the
-//! faulting instruction, matching real hardware behaviour.
+//! `UD2` and `INT3` VM exits: block terminators that sync state and return with a dedicated reason; RIP points at the instruction.
 
 use microlift::testkit::prelude::*;
 
@@ -116,9 +112,7 @@ fn test_int3_state_synced_on_exit() {
     assert_eq!(ctx.rip, 0x100E, "rip should point at the int3 byte");
 }
 
-/// After the host advances RIP past `int3` (+1 byte), execution can continue.
-/// Simulate this by placing `int3; mov rax, 99; ret` and manually skipping the
-/// breakpoint: run once (gets Breakpoint exit), bump rip by 1, re-lift and re-run.
+/// After the host advances RIP past `int3`, execution continues: run once, bump rip by 1, re-lift and re-run.
 #[test]
 fn test_int3_resume_by_advancing_rip() {
     // int3 @ 0x1000 (1 byte); mov rax, 99 @ 0x1001 (7 bytes); ret @ 0x1008
@@ -129,25 +123,17 @@ fn test_int3_resume_by_advancing_rip() {
         0xC3,                                       // ret        @ 0x1008
     ];
 
-    // First run: hits int3 immediately.
-    //
-    // Bind the whole `RunOutcome` rather than just its `ctx`: the returned
-    // `rsp` points into the guest stack *owned by the outcome's harness*.
-    // Dropping the outcome here (as `compile_and_run` does) would free that
-    // stack and leave the `rsp` carried into the second run dangling - the
-    // re-entry below would then write its exit trampoline into freed memory.
+    // Bind the whole `RunOutcome`: `rsp` points into a stack owned by its harness, so dropping it would leave the second run's `rsp` dangling.
     let first = LiftTest::new(&bytes).run();
     let ctx = first.ctx;
     assert_eq!(ctx.exit_reason, ExitReason::Breakpoint as u32);
     assert_eq!(ctx.rip, 0x1000);
 
-    // Simulate host advancing RIP by 1 and re-entering (re-lift the same region).
+    // Host advances RIP by 1 and re-enters.
     let mut ctx2 = ctx;
     ctx2.rip = 0x1001; // skip the int3
 
-    // Re-lift with VmResumptionPoints::All so every instruction boundary is a block
-    // leader and the dispatch switch has a case for 0x1001. The preset rip
-    // routes the entry dispatch straight to the `mov rax, 99` block.
+    // `VmResumptionPoints::All` gives the dispatch a case for 0x1001; the preset rip routes to the `mov rax, 99` block.
     let out = LiftTest::new(&bytes)
         .with_config(|c| c.resumption = VmResumptionPoints::All)
         .ctx(ctx2)
@@ -156,13 +142,11 @@ fn test_int3_resume_by_advancing_rip() {
     assert_eq!(out.ctx.exit_reason, ExitReason::Return as u32);
     assert_eq!(out.ctx.rax, 99);
 
-    // Keep the first harness (and thus the shared guest stack) alive until both
-    // runs are done.
+    // Keep the first harness (and shared stack) alive until both runs finish.
     drop(first);
 }
 
-/// `ud2` and `int3` must produce different exit reasons so the host can
-/// tell them apart.
+/// `ud2` and `int3` report different exit reasons.
 #[test]
 fn test_ud2_and_int3_exit_reasons_are_distinct() {
     assert_ne!(ExitReason::Ud2 as u32, ExitReason::Breakpoint as u32);
@@ -213,8 +197,7 @@ fn test_int1_exit_reason_and_vector() {
     assert_eq!(ctx.rip, 0x1001, "rip should point past the int1 byte");
 }
 
-/// `INTO` (`0xCE`) does not exist in 64-bit mode - the decoder rejects it as an
-/// invalid instruction rather than treating it as a software interrupt.
+/// `INTO` (`0xCE`) does not exist in 64-bit mode; the decoder rejects it.
 #[test]
 fn test_into_is_invalid_in_64bit() {
     #[rustfmt::skip]
@@ -225,16 +208,13 @@ fn test_into_is_invalid_in_64bit() {
     assert_eq!(ctx.exit_reason, ExitReason::InvalidInstruction as u32);
 }
 
-/// `INT3`, `INT imm8`, and `INT1` must all be distinguishable: the dedicated
-/// breakpoint opcode reports `Breakpoint`, the rest report `Interrupt`.
+/// `INT3` reports `Breakpoint`; `INT imm8` and `INT1` report `Interrupt`.
 #[test]
 fn test_int_family_exit_reasons_are_distinct() {
     assert_ne!(ExitReason::Breakpoint as u32, ExitReason::Interrupt as u32);
 }
 
-/// `INSD` (`0x6D`) must exit with `ExitReason::PortInput`, report the element
-/// size (4 bytes) in `exit_code`, and point RIP *at* the instruction so the
-/// host can emulate the port access.
+/// `INSD` (`0x6D`) exits `PortInput` with element size 4 in `exit_code`; RIP points at the instruction.
 #[test]
 fn test_insd_exit_reason_and_size() {
     #[rustfmt::skip]
@@ -250,8 +230,7 @@ fn test_insd_exit_reason_and_size() {
     assert_eq!(ctx.rip, 0x1000, "rip should point at the insd instruction");
 }
 
-/// `INSB` (`0x6C`) reports an element size of 1; side-effects before it remain
-/// visible on exit (DX/RDI are synced for the host to emulate the access).
+/// `INSB` (`0x6C`) reports size 1; DX/RDI are synced.
 #[test]
 fn test_insb_size_and_state_synced() {
     #[rustfmt::skip]
@@ -269,8 +248,7 @@ fn test_insb_size_and_state_synced() {
     assert_eq!(ctx.rip, 0x1007, "rip should point at the insb instruction");
 }
 
-/// `OUTSD` (`0x6F`) must exit with `ExitReason::PortOutput`, report the element
-/// size (4), and point RIP *at* the instruction.
+/// `OUTSD` (`0x6F`) exits `PortOutput` with size 4; RIP points at the instruction.
 #[test]
 fn test_outsd_exit_reason_and_size() {
     #[rustfmt::skip]
@@ -286,8 +264,7 @@ fn test_outsd_exit_reason_and_size() {
     assert_eq!(ctx.rip, 0x1000, "rip should point at the outsd instruction");
 }
 
-/// `OUTSB` (`0x6E`) reports size 1; the source pointer (RSI) and port (DX) are
-/// synced so the host can emulate the access.
+/// `OUTSB` (`0x6E`) reports size 1; RSI and DX are synced.
 #[test]
 fn test_outsb_size_and_state_synced() {
     #[rustfmt::skip]
@@ -311,8 +288,7 @@ fn test_port_io_exit_reasons_are_distinct() {
     assert_ne!(ExitReason::PortInput as u32, ExitReason::PortOutput as u32);
 }
 
-/// `RDTSC` (`0F 31`) must exit with `ExitReason::Rdtsc` and point RIP *past* the
-/// instruction (the resume point) so the host can supply the counter in RAX/RDX.
+/// `RDTSC` (`0F 31`) exits `Rdtsc` with RIP past the instruction so the host can supply RAX/RDX.
 #[test]
 fn test_rdtsc_exit_reason() {
     #[rustfmt::skip]
@@ -327,8 +303,7 @@ fn test_rdtsc_exit_reason() {
     );
 }
 
-/// State preceding `RDTSC` must be synced on exit so the host sees current
-/// registers before populating the timestamp.
+/// State before `RDTSC` is synced on exit.
 #[test]
 fn test_rdtsc_state_synced() {
     #[rustfmt::skip]

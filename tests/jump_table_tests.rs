@@ -1,33 +1,14 @@
-//! Experimental Clang jump-table recovery (`LifterConfig::analyze_jump_tables`).
-//!
-//! Each program below is a `switch` in one of the shapes Clang emits. The point
-//! of the pass is that the indirect `JMP` stops being a dead end for block
-//! discovery, so the tests check both halves of that: the table the analyzer
-//! recovers, and that the lifted code dispatches through it instead of taking
-//! an `UnknownJump` VM exit.
-//!
-//! Executing one of these means the *lifted code* really loads the table, so
-//! the table has to exist in host memory as well as in the lift-time
-//! [`MemorySegment`]. [`host_image`] lays out that memory and returns the
-//! address to use as `image_base`, which is what maps the lift-time VAs the
-//! analyzer works in onto it.
+//! Clang jump-table recovery (`analyze_jump_tables`): the recovered table, and dispatch through it instead of `UnknownJump`.
+//! Executed tables must exist in host memory too; [`host_image`] lays it out and returns the `image_base`.
 
 use microlift::arch::x86_64::jumptable::{JumpTableKind, analyze_jump_tables};
 use microlift::context::MemorySegment;
 use microlift::testkit::prelude::*;
 
-/// Lift-time VA of the code.
 const BASE: u64 = 0x1000;
-/// Lift-time VA of the read-only table, when it lives outside the code.
 const RODATA: u64 = 0x2000;
 
-/// Materialize the region in host memory: `code` at [`BASE`], plus each blob at
-/// its own lift-time VA. Returns the host address [`BASE`] maps to, i.e. the
-/// `image_base` the run needs, so guest VA `v` is readable at
-/// `image_base + (v - BASE)`.
-///
-/// The allocation is leaked: the lifted code holds raw addresses into it, and a
-/// test that keeps running after the buffer is freed is a use-after-free.
+/// Lays out `code` at [`BASE`] and each blob at its lift-time VA; returns the `image_base`. Leaked on purpose: lifted code holds raw addresses.
 fn host_image(code: &[u8], blobs: &[(u64, Vec<u8>)]) -> u64 {
     let end = blobs
         .iter()
@@ -46,7 +27,7 @@ fn host_image(code: &[u8], blobs: &[(u64, Vec<u8>)]) -> u64 {
     Box::leak(image.into_boxed_slice()).as_ptr() as u64
 }
 
-/// PIC form, table in a caller-supplied read-only segment:
+/// PIC form, table in a supplied read-only segment:
 ///
 /// ```text
 /// 0x1000  cmp    edi, 3
@@ -56,10 +37,7 @@ fn host_image(code: &[u8], blobs: &[(u64, Vec<u8>)]) -> u64 {
 /// 0x100e  movsxd rdx, dword ptr [rcx+rax*4]
 /// 0x1012  add    rdx, rcx
 /// 0x1015  jmp    rdx
-/// 0x1017  case0: mov eax, 10 ; ret
-/// 0x101d  case1: mov eax, 20 ; ret
-/// 0x1023  case2: mov eax, 30 ; ret
-/// 0x1029  case3: mov eax, 40 ; ret
+/// 0x1017  case0..case3: mov eax, 10/20/30/40 ; ret
 /// 0x102f  dflt:  mov eax, 99 ; ret
 /// ```
 #[rustfmt::skip]
@@ -80,9 +58,7 @@ const PIC_SWITCH: &[u8] = &[
 
 const PIC_CASES: [u64; 4] = [0x1017, 0x101D, 0x1023, 0x1029];
 
-/// The four `i32` displacements from the table's own address, as Clang would
-/// emit them into `.rodata`. Being displacements, they are position independent:
-/// the same bytes serve as the lift-time hint and as the runtime memory.
+/// Displacements from the table's own address, so one copy serves as lift-time hint and runtime memory.
 fn pic_entries() -> Vec<u8> {
     let mut data = Vec::new();
     for target in PIC_CASES {
@@ -132,8 +108,7 @@ fn pic_switch_dispatches_without_exiting() {
 
 #[test]
 fn out_of_range_index_still_takes_the_default_arm() {
-    // The range check is guest code like any other; recovering the table must
-    // not change what an out-of-range index does.
+    // Recovery must not change out-of-range behaviour.
     let out = pic_test().analyze_jump_tables().reg(|c| c.rdi = 7).run();
 
     assert_eq!(out.exit, ExitReason::Return);
@@ -142,8 +117,7 @@ fn out_of_range_index_still_takes_the_default_arm() {
 
 #[test]
 fn without_the_pass_the_switch_exits() {
-    // Baseline: the case blocks are not leaders, so the runtime dispatch has
-    // nothing to match and the indirect jump leaves the region.
+    // Baseline: case blocks are not leaders, so the jump leaves the region.
     let image = host_image(PIC_SWITCH, &[(RODATA, pic_entries())]);
     let out = LiftTest::new(PIC_SWITCH)
         .at(BASE)
@@ -162,7 +136,7 @@ fn without_the_pass_the_switch_exits() {
 
 #[test]
 fn writable_segments_are_not_trusted() {
-    // Same table, but in memory the guest could have rewritten since lift time.
+    // Same table in memory the guest could have rewritten.
     let tables = analyze_jump_tables(PIC_SWITCH, BASE, &[pic_table(true)]);
     assert!(tables.is_empty(), "recovered a table from writable memory");
 }
@@ -173,23 +147,8 @@ fn missing_segment_recovers_nothing() {
     assert!(tables.is_empty());
 }
 
-/// Non-PIC form: the dispatch loads an absolute address straight out of the
-/// table, with no relocation step after the load.
-///
-/// ```text
-/// 0x1000  cmp edi, 3
-/// 0x1003  ja  0x1029
-/// 0x1005  mov eax, edi
-/// 0x1007  lea rcx, [rip + 0xff2]        ; 0x2000
-/// 0x100e  jmp qword ptr [rcx + rax*8]
-/// 0x1011  case0..case3, then dflt at 0x1029
-/// ```
-///
-/// The table is addressed through a register rather than as a bare `[0x2000]`
-/// displacement, because an absolute displacement in guest code is *not* an
-/// address the lifter relocates - only RIP-relative operands are - so the bare
-/// form would run against unmapped memory here for reasons that have nothing to
-/// do with this pass.
+/// Non-PIC form: `jmp qword ptr [rcx + rax*8]` loads an absolute address, table at 0x2000, cases from 0x1011, dflt at 0x1029.
+/// The table is reached via a register because only RIP-relative operands are relocated, not bare absolute displacements.
 #[rustfmt::skip]
 const ABS_SWITCH: &[u8] = &[
     0x83, 0xFF, 0x03,                          // cmp edi, 3
@@ -206,10 +165,7 @@ const ABS_SWITCH: &[u8] = &[
 
 const ABS_CASES: [u64; 4] = [0x1011, 0x1017, 0x101D, 0x1023];
 
-/// Absolute entries are *not* position independent, so the two copies differ:
-/// the lift-time segment holds the VAs the analyzer reasons in, while the image
-/// in host memory holds the same addresses after relocation to `image_base` -
-/// which is exactly what a loader would have written there.
+/// Absolute entries differ per copy: VAs for the analyzer, relocated to `image_base` in host memory.
 fn abs_entries(image_base: u64) -> Vec<u8> {
     let mut data = Vec::new();
     for target in ABS_CASES {
@@ -234,12 +190,10 @@ fn absolute_table_is_recovered() {
 #[test]
 fn absolute_switch_dispatches_without_exiting() {
     for (index, expected) in [(0u64, 10u64), (1, 20), (2, 30), (3, 40)] {
-        // The image must exist before its entries can be relocated into it, so
-        // lay it out with a placeholder and patch the table afterwards.
+        // The image must exist before entries can be relocated into it.
         let image = host_image(ABS_SWITCH, &[(RODATA, abs_entries(BASE))]);
         let relocated = abs_entries(image);
-        // SAFETY: `image` is a leaked, uniquely-owned buffer of at least
-        // `RODATA - BASE + relocated.len()` bytes; nothing else refers to it yet.
+        // SAFETY: `image` is a leaked, uniquely-owned buffer large enough for the relocated table.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 relocated.as_ptr(),
@@ -261,17 +215,8 @@ fn absolute_switch_dispatches_without_exiting() {
     }
 }
 
-/// PIC form with the table emitted *inside* the lifted region, past the `ret`s -
-/// the layout Clang produces for a `switch` in a hot function. No segment is
-/// supplied: the region is its own read-only backing store.
-///
-/// ```text
-/// 0x1000  cmp edi, 2 ; ja 0x1029 ; mov eax, edi
-/// 0x1007  lea rcx, [rip+0x21]            ; 0x102f, the table
-/// 0x100e  movsxd rdx, [rcx+rax*4] ; add rdx, rcx ; jmp rdx
-/// 0x1017  case0 / case1 / case2, dflt at 0x1029
-/// 0x102f  .long case0-0x102f, case1-0x102f, case2-0x102f
-/// ```
+/// PIC form with the table inside the region past the `ret`s and no segment supplied (Clang's layout for a hot `switch`).
+/// `lea rcx,[rip+0x21]` at 0x1007 -> table at 0x102f; cases from 0x1017, dflt at 0x1029.
 #[rustfmt::skip]
 const INLINE_TABLE_SWITCH: &[u8] = &[
     0x83, 0xFF, 0x02,                          // cmp edi, 2
@@ -315,17 +260,8 @@ fn in_region_table_switch_dispatches_without_exiting() {
     }
 }
 
-/// The same PIC dispatch with no `cmp`/`ja` range check in front of it, so
-/// nothing bounds the table. The heuristic walk has to find the end itself -
-/// here by running off the region while reading entry 3.
-///
-/// ```text
-/// 0x1000  mov eax, edi
-/// 0x1002  lea rcx, [rip+0x1b]            ; 0x1024, the table
-/// 0x1009  movsxd rdx, [rcx+rax*4] ; add rdx, rcx ; jmp rdx
-/// 0x1012  case0 / case1 / case2
-/// 0x1024  .long case0-0x1024, case1-0x1024, case2-0x1024
-/// ```
+/// PIC dispatch with no range check: the walk must find the table end itself, by running off the region at entry 3.
+/// Table at 0x1024, cases from 0x1012.
 #[rustfmt::skip]
 const UNBOUNDED_SWITCH: &[u8] = &[
     0x89, 0xF8,                                // mov eax, edi
@@ -367,8 +303,7 @@ fn unbounded_table_switch_dispatches_without_exiting() {
 
 #[test]
 fn plain_indirect_jump_is_left_alone() {
-    // `jmp rax` with no table behind it: nothing to recover, and nothing that
-    // could be mistaken for a table.
+    // Nothing to recover from a bare `jmp rax`.
     let out = LiftTest::new(&[0xFF, 0xE0])
         .at(BASE)
         .analyze_jump_tables()

@@ -1,12 +1,4 @@
-//! Regression tests for the third x86-64 lifter review round.
-//!
-//! Covers:
-//! 1. Indirect `JMP` must not be classified as a direct branch to address 0.
-//! 2. `RCL` (rotate-through-carry-left) is implemented and bit-exact.
-//! 3. `BSF`/`BSR` with a zero source leave the *entire* destination register
-//!    unchanged (including the upper 32 bits of a 64-bit register).
-//! 4. `LOCK NOT` / `LOCK NEG` remain correct after the atomic-RMW rework.
-//! 5. Address-size-prefixed (`0x67`) string ops select ECX/ESI/EDI and verify.
+//! Regression tests for the third x86-64 lifter review round (indirect JMP, RCL, BSF/BSR zero source, LOCK NOT/NEG, 0x67 string ops).
 
 use cranelift::prelude::*;
 use cranelift_codegen::ir::{Function, UserFuncName};
@@ -21,12 +13,10 @@ use microlift::os::get_host_calling_conv;
 
 const LIFT_BASE: u64 = 0x1000;
 
-/// The sentinel return address this file's harness pushes; a `RET` to it exits
-/// with `ExitReason::Return` because the config below declares it.
+/// Sentinel return address; a `RET` to it exits with `Return`.
 const EXIT_TRAMPOLINE: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 
-/// Lift + JIT `bytes` at LIFT_BASE, run against `ctx`, and return the mutated
-/// context. A fresh stack is installed with the exit trampoline pre-pushed.
+/// Lift + JIT `bytes` at LIFT_BASE and return the mutated context.
 fn run(bytes: &[u8], mut ctx: RegisterContext) -> RegisterContext {
     let mut flag_builder = settings::builder();
     flag_builder.set("use_colocated_libcalls", "false").unwrap();
@@ -107,7 +97,7 @@ fn rcl_rax_by_1_through_carry() {
     ctx.rax = 0x8000_0000_0000_0001;
     ctx.cf = 0;
     let out = run(&[0x48, 0xC1, 0xD0, 0x01], ctx);
-    // CF:rax = 0:0x8000000000000001 rotated left 1 -> rax=0x2, the old MSB into CF.
+    // CF:rax = 0:0x8000000000000001 rotated left 1 -> rax=0x2, old MSB into CF.
     assert_eq!(out.rax, 0x2, "rax");
     assert_eq!(out.cf, 1, "cf");
 }
@@ -126,8 +116,7 @@ fn rcl_al_by_1_wraps_carry_into_lsb() {
 
 #[test]
 fn rcl_matches_rcr_roundtrip() {
-    // rcl then rcr by the same count restores the original (with same CF in).
-    // 48 c1 d0 05 = rcl rax,5 ; 48 c1 d8 05 = rcr rax,5
+    // rcl then rcr by the same count restores the original: 48 c1 d0 05 ; 48 c1 d8 05
     let mut ctx = RegisterContext::default();
     ctx.rax = 0x0123_4567_89AB_CDEF;
     ctx.cf = 0;
@@ -247,9 +236,7 @@ fn rep_stosb_64bit_addr_size_still_works() {
 
 #[test]
 fn addr_size_prefixed_string_op_lifts_and_compiles() {
-    // 67 f3 a4 = rep movsb with 32-bit address size (ECX/ESI/EDI). Executing it
-    // would require low-4GB buffers; here we assert the lowering is well-formed
-    // (selects the 32-bit registers and passes the IR verifier + isel).
+    // Executing needs low-4GB buffers; assert only that the lowering is well-formed.
     let func = lift_to_function::<X86_64>(&[0x67, 0xF3, 0xA4], LIFT_BASE, LifterConfig::default())
         .expect("32-bit-addr rep movsb should lift");
     let mut backend = CraneliftBackend::new().unwrap();

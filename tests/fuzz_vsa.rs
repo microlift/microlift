@@ -1,9 +1,4 @@
-//! VSA soundness fuzzing; an indirect `jmp`/`call` whose only possible
-//! runtime target is known by construction. Value-Set Analysis is an
-//! over-approximation: whenever it resolves the site it must include the real
-//! target; leaving the site unresolved is always sound. It must never resolve
-//! to a set that omits a reachable target.
-//!
+//! VSA soundness: a resolved indirect `jmp`/`call` target set must contain the real target; unresolved is always sound.
 //! Run: `cargo test --features fuzzing --test fuzz_vsa`
 
 #![cfg(feature = "fuzzing")]
@@ -17,8 +12,7 @@ use proptest::prelude::*;
 
 const LIFT_BASE: u64 = 0x1000;
 
-/// `mov eax, imm32` (zero-extends into rax), then a 2-byte indirect transfer.
-/// The indirect site is at `LIFT_BASE + 5`.
+/// `mov eax, imm32` then a 2-byte indirect transfer at `LIFT_BASE + 5`.
 fn snippet(imm: u32, modrm_op: [u8; 2]) -> Vec<u8> {
     let mut bytes = vec![0xB8]; // mov eax, imm32
     bytes.extend_from_slice(&imm.to_le_bytes());
@@ -27,8 +21,6 @@ fn snippet(imm: u32, modrm_op: [u8; 2]) -> Vec<u8> {
 }
 
 proptest! {
-    /// `jmp rax` with a statically-known `rax`: if VSA resolves the site, the
-    /// resolved set must contain the true target.
     #[test]
     fn indirect_jmp_target_is_sound(imm in any::<u32>()) {
         let bytes = snippet(imm, [0xFF, 0xE0]); // jmp rax
@@ -43,7 +35,6 @@ proptest! {
         }
     }
 
-    /// Same soundness property for `call rax`.
     #[test]
     fn indirect_call_target_is_sound(imm in any::<u32>()) {
         let bytes = snippet(imm, [0xFF, 0xD0]); // call rax
@@ -58,8 +49,6 @@ proptest! {
         }
     }
 
-    /// A register copy between the constant and the branch must not lose the
-    /// target: `mov eax,imm ; mov ecx,eax ; jmp rcx`.
     #[test]
     fn indirect_jmp_through_copy_is_sound(imm in any::<u32>()) {
         let mut bytes = vec![0xB8]; // mov eax, imm32

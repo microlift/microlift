@@ -1,5 +1,4 @@
-//! x86-64 decoding (via iced-x86) and static control-flow classification used
-//! by the engine's block-leader discovery pass.
+//! x86-64 decoding (iced-x86) and static control-flow classification for leader discovery.
 
 use crate::arch::{ControlFlow, InstructionEffects};
 use iced_x86::{
@@ -7,10 +6,7 @@ use iced_x86::{
     Register, RflagsBits,
 };
 
-/// Decode every instruction in `bytes` starting at virtual address `ip`.
-///
-/// Mirrors the original scan loop: invalid instructions are retained in the
-/// stream (phase 2 emits a fault stub for them).
+/// Decodes every instruction in `bytes` from `ip`; invalid ones are kept so phase 2 emits a fault stub.
 pub fn decode_region(bytes: &[u8], ip: u64) -> Vec<Instruction> {
     let mut decoder = Decoder::with_ip(64, bytes, ip, DecoderOptions::NONE);
     let mut instructions = Vec::new();
@@ -22,10 +18,7 @@ pub fn decode_region(bytes: &[u8], ip: u64) -> Vec<Instruction> {
     instructions
 }
 
-/// Decode a single instruction at the start of `bytes` (first byte at `ip`).
-///
-/// Returns `None` only for an empty slice. A truncated or undecodable encoding
-/// yields an instruction for which [`is_invalid`] returns true.
+/// `None` only for an empty slice; a truncated or undecodable encoding is [`is_invalid`].
 pub fn decode_one(bytes: &[u8], ip: u64) -> Option<Instruction> {
     if bytes.is_empty() {
         return None;
@@ -36,12 +29,8 @@ pub fn decode_one(bytes: &[u8], ip: u64) -> Option<Instruction> {
     Some(instruction)
 }
 
-/// Classify an instruction's static control-flow facts for leader discovery.
-///
-/// This intentionally reproduces the exact leader set the monolithic lifter
-/// computed: the listed `Jmp`/`Jcc`/`Loop` mnemonics contribute their
-/// `near_branch_target()` (which may be 0 for non-near forms), direct `CALL`s
-/// contribute their static callee, and everything else contributes nothing.
+/// Control-flow facts for leader discovery: listed `Jmp`/`Jcc`/`Loop` contribute `near_branch_target()`
+/// (may be 0 for non-near forms), direct `CALL`s their callee, all else nothing.
 pub fn control_flow(instruction: &Instruction) -> ControlFlow {
     if instruction.is_invalid() {
         return ControlFlow::invalid();
@@ -49,10 +38,7 @@ pub fn control_flow(instruction: &Instruction) -> ControlFlow {
 
     match instruction.mnemonic() {
         Mnemonic::Jmp => {
-            // Only near-branch (direct) jumps have a statically known target;
-            // register/memory-indirect jumps do not (mirrors the `Call` arm
-            // below). Classifying an indirect jump as a direct branch would
-            // report a bogus target of 0 (from `near_branch_target()`).
+            // Only near-branch jumps have a static target; indirect ones would report a bogus 0.
             if matches!(
                 instruction.op0_kind(),
                 OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
@@ -83,7 +69,7 @@ pub fn control_flow(instruction: &Instruction) -> ControlFlow {
         | Mnemonic::Loope
         | Mnemonic::Loopne => ControlFlow::cond_branch(instruction.near_branch_target()),
         Mnemonic::Call => {
-            // Only direct (near-branch) calls have a statically known target.
+            // Only direct calls have a static target.
             if matches!(
                 instruction.op0_kind(),
                 OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
@@ -113,8 +99,7 @@ pub fn is_invalid(i: &Instruction) -> bool {
     i.is_invalid()
 }
 
-/// Compute the register/memory read-write effects of an instruction using
-/// iced's instruction-info database (accurate per-register access flags).
+/// Register/memory effects from iced's instruction-info database.
 pub fn instruction_effects(i: &Instruction) -> InstructionEffects {
     let mut factory = InstructionInfoFactory::new();
     let info = factory.info(i);
@@ -139,13 +124,11 @@ pub fn instruction_effects(i: &Instruction) -> InstructionEffects {
         }
     }
 
-    // Status flags are tracked separately from registers by iced; fold them in
-    // as pseudo-registers (`cf`, `zf`, ) for def-use analysis.
+    // Status flags are folded in as pseudo-registers (`cf`, `zf`, ...).
     for (bit, name) in RFLAG_NAMES {
         if i.rflags_read() & bit != 0 {
             push_unique(&mut reads, name);
         }
-        // A flag that is written, cleared, or set is a definition of that flag.
         if (i.rflags_written() | i.rflags_cleared() | i.rflags_set()) & bit != 0 {
             push_unique(&mut writes, name);
         }
@@ -179,8 +162,7 @@ fn push_unique(v: &mut Vec<String>, name: &str) {
     }
 }
 
-/// Status-flag bit -> lower-case flag name, for folding flag effects into
-/// [`InstructionEffects`].
+/// Status-flag bit -> lower-case name, for [`InstructionEffects`].
 const RFLAG_NAMES: [(u32, &str); 8] = [
     (RflagsBits::CF, "cf"),
     (RflagsBits::PF, "pf"),

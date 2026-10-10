@@ -1,5 +1,4 @@
-//! aarch64 guest frontend: decode classification + JIT round-trip tests for the
-//! instruction-semantics vertical slice.
+//! aarch64 frontend: decode classification and JIT round-trip tests.
 
 use cranelift::prelude::*;
 use cranelift_codegen::ir::{Function, UserFuncName};
@@ -14,8 +13,6 @@ use microlift::os::get_host_calling_conv;
 
 const BASE: u64 = 0x1000;
 
-/// Lift `bytes` as an aarch64 guest region at `BASE`, JIT-compile, run against
-/// `ctx`, and return the resulting context.
 fn run(bytes: &[u8], mut ctx: Aarch64RegisterContext) -> Aarch64RegisterContext {
     let mut flag_builder = settings::builder();
     flag_builder.set("use_colocated_libcalls", "false").unwrap();
@@ -45,7 +42,7 @@ fn run(bytes: &[u8], mut ctx: Aarch64RegisterContext) -> Aarch64RegisterContext 
     ctx
 }
 
-// Hand-encoded A64 instructions (little-endian on the wire).
+// Little-endian A64 encodings.
 const MOVZ_X0_42: [u8; 4] = [0x40, 0x05, 0x80, 0xD2]; // movz x0, #42
 const MOVZ_X0_10: [u8; 4] = [0x40, 0x01, 0x80, 0xD2]; // movz x0, #10
 const MOVZ_X1_20: [u8; 4] = [0x81, 0x02, 0x80, 0xD2]; // movz x1, #20
@@ -112,7 +109,6 @@ fn decode_movz_and_ret() {
 
 #[test]
 fn decode_conditional_branch_target() {
-    // subs at 0x1008, b.eq at 0x100C -> taken target 0x1014.
     let bytes = program(&[
         MOVZ_X0_7,
         MOVZ_X1_7,
@@ -149,7 +145,7 @@ fn add_three_regs() {
 
 #[test]
 fn subs_sets_flags() {
-    // 5 - 3 = 2; N=0, Z=0, C=1 (no borrow), V=0.
+    // No borrow: C=1.
     let bytes = program(&[MOVZ_X0_5, MOVZ_X1_3, SUBS_X2_X0_X1, RET]);
     let ctx = run(&bytes, Aarch64RegisterContext::default());
     assert_eq!(ctx.x[2], 2);
@@ -161,7 +157,6 @@ fn subs_sets_flags() {
 
 #[test]
 fn conditional_branch_taken() {
-    // 7 == 7 -> Z=1 -> b.eq taken -> skips `movz x0, #0`, so x0 stays 7.
     let bytes = program(&[
         MOVZ_X0_7,
         MOVZ_X1_7,
@@ -178,7 +173,6 @@ fn conditional_branch_taken() {
 
 #[test]
 fn store_then_load_roundtrip() {
-    // movz x0,#42; str x0,[sp]; ldr x1,[sp]; ret  -> x1 == 42.
     let mut stack = [0u64; 64];
     let sp = stack.as_mut_ptr() as u64 + 256;
     let mut ctx = Aarch64RegisterContext::default();
@@ -192,8 +186,7 @@ fn store_then_load_roundtrip() {
 
 #[test]
 fn paciasp_autiasp_are_noops() {
-    // The sign/authenticate pair must round-trip the link register to its
-    // original value (identity, since we don't model PAC enforcement).
+    // PAC is not enforced: sign/authenticate is identity.
     let mut ctx = Aarch64RegisterContext::default();
     ctx.x[30] = 0xDEAD_BEEF;
     let ctx = run(&program(&[PACIASP, MOVZ_X0_42, AUTIASP, RET]), ctx);
@@ -203,7 +196,6 @@ fn paciasp_autiasp_are_noops() {
 
 #[test]
 fn stp_stores_register_pair() {
-    // stp x0, x1, [sp] writes x0 at [sp+0] and x1 at [sp+8].
     let mut stack = [0u64; 64];
     let sp = stack.as_mut_ptr() as u64 + 256;
     let mut ctx = Aarch64RegisterContext::default();
@@ -216,7 +208,7 @@ fn stp_stores_register_pair() {
 
 #[test]
 fn adrp_forms_page_address() {
-    // adrp x0, #0x1000 at PC 0x1000: (0x1000 & ~0xFFF) + 0x1000 = 0x2000.
+    // adrp masks PC to the page.
     let ctx = run(
         &program(&[ADRP_X0_1, RET]),
         Aarch64RegisterContext::default(),
@@ -226,7 +218,6 @@ fn adrp_forms_page_address() {
 
 #[test]
 fn blr_exits_indirect_with_link() {
-    // movz x0,#42; blr x0  -> IndirectCall to 42, x30/pc = resume (0x1008).
     let ctx = run(
         &program(&[MOVZ_X0_42, BLR_X0]),
         Aarch64RegisterContext::default(),
@@ -239,7 +230,6 @@ fn blr_exits_indirect_with_link() {
 
 #[test]
 fn tbz_taken_when_bit_clear() {
-    // tbz w0,#0,#+8 with x0=4 (bit0 clear) -> branch to RET, skips movz x0,#0.
     let mut ctx = Aarch64RegisterContext::default();
     ctx.x[0] = 4;
     let ctx = run(&program(&[TBZ_X0_0_PLUS8, MOVZ_X0_0, RET]), ctx);
@@ -248,7 +238,6 @@ fn tbz_taken_when_bit_clear() {
 
 #[test]
 fn tbz_not_taken_when_bit_set() {
-    // tbz w0,#0,#+8 with x0=5 (bit0 set) -> falls through to movz x0,#0.
     let mut ctx = Aarch64RegisterContext::default();
     ctx.x[0] = 5;
     let ctx = run(&program(&[TBZ_X0_0_PLUS8, MOVZ_X0_0, RET]), ctx);
@@ -257,7 +246,7 @@ fn tbz_not_taken_when_bit_set() {
 
 #[test]
 fn tst_nonzero_clears_carry_and_overflow() {
-    // tst x0,x1 (7 & 7 = 7): Z=0, N=0; C and V are always cleared.
+    // C and V are cleared.
     let mut ctx = Aarch64RegisterContext::default();
     ctx.c = 1;
     ctx.vf = 1;
@@ -271,7 +260,6 @@ fn tst_nonzero_clears_carry_and_overflow() {
 
 #[test]
 fn tst_zero_sets_zero_flag() {
-    // tst x0,x1 with 8 & 7 = 0 -> Z=1.
     let mut ctx = Aarch64RegisterContext::default();
     ctx.x[0] = 8;
     ctx.x[1] = 7;
@@ -282,7 +270,6 @@ fn tst_zero_sets_zero_flag() {
 
 #[test]
 fn csel_picks_first_when_cond_true() {
-    // csel x2,x0,x1,eq with Z=1 -> x2 = x0 = 10.
     let mut ctx = Aarch64RegisterContext::default();
     ctx.z = 1;
     let ctx = run(
@@ -294,7 +281,6 @@ fn csel_picks_first_when_cond_true() {
 
 #[test]
 fn csel_picks_second_when_cond_false() {
-    // csel x2,x0,x1,eq with Z=0 -> x2 = x1 = 20.
     let mut ctx = Aarch64RegisterContext::default();
     ctx.z = 0;
     let ctx = run(
@@ -306,7 +292,6 @@ fn csel_picks_second_when_cond_false() {
 
 #[test]
 fn conditional_branch_not_taken() {
-    // 5 != 3 -> Z=0 -> b.eq not taken -> falls through to `movz x0, #0`.
     let bytes = program(&[
         MOVZ_X0_5,
         MOVZ_X1_3,
@@ -331,7 +316,6 @@ fn decode_cbz_is_cond_branch() {
 
 #[test]
 fn cbz_taken_when_zero() {
-    // x0 == 0 -> cbz branches over `movz x0,#42`, leaving x0 == 0.
     let bytes = program(&[CBZ_X0_PLUS8, MOVZ_X0_42, RET]);
     let ctx = run(&bytes, Aarch64RegisterContext::default());
     assert_eq!(ctx.x[0], 0);
@@ -339,7 +323,6 @@ fn cbz_taken_when_zero() {
 
 #[test]
 fn cbz_not_taken_when_nonzero() {
-    // x0 != 0 -> cbz falls through to `movz x0,#42`.
     let mut ctx = Aarch64RegisterContext::default();
     ctx.x[0] = 9;
     let ctx = run(&program(&[CBZ_X0_PLUS8, MOVZ_X0_42, RET]), ctx);
@@ -348,7 +331,6 @@ fn cbz_not_taken_when_nonzero() {
 
 #[test]
 fn cbnz_taken_when_nonzero() {
-    // x0 != 0 -> cbnz branches over `movz x0,#42`, leaving x0 unchanged.
     let mut ctx = Aarch64RegisterContext::default();
     ctx.x[0] = 7;
     let ctx = run(&program(&[CBNZ_X0_PLUS8, MOVZ_X0_42, RET]), ctx);
@@ -364,7 +346,6 @@ fn mul_multiplies() {
 
 #[test]
 fn madd_multiply_accumulate() {
-    // x2 = x3 + x0 * x1 = 100 + 7 * 3 = 121.
     let mut ctx = Aarch64RegisterContext::default();
     ctx.x[0] = 7;
     ctx.x[1] = 3;
@@ -375,7 +356,6 @@ fn madd_multiply_accumulate() {
 
 #[test]
 fn msub_multiply_subtract() {
-    // x2 = x3 - x0 * x1 = 100 - 7 * 3 = 79.
     let mut ctx = Aarch64RegisterContext::default();
     ctx.x[0] = 7;
     ctx.x[1] = 3;
@@ -395,7 +375,7 @@ fn udiv_divides() {
 
 #[test]
 fn udiv_by_zero_yields_zero() {
-    // A64 divide-by-zero produces 0 rather than trapping.
+    // A64 divide-by-zero yields 0.
     let mut ctx = Aarch64RegisterContext::default();
     ctx.x[0] = 20;
     ctx.x[1] = 0;
@@ -405,7 +385,6 @@ fn udiv_by_zero_yields_zero() {
 
 #[test]
 fn sdiv_rounds_toward_zero() {
-    // -7 / 2 = -3 (truncated toward zero).
     let mut ctx = Aarch64RegisterContext::default();
     ctx.x[0] = (-7i64) as u64;
     ctx.x[1] = 2;
@@ -424,7 +403,7 @@ fn sdiv_by_zero_yields_zero() {
 
 #[test]
 fn sdiv_int_min_over_neg_one_no_trap() {
-    // INT_MIN / -1 overflows; A64 defines the result as INT_MIN (no trap).
+    // INT_MIN / -1 yields INT_MIN, no trap.
     let mut ctx = Aarch64RegisterContext::default();
     ctx.x[0] = i64::MIN as u64;
     ctx.x[1] = (-1i64) as u64;
@@ -461,7 +440,6 @@ fn asrv_arithmetic_shift_preserves_sign() {
 
 #[test]
 fn rorv_rotates_right() {
-    // Rotate 0x1 right by 4 in 64-bit -> bit moves to position 60.
     let mut ctx = Aarch64RegisterContext::default();
     ctx.x[0] = 0x1;
     ctx.x[1] = 4;
@@ -471,7 +449,6 @@ fn rorv_rotates_right() {
 
 #[test]
 fn ldp_loads_register_pair() {
-    // Stack holds two values; ldp pulls them into x0 and x1.
     let mut stack = [0u64; 64];
     stack[32] = 0xAAAA;
     stack[33] = 0xBBBB;
@@ -491,7 +468,6 @@ fn stp_ldp_roundtrip() {
     ctx.sp = sp;
     ctx.x[0] = 0x1234;
     ctx.x[1] = 0x5678;
-    // stp x0,x1,[sp]; clobber; ldp x0,x1,[sp] back.
     let ctx = run(&program(&[STP_X0_X1_SP, MOVZ_X0_0, LDP_X0_X1_SP, RET]), ctx);
     assert_eq!(ctx.x[0], 0x1234);
     assert_eq!(ctx.x[1], 0x5678);
@@ -499,7 +475,6 @@ fn stp_ldp_roundtrip() {
 
 #[test]
 fn csinc_else_increments() {
-    // Z=0 -> cond false -> x2 = x1 + 1 = 21.
     let mut ctx = Aarch64RegisterContext::default();
     ctx.z = 0;
     let ctx = run(
@@ -511,7 +486,6 @@ fn csinc_else_increments() {
 
 #[test]
 fn csinc_true_picks_first() {
-    // Z=1 -> cond true -> x2 = x0 = 10 (no increment).
     let mut ctx = Aarch64RegisterContext::default();
     ctx.z = 1;
     let ctx = run(
@@ -523,7 +497,6 @@ fn csinc_true_picks_first() {
 
 #[test]
 fn csinv_else_inverts() {
-    // Z=0 -> x2 = ~x1 = ~20.
     let mut ctx = Aarch64RegisterContext::default();
     ctx.z = 0;
     let ctx = run(
@@ -535,7 +508,6 @@ fn csinv_else_inverts() {
 
 #[test]
 fn csneg_else_negates() {
-    // Z=0 -> x2 = -x1 = -20.
     let mut ctx = Aarch64RegisterContext::default();
     ctx.z = 0;
     let ctx = run(
@@ -571,7 +543,7 @@ fn rev_reverses_bytes() {
 
 #[test]
 fn adr_forms_byte_address() {
-    // adr x0,#+8 at PC 0x1000 -> 0x1008 (no page masking).
+    // adr does not page-mask.
     let ctx = run(
         &program(&[ADR_X0_PLUS8, RET]),
         Aarch64RegisterContext::default(),
@@ -581,7 +553,6 @@ fn adr_forms_byte_address() {
 
 #[test]
 fn mvn_inverts() {
-    // mvn x0,x1 (orn x0,xzr,x1): x0 = ~x1.
     let mut ctx = Aarch64RegisterContext::default();
     ctx.x[1] = 0x00FF;
     let ctx = run(&program(&[MVN_X0_X1, RET]), ctx);
@@ -590,7 +561,6 @@ fn mvn_inverts() {
 
 #[test]
 fn bic_and_with_inverted() {
-    // bic x2,x0,x1: x2 = x0 & ~x1 = 0xFF & ~0x0F = 0xF0.
     let mut ctx = Aarch64RegisterContext::default();
     ctx.x[0] = 0xFF;
     ctx.x[1] = 0x0F;

@@ -1,8 +1,6 @@
-//! aarch64 decoding (via yaxpeax-arm) and static control-flow classification.
+//! aarch64 decoding (yaxpeax-arm) and static control-flow classification.
 //!
-//! A64 instructions are a fixed 4 bytes wide, which makes leader discovery and
-//! IP tracking simple. yaxpeax instructions do not carry their own address, so
-//! each decoded instruction is wrapped together with its IP.
+//! A64 is fixed 4-byte; yaxpeax instructions carry no address, so each is wrapped with its IP.
 
 use crate::arch::ControlFlow;
 use yaxpeax_arch::{Decoder, U8Reader};
@@ -13,12 +11,10 @@ use yaxpeax_arm::armv8::a64::{InstDecoder, Instruction as RawInst, Opcode, Opera
 pub struct A64Instr {
     pub ip: u64,
     pub inst: RawInst,
-    /// Whether decoding succeeded. Invalid 4-byte words are retained so phase 2
-    /// can emit a fault stub.
+    /// Invalid words are kept so phase 2 can emit a fault stub.
     pub valid: bool,
 }
 
-/// Decode every 4-byte word in `bytes` starting at virtual address `ip`.
 pub fn decode_region(bytes: &[u8], ip: u64) -> Vec<A64Instr> {
     let decoder = InstDecoder::default();
     let mut out = Vec::new();
@@ -47,9 +43,7 @@ pub fn decode_region(bytes: &[u8], ip: u64) -> Vec<A64Instr> {
     out
 }
 
-/// Decode the single 4-byte instruction at the start of `bytes` (first byte at
-/// `ip`). Returns `None` if fewer than 4 bytes are available; an undecodable
-/// word yields an `A64Instr` with `valid == false`.
+/// `None` if fewer than 4 bytes remain; an undecodable word yields `valid == false`.
 pub fn decode_one(bytes: &[u8], ip: u64) -> Option<A64Instr> {
     if bytes.len() < 4 {
         return None;
@@ -57,7 +51,6 @@ pub fn decode_one(bytes: &[u8], ip: u64) -> Option<A64Instr> {
     decode_region(&bytes[..4], ip).into_iter().next()
 }
 
-/// Find the first PC-relative offset operand and resolve it against `ip`.
 fn branch_target(i: &A64Instr) -> Option<u64> {
     for op in &i.inst.operands {
         if let Operand::PCOffset(off) = op {
@@ -67,7 +60,6 @@ fn branch_target(i: &A64Instr) -> Option<u64> {
     None
 }
 
-/// Classify an instruction's static control-flow facts for leader discovery.
 pub fn control_flow(i: &A64Instr) -> ControlFlow {
     if !i.valid {
         return ControlFlow::invalid();

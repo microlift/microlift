@@ -1,17 +1,12 @@
-//! x86 condition code handling.
+//! Condition codes shared by `Jcc`, `SETcc` and `CMOVcc`.
 //!
-//! `Jcc`, `SETcc` and `CMOVcc` differ only in what they do with a condition.
-//! the condition itself is one of sixteen flag expressions built out of eight
-//! base predicates and their negations.
+//! Sixteen conditions built from eight base predicates and their negations.
 
 use crate::lifter::{Lifter, X86Flag};
 use cranelift::prelude::*;
 use iced_x86::Instruction;
 
-/// One x86 condition code, named after the `Jcc`/`SETcc`/`CMOVcc` suffix.
-///
-/// The aliases each mnemonic carries (`JZ` = `JE`, `JNAE` = `JB`, ...) are
-/// resolved by the caller; iced reports one canonical mnemonic per encoding.
+/// One x86 condition code; mnemonic aliases (`JZ` = `JE`, ...) are resolved by the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Cond {
     /// OF=1
@@ -49,10 +44,7 @@ pub(super) enum Cond {
 }
 
 impl Cond {
-    /// The condition this one is the negation of, paired with whether that
-    /// negation is in effect. `(Self::Le, true)` for [`Cond::G`], and so on.
-    ///
-    /// The positive member of each pair is the one that needs no final complement.
+    /// The base condition this one negates, and whether the negation applies: `(Le, true)` for `G`.
     fn base(self) -> (Base, bool) {
         match self {
             Cond::O => (Base::Of, false),
@@ -92,29 +84,18 @@ enum Base {
 }
 
 impl<'a> Lifter<'a> {
-    /// Read one flag as its `I8` boolean (0 or 1).
     fn flag(&mut self, flag: X86Flag) -> Value {
-        // `get_flag`, not the variable: PF and AF are stored as the values they
-        // are derived from, and a condition code is exactly the place that
-        // derivation is meant to happen.
+        // PF/AF are stored as source values; `get_flag` derives them.
         self.get_flag(flag)
     }
 
-    /// Invert an `I8` boolean (0 -> 1, 1 -> 0) with an equality compare.
     fn bool_not(&mut self, val: Value) -> Value {
         self.builder.ins().icmp_imm_s(IntCC::Equal, val, 0)
     }
 
-    /// Build `cond`'s flag expression, as `(value, invert)`: the condition holds
-    /// when `value` is nonzero, unless `invert`, in which case it holds when
-    /// `value` is zero.
-    ///
-    /// Callers that need a plain boolean should use
-    /// [`eval_cond_value`](Self::eval_cond_value); the split form exists for
-    /// `Jcc`, which spends the inversion on its branch destinations.
+    /// `cond` as `(value, invert)`: holds when `value` is nonzero, unless `invert`.
+    /// `Jcc` spends the inversion on its branch destinations.
     fn eval_cond(&mut self, cond: Cond) -> Value {
-        // Flags are read in the order the hand-written handlers read them, so
-        // the resulting IR is value-for-value what they emitted.
         match cond.base().0 {
             Base::Cf => self.flag(X86Flag::Carry),
             Base::Zf => self.flag(X86Flag::Zero),
@@ -141,8 +122,7 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// `cond` as a plain `I8` boolean, complementing the base expression when
-    /// the condition is the negated member of its pair.
+    /// `cond` as a plain `I8` boolean.
     fn eval_cond_value(&mut self, cond: Cond) -> Value {
         let val = self.eval_cond(cond);
         if cond.base().1 {
@@ -162,10 +142,7 @@ impl<'a> Lifter<'a> {
         self.write_operand(instruction, 0, val)
     }
 
-    /// `CMOVcc` - move the source to the destination when the condition holds.
-    ///
-    /// Both operands are read unconditionally; the choice is a `select`, not a
-    /// branch, which is also what hardware does.
+    /// `CMOVcc` - move source to destination when the condition holds (a `select`; both operands read).
     pub(super) fn handle_cmovcc(
         &mut self,
         instruction: &Instruction,
@@ -179,11 +156,7 @@ impl<'a> Lifter<'a> {
         self.write_operand(instruction, 0, result)
     }
 
-    /// `Jcc` - branch to the near target when the condition holds, otherwise
-    /// fall through.
-    ///
-    /// The inversion is spent on the `brif` destinations rather than on an
-    /// extra compare, so `JAE` costs exactly the `CF` read.
+    /// `Jcc` - branch to the near target when the condition holds; inversion lands on the `brif` destinations.
     pub(super) fn handle_jcc(
         &mut self,
         instruction: &Instruction,

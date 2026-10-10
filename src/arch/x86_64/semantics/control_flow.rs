@@ -17,9 +17,7 @@ impl<'a> Lifter<'a> {
         match instruction.op0_kind() {
             OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
                 let target = instruction.near_branch_target();
-                // A `JMP` to a known import is a tail call: the stub jumps straight into the
-                // imported function, which returns to *our* caller. Handled here rather than
-                // exiting to a host that must re-recognise the stub before every entry.
+                // Tail `JMP` to a known import: jump straight into it; its `RET` returns to our caller.
                 if !self.config.analysis_mode
                     && self.is_import(target)
                     && self.emit_import_tail_jump(target)?
@@ -52,22 +50,11 @@ impl<'a> Lifter<'a> {
     }
 
     pub(super) fn handle_ret(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        // Near return: pop a full 64-bit return address off the stack.
         self.emit_return(instruction, 8, false)
     }
 
-    /// `RETF`/`RETFQ` - far return.
-    ///
-    /// Pops the return offset and then the code selector, both stored in
-    /// operand-size-wide stack slots: 2 bytes each for `RETFW` (0x66 prefix),
-    /// 4 for `RETFD` (the 64-bit-mode default), 8 for `RETFQ` (REX.W).
-    ///
-    /// Microlift models a flat address space with no segmentation, so the
-    /// popped CS selector is discarded (it cannot change the linear address of
-    /// the target) - only the stack adjustment and the branch to the popped
-    /// offset are architecturally observable here. Everything past the pop
-    /// (in-region dispatch, exit trampoline, `UnknownJump`) is identical to a
-    /// near `RET`.
+    /// `RETF`/`RETFQ` - far return: pops offset then CS, each an operand-size slot (2 for `RETFW`, 4 for `RETFD`, 8 for `RETFQ`).
+    /// The selector is discarded (flat address space); the rest is identical to a near `RET`.
     pub(super) fn handle_retf(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let operand_size = match instruction.code() {
             Code::Retfw | Code::Retfw_imm16 => 2,
@@ -78,12 +65,7 @@ impl<'a> Lifter<'a> {
         self.emit_return(instruction, operand_size, true)
     }
 
-    /// Shared `RET`/`RETF` emitter.
-    ///
-    /// `slot_size` is the width in bytes of each stack slot popped (8 for a
-    /// near return, the operand size for a far one) and `pop_cs` selects
-    /// whether a second (discarded) selector slot follows the return offset.
-    /// `RET/RETF imm16` additionally releases `imm16` bytes of arguments.
+    /// Shared `RET`/`RETF` emitter: `slot_size` is the popped slot width, `pop_cs` adds a discarded selector slot; `imm16` forms release argument bytes.
     fn emit_return(
         &mut self,
         instruction: &Instruction,
@@ -91,8 +73,7 @@ impl<'a> Lifter<'a> {
         pop_cs: bool,
     ) -> crate::Result<()> {
         if self.config.analysis_mode {
-            // Inspection IR: a return terminates the function. The stack pop, dispatch
-            // switch and trampoline check are execution-only machinery.
+            // Inspection IR: a return terminates the function.
             self.emit_host_return();
             self.block_terminated = true;
             return Ok(());
@@ -101,9 +82,7 @@ impl<'a> Lifter<'a> {
         let imm = instruction.immediate16(); // for RET n
 
         let rsp = self.get_reg_val(Register::RSP)?;
-        // A narrow far return leaves the upper bits of the target undefined on
-        // real hardware; zero-extending the popped slot matches what the CPU
-        // loads into RIP.
+        // A narrow far return leaves the target's upper bits undefined; zero-extend like the CPU.
         let slot_ty = size_to_type(slot_size as usize);
         let popped = self.builder.ins().load(slot_ty, self.guest_flags, rsp, 0);
         let target_ip = if slot_ty == types::I64 {
@@ -112,8 +91,6 @@ impl<'a> Lifter<'a> {
             self.builder.ins().uextend(types::I64, popped)
         };
 
-        // Pop the return offset, then the discarded CS selector for a far
-        // return, then any `imm16` argument bytes.
         let popped_bytes = if pop_cs { slot_size * 2 } else { slot_size };
         let mut new_rsp = self.builder.ins().iadd_imm_s(rsp, popped_bytes);
         if imm > 0 {
@@ -124,15 +101,9 @@ impl<'a> Lifter<'a> {
         self.emit_return_dispatch(target_ip)
     }
 
-    /// Transfer control to a popped return address: dispatch into the region if
-    /// it names a known block, otherwise exit - as an `UnknownJump`/`Return`,
-    /// or cleanly via the trampoline when
-    /// [`LifterConfig::exit_trampoline_address`](crate::core::LifterConfig::exit_trampoline_address)
-    /// named one and the address is it.
-    ///
-    /// Split out of [`Self::emit_return`] so an import tail `JMP` can perform
-    /// exactly the return its callee's `RET` would have, after the stack pointer
-    /// has already been adjusted.
+    /// Transfer to a popped return address: dispatch in-region if known, else exit as `UnknownJump`/`Return`,
+    /// or via the [`exit_trampoline_address`](crate::core::LifterConfig::exit_trampoline_address) sentinel.
+    /// Split from [`Self::emit_return`] so an import tail `JMP` can perform its callee's return.
     fn emit_return_dispatch(&mut self, target_ip: Value) -> crate::Result<()> {
         let target_offset = self.to_lift_va(target_ip);
 
@@ -142,10 +113,7 @@ impl<'a> Lifter<'a> {
         self.builder.switch_to_block(external_check_block);
         self.builder.seal_block(external_check_block);
 
-        // The trampoline test - constant, compare, branch - is paid by every
-        // out-of-region RET, so it is only emitted for a host that declared a
-        // sentinel. Without one, every such return is "keep going at this PC",
-        // which is also the linkable exit.
+        // The trampoline compare is only emitted when the host declared a sentinel.
         let unknown_block = if let Some(trampoline_addr) = self.config.exit_trampoline_address {
             let trampoline = self
                 .builder
@@ -175,15 +143,10 @@ impl<'a> Lifter<'a> {
         self.sync_to_context(Some(target_ip), ExitReason::UnknownJump)?;
         self.write_exit_code(TransferKind::Return as u32);
         if self.returns_through_host_frames() {
-            // A caller may be waiting on the host stack for exactly this, and
-            // linking instead would strand its frame - see
-            // `LiftEngine::returns_through_host_frames`. Whoever catches the
-            // return decides whether it was the one they wanted.
+            // A caller may be waiting on the host stack; linking would strand its frame (see `LiftEngine::returns_through_host_frames`).
             self.emit_host_return();
         } else {
-            // After the trampoline test, so a `RET` to the host's sentinel stays
-            // deliberately unlinkable - and after the sync, so a miss leaves the
-            // context exactly as the host has always seen it.
+            // After the trampoline test, so a `RET` to the sentinel stays unlinkable, and after the sync.
             self.emit_callret_pop(target_ip);
             self.emit_exit(Some(target_ip));
         }
@@ -201,13 +164,10 @@ impl<'a> Lifter<'a> {
                 let target = instruction.near_branch_target();
 
                 if self.is_import(target) {
-                    // Registered import - fast-call or slow VM exit.
                     return self.emit_import_call(target);
                 }
 
-                // Out-of-region direct call. `UnknownJump` + `DirectCall` so the runtime can
-                // distinguish it from a real `ImportedFunctionCall`, whose callee is always
-                // native - a `DirectCall` callee may itself be virtualized.
+                // Out-of-region direct call: `UnknownJump` + `DirectCall`, since a `DirectCall` callee may be virtualized.
                 if !self.in_region(target) {
                     self.get_block(self.current_ip);
 
@@ -217,8 +177,6 @@ impl<'a> Lifter<'a> {
                     let va_offset = <X86_64 as GuestArch>::imported_function_va_offset();
                     self.ctx_store(rebased_callee, ctx_ptr, va_offset);
 
-                    // Push the return address onto the guest stack exactly as a
-                    // real CALL does, so the callee can RET correctly.
                     let ret_addr = self.runtime_current_ip();
                     let rsp = self.get_reg_val(Register::RSP)?;
                     let new_rsp = self.builder.ins().iadd_imm_s(rsp, -8);
@@ -227,24 +185,15 @@ impl<'a> Lifter<'a> {
                         .ins()
                         .store(self.guest_flags, ret_addr, new_rsp, 0);
 
-                    // Record where this call comes back to, so the callee's
-                    // `RET` can find its way here without a lookup. The cell it
-                    // names is one of *this* region's - the return address is a
-                    // resume point of the region making the call.
+                    // Record the return resume point so the callee's `RET` finds it without a lookup.
                     self.emit_callret_push(instruction.next_ip(), ret_addr);
 
                     self.sync_to_context(None, ExitReason::UnknownJump)?;
                     self.write_exit_code(TransferKind::DirectCall as u32);
 
-                    // First choice: make it a real host call, so the callee's `RET`
-                    // is a `ret` the return-address stack predicts and lands at the
-                    // instruction after this one rather than back through this
-                    // region's entry dispatch. Emits nothing and returns `false`
-                    // when that is off, leaving the exit below as it was.
+                    // Prefer a real host call so the callee's `ret` is predicted; emits nothing and returns `false` when off.
                     if self.emit_host_frame_call(target, rebased_callee, self.current_ip)? {
-                        // The builder is in the arm where the call could not be
-                        // made - no cell yet, or the host stack is as deep as it
-                        // may go - which takes the ordinary exit.
+                        // Call not possible (no cell yet, or host stack too deep): take the ordinary exit.
                         self.emit_static_exit(
                             target,
                             Some(rebased_callee),
@@ -254,11 +203,8 @@ impl<'a> Lifter<'a> {
                         return Ok(());
                     }
 
-                    // Linkable, and *statically* linkable: the return address is pushed and
-                    // `rip` is the callee, so the host has nothing left to do but enter it -
-                    // and the callee is a lift-time constant, which is what earns it a cell.
-                    // `Some(rebased_callee)` because `current_ip` here is the *return*
-                    // address, not where execution continues.
+                    // Statically linkable: the callee is a lift-time constant, so it earns a cell.
+                    // `current_ip` is the *return* address, hence `Some(rebased_callee)`.
                     self.emit_static_exit(
                         target,
                         Some(rebased_callee),
@@ -268,7 +214,6 @@ impl<'a> Lifter<'a> {
                     return Ok(());
                 }
 
-                // Internal direct call - push return address and jump.
                 let next_ip = instruction.next_ip();
                 self.get_block(next_ip);
 
@@ -312,12 +257,7 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// Analysis-mode `CALL`: emit a real Cranelift `call`/`call_indirect` to an
-    /// external function representing the callee, then **fall through** to the
-    /// next instruction. Unlike the execution path this does not touch RSP, push
-    /// a return address, jump into the callee, or terminate the block - so the
-    /// IR reads as a clean call with its continuation intact, and in-region
-    /// callees are no longer inlined as jumps.
+    /// Analysis-mode `CALL`: a real `call`/`call_indirect` that falls through; no RSP push, jump or terminator.
     fn handle_call_analysis(&mut self, instruction: &Instruction) -> crate::Result<()> {
         match instruction.op0_kind() {
             OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
@@ -326,8 +266,7 @@ impl<'a> Lifter<'a> {
                 self.builder.ins().call(fref, &[]);
             }
             OpKind::Register => {
-                // Indirect call: no statically-known callee, so no external function is
-                // declared; `call_indirect` carries the runtime target directly.
+                // Indirect: no declared function; `call_indirect` carries the target.
                 let target_val = self.get_reg_val(instruction.op0_register())?;
                 let sig = self.analysis_call_sig();
                 self.builder.ins().call_indirect(sig, target_val, &[]);
@@ -347,18 +286,14 @@ impl<'a> Lifter<'a> {
                 });
             }
         }
-        // Execution continues at the next instruction; do not terminate.
         self.block_terminated = false;
         Ok(())
     }
 
-    /// Dispatch a call to a registered import address: a runtime bridge, a fast
-    /// inline call, or a slow `ImportedFunctionCall` VM exit, in that order of
-    /// preference.
+    /// Dispatch a call to a registered import: bridge, fast inline call or slow `ImportedFunctionCall` exit, in that order.
     fn emit_import_call(&mut self, import_va: u64) -> crate::Result<()> {
         if let Some(ImportKind::Bridge(bridge)) = self.lookup_import(import_va) {
-            // A bridge that exits parks the resume PC at the next instruction,
-            // so that address needs a block to come back to.
+            // A bridge that exits parks the resume PC at the next instruction, which needs a block.
             self.get_block(self.current_ip);
             let callee = self.builder.ins().iconst(types::I64, import_va as i64);
             return self.emit_bridge_call(&bridge, callee, None, ExitReason::ImportedFunctionCall);
@@ -369,18 +304,9 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// Emit an import reached by tail `JMP`: perform the call inline, then the
-    /// return the imported function's own `RET` would have performed.
-    ///
-    /// Returns `false` when the import has no inline form (a slow import, or a
-    /// fast one whose ABI cannot place its arguments), leaving the caller to
-    /// emit the ordinary out-of-region jump exit - a slow import cannot be
-    /// tail-jumped inline, because the host would have to service the call and
-    /// then perform a return the lifted code never described.
-    ///
-    /// The return address is popped *before* the call, which puts the stack in
-    /// exactly the state the callee's ABI expects: stack arguments at `RSP+0`,
-    /// as at any other call site the fast path replaces.
+    /// Emit an import reached by tail `JMP`: the call inline, then the return its `RET` would perform.
+    /// Returns `false` for a slow import or a fast one whose ABI cannot place its arguments; the caller emits the ordinary exit.
+    /// The return address is popped before the call so stack arguments sit at `RSP+0`.
     fn emit_import_tail_jump(&mut self, import_va: u64) -> crate::Result<bool> {
         let bridge = match self.lookup_import(import_va) {
             Some(ImportKind::Bridge(b)) => Some(b),
@@ -405,8 +331,7 @@ impl<'a> Lifter<'a> {
         match (bridge, fast) {
             (Some(bridge), _) => {
                 let callee = self.builder.ins().iconst(types::I64, import_va as i64);
-                // If the bridge exits, the guest is architecturally *past* the
-                // stub already: resume at the popped return address.
+                // An exiting bridge leaves the guest past the stub: resume at the popped return address.
                 self.emit_bridge_call(
                     &bridge,
                     callee,
@@ -422,10 +347,7 @@ impl<'a> Lifter<'a> {
         Ok(true)
     }
 
-    /// Emit an `ImportedFunctionCall` VM exit for a direct import call.
-    ///
-    /// `self.current_ip` already holds the instruction after the CALL (the
-    /// resume point), so we sync and store that as RIP.
+    /// `ImportedFunctionCall` VM exit for a direct import call; `current_ip` (the next instruction) is stored as RIP.
     fn emit_import_slow_exit(&mut self, import_va: u64) -> crate::Result<()> {
         // Ensure the resume block exists even without VmResumptionPoints::All.
         self.get_block(self.current_ip);
@@ -441,29 +363,15 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Emit an `IndirectCall` VM exit for an indirect call whose target
-    /// address is only known at runtime (unregistered `CALL reg` / `CALL [mem]`).
-    ///
-    /// `target_val` is the runtime callee address (I64). `self.current_ip`
-    /// holds the resume point (next instruction after the CALL).
-    ///
-    /// RSP is intentionally left unchanged. See `ExitReason::IndirectCall` for
-    /// the contract the host must uphold when dispatching the callee.
-    ///
-    /// Unless the callee links. The host's decision - native function or guest
-    /// code - is what keeps the push out of this exit, and a matching row makes
-    /// it for us: it is guest code, and it has been translated. So a hit does
-    /// the push here and continues at the callee, exactly as an out-of-region
-    /// direct `CALL` does; see [`LiftEngine::emit_dynamic_link`] for why the
-    /// commit is in the hit arm rather than before the probe.
+    /// `IndirectCall` VM exit for a runtime-only target (`CALL reg` / `CALL [mem]`); `current_ip` is the resume point.
+    /// RSP is left unchanged (see `ExitReason::IndirectCall`) unless a link row hits: then the push happens in the hit arm
+    /// and execution continues at the callee; see [`LiftEngine::emit_dynamic_link`].
     ///
     /// [`LiftEngine::emit_dynamic_link`]: crate::core::LiftEngine::emit_dynamic_link
     fn emit_indirect_call_exit(&mut self, target_val: Value) -> crate::Result<()> {
         self.get_block(self.current_ip);
 
-        // With an indirect-call bridge the runtime dispatches host-side and usually
-        // handles the call inline, so a `dlsym`ed pointer or `call *%r12` costs a
-        // call rather than a VM exit. It still returns non-zero for guest code.
+        // An indirect-call bridge usually handles the call inline; it returns non-zero for guest code.
         if let Some(bridge) = self.config.indirect_call_bridge.clone() {
             return self.emit_bridge_call(&bridge, target_val, None, ExitReason::IndirectCall);
         }
@@ -488,8 +396,7 @@ impl<'a> Lifter<'a> {
             Ok(())
         })?;
 
-        // Reached when nothing links, which is every lift that is not linking at
-        // all: the exit the host has always been given, stack untouched.
+        // Nothing links: the plain exit, stack untouched.
         self.sync_to_context(None, ExitReason::IndirectCall)?;
         self.emit_host_return();
         self.block_terminated = true;
@@ -498,39 +405,17 @@ impl<'a> Lifter<'a> {
 
     /// Emit an inline call for a non-variadic fast-call import.
     ///
-    /// Argument values are read from wherever the import's [`CallAbi`] says the
-    /// guest placed them - a general-purpose register, an XMM register, or a
-    /// stack slot relative to RSP - and the return value is written back to the
-    /// ABI's return register. Both execution modes share this path; only the
-    /// call instruction differs:
-    ///
-    /// - [`FastCallTarget::Absolute`] (`Jit`): `call_indirect` through the
-    ///   symbol's address.
-    /// - [`FastCallTarget::Relocatable`] (`RuntimeAssisted`): `call` a declared
-    ///   external function, so the object backend emits a named relocation
-    ///   rather than an embedded absolute address.
-    ///
-    /// Stack arguments are read at `RSP + offset`: the fast path replaces the
-    /// `CALL` outright, so no return address has been pushed and RSP still
-    /// points where the guest's caller left it.
+    /// Arguments are read per the import's [`CallAbi`] (GPR, XMM, or stack slot at `RSP + offset`; no return address was pushed)
+    /// and the result is written to the ABI's return register.
+    /// [`FastCallTarget::Absolute`] (`Jit`) uses `call_indirect`; [`FastCallTarget::Relocatable`] (`RuntimeAssisted`)
+    /// calls a declared function so the object gets a named relocation.
     ///
     /// # A fast import must not touch the `RegisterContext`
     ///
-    /// Reading or writing it - directly, or by re-entering guest code against
-    /// the same context - is **undefined behaviour**. This path publishes no
-    /// registers and reloads none: the region's state is in machine registers
-    /// and stays there across the call, so the context holds whatever it held
-    /// at entry and the region will overwrite anything the callee put there.
-    /// A callee that needs the whole context is a
-    /// [bridge](crate::core::bridge), and one the host must service is a slow
-    /// import; both exist precisely for this.
-    ///
-    /// The rule also underwrites [`crate::core::regsync`]: with it, a register
-    /// this region never defined provably still holds its entry-loaded value
-    /// even past a fast call, so its store back really is idempotent. (If a
-    /// future caller needs the escape hatch, the shape is a per-import flag
-    /// asking for full materialisation around the call, not a blanket
-    /// pessimisation of every import.)
+    /// Reading or writing it, directly or by re-entering guest code against it, is **undefined behaviour**:
+    /// nothing is published or reloaded, and the region overwrites whatever the callee left there.
+    /// Use a [bridge](crate::core::bridge) or a slow import instead. The rule also underwrites [`crate::core::regsync`]:
+    /// a register the region never defined still holds its entry value past a fast call.
     fn emit_fast_import_call(&mut self, fast_call: FastCall) -> crate::Result<()> {
         let FastCall {
             target,
@@ -539,9 +424,7 @@ impl<'a> Lifter<'a> {
         } = fast_call;
 
         let placement = abi.place_args(&arg_types).ok_or_else(|| {
-            // Registration demotes such imports to the slow path; emitting a
-            // shorter arg list than the signature would fail the IR verifier,
-            // so error out loudly instead of miscompiling.
+            // Registration demotes such imports to slow; a short arg list would fail the verifier.
             MicroliftError::UnsupportedInstruction {
                 mnemonic: format!(
                     "fast-import-call with unplaceable arguments under {}",
@@ -555,9 +438,7 @@ impl<'a> Lifter<'a> {
             call_args.push(self.load_fast_call_arg(ty, loc)?);
         }
 
-        // Host code is about to run with this region's state in registers, so
-        // anything pinned must be in the context for the duration - a host import
-        // may read the guest stack, or call back into guest code below the frame.
+        // Pinned registers must be in the context while host code runs; it may read the stack or re-enter guest code.
         self.publish_pinned()?;
 
         let call = match target {
@@ -576,12 +457,10 @@ impl<'a> Lifter<'a> {
             self.store_fast_call_result(ret_ty, loc, ret_val)?;
         }
 
-        // Fast calls do NOT terminate the block; execution continues inline.
         Ok(())
     }
 
-    /// Read one fast-call argument of type `ty` from the guest location `loc`,
-    /// converted to the Cranelift type the callee's signature declares.
+    /// Read one fast-call argument of type `ty` from `loc`, converted to the callee's declared type.
     fn load_fast_call_arg(
         &mut self,
         ty: FunctionArgumentType,
@@ -594,7 +473,6 @@ impl<'a> Lifter<'a> {
         let val = match loc {
             ArgLocation::IntReg(reg) => {
                 let val = self.get_reg_val(x86_reg(reg)?)?;
-                // Guest GPRs are held as I64; narrow to the declared width.
                 if cl_ty == types::I64 {
                     val
                 } else {
@@ -622,8 +500,7 @@ impl<'a> Lifter<'a> {
         Ok(val)
     }
 
-    /// Write a fast call's return value back into the guest register the ABI
-    /// designates, widening integers to the full 64-bit guest register.
+    /// Write a fast call's return value to the ABI's guest register, widened to 64 bits.
     fn store_fast_call_result(
         &mut self,
         ty: FunctionArgumentType,
@@ -632,8 +509,7 @@ impl<'a> Lifter<'a> {
     ) -> crate::Result<()> {
         match loc {
             ArgLocation::FpReg(idx) => {
-                // Float -> raw bits, zero-extended into the low half of the
-                // vector register; the high half is cleared.
+                // Float -> raw bits in the vector register's low half; the high half is cleared.
                 let bits = if ty == FunctionArgumentType::SinglePrecisionFp {
                     let i32_val =
                         self.builder
@@ -686,12 +562,9 @@ impl<'a> Lifter<'a> {
         self.handle_conditional_branch(instruction, cond)
     }
 
-    /// Decrement the LOOP counter register (CX/ECX/RCX, chosen by encoding) and
-    /// return an I8 boolean that is true when the decremented counter is nonzero.
+    /// Decrement the LOOP counter (CX/ECX/RCX per encoding); returns an `I8` true when it is nonzero.
     fn decrement_loop_counter(&mut self, instruction: &Instruction) -> crate::Result<Value> {
-        // In iced's Code naming the *suffix* names the counter register (the
-        // `rel8_16/32/64` part is the branch operand size, which does not
-        // affect which counter is decremented).
+        // The encoding suffix names the counter; `rel8_16/32/64` is only the branch operand size.
         let counter_reg = match instruction.code() {
             Code::Loop_rel8_16_CX
             | Code::Loope_rel8_16_CX
@@ -761,7 +634,6 @@ impl<'a> Lifter<'a> {
         self.handle_conditional_branch(instruction, cond)
     }
 
-    // Shared branch helpers
 
     pub fn handle_conditional_branch(
         &mut self,
@@ -828,10 +700,8 @@ mod analysis_call_tests {
             0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3, // mov eax,1 ; ret
         ];
         let (ir, targets) = analysis_ir(&bytes, 0x1000);
-        // The call is a first-class IR op referencing an analysis funcref...
         assert!(ir.contains("call fn0()"), "ir was:\n{ir}");
         assert!(ir.contains("fn0 = u1:0"), "ir was:\n{ir}");
-        // ...and the index->VA map resolves fn0 to the callee.
         assert_eq!(targets, vec![0x100A]);
     }
 

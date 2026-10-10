@@ -1,13 +1,5 @@
-//! Thread-Local Storage (TLS) / FS-GS segment selector tests.
-//!
-//! These tests verify that:
-//!  - FS- and GS-prefixed memory accesses correctly add the segment base.
-//!  - `rdfsbase` / `rdgsbase` read the segment base into a GPR.
-//!  - `wrfsbase` / `wrgsbase` write a GPR into the segment base.
-//!
-//! No real multithreading is required; we simply pre-load `ctx.fs_base` /
-//! `ctx.gs_base` with the address of a local buffer and verify that the
-//! segment-prefixed instructions address that buffer correctly.
+//! FS/GS segment-base tests: prefixed accesses add the base; `rd/wr{fs,gs}base` move it to/from a GPR.
+//! Bases are pre-loaded with a local buffer address; no multithreading needed.
 
 use microlift::testkit::prelude::*;
 
@@ -15,8 +7,6 @@ use microlift::testkit::prelude::*;
 fn test_fs_segment_read_via_reg() {
     // mov rax, qword ptr fs:[rcx]  ; 64 48 8B 01
     // ret                           ; C3
-    //
-    // Loads a 64-bit value from (fs_base + rcx).
     let bytes = [0x64, 0x48, 0x8B, 0x01, 0xC3];
 
     let tls_data: [u64; 2] = [0xDEAD_BEEF_1234_5678, 0xCAFE_BABE_0000_0001];
@@ -30,10 +20,8 @@ fn test_fs_segment_read_via_reg() {
 
 #[test]
 fn test_fs_segment_read_with_offset() {
-    // mov rax, qword ptr fs:[rcx]  ; 64 48 8B 01
+    // mov rax, qword ptr fs:[rcx]  ; 64 48 8B 01 (rcx = 8: second element)
     // ret                           ; C3
-    //
-    // Same instruction, but rcx = 8 to read the second element.
     let bytes = [0x64, 0x48, 0x8B, 0x01, 0xC3];
 
     let tls_data: [u64; 2] = [0x1111_1111_1111_1111, 0x2222_2222_2222_2222];
@@ -64,8 +52,6 @@ fn test_gs_segment_read_via_reg() {
 fn test_fs_segment_write_via_reg() {
     // mov qword ptr fs:[rcx], rax  ; 64 48 89 01
     // ret                           ; C3
-    //
-    // Stores rax into (fs_base + rcx).
     let bytes = [0x64, 0x48, 0x89, 0x01, 0xC3];
 
     let mut tls_data: [u64; 2] = [0, 0];
@@ -125,8 +111,6 @@ fn test_gs_segment_write_via_reg() {
 fn test_rdfsbase() {
     // rdfsbase rax  ; F3 48 0F AE C0
     // ret           ; C3
-    //
-    // Reads ctx.fs_base into rax.
     let bytes = [0xF3, 0x48, 0x0F, 0xAE, 0xC0, 0xC3];
 
     let mut ctx = RegisterContext::default();
@@ -143,8 +127,6 @@ fn test_rdfsbase() {
 fn test_wrfsbase() {
     // wrfsbase rax  ; F3 48 0F AE D0
     // ret           ; C3
-    //
-    // Writes rax into ctx.fs_base.
     let bytes = [0xF3, 0x48, 0x0F, 0xAE, 0xD0, 0xC3];
 
     let mut ctx = RegisterContext::default();
@@ -160,10 +142,8 @@ fn test_wrfsbase() {
 #[test]
 fn test_wrfsbase_then_read() {
     // wrfsbase rax        ; F3 48 0F AE D0
-    // mov rbx, [fs:rcx]  ; 64 48 8B 19
+    // mov rbx, [fs:rcx]  ; 64 48 8B 19  (read via the new base)
     // ret                 ; C3
-    //
-    // Sets fs_base = rax, then reads from the new base + rcx.
     let bytes = [
         0xF3, 0x48, 0x0F, 0xAE, 0xD0, // wrfsbase rax
         0x64, 0x48, 0x8B, 0x19, // mov rbx, [fs:rcx]
@@ -222,11 +202,8 @@ fn test_wrgsbase() {
 #[test]
 fn test_fs_gs_independent() {
     // rdfsbase rax   ; F3 48 0F AE C0
-    // rdgsbase rcx   ; F3 48 0F AE C8  (but dst = rcx, ModRM C9)
+    // rdgsbase rcx   ; F3 48 0F AE C9  (C9 = mod 11, reg 001, rm 001)
     // ret            ; C3
-    //
-    // rdgsbase rcx: F3 48 0F AE C9
-    //   C9 = mod=11, reg=001 (rdgsbase), rm=001 (RCX)
     let bytes = [
         0xF3, 0x48, 0x0F, 0xAE, 0xC0, // rdfsbase rax
         0xF3, 0x48, 0x0F, 0xAE, 0xC9, // rdgsbase rcx

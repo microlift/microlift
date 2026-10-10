@@ -1,5 +1,4 @@
-//! Eager condition-flag updates. The finished SSA pass removes unused pure
-//! computations; no instruction classification suppresses writes during lifting.
+//! Eager condition-flag updates; the finished SSA pass removes unused computations.
 //!
 //! PF and AF are stored as source bytes and folded into booleans at their readers.
 
@@ -8,15 +7,7 @@ use cranelift::prelude::*;
 use iced_x86::Instruction;
 
 impl<'a> Lifter<'a> {
-    /// The byte PF is the parity of: the low byte of `res`, unchanged.
-    ///
-    /// This is the whole of the deferral. PF is defined as the even parity of
-    /// the result's low byte, so the *result* is already a valid stored form and
-    /// the fold that turns it into a bit belongs at the reader - see
-    /// [`Lifter::get_flag`]. What this replaces cost a `popcnt`, a `band` and a
-    /// `bxor` on every arithmetic instruction in the program, for a flag that
-    /// only `jp`/`jnp`/`setp`/`pushfq`/`lahf` ever read, and which the dead-flag
-    /// analysis cannot drop at a region exit because every flag is live there.
+    /// The byte PF is the parity of: the low byte of `res`, unchanged; the fold happens at the reader ([`Lifter::get_flag`]).
     fn parity_source(&mut self, res: Value) -> Value {
         if self.builder.func.dfg.value_type(res) == types::I8 {
             res
@@ -25,12 +16,7 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// The byte AF is bit 4 of: `lhs ^ rhs ^ res`.
-    ///
-    /// AF is the carry out of bit 3, which that three-way xor captures for every
-    /// add- and subtract-shaped operation, carry-in included - the carry only
-    /// reaches bit 0, and the xor still captures bit 3's carry into bit 4. The
-    /// shift and mask that used to follow are the reader's, as for parity.
+    /// The byte AF is bit 4 of `lhs ^ rhs ^ res`; the shift and mask are the reader's.
     fn auxiliary_source(&mut self, lhs: Value, rhs: Value, res: Value) -> Value {
         let lhs_xor_rhs = self.builder.ins().bxor(lhs, rhs);
         let af_xor = self.builder.ins().bxor(lhs_xor_rhs, res);
@@ -41,13 +27,7 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// ZF, SF, AF and PF - the four flags every add- and subtract-shaped operation
-    /// derives the same way, from the operands and the result and from nothing
-    /// about how the result was produced.
-    ///
-    /// Factored out because that is precisely what [`Spec::IntegerOverflowFlags`]
-    /// does *not* change: CF and OF have a machine instruction behind them, these
-    /// four do not.
+    /// ZF, SF, AF and PF: derived from operands and result alone, unlike CF/OF which [`Spec::IntegerOverflowFlags`] takes from the machine.
     ///
     /// [`Spec::IntegerOverflowFlags`]: crate::core::specialize::Spec::IntegerOverflowFlags
     fn update_flags_zsap(
@@ -59,28 +39,22 @@ impl<'a> Lifter<'a> {
     ) -> crate::Result<()> {
         let bit_width = (size * 8) as i64;
 
-        // Zero Flag (ZF)
         if self.flag_needed(X86Flag::Zero) {
             let zf = self.builder.ins().icmp_imm_s(IntCC::Equal, res, 0);
             self.set_flag(X86Flag::Zero, zf)?;
         }
 
-        // Sign Flag (SF): MSB of result
         if self.flag_needed(X86Flag::Sign) {
             let sf = self.builder.ins().ushr_imm_u(res, bit_width - 1);
             self.set_flag(X86Flag::Sign, sf)?;
         }
 
-        // Auxiliary Carry (AF): carry from bit 3 -> ((lhs ^ rhs ^ res) >> 4) & 1.
-        // For ADC/SBB this matches hardware because the carry-in only affects
-        // bit 0, and bit-3's carry into bit 4 is still captured by the xor of
-        // the three operands.
+        // AF is the carry out of bit 3; right for ADC/SBB since the carry-in only reaches bit 0.
         if self.flag_needed(X86Flag::Auxiliary) {
             let af = self.auxiliary_source(lhs, rhs, res);
             self.set_flag_source(X86Flag::Auxiliary, af)?;
         }
 
-        // Parity Flag (PF): 1 if low 8 bits of result have even popcount
         if self.flag_needed(X86Flag::Parity) {
             let pf = self.parity_source(res);
             self.set_flag_source(X86Flag::Parity, pf)?;
@@ -159,11 +133,7 @@ impl<'a> Lifter<'a> {
         self.set_flag(X86Flag::Direction, zero)
     }
 
-    /// The flags an `ADD` writes, given a sum somebody else computed.
-    ///
-    /// The portable definition. Handlers should call
-    /// [`Lifter::add_with_flags`] instead, which is free to get CF and OF from
-    /// the machine.
+    /// The flags an `ADD` writes given a computed sum; the portable definition behind [`Lifter::add_with_flags`].
     pub fn update_flags_add(
         &mut self,
         lhs: Value,
@@ -171,7 +141,6 @@ impl<'a> Lifter<'a> {
         res: Value,
         size: usize,
     ) -> crate::Result<()> {
-        // Carry Flag (CF): unsigned overflow - result < lhs
         if self.flag_needed(X86Flag::Carry) {
             let cf = self.builder.ins().icmp(IntCC::UnsignedLessThan, res, lhs);
             self.set_flag(X86Flag::Carry, cf)?;
@@ -180,9 +149,7 @@ impl<'a> Lifter<'a> {
         self.update_flags_zsap(lhs, rhs, res, size)
     }
 
-    /// The flags a `SUB` writes, given a difference somebody else computed.
-    ///
-    /// The portable definition; see [`Lifter::sub_with_flags`].
+    /// The flags a `SUB` writes given a computed difference; see [`Lifter::sub_with_flags`].
     pub fn update_flags_sub(
         &mut self,
         lhs: Value,
@@ -190,7 +157,6 @@ impl<'a> Lifter<'a> {
         res: Value,
         size: usize,
     ) -> crate::Result<()> {
-        // Carry Flag (CF) - borrow: lhs < rhs (unsigned)
         if self.flag_needed(X86Flag::Carry) {
             let cf = self.builder.ins().icmp(IntCC::UnsignedLessThan, lhs, rhs);
             self.set_flag(X86Flag::Carry, cf)?;
@@ -199,11 +165,7 @@ impl<'a> Lifter<'a> {
         self.update_flags_zsap(lhs, rhs, res, size)
     }
 
-    /// `lhs + rhs`, and every flag an `ADD` writes.
-    ///
-    /// The entry point for `ADD`, `XADD`, `LOCK ADD` and `LOCK XADD` - anything
-    /// whose flag half is an add. Returns the wrapped sum, which is the same
-    /// value an `iadd` would have produced whichever path ran.
+    /// `lhs + rhs` and every flag an `ADD` writes (`ADD`, `XADD` and their locked forms).
     pub fn add_with_flags(&mut self, lhs: Value, rhs: Value, size: usize) -> crate::Result<Value> {
         match self.try_native_add_flags(lhs, rhs)? {
             Some(res) => {
@@ -218,10 +180,7 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// `lhs - rhs`, and every flag a `SUB` writes.
-    ///
-    /// The entry point for `SUB`, `CMP` (which discards the difference), `NEG`
-    /// (`0 - x`), `CMPXCHG`'s comparison, and the locked forms of all of them.
+    /// `lhs - rhs` and every flag a `SUB` writes (`SUB`, `CMP`, `NEG`, `CMPXCHG`'s compare, locked forms).
     pub fn sub_with_flags(&mut self, lhs: Value, rhs: Value, size: usize) -> crate::Result<Value> {
         match self.try_native_sub_flags(lhs, rhs)? {
             Some(res) => {
@@ -236,11 +195,7 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// `lhs + 1` or `lhs - 1`, and every flag an `INC`/`DEC` writes - which is
-    /// all of them except CF, left exactly as it was.
-    ///
-    /// `rhs` is the constant one, passed in rather than materialized here so
-    /// the caller's operand type is the authority on its type.
+    /// `lhs ± 1` and every flag an `INC`/`DEC` writes (all but CF); `rhs` is the constant one in the operand's type.
     pub fn inc_dec_with_flags(
         &mut self,
         lhs: Value,
@@ -265,16 +220,9 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// `lhs + rhs + cf_in` (`is_adc`) or `lhs - rhs - cf_in`, and every flag an
-    /// `ADC`/`SBB` writes.
-    ///
-    /// `cf_in` is the incoming carry already widened to the operand type. The carry
-    /// *out* is the expensive half and is built only when something reads CF; the
-    /// two-step result is needed either way.
-    ///
-    /// Cranelift has exact opcodes for this shape (`uadd_overflow_cin`,
-    /// `usub_overflow_bin`) but no backend lowers them, so the carry chain is spelled
-    /// out as two ordinary overflow ops.
+    /// `lhs + rhs + cf_in` (`is_adc`) or `lhs - rhs - cf_in`, and every flag an `ADC`/`SBB` writes.
+    /// `cf_in` is pre-widened; the carry out is built only when CF is read.
+    /// No backend lowers `uadd_overflow_cin`/`usub_overflow_bin`, so the chain is two ordinary overflow ops.
     pub fn adc_sbb_with_flags(
         &mut self,
         lhs: Value,
@@ -300,21 +248,15 @@ impl<'a> Lifter<'a> {
         Ok(res)
     }
 
-    /// `lhs * rhs` truncated to the operand width, and the flags the two- and
-    /// three-operand `IMUL` forms write.
-    ///
-    /// Those are CF and OF alone, both meaning "the full signed product did not
-    /// fit"; ZF/SF/AF/PF are undefined and left as they were. The portable answer
-    /// needs a second, widening multiply to see the dropped bits, so a dead CF
-    /// *and* OF saves the whole `smulhi`.
+    /// `lhs * rhs` truncated, with the flags of the two- and three-operand `IMUL`.
+    /// CF and OF both mean "the full signed product did not fit"; ZF/SF/AF/PF are left as they were.
     pub fn imul_with_flags(&mut self, lhs: Value, rhs: Value, size: usize) -> crate::Result<Value> {
         if let Some(res) = self.try_native_imul_flags(lhs, rhs)? {
             return Ok(res);
         }
         let res = self.builder.ins().imul(lhs, rhs);
         if self.flag_needed(X86Flag::Carry) || self.flag_needed(X86Flag::Overflow) {
-            // Overflowed exactly when the high half is not the sign extension
-            // of the low half.
+            // Overflowed when the high half is not the sign extension of the low half.
             let hi = self.builder.ins().smulhi(lhs, rhs);
             let sign_ext = self.builder.ins().sshr_imm_u(res, (size * 8 - 1) as i64);
             let of_cf = self.builder.ins().icmp(IntCC::NotEqual, sign_ext, hi);
@@ -324,11 +266,8 @@ impl<'a> Lifter<'a> {
         Ok(res)
     }
 
-    /// `lhs + rhs + cf_in` / `lhs - rhs - cf_in` and nothing else - no flags read,
-    /// none written.
-    ///
-    /// The locked `ADC`/`SBB` retry loop needs the result on every iteration but
-    /// the flags only for the iteration that won.
+    /// `lhs + rhs + cf_in` / `lhs - rhs - cf_in` with no flags read or written.
+    /// The locked retry loop needs flags only for the winning iteration.
     pub(super) fn adc_sbb_value(
         &mut self,
         lhs: Value,
@@ -345,9 +284,7 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// The two-step `ADC`/`SBB`, with the carry out assembled from the carry out
-    /// of each step - the portable spelling, and the fallback for
-    /// [`Lifter::adc_sbb_with_flags`].
+    /// The portable two-step `ADC`/`SBB`; fallback for [`Lifter::adc_sbb_with_flags`].
     fn adc_sbb_portable(
         &mut self,
         lhs: Value,
@@ -380,13 +317,11 @@ impl<'a> Lifter<'a> {
     pub fn update_flags_logical(&mut self, res: Value, size: usize) -> crate::Result<()> {
         let bit_width = (size * 8) as i64;
 
-        // Zero Flag (ZF)
         if self.flag_needed(X86Flag::Zero) {
             let zf = self.builder.ins().icmp_imm_s(IntCC::Equal, res, 0);
             self.set_flag(X86Flag::Zero, zf)?;
         }
 
-        // Sign Flag (SF)
         if self.flag_needed(X86Flag::Sign) {
             let sf = self.builder.ins().ushr_imm_u(res, bit_width - 1);
             self.set_flag(X86Flag::Sign, sf)?;
@@ -399,22 +334,17 @@ impl<'a> Lifter<'a> {
             self.set_flag(X86Flag::Overflow, zero)?;
         }
 
-        // Parity Flag (PF): 1 if low 8 bits of result have even popcount
         if self.flag_needed(X86Flag::Parity) {
             let pf = self.parity_source(res);
             self.set_flag_source(X86Flag::Parity, pf)?;
         }
 
-        // AF is undefined for logical ops per Intel SDM; leave unchanged. Which
-        // preserves its previous SSA definition: a
-        // reader downstream sees whatever set it last, so that write has to stay
-        // live across an `AND`.
+        // AF is undefined for logical ops; its previous definition stays live across an `AND`.
 
         Ok(())
     }
 
-    /// The flags an `ADC` writes, given a result and a carry-out somebody else
-    /// computed. The portable definition; see [`Lifter::adc_sbb_with_flags`].
+    /// The flags an `ADC` writes given a result and carry-out; portable, see [`Lifter::adc_sbb_with_flags`].
     pub fn update_flags_adc(
         &mut self,
         lhs: Value,
@@ -424,13 +354,11 @@ impl<'a> Lifter<'a> {
         size: usize,
     ) -> crate::Result<()> {
         self.set_flag(X86Flag::Carry, cf_out)?;
-        // OF: signed overflow in lhs + rhs + cf_in.
         self.update_overflow_add(lhs, rhs, res, size)?;
         self.update_flags_zsap(lhs, rhs, res, size)
     }
 
-    /// The flags an `SBB` writes, given a result and a borrow-out somebody else
-    /// computed. The portable definition; see [`Lifter::adc_sbb_with_flags`].
+    /// The flags an `SBB` writes given a result and borrow-out; portable, see [`Lifter::adc_sbb_with_flags`].
     pub fn update_flags_sbb(
         &mut self,
         lhs: Value,
@@ -440,15 +368,11 @@ impl<'a> Lifter<'a> {
         size: usize,
     ) -> crate::Result<()> {
         self.set_flag(X86Flag::Carry, cf_out)?;
-        // OF: signed overflow in lhs - rhs - cf_in.
         self.update_overflow_sub(lhs, rhs, res, size)?;
         self.update_flags_zsap(lhs, rhs, res, size)
     }
 
-    /// The flags an `INC`/`DEC` writes - everything but CF, which is
-    /// architecturally untouched and is left holding whatever set it last.
-    ///
-    /// The portable definition; see [`Lifter::inc_dec_with_flags`].
+    /// The flags an `INC`/`DEC` writes (all but CF); see [`Lifter::inc_dec_with_flags`].
     pub fn update_flags_inc_dec(
         &mut self,
         lhs: Value,
@@ -465,21 +389,9 @@ impl<'a> Lifter<'a> {
         self.update_flags_zsap(lhs, rhs, res, size)
     }
 
-    /// Update flags for a shift operation (SHL/SHR/SAR/SHLD/SHRD).
-    ///
-    /// `orig` is the pre-shift destination, `res` the result (both in the operand
-    /// type), `cf_bit` the last bit shifted out, `count` the masked count, `size`
-    /// the operand size in bytes.
-    ///
-    /// If the masked count is 0, **no flags are affected** - so the prior values
-    /// must be preserved rather than clobbered with the garbage the shift formula
-    /// produces at count 0.
-    ///
-    /// OF is architecturally defined only for count == 1, where for every flavour
-    /// it is "the sign changed": SHL's `MSB(res) ^ CF` and SHRD's definition both
-    /// reduce to `MSB(orig) ^ MSB(res)`, SHR's `MSB(orig)` matches because
-    /// `MSB(res)` is 0, and SAR's 0 matches because the sign is preserved. For
-    /// counts > 1 it is undefined and cleared here.
+    /// Flags for SHL/SHR/SAR/SHLD/SHRD: `orig` pre-shift destination, `res` result, `cf_bit` last bit shifted out, `count` masked count, `size` bytes.
+    /// A zero masked count affects no flags, so prior values are preserved.
+    /// OF is defined only for count == 1 (the sign changed: `MSB(orig) ^ MSB(res)`); cleared for larger counts.
     pub fn update_flags_shift(
         &mut self,
         orig: Value,
@@ -490,8 +402,7 @@ impl<'a> Lifter<'a> {
     ) -> crate::Result<()> {
         let bit_width = (size * 8) as i64;
 
-        // The old flag sources are real SSA dependencies of the selects. A
-        // zero count preserves them; the finished pass follows those uses.
+        // Old flag sources feed the selects: a zero count preserves them.
         let (zf, sf, cf, of, pf) = (
             self.flag_needed(X86Flag::Zero),
             self.flag_needed(X86Flag::Sign),
@@ -503,7 +414,6 @@ impl<'a> Lifter<'a> {
             return Ok(());
         }
 
-        // is_zero is I8 (icmp_imm_s result); select uses any nonzero as true.
         let is_zero = self.builder.ins().icmp_imm_s(IntCC::Equal, count, 0);
 
         if zf {
@@ -515,8 +425,7 @@ impl<'a> Lifter<'a> {
 
         if sf {
             let old_sf = self.builder.use_var(self.state.flags[&X86Flag::Sign]);
-            // Newly-computed flag values (in operand width), reduced to I8 to
-            // match the flag SSA variable type that `select` requires.
+            // Reduced to `I8`, the flag variable type `select` needs.
             let new_sf_w = self.builder.ins().ushr_imm_u(res, bit_width - 1);
             let new_sf = if size == 1 {
                 new_sf_w
@@ -556,10 +465,7 @@ impl<'a> Lifter<'a> {
         }
 
         if pf {
-            // Both arms are parity *sources*, in the same encoding, so the
-            // select happens before the fold rather than after it - a shift by
-            // zero leaves the stored byte alone, which is what "PF unchanged"
-            // means once PF is deferred.
+            // Select before the fold so a zero count leaves the stored PF source unchanged.
             let old_pf = self.builder.use_var(self.state.flags[&X86Flag::Parity]);
             let new_pf = self.parity_source(res);
             let final_pf = self.builder.ins().select(is_zero, old_pf, new_pf);

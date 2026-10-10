@@ -1,21 +1,8 @@
-//! Software x87 80-bit extended-precision floating point, as pure Cranelift IR.
+//! Software x87 80-bit floating point as pure Cranelift IR.
 //!
-//! Each operation is a free `emit_*` function building into a given
-//! [`FunctionBuilder`], taking and returning the raw 80-bit representation: a
-//! `(mant: i64, se: i32)` pair, where `mant` is the significand (explicit integer
-//! bit at 63) and `se` holds the sign at bit 15 and the 15-bit biased exponent
-//! (bias 16383) below it.
-//!
-//! Free builders rather than `Lifter` methods so one body serves both emission
-//! strategies: inline at each site, or emitted once into a helper every site
-//! `call`s ([`F80Kernel`]). Outlining is the default - the kernels run to
-//! hundreds of IR instructions each.
-//!
-//! Approximations: subnormal *results* flush to zero and subnormal *inputs* are
-//! used as stored; NaN results are the canonical x87 QNaN indefinite rather than
-//! propagating input payloads; and [`emit_f80_trig`] is correctly *reduced* but
-//! not correctly *rounded* (see its own accuracy note). Everything else is
-//! correct for `+ - * /` and the ordering compare, round-to-nearest-even.
+//! Free `emit_*` builders over raw `(mant: i64, se: i32)` pairs (explicit integer bit at 63; `se` = sign at bit 15, biased exponent below).
+//! Free so one body serves inline emission and outlined helpers ([`F80Kernel`]), the default.
+//! Subnormal results flush to zero, NaN results are the QNaN indefinite, and [`emit_f80_trig`] is reduced but not correctly rounded.
 
 use cranelift::prelude::*;
 use cranelift_codegen::isa::CallConv;
@@ -68,7 +55,6 @@ fn is_zero(b: &mut FunctionBuilder, mant: Value, se: Value) -> Value {
     b.ins().band(ez, mz)
 }
 
-/// Assemble a `se` field (I32) from a sign bit (0/1) and biased exponent.
 fn compose_se(b: &mut FunctionBuilder, sign: Value, exp: Value) -> Value {
     let s = b.ins().ishl_imm_u(sign, 15);
     b.ins().bor(s, exp)
@@ -94,12 +80,10 @@ fn signed_zero(b: &mut FunctionBuilder, sign: Value) -> (Value, Value) {
     (m, se)
 }
 
-/// Round a 64-bit significand `sig` up by `inc` (0/1) with carry handling: if it
-/// overflows to `2^64`, reset to `0x80000` and report a `+1` exponent step.
+/// Round `sig` up by `inc` (0/1); on overflow to `2^64` reset to the integer bit and report a `+1` exponent step.
 /// Returns `(sig_rounded, exp_carry_i32)`.
 fn round_significand(b: &mut FunctionBuilder, sig: Value, inc: Value) -> (Value, Value) {
     let sig_r = b.ins().iadd(sig, inc);
-    // Overflow only when sig was all-ones and inc==1, wrapping to 0.
     let carry = b.ins().icmp_imm_s(IntCC::Equal, sig_r, 0);
     let msb = b.ins().iconst(types::I64, INT_BIT);
     let sig_final = b.ins().select(carry, msb, sig_r);
@@ -107,9 +91,7 @@ fn round_significand(b: &mut FunctionBuilder, sig: Value, inc: Value) -> (Value,
     (sig_final, exp_carry)
 }
 
-/// Select the special-case result for `a op b`, given the normal-path result
-/// `(nm, nse)` and the operand classes. `mode` picks multiply vs divide operand
-/// combinations.
+/// Select the special-case result for `a op b` from the normal-path `(nm, nse)` and operand classes; `mode` picks multiply vs divide combinations.
 #[allow(clippy::too_many_arguments)]
 fn apply_specials_mul(
     b: &mut FunctionBuilder,
@@ -178,7 +160,6 @@ fn clamp_over_under(
     (m, se)
 }
 
-/// Emit `a * b` for two raw 80-bit values.
 pub fn emit_f80_mul(
     b: &mut FunctionBuilder,
     am: Value,
@@ -199,8 +180,7 @@ pub fn emit_f80_mul(
     let a_zero = is_zero(b, am, ase);
     let b_zero = is_zero(b, bm, bse);
 
-    // 128-bit product of the two 64-bit significands. Both are in [2^63, 2^64)
-    // for normals, so the product is in [2^126, 2^128): MSB at bit 126 or 127.
+    // 128-bit product of significands in [2^63, 2^64): MSB at bit 126 or 127.
     let pa = b.ins().uextend(types::I128, am);
     let pb = b.ins().uextend(types::I128, bm);
     let prod = b.ins().imul(pa, pb);
@@ -209,14 +189,12 @@ pub fn emit_f80_mul(
     let top128 = b.ins().ushr_imm_u(prod, 127);
     let top = b.ins().ireduce(types::I32, top128);
 
-    // Extract the 64-bit significand: shift = 63 + top so the integer bit lands
-    // at bit 63 of the low word.
+    // shift = 63 + top lands the integer bit at bit 63.
     let top128_ext = b.ins().uextend(types::I128, top);
     let extract_shift = b.ins().iadd_imm_s(top128_ext, 63);
     let sig128 = b.ins().ushr(prod, extract_shift);
     let sig = b.ins().ireduce(types::I64, sig128);
 
-    // Round-to-nearest-even using the bits below `extract_shift`.
     let one64 = b.ins().iconst(types::I64, 1);
     let one128 = b.ins().uextend(types::I128, one64);
     let mask = {
@@ -250,9 +228,7 @@ pub fn emit_f80_mul(
     apply_specials_mul(b, nm, nse, sign, a_nan, b_nan, a_inf, b_inf, a_zero, b_zero)
 }
 
-/// Unsigned 128-bit / 128-bit division via restoring shift/subtract, returning
-/// `(quotient, remainder)` as `I128`. The backend has no native `udiv.i128`,
-/// but supports i128 shifts/adds/subtracts/compares, which is all this needs.
+/// Unsigned 128-bit division by restoring shift/subtract, returning `(quotient, remainder)`; the backend has no `udiv.i128`.
 fn udivmod128(b: &mut FunctionBuilder, n: Value, d: Value) -> (Value, Value) {
     let i128 = types::I128;
     let zero = {
@@ -323,7 +299,6 @@ fn udivmod128(b: &mut FunctionBuilder, n: Value, d: Value) -> (Value, Value) {
     (quot, rem)
 }
 
-/// Emit `a / b` for two raw 80-bit values.
 pub fn emit_f80_div(
     b: &mut FunctionBuilder,
     am: Value,
@@ -364,9 +339,7 @@ pub fn emit_f80_div(
     };
     let sig = b.ins().select(is_big, q_big, q_small);
 
-    // Rounding.
-    //  big:   guard = Q&1, sticky = (R != 0).
-    //  small: fraction R/bm -> compare 2R with bm.
+    // Rounding. big: guard = Q&1, sticky = (R != 0); small: compare 2R with bm.
     let r_nz = {
         let z128 = {
             let z = b.ins().iconst(types::I64, 0);
@@ -405,7 +378,6 @@ pub fn emit_f80_div(
     let nse = compose_se(b, sign, exp);
     let (nm, nse) = clamp_over_under(b, sign, exp, sig_r, nse);
 
-    // Special cases (division-specific operand combinations).
     let (zm, zse) = signed_zero(b, sign);
     let (im, ise) = inf(b, sign);
     let (qm, qse) = qnan(b);
@@ -446,7 +418,6 @@ pub fn emit_f80_div(
     (m, se)
 }
 
-// --- add / subtract ------------------------------------------------------
 
 /// Count leading zeros of a 128-bit value, returned as an `I64`.
 fn clz128(b: &mut FunctionBuilder, x: Value) -> Value {
@@ -464,7 +435,6 @@ fn clz128(b: &mut FunctionBuilder, x: Value) -> Value {
     b.ins().select(hi_nz, clz_hi, clz_lo)
 }
 
-/// Emit `a + b` for two raw 80-bit values.
 pub fn emit_f80_add(
     b: &mut FunctionBuilder,
     am: Value,
@@ -536,7 +506,6 @@ pub fn emit_f80_add(
 
     let same_sign = b.ins().icmp(IntCC::Equal, sign_a, sign_b);
 
-    // ---- effective addition ----
     let sum = b.ins().iadd(hi128, lo_aligned);
     let carry = b.ins().icmp(IntCC::UnsignedLessThan, sum, hi128);
     let sum_shr1 = b.ins().ushr_imm_u(sum, 1);
@@ -551,10 +520,7 @@ pub fn emit_f80_add(
         b.ins().iadd(exp_hi, c)
     };
 
-    // ---- effective subtraction ----
-    // Select the (non-negative) difference directly rather than max/min of the
-    // operands: `select(uge(a,b), a, b)` would be folded by the mid-end into
-    // `umax.i128`, which the x86 backend cannot lower.
+    // Effective subtraction: select the non-negative difference directly; `select(uge(a,b), a, b)` folds to `umax.i128`, which x86 cannot lower.
     let hi_ge = b
         .ins()
         .icmp(IntCC::UnsignedGreaterThanOrEqual, hi128, lo_aligned);
@@ -571,12 +537,10 @@ pub fn emit_f80_add(
         b.ins().isub(exp_hi, cz32)
     };
 
-    // Pick add vs sub.
     let res128 = b.ins().select(same_sign, add_res, sub_res);
     let res_exp = b.ins().select(same_sign, add_exp, sub_exp);
     let res_sign = b.ins().select(same_sign, hi_sign, sub_sign);
 
-    // Round at the bit-64 boundary (round-to-nearest-even).
     let keep = {
         let k = b.ins().ushr_imm_u(res128, 64);
         b.ins().ireduce(types::I64, k)
@@ -609,8 +573,7 @@ pub fn emit_f80_add(
     let nm = b.ins().select(cancel, zero_m, nm);
     let nse = b.ins().select(cancel, zero_se, nse);
 
-    // Specials: infinities and NaNs (zeros fall through the normal path
-    // correctly - a zero operand has mantissa 0, so it aligns to nothing).
+    // Infinities and NaNs; a zero operand has mantissa 0 and aligns to nothing, so zeros take the normal path.
     let both_inf = b.ins().band(a_inf, b_inf);
     let signs_differ = b.ins().icmp(IntCC::NotEqual, sign_a, sign_b);
     let inf_nan = b.ins().band(both_inf, signs_differ);
@@ -641,9 +604,7 @@ pub fn emit_f80_sub(
     emit_f80_add(b, am, ase, bm, neg_bse)
 }
 
-/// Integer square root of a 128-bit value, returning `(floor_sqrt, remainder)`
-/// as `I128` (`remainder = n - floor_sqrt^2`). Classic bit-by-bit restoring
-/// algorithm; the result fits in 64 bits for any `n < 2^128`.
+/// Integer square root of a 128-bit value as `(floor_sqrt, remainder)` (`remainder = n - floor_sqrt^2`); bit-by-bit restoring.
 fn isqrt128(b: &mut FunctionBuilder, n0: Value) -> (Value, Value) {
     let i128 = types::I128;
     let zero = {
@@ -709,7 +670,6 @@ fn isqrt128(b: &mut FunctionBuilder, n0: Value) -> (Value, Value) {
     (sqrt, rem)
 }
 
-/// Emit `sqrt(a)` for a raw 80-bit value.
 pub fn emit_f80_sqrt(b: &mut FunctionBuilder, am: Value, ase: Value) -> (Value, Value) {
     let sign = sign_of(b, ase);
     let ebiased = exp_of(b, ase);
@@ -718,8 +678,7 @@ pub fn emit_f80_sqrt(b: &mut FunctionBuilder, am: Value, ase: Value) -> (Value, 
     let a_zero = is_zero(b, am, ase);
     let is_neg = b.ins().icmp_imm_s(IntCC::Equal, sign, 1);
 
-    // Radicand scaled into 128 bits. The shift makes the effective exponent even
-    // so the result exponent is exact: 64 for even biased exponent, 63 for odd.
+    // Radicand scaled so the effective exponent is even: shift 64 for even biased exponent, 63 for odd.
     let even = {
         let lsb = b.ins().band_imm_u(ebiased, 1);
         b.ins().icmp_imm_s(IntCC::Equal, lsb, 0)
@@ -737,14 +696,12 @@ pub fn emit_f80_sqrt(b: &mut FunctionBuilder, am: Value, ase: Value) -> (Value, 
     let (q128, rem) = isqrt128(b, rad);
     let q = b.ins().ireduce(types::I64, q128);
 
-    // Round to nearest: sqrt is never exactly halfway, so round up iff the
-    // remainder exceeds the truncated root.
+    // sqrt is never exactly halfway: round up iff the remainder exceeds the truncated root.
     let round_up = b.ins().icmp(IntCC::UnsignedGreaterThan, rem, q128);
     let inc = b.ins().uextend(types::I64, round_up);
     let (sig_r, exp_carry) = round_significand(b, q, inc);
 
-    // Result biased exponent: (ebiased - 16384)/2 + 16383 (even) or
-    // (ebiased - 16383)/2 + 16383 (odd); `base` is even in both cases.
+    // Biased exponent: (ebiased - 16384)/2 + 16383 (even) or (ebiased - 16383)/2 + 16383 (odd).
     let base = {
         let be = b.ins().iadd_imm_s(ebiased, -16384);
         let bo = b.ins().iadd_imm_s(ebiased, -16383);
@@ -759,7 +716,6 @@ pub fn emit_f80_sqrt(b: &mut FunctionBuilder, am: Value, ase: Value) -> (Value, 
     let nse = compose_se(b, sign, exp);
     let (nm, nse) = clamp_over_under(b, sign, exp, sig_r, nse);
 
-    // Specials.
     let (qm, qse) = qnan(b);
     let (zm, zse) = signed_zero(b, sign);
     let pos = b.ins().iconst(types::I32, 0);
@@ -780,10 +736,8 @@ pub fn emit_f80_sqrt(b: &mut FunctionBuilder, am: Value, ase: Value) -> (Value, 
     (m, se)
 }
 
-/// Emit an ordered compare of two raw 80-bit values, returning the three
-/// predicates `(unordered, equal, less_than)` as I8 booleans (the interface the
-/// `FCOM`/`FUCOMI` handlers consume). When unordered, `equal`/`less_than` are
-/// unspecified; callers OR `unordered` into the flags.
+/// Ordered compare of two raw 80-bit values, returning `(unordered, equal, less_than)` as I8;
+/// when unordered the other two are unspecified (callers OR `unordered` into the flags).
 pub fn emit_f80_cmp(
     b: &mut FunctionBuilder,
     am: Value,
@@ -804,8 +758,7 @@ pub fn emit_f80_cmp(
     let sa_eff = b.ins().select(a_zero, zero_i32, sa);
     let sb_eff = b.ins().select(b_zero, zero_i32, sb);
 
-    // Magnitude key: (exp << 64) | mant. Higher exponent dominates; equal
-    // exponents fall back to the significand. Zeros carry exp=0, mant=0.
+    // Magnitude key: (exp << 64) | mant; zeros are 0.
     let exp_a = exp_of(b, ase);
     let exp_b = exp_of(b, bse);
     let mag = |b: &mut FunctionBuilder, exp: Value, mant: Value| -> Value {
@@ -834,11 +787,7 @@ pub fn emit_f80_cmp(
 }
 
 /// `floor((2/pi) * 2^256)`, least-significant limb first.
-///
-/// Argument reduction is Payne-Hanek: the quadrant and the reduced argument both
-/// come out of the bits of `|x| * 2/pi`, which needs `2/pi` to far more than 80
-/// bits. 256 is sized for the whole domain - `|x| < 2^63` puts the worst-case
-/// cancellation around 2^-70, leaving well over 64 good bits.
+/// Payne-Hanek needs `2/pi` far past 80 bits; 256 covers `|x| < 2^63` (worst-case cancellation ~2^-70).
 const TWO_OVER_PI_Q256: [u64; 4] = [
     0xFE51_63AB_DEBB_C561,
     0xDB62_9599_3C43_9041,
@@ -849,11 +798,7 @@ const TWO_OVER_PI_Q256: [u64; 4] = [
 /// `floor((pi/2) * 2^127)`, as `(high, low)` 64-bit halves.
 const PI_OVER_2_Q127: (u64, u64) = (0xC90F_DAA2_2168_C234, 0xC4C6_628B_80DC_1CD1);
 
-/// Taylor coefficients of `cos` in `u = r^2`: `(-1)^k / (2k)!`, as Q126
-/// two's-complement `(high, low)` halves.
-///
-/// Twelve terms put the truncation error below 2^-87 over `|r| <= pi/4`, far
-/// under the Q126 accumulator's own rounding noise.
+/// Taylor coefficients of `cos` in `u = r^2`: `(-1)^k / (2k)!`, Q126 `(high, low)`; twelve terms give error below 2^-87 over `|r| <= pi/4`.
 const COS_COEFFS_Q126: [(u64, u64); TRIG_POLY_TERMS] = [
     (0x4000_0000_0000_0000, 0x0000_0000_0000_0000),
     (0xE000_0000_0000_0000, 0x0000_0000_0000_0000),
@@ -887,19 +832,16 @@ const SIN_COEFFS_Q126: [(u64, u64); TRIG_POLY_TERMS] = [
 
 const TRIG_POLY_TERMS: usize = 12;
 
-/// Biased exponent of `0.5` - at or above it an argument can exceed `pi/4` and
-/// needs reducing; below it, it *is* its own reduced argument.
+/// Biased exponent of `0.5`: at or above it an argument may exceed `pi/4` and needs reducing.
 const REDUCE_MIN_EXP: i64 = 16382;
 
-/// Materialise a 128-bit constant from its two 64-bit halves (Cranelift's
-/// `iconst` tops out at `I64`).
+/// Materialise a 128-bit constant from 64-bit halves (`iconst` tops out at `I64`).
 fn const_i128(b: &mut FunctionBuilder, hi: u64, lo: u64) -> Value {
     let h = b.ins().iconst(types::I64, hi as i64);
     let l = b.ins().iconst(types::I64, lo as i64);
     join128(b, h, l)
 }
 
-/// Join two `I64` halves into an `I128`.
 fn join128(b: &mut FunctionBuilder, hi: Value, lo: Value) -> Value {
     let h = b.ins().uextend(types::I128, hi);
     let h = b.ins().ishl_imm_u(h, 64);
@@ -921,17 +863,12 @@ fn zero128(b: &mut FunctionBuilder) -> Value {
     b.ins().uextend(types::I128, z)
 }
 
-/// Widen an `I32`/`I64` shift amount to `I128`, the width the value being
-/// shifted has.
+/// Widen an `I32`/`I64` shift amount to `I128`.
 fn shift_amt(b: &mut FunctionBuilder, v: Value) -> Value {
     b.ins().uextend(types::I128, v)
 }
 
-/// High 128 bits of the unsigned 256-bit product `x * y`.
-///
-/// Cranelift's `imul` on `I128` keeps only the low half and there is no
-/// `umulhi.i128`, so this is schoolbook over the four 64-bit limbs - each
-/// partial product is an exact `I128` multiply of two zero-extended limbs.
+/// High 128 bits of the unsigned 256-bit product `x * y`; schoolbook over four 64-bit limbs (no `umulhi.i128`).
 fn umulhi128(b: &mut FunctionBuilder, x: Value, y: Value) -> Value {
     let x0 = lo64(b, x);
     let x1 = hi64(b, x);
@@ -963,8 +900,7 @@ fn umulhi128(b: &mut FunctionBuilder, x: Value, y: Value) -> Value {
     b.ins().iadd(s, hmid)
 }
 
-/// High 128 bits of `a * y` where `a` is **signed** and `y` unsigned - the
-/// usual correction on top of the unsigned product.
+/// High 128 bits of `a * y` with `a` signed and `y` unsigned: the unsigned product plus a correction.
 fn mulhi_su(b: &mut FunctionBuilder, a: Value, y: Value) -> Value {
     let hi = umulhi128(b, a, y);
     let z = zero128(b);
@@ -973,21 +909,14 @@ fn mulhi_su(b: &mut FunctionBuilder, a: Value, y: Value) -> Value {
     b.ins().isub(hi, corr)
 }
 
-/// Reduce `|x|` (as its raw significand and biased exponent) modulo `pi/2`.
-///
-/// Returns `(n, r_sig, r_exp, r_sign)`: the nearest quadrant index
-/// `n = round(|x| / (pi/2))`, and the remainder `r = |x| - n*(pi/2)` with
-/// `|r| <= pi/4`, as a normalised significand, biased exponent and sign bit.
-///
-/// The caller must have established that `x` is finite and `|x| < 2^63`, which
-/// is exactly what makes the fixed 256-bit `2/pi` window enough.
+/// Reduce `|x|` (raw significand and biased exponent) modulo `pi/2`, returning `(n, r_sig, r_exp, r_sign)`:
+/// the nearest quadrant `n = round(|x| / (pi/2))` and the remainder `|r| <= pi/4` as normalised significand, exponent and sign.
+/// The caller must have established that `x` is finite and `|x| < 2^63`, which the 256-bit `2/pi` window needs.
 fn emit_trig_reduce(b: &mut FunctionBuilder, m: Value, e: Value) -> (Value, Value, Value, Value) {
     let i128 = types::I128;
     let i32t = types::I32;
 
-    // `|x| < 1/2` is already its own remainder, in quadrant 0. Both paths are
-    // computed and selected between; the shifts below are clamped so the
-    // discarded one cannot produce an out-of-range shift amount.
+    // `|x| < 1/2` is its own remainder in quadrant 0; both paths are computed and selected, with shifts clamped.
     let need = b
         .ins()
         .icmp_imm_s(IntCC::SignedGreaterThanOrEqual, e, REDUCE_MIN_EXP);
@@ -1040,8 +969,7 @@ fn emit_trig_reduce(b: &mut FunctionBuilder, m: Value, e: Value) -> (Value, Valu
     let frac_lo = join128(b, frac[1], frac[0]);
     let frac_hi = join128(b, frac[3], frac[2]);
 
-    // Round the quotient to nearest: a fraction at or above 1/2 belongs to the
-    // next quadrant, with a negative remainder.
+    // Round the quotient to nearest: a fraction >= 1/2 goes to the next quadrant with a negative remainder.
     let half = {
         let s = b.ins().ushr_imm_u(frac_hi, 127);
         b.ins().ireduce(types::I64, s)
@@ -1083,8 +1011,7 @@ fn emit_trig_reduce(b: &mut FunctionBuilder, m: Value, e: Value) -> (Value, Valu
             let d = b.ins().isub(c128v, c32);
             let d = shift_amt(b, d);
             let r = b.ins().ushr(mag_lo, d);
-            // `c == 0` would make that a 128-bit shift, which Cranelift masks
-            // back to zero; there is nothing to carry in then anyway.
+            // `c == 0` would be a 128-bit shift, masked to zero by Cranelift; nothing to carry then.
             let c_zero = b.ins().icmp_imm_s(IntCC::Equal, c, 0);
             b.ins().select(c_zero, z, r)
         };
@@ -1155,37 +1082,20 @@ fn emit_trig_reduce(b: &mut FunctionBuilder, m: Value, e: Value) -> (Value, Valu
 
 /// [`emit_f80_trig`]'s `phase` for `cos`: the quadrant is used as reduced.
 pub const TRIG_PHASE_COS: i64 = 0;
-/// [`emit_f80_trig`]'s `phase` for `sin`: `sin(x) == cos(x - pi/2)`, one
-/// quadrant back, plus the odd-function sign of the argument.
+/// [`emit_f80_trig`]'s `phase` for `sin`: `cos(x - pi/2)` plus the argument's sign.
 pub const TRIG_PHASE_SIN: i64 = 1;
 
-/// Emit `cos(a)` or `sin(a)` for a raw 80-bit value, selected by `phase`
-/// ([`TRIG_PHASE_COS`]/[`TRIG_PHASE_SIN`], an `I32`).
+/// Emit `cos(a)` or `sin(a)` for a raw 80-bit value, selected by an `I32` `phase` ([`TRIG_PHASE_COS`]/[`TRIG_PHASE_SIN`]).
 ///
-/// `phase` is a *runtime* value on purpose: the quadrant selection it feeds is
-/// already a chain of `select`s, so one outlined helper serves `FSIN`, `FCOS`,
-/// `FSINCOS` and `FPTAN`.
+/// `phase` is a runtime value so one outlined helper serves `FSIN`, `FCOS`, `FSINCOS` and `FPTAN`.
+/// The caller owns the x87 out-of-range protocol; this assumes `|a| < 2^63` and returns the QNaN indefinite for NaN/infinity.
 ///
-/// The caller owns the x87 out-of-range protocol; this assumes `|a| < 2^63` and
-/// returns the QNaN indefinite for a NaN or infinite input.
+/// Payne-Hanek reduction gives the quadrant and `|r| <= pi/4`; a twelve-term Horner evaluation in `u = r^2` in 128-bit
+/// fixed point gives `cos(r)` or `sin(r)/r`, sharing one evaluation. `sin` multiplies by the *normalised* `r`,
+/// preserving relative accuracy near multiples of `pi/2`.
 ///
-/// Shape: Payne-Hanek reduction against a 256-bit `2/pi` gives the quadrant and
-/// a remainder `|r| <= pi/4`; a twelve-term Horner evaluation in `u = r^2` gives
-/// `cos(r)` or `sin(r)/r`, selected per coefficient by the quadrant so both
-/// series share one evaluation. The polynomial runs in 128-bit fixed point
-/// rather than through the 80-bit kernels: the series value is near 1, so
-/// absolute precision there *is* relative precision, at a fraction of the IR.
-/// The `sin` case multiplies by the *normalised* `r`, which is what preserves
-/// relative accuracy for an argument landing almost exactly on a multiple of
-/// `pi/2`.
-///
-/// Accuracy: faithful to the 64-bit significand. Against the 90-digit reference
-/// tables in `fpu_tests::test_fcos_full_80_bit_precision` and its `fsin`
-/// sibling, every case is correctly rounded but one, which is 1 ulp out - so the
-/// tests bound the error at 1 ulp rather than asserting correct rounding, which
-/// nothing here proves. Real x87 hardware reduces against a 66-bit `pi` and is
-/// far *less* accurate for large arguments, so bit-exact agreement with it is
-/// neither possible nor attempted.
+/// Accuracy: faithful to the 64-bit significand (tests bound the error at 1 ulp). Real x87 hardware reduces against
+/// a 66-bit `pi` and is less accurate for large arguments, so bit-exact agreement is not attempted.
 pub fn emit_f80_trig(
     b: &mut FunctionBuilder,
     am: Value,
@@ -1200,13 +1110,11 @@ pub fn emit_f80_trig(
     let a_inf = is_inf(b, am, ase);
     let a_sign = sign_of(b, ase);
 
-    // Both functions are reduced against the same |x|: cos is even, and sin's
-    // oddness is re-applied to the result at the end.
+    // Reduce against the same |x|: cos is even; sin's oddness is re-applied at the end.
     let (n, r_sig, r_exp, r_sign) = emit_trig_reduce(b, am, e);
 
-    // cos(n*pi/2 + r) is cos(r), -sin(r), -cos(r), sin(r) for n mod 4 = 0..3;
-    // sin is the same table one quadrant back. `n - phase` is >= -1, so the
-    // `n + 1` below stays non-negative and the logical shift is safe.
+    // cos(n*pi/2 + r) is cos(r), -sin(r), -cos(r), sin(r) for n mod 4 = 0..3; sin is one quadrant back.
+    // `n - phase >= -1`, so `n + 1` stays non-negative.
     let nq = {
         let p = b.ins().uextend(types::I64, phase);
         b.ins().isub(n, p)
@@ -1222,9 +1130,7 @@ pub fn emit_f80_trig(
         b.ins().ireduce(i32t, s)
     };
 
-    // u = r^2 as Q127. `r = r_sig * 2^(r_exp - 16446)`, so the square needs a
-    // right shift of `32765 - 2*r_exp`, which is at least 1 for any |r| < 1 and
-    // saturates to "u is zero" for arguments too small to matter.
+    // u = r^2 as Q127: right shift by `32765 - 2*r_exp` (>= 1 for |r| < 1; saturates to zero for tiny arguments).
     let rsq = {
         let rs = b.ins().uextend(i128, r_sig);
         b.ins().imul(rs, rs)
@@ -1240,9 +1146,7 @@ pub fn emit_f80_trig(
         b.ins().select(vanishes, z, u)
     };
 
-    // Horner over the Taylor series. Both coefficient sets have the same shape,
-    // so selecting the coefficient per term costs twelve `select`s instead of a
-    // second full evaluation.
+    // Horner over both series: selecting the coefficient per term costs twelve `select`s instead of a second evaluation.
     let coeff = |b: &mut FunctionBuilder, k: usize, use_sin: Value| {
         let c = const_i128(b, COS_COEFFS_Q126[k].0, COS_COEFFS_Q126[k].1);
         let s = const_i128(b, SIN_COEFFS_Q126[k].0, SIN_COEFFS_Q126[k].1);
@@ -1257,8 +1161,7 @@ pub fn emit_f80_trig(
         p = b.ins().iadd(t, c);
     }
 
-    // The series value is positive and in [0.7, 1] either way; normalise it into
-    // an 80-bit significand and exponent.
+    // The series value is in [0.7, 1]; normalise to an 80-bit significand and exponent.
     let pc = clz128(b, p);
     let pn = {
         let sh = shift_amt(b, pc);
@@ -1291,9 +1194,7 @@ pub fn emit_f80_trig(
         let rs = b.ins().uextend(i32t, r_sign);
         let s = b.ins().select(use_sin, rs, zero32);
         let sign = b.ins().bxor(base_sign, s);
-        // sin is odd, so it carries the argument's sign; cos is even and does
-        // not. This is also what preserves `sin(-0) == -0`, which falls out of
-        // the zero remainder rather than needing a special case.
+        // sin is odd and carries the argument's sign (which also gives `sin(-0) == -0`); cos does not.
         let is_sin_fn = b.ins().icmp_imm_s(IntCC::NotEqual, phase, 0);
         let arg = b.ins().select(is_sin_fn, a_sign, zero32);
         b.ins().bxor(sign, arg)
@@ -1303,8 +1204,7 @@ pub fn emit_f80_trig(
         compose_se(b, sign, mag)
     };
 
-    // An infinite argument is an invalid operation, and a NaN one propagates;
-    // both deliver the QNaN indefinite.
+    // Infinity is invalid and NaN propagates; both give the QNaN indefinite.
     let (qm, qse) = qnan(b);
     let bad = b.ins().bor(a_nan, a_inf);
     let m = b.ins().select(bad, qm, vm);
@@ -1312,18 +1212,10 @@ pub fn emit_f80_trig(
     (m, se)
 }
 
-// --- outlinable kernels --------------------------------------------------
 
-/// One 80-bit softfloat kernel, identified so it can be emitted **once** into a
-/// shared helper function and `call`ed from every x87 site that needs it.
-///
-/// The helper body is exactly the corresponding `emit_f80_*`, wrapped in a
-/// function whose parameters and results are the same raw `(mant, se)` pairs -
-/// so inline and outlined emission are bit-identical by construction.
-///
-/// `Sub` is its own kernel rather than a call into `Add` with a flipped sign:
-/// the flip is one `bxor`, so routing through `Add` would pay a second call for
-/// nothing. `FSUBR`/`FDIVR` reuse `Sub`/`Div` with swapped arguments.
+/// One 80-bit softfloat kernel, emitted **once** into a shared helper and `call`ed from every x87 site.
+/// The helper body is the corresponding `emit_f80_*`, so inline and outlined emission are bit-identical.
+/// `Sub` is its own kernel (the flip is one `bxor`, not worth a second call); `FSUBR`/`FDIVR` swap arguments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum F80Kernel {
     Add,
@@ -1331,14 +1223,12 @@ pub enum F80Kernel {
     Mul,
     Div,
     Sqrt,
-    /// Sine or cosine, selected by a third `phase` argument, on the reduced
-    /// domain `|x| < 2^63` (see [`emit_f80_trig`]).
+    /// Sine or cosine selected by a third `phase` argument, on `|x| < 2^63` (see [`emit_f80_trig`]).
     Trig,
     /// Ordered compare, returning the `(unordered, equal, less_than)` triple.
     Cmp,
 }
 
-/// Every kernel, for callers that want to pre-emit or enumerate them.
 pub const F80_KERNELS: [F80Kernel; 7] = [
     F80Kernel::Add,
     F80Kernel::Sub,
@@ -1350,9 +1240,7 @@ pub const F80_KERNELS: [F80Kernel; 7] = [
 ];
 
 impl F80Kernel {
-    /// The symbol the helper function is declared under. Kept stable and
-    /// namespaced: AOT output containing x87 code carries these as local
-    /// symbols, and two lifted regions linked together must share one copy.
+    /// Helper symbol; stable and namespaced so AOT regions linked together share one copy.
     pub fn symbol(self) -> &'static str {
         match self {
             F80Kernel::Add => "__microlift_f80_add",
@@ -1365,8 +1253,7 @@ impl F80Kernel {
         }
     }
 
-    /// Number of 80-bit operands the kernel takes (each is one `(mant, se)`
-    /// parameter pair).
+    /// Number of 80-bit operands (one `(mant, se)` pair each).
     fn operand_count(self) -> usize {
         match self {
             F80Kernel::Sqrt | F80Kernel::Trig => 1,
@@ -1374,9 +1261,7 @@ impl F80Kernel {
         }
     }
 
-    /// The helper's signature: one `(I64 mant, I32 se)` pair per operand, and
-    /// either an 80-bit result pair or - for [`F80Kernel::Cmp`] - three `I8`
-    /// predicates. `call_conv` should match the calling function's.
+    /// `(I64 mant, I32 se)` per operand; the result is an 80-bit pair or, for [`F80Kernel::Cmp`], three `I8` predicates.
     pub fn signature(self, call_conv: CallConv) -> Signature {
         let mut sig = Signature::new(call_conv);
         for _ in 0..self.operand_count() {
@@ -1401,12 +1286,8 @@ impl F80Kernel {
         sig
     }
 
-    /// Emit the kernel's body into `b`, whose function must already have been given
-    /// [`signature`](Self::signature).
-    ///
-    /// The `emit_f80_*` builders create and seal their own internal blocks and leave
-    /// the builder positioned in the block holding the result, which is where the
-    /// `return` lands.
+    /// Emit the kernel's body into `b` (already given [`signature`](Self::signature));
+    /// the `emit_f80_*` builders leave the builder in the block holding the result.
     pub fn build_body(self, b: &mut FunctionBuilder) {
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);

@@ -1,18 +1,14 @@
-//! Legacy x86 flag-effect metadata, retained for callers inspecting instructions.
+//! Legacy x86 flag-effect metadata for callers inspecting instructions.
 //!
-//! Dead flag elimination does not consult this table. It follows actual SSA
-//! dependencies after lifting, so these predictions cannot suppress flag writes.
+//! Dead flag elimination does not consult this table; it follows SSA dependencies after lifting.
 //!
 use iced_x86::{Instruction, Mnemonic, Register, RflagsBits};
 
 use crate::arch::x86_64::regs::X86Flag;
 use crate::core::flags::{FlagEffects, FlagSet};
 
-/// One flag, as a set.
-///
-/// The bit index is the `X86Flag` discriminant, which is also what the
-/// semantics pass to [`LiftEngine::flag_live`](crate::core::LiftEngine::flag_live)
-/// - one numbering, defined by the enum, used on both sides.
+/// One flag, as a set; the bit index is the `X86Flag` discriminant, which the semantics also pass to
+/// [`LiftEngine::flag_live`](crate::core::LiftEngine::flag_live).
 const fn f(flag: X86Flag) -> FlagSet {
     FlagSet::bit(flag as u8)
 }
@@ -25,22 +21,14 @@ const SF: FlagSet = f(X86Flag::Sign);
 const OF: FlagSet = f(X86Flag::Overflow);
 const DF: FlagSet = f(X86Flag::Direction);
 
-/// Everything `update_flags_add` / `_sub` / `_adc` / `_sbb` assign.
 const ARITH: FlagSet = CF.union(PF).union(AF).union(ZF).union(SF).union(OF);
-/// `update_flags_logical`: as `ARITH` but AF is left alone.
 const LOGICAL: FlagSet = CF.union(PF).union(ZF).union(SF).union(OF);
-/// `update_flags_inc_dec`: as `ARITH` but CF is left alone.
 const INC_DEC: FlagSet = PF.union(AF).union(ZF).union(SF).union(OF);
-/// `update_flags_shift`, which both reads and writes this set.
 const SHIFT: FlagSet = CF.union(PF).union(ZF).union(SF).union(OF);
 
-/// The flag effects of lifting `i`, or `None` where nobody has audited it.
-///
-/// `None` and [`FlagEffects::CONSERVATIVE`] mean the same thing to the caller;
-/// the distinction is only that `None` says "not classified" rather than
-/// "classified as touching everything".
+/// The flag effects of lifting `i`, or `None` where unaudited ([`FlagEffects::CONSERVATIVE`] to callers).
 pub fn flag_effects(i: &Instruction) -> Option<FlagEffects> {
-    // Routes to a handler this table was not read against. See the module note.
+    // Routes to a handler this table was not read against.
     if i.has_lock_prefix()
         || i.has_rep_prefix()
         || i.has_repne_prefix()
@@ -51,27 +39,24 @@ pub fn flag_effects(i: &Instruction) -> Option<FlagEffects> {
     }
 
     let effects = match i.mnemonic() {
-        // `update_flags_add` and `update_flags_sub`. `CMP` is a `SUB` that
-        // discards its result; `NEG` is `0 - x`; `XADD`'s flag half is an `ADD`.
+        // `CMP` is a `SUB` discarding its result; `NEG` is `0 - x`; `XADD`'s flag half is an `ADD`.
         Mnemonic::Add | Mnemonic::Xadd | Mnemonic::Sub | Mnemonic::Cmp | Mnemonic::Neg => {
             FlagEffects::writing(ARITH)
         }
-        // `update_flags_adc` / `_sbb`, plus the carry-in the handler folds into
-        // the result before it ever reaches the flag update.
+        // Carry-in is folded into the result before the flag update.
         Mnemonic::Adc | Mnemonic::Sbb => FlagEffects {
             reads: CF,
             writes: ARITH,
         },
-        // `update_flags_inc_dec`: CF is architecturally untouched, and the
-        // handler leaves it alone.
+        // CF is untouched.
         Mnemonic::Inc | Mnemonic::Dec => FlagEffects::writing(INC_DEC),
 
-        // AF is left as it was, so it is not a write
+        // AF is left as it was, so not a write.
         Mnemonic::And | Mnemonic::Or | Mnemonic::Xor | Mnemonic::Test => {
             FlagEffects::writing(LOGICAL)
         }
 
-        // a zero count keeps the old flags and the handler selects between them.
+        // A zero count keeps the old flags, so they are read too.
         Mnemonic::Shl
         | Mnemonic::Sal
         | Mnemonic::Shr
@@ -84,16 +69,13 @@ pub fn flag_effects(i: &Instruction) -> Option<FlagEffects> {
 
         Mnemonic::Imul | Mnemonic::Mul => FlagEffects::writing(CF.union(OF)),
 
-        // `bt_common` sets CF for all four of BT/BTS/BTR/BTC and touches no
-        // other flag; `handle_bsf`/`handle_bsr` set ZF only.
+        // `bt_common` sets CF only; BSF/BSR set ZF only.
         Mnemonic::Bt | Mnemonic::Bts | Mnemonic::Btr | Mnemonic::Btc => FlagEffects::writing(CF),
         Mnemonic::Bsf | Mnemonic::Bsr => FlagEffects::writing(ZF),
         Mnemonic::Tzcnt | Mnemonic::Lzcnt => FlagEffects::writing(CF.union(ZF)),
-        // `handle_popcnt` sets ZF and *clears* the other five, which is a write
-        // of each of them - unlike the bit scans above, none is left alone.
+        // POPCNT sets ZF and clears the other five, which is a write of each.
         Mnemonic::Popcnt => FlagEffects::writing(ARITH),
-        // The SSE4.2 string compares define CF/ZF/SF/OF from the comparison and
-        // clear AF/PF; `pcmpstr_flags` assigns all six.
+        // CF/ZF/SF/OF from the comparison, AF/PF cleared; all six assigned.
         Mnemonic::Pcmpistri
         | Mnemonic::Pcmpistrm
         | Mnemonic::Pcmpestri
@@ -108,26 +90,14 @@ pub fn flag_effects(i: &Instruction) -> Option<FlagEffects> {
         },
         Mnemonic::Std | Mnemonic::Cld => FlagEffects::writing(DF),
 
-        // A `Jcc`, `SETcc` or `CMOVcc` reads exactly the flags of its condition and
-        // writes none, and *which* flags is per-condition - so iced answers it rather
-        // than sixty match arms. Safe here in a way it is not for a producer: this is
-        // the `reads` direction, where the requirement is a superset.
-        //
-        // These are also why the whole optimisation pays: `cmp; je` wants ZF, leaving
-        // the other five of the `CMP`'s flags with no reader at all.
+        // Reads exactly the flags of its condition (iced answers per-condition); `cmp; je` leaves
+        // five of CMP's six flags with no reader. Safe: reads are a superset requirement.
         m if is_condition_consumer(m) => FlagEffects::reading(from_rflags(i.rflags_read())),
 
-        // Checked last so any mnemonic named above wins. The two sets are disjoint by
-        // construction (`the_two_halves_of_the_table_are_disjoint` asserts it), and the
-        // ordering resolves a future overlap in favour of the hand-written entry.
-        //
-        // Transparency is what lets liveness see *through* a stretch of code; without
-        // it, it stops at the first `MOV` and `cmp; mov; mov; jne` keeps every flag.
+        // Last, so hand-written entries win an overlap. Transparency lets liveness see through `mov`.
         m if is_flag_free(m) => FlagEffects::TRANSPARENT,
 
-        // Everything else, including every instruction that lifts to a VM exit
-        // and every one microlift does not implement. See the module note on
-        // why this is where safety comes from.
+        // Everything else, including VM exits and unimplemented instructions.
         _ => return None,
     };
     Some(effects)
@@ -135,27 +105,13 @@ pub fn flag_effects(i: &Instruction) -> Option<FlagEffects> {
 
 /// Mnemonics whose lift provably touches no flag and never syncs to the host.
 ///
-/// **Generated, not written.** `tools/derive-flag-free.py` re-derives it from
-/// `semantics/`:
+/// **Generated** by `tools/derive-flag-free.py`; rerun after touching `semantics/`.
+/// A handler is tainted if its body mentions `set_flag`, `state.flags`, `flag_needed`,
+/// `sync_to_context`, `write_exit_reason`, `write_exit_code`, `resumes_at` or `handle_unimplemented`,
+/// propagated through **any mention** of another function's name (`MOVSB` reaches DF via a
+/// `Self::emit_movs` value; a call-shaped search would miscompile it).
 ///
-/// 1. Take every mnemonic `handle_instruction` dispatches and its handler.
-/// 2. Mark a function *tainted* if its body mentions `set_flag`, `state.flags`,
-///    `flag_needed`, `sync_to_context`, `write_exit_reason`, `write_exit_code`,
-///    `resumes_at`, or `handle_unimplemented`.
-/// 3. Propagate to a fixpoint through **any mention** of another function's
-///    name, not just `self.f(` calls. That over-approximation is the point:
-///    `MOVSB` reaches DF through `Self::emit_movs` passed as a value, and a
-///    call-shaped search alone would declare it flag-free - a miscompile.
-/// 4. Keep the mnemonics whose handler is untainted.
-///
-/// Both halves of the taint matter: a handler that touches a flag obviously
-/// cannot be transparent, and one that **syncs to the host** cannot either,
-/// since the sync publishes every flag and an elided write would publish a
-/// stale one. That is what keeps `CPUID`, `SYSCALL`, `DIV` and the rest out.
-///
-/// Re-run the script after touching `semantics/`. It is an allowlist, so the
-/// dangerous direction is a handler that gains a `set_flag` and stays listed; a
-/// mnemonic that merely stops being listed costs speed alone.
+/// A handler that gains a `set_flag` while staying listed is the miscompile direction.
 fn is_flag_free(m: Mnemonic) -> bool {
     matches!(
         m,
@@ -478,12 +434,8 @@ fn is_flag_free(m: Mnemonic) -> bool {
     )
 }
 
-/// Whether `m` is a `Jcc`, `SETcc` or `CMOVcc` - an instruction whose only flag
-/// interaction is evaluating a condition.
-///
-/// `JRCXZ`, `LOOP`, `LOOPE` and `LOOPNE` are deliberately absent even though
-/// they branch: their handlers also decrement `RCX`, so they classify
-/// conservatively until someone has read them.
+/// A `Jcc`, `SETcc` or `CMOVcc`: its only flag interaction is evaluating a condition.
+/// `JRCXZ`/`LOOP*` are absent: their handlers also decrement `RCX`, so they stay conservative.
 fn is_condition_consumer(m: Mnemonic) -> bool {
     use Mnemonic::*;
     matches!(
@@ -538,10 +490,7 @@ fn is_condition_consumer(m: Mnemonic) -> bool {
     )
 }
 
-/// Translate an iced `RflagsBits` mask into this frontend's [`FlagSet`].
-///
-/// Only the six status flags and DF are represented; IF, and the bits iced
-/// reports for the system flags, have no SSA variable here and are dropped.
+/// Translates an iced `RflagsBits` mask to [`FlagSet`]; IF and system flags have no SSA variable and are dropped.
 fn from_rflags(bits: u32) -> FlagSet {
     let mut set = FlagSet::NONE;
     for (bit, flag) in [
@@ -560,8 +509,7 @@ fn from_rflags(bits: u32) -> FlagSet {
     set
 }
 
-/// An MMX operand routes to the unimplemented exit before the semantics
-/// dispatch ever sees the mnemonic; mirrors `semantics::uses_mmx_register`.
+/// MMX operands exit as unimplemented before semantics dispatch; mirrors `semantics::uses_mmx_register`.
 fn uses_mmx_register(instruction: &Instruction) -> bool {
     (0..instruction.op_count()).any(|i| {
         matches!(
@@ -588,64 +536,53 @@ mod tests {
         decoder.decode()
     }
 
-    /// The classification is about the handler, so the entries that differ from
-    /// the architecture are the ones worth pinning: each of these three would be
-    /// a miscompile if iced's answer had been taken instead.
+    /// Pins entries that differ from the architecture; taking iced's answer would miscompile each.
     #[test]
     fn the_lift_and_the_manual_disagree_in_three_places() {
-        // `and eax, eax` - AF is architecturally undefined here, and
-        // `update_flags_logical` leaves it unchanged, so it is not a write.
+        // AF is undefined here and `update_flags_logical` leaves it, so not a write.
         let and = flag_effects(&decode(&[0x21, 0xC0])).expect("AND is classified");
         assert!(!and.writes.contains(X86Flag::Auxiliary as u8));
         assert!(and.writes.contains(X86Flag::Zero as u8));
 
-        // `imul eax, eax` - the handler assigns CF and OF only.
+        // Handler assigns CF and OF only.
         let imul = flag_effects(&decode(&[0x0F, 0xAF, 0xC0])).expect("IMUL is classified");
         assert_eq!(imul.writes, CF.union(OF));
 
-        // `shl eax, cl` - reads the flags it may have to keep.
+        // Reads the flags it may have to keep.
         let shl = flag_effects(&decode(&[0xD3, 0xE0])).expect("SHL is classified");
         assert_eq!(shl.reads, SHIFT);
         assert_eq!(shl.writes, SHIFT);
     }
 
-    /// A `Jcc` reads its own condition and no more, which is the entire source
-    /// of the optimisation: five of a `CMP`'s six flags have no reader.
+    /// A `Jcc` reads only its condition's flags.
     #[test]
     fn a_conditional_branch_reads_only_its_condition() {
-        // `je +0`
         let je = flag_effects(&decode(&[0x74, 0x00])).expect("JE is classified");
         assert_eq!(je.reads, ZF);
         assert_eq!(je.writes, FlagSet::NONE);
 
-        // `jbe +0` reads CF and ZF.
+        // CF and ZF.
         let jbe = flag_effects(&decode(&[0x76, 0x00])).expect("JBE is classified");
         assert_eq!(jbe.reads, CF.union(ZF));
 
-        // `jg +0` reads ZF, SF and OF.
+        // ZF, SF, OF.
         let jg = flag_effects(&decode(&[0x7F, 0x00])).expect("JG is classified");
         assert_eq!(jg.reads, ZF.union(SF).union(OF));
     }
 
-    /// The three whole-instruction short-circuits, each of which routes to a
-    /// handler the table was not audited against.
+    /// Whole-instruction short-circuits that route to unaudited handlers.
     #[test]
     fn a_different_handler_is_not_this_table() {
-        // `lock add [rax], ecx` goes to `handle_locked_instruction`.
         assert!(flag_effects(&decode(&[0xF0, 0x01, 0x08])).is_none());
-        // `rep stosb` is a string op, not the `STOS` this table never listed.
+        // String op, not the unlisted `STOS`.
         assert!(flag_effects(&decode(&[0xF3, 0xAA])).is_none());
-        // `paddb mm0, mm1` exits before the semantics dispatch.
+        // Exits before semantics dispatch.
         assert!(flag_effects(&decode(&[0x0F, 0xFC, 0xC1])).is_none());
     }
 
-    /// The instructions that hand control to the host - by a VM exit, or by a
-    /// callback that syncs and reloads around a call - must stay unclassified,
-    /// because that sync publishes every flag and the analysis only knows it by
-    /// their absence.
+    /// Host-handoff instructions must stay unclassified: their sync publishes every flag.
     #[test]
     fn everything_that_exits_is_unclassified() {
-        // cpuid, syscall, rdtsc, int3, ud2, hlt, in al, dx
         for bytes in [
             &[0x0F, 0xA2][..],
             &[0x0F, 0x05][..],
@@ -664,15 +601,12 @@ mod tests {
         }
     }
 
-    /// A flag-free `MOV` has to be *transparent* rather than unclassified, or
-    /// liveness stops at the first one and almost nothing is ever elided.
+    /// A flag-free `MOV` must be transparent or liveness stops at the first one.
     #[test]
     fn data_movement_is_transparent() {
-        // `mov rax, rbx`
         let mov = flag_effects(&decode(&[0x48, 0x89, 0xD8])).expect("MOV is classified");
         assert_eq!(mov, FlagEffects::TRANSPARENT);
-        // and so is the floating-point arithmetic a compiled program is full
-        // of: `addsd xmm0, xmm1`, `cvtsi2sd xmm0, rax`.
+        // FP arithmetic: `addsd xmm0, xmm1`, `cvtsi2sd xmm0, rax`.
         for bytes in [
             &[0xF2, 0x0F, 0x58, 0xC1][..],
             &[0xF2, 0x48, 0x0F, 0x2A, 0xC0][..],
@@ -687,12 +621,7 @@ mod tests {
         }
     }
 
-    /// The generated flag-free list and the hand-written entries must not
-    /// overlap: an overlap means one of them is a lie, and since the generated
-    /// half is derived from the handlers, the lie would be the hand-written one.
-    ///
-    /// The `match` resolves it in favour of the hand-written arm regardless -
-    /// this asserts the situation does not arise rather than relying on that.
+    /// Generated and hand-written halves must not overlap.
     #[test]
     fn the_two_halves_of_the_table_are_disjoint() {
         for m in [
@@ -747,10 +676,7 @@ mod tests {
         }
     }
 
-    /// The string operations read DF through a function pointer, which is the
-    /// one thing a call-shaped taint search misses - and the reason
-    /// `tools/derive-flag-free.py` propagates through any mention of a name.
-    /// Their being unclassified is load-bearing, not incidental.
+    /// String ops read DF through a function pointer, which a call-shaped taint search misses; they must stay unclassified.
     #[test]
     fn the_string_operations_are_not_flag_free() {
         for m in [

@@ -5,22 +5,14 @@ use super::oracle::{
 use super::{LiftTest, RetAddr};
 use crate::context::{ExitReason, RegisterContext};
 
-/// Default cap on how many import calls a single run may service before it is
-/// declared runaway. Guards against a lifting bug that loops on the import exit
-/// instead of making progress.
+/// Cap on import calls per run before it is declared runaway.
 pub const DEFAULT_IMPORT_CALL_BUDGET: usize = 4096;
 
-/// The set of guest addresses that trap to the host, plus the handler that
-/// services them.
+/// Guest addresses that trap to the host, plus the handler servicing them.
 ///
-/// The handler receives the callee VA and the guest state *as an ordinary
-/// function would see it at its entry point*: arguments in the ABI registers,
-/// the stack pointer already past the pushed return address. It writes results
-/// back into the same [`CpuState`]. `rip` is managed by the engine; a handler
-/// must not set it.
-///
-/// One table drives one run: it borrows the handler mutably and counts calls, so
-/// [`differential_with_imports`] builds a fresh handler per engine.
+/// The handler sees the callee VA and the state as at function entry (args in ABI registers, `rsp`
+/// past the return address) and writes results back; it must not set `rip`. One table drives one
+/// run: [`differential_with_imports`] builds a fresh handler per engine.
 pub struct ImportTable<'h> {
     vas: Vec<u64>,
     handler: &'h mut dyn FnMut(u64, &mut CpuState),
@@ -29,7 +21,6 @@ pub struct ImportTable<'h> {
 }
 
 impl<'h> ImportTable<'h> {
-    /// Trap every VA in `vas` to `handler`.
     pub fn new(
         vas: impl IntoIterator<Item = u64>,
         handler: &'h mut dyn FnMut(u64, &mut CpuState),
@@ -42,29 +33,24 @@ impl<'h> ImportTable<'h> {
         }
     }
 
-    /// Override [`DEFAULT_IMPORT_CALL_BUDGET`].
     pub fn budget(mut self, budget: usize) -> Self {
         self.budget = budget;
         self
     }
 
-    /// The trapped addresses.
     pub fn vas(&self) -> &[u64] {
         &self.vas
     }
 
-    /// Whether `va` is trapped.
     pub fn contains(&self, va: u64) -> bool {
         self.vas.contains(&va)
     }
 
-    /// How many calls have been serviced so far in this run.
     pub fn calls(&self) -> usize {
         self.calls
     }
 
-    /// Run the handler for `va` against `state`. Returns `false` once the call
-    /// budget is exhausted, at which point the engine abandons the run.
+    /// Runs the handler for `va`; `false` once the call budget is exhausted.
     pub fn service(&mut self, va: u64, state: &mut CpuState) -> bool {
         if self.calls >= self.budget {
             return false;
@@ -75,36 +61,29 @@ impl<'h> ImportTable<'h> {
     }
 }
 
-/// A host-allocated guest stack at a fixed address, so two oracles can be run
-/// against *the same* stack memory and their `rsp` values compared directly.
-///
-/// The allocation lives in the `HostStack`; keep it alive for the whole
-/// comparison. Both oracles push the exit trampoline at `[rsp]` themselves.
+/// Host-allocated guest stack at a fixed address, so two oracles share stack memory and `rsp` is
+/// comparable. Keep it alive for the whole comparison.
 pub struct HostStack {
     mem: Vec<u64>,
 }
 
 impl HostStack {
-    /// Allocate a `words * 8` byte guest stack.
     pub fn new(words: usize) -> Self {
         Self {
             mem: vec![0u64; words],
         }
     }
 
-    /// The initial `rsp`: one slot below the top, where the exit trampoline
-    /// return address is written.
+    /// Initial `rsp`: one slot below the top, where the exit trampoline address goes.
     pub fn rsp(&self) -> u64 {
         let top = self.mem.as_ptr() as u64 + (self.mem.len() as u64) * 8;
         top - 8
     }
 }
 
-/// A [`CpuOracle`] that can additionally service host calls through an
-/// [`ImportTable`].
+/// A [`CpuOracle`] that can also service host calls through an [`ImportTable`].
 pub trait ImportOracle: CpuOracle {
-    /// Like [`CpuOracle::run`], but calls to any VA in `imports` are trapped and
-    /// serviced by its handler instead of being executed as guest code.
+    /// Like [`CpuOracle::run`], but calls to `imports` are serviced by its handler, not executed.
     fn run_with_imports(
         &mut self,
         code: &[u8],
@@ -136,8 +115,7 @@ impl ImportOracle for MicroliftOracle {
             .opt(self.opt)
             .ctx(ctx)
             .ret_addr(RetAddr::Trampoline)
-            // The automatic cross-check compares a *single* entry; an import
-            // run is a multi-entry loop and is diffed by the caller instead.
+            // The automatic cross-check compares a single entry; import runs are diffed by the caller.
             .no_unicorn();
         for va in vas {
             test = test.with_config(move |c| c.register_slow_import(va));
@@ -150,8 +128,7 @@ impl ImportOracle for MicroliftOracle {
             match exit {
                 ExitReason::Return | ExitReason::None => return OracleOutcome::Halted(state),
                 ExitReason::ImportedFunctionCall => {
-                    // Microlift leaves `rsp` untouched and parks the resume PC
-                    // in `rip`, so `state` is already the handler's view.
+                    // Microlift leaves `rsp` untouched and parks the resume PC in `rip`.
                     let va = harness.ctx.imported_function_va;
                     if !imports.service(va, &mut state) {
                         return OracleOutcome::Exit {
@@ -172,13 +149,8 @@ impl ImportOracle for MicroliftOracle {
     }
 }
 
-/// Run `code` on both oracles with the same import trampolines and diff the
-/// resulting states. `None` means one engine hit a non-diffable event, so there
-/// is nothing sound to compare.
-///
-/// `handler_factory` is invoked once per engine: the runs are sequential and
-/// each gets its own handler, so a test can count calls or record arguments per
-/// engine without the two interleaving.
+/// Runs `code` on both oracles with the same import trampolines and diffs the states; `None` when
+/// an engine hit a non-diffable event. `handler_factory` is called once per engine.
 pub fn differential_oracles_with_imports<A, B, H, F>(
     a: &mut A,
     b: &mut B,
@@ -213,8 +185,7 @@ where
     Some(super::oracle::diff_states(oa.state(), ob.state(), opts))
 }
 
-/// [`differential_oracles_with_imports`] against the default pair: the Microlift
-/// JIT versus Unicorn.
+/// [`differential_oracles_with_imports`] on the default pair: Microlift JIT versus Unicorn.
 #[cfg(feature = "unicorn-oracle")]
 pub fn differential_with_imports<H, F>(
     code: &[u8],

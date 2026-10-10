@@ -1,9 +1,4 @@
-//! Value Set Analysis - a lightweight abstract interpretation pass for
-//! resolving indirect control flow at lift time.
-//!
-//! VSA determines the set of possible values a register can hold at each program
-//! point, which turns `JMP RAX` from a full runtime dispatch switch into a
-//! targeted one (or a direct jump) when the value set is small.
+//! Value Set Analysis: abstract interpretation that narrows indirect `JMP`/`CALL` targets at lift time.
 //!
 //! ```text
 //!              Top   (completely unknown)
@@ -24,11 +19,8 @@ use iced_x86::{
 };
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
-/// Default caller-saved GPRs assumed clobbered across a `CALL`: the union of the
-/// System V and Windows x64 volatile sets, so it is sound under either. The rest
-/// (RBX, RBP, RSP, R12-R15) are assumed preserved, which holds only if the
-/// analysed code follows one of those ABIs - see
-/// [`ValueSetAnalyzer::all_gpr_clobbers`] for the conservative choice.
+/// Registers assumed clobbered across a `CALL` in ABI-aware mode: the System V and Windows x64
+/// volatile union. Others are assumed preserved; see [`ValueSetAnalyzer::all_gpr_clobbers`].
 const DEFAULT_CALL_CLOBBERS: &[Register] = &[
     Register::RAX,
     Register::RCX,
@@ -41,14 +33,10 @@ const DEFAULT_CALL_CLOBBERS: &[Register] = &[
     Register::R11,
 ];
 
-/// Registers assumed clobbered by a `SYSCALL`. RCX (<- RIP) and R11 (<- RFLAGS)
-/// are written by the instruction itself on all x86-64; RAX is the syscall
-/// return register under every mainstream OS (Linux/*BSD/Windows). Every other
-/// GPR is preserved across a syscall under those conventions.
+/// Registers a `SYSCALL` clobbers: RCX, R11 (written by the instruction) and RAX (return value).
 const DEFAULT_SYSCALL_CLOBBERS: &[Register] = &[Register::RAX, Register::RCX, Register::R11];
 
-/// All 16 general-purpose registers - the ABI-agnostic conservative clobber set
-/// for a `CALL` whose callee convention is unknown or untrusted.
+/// All 16 GPRs: the conservative `CALL` clobber set.
 const ALL_GPRS: &[Register] = &[
     Register::RAX,
     Register::RBX,
@@ -68,28 +56,22 @@ const ALL_GPRS: &[Register] = &[
     Register::R15,
 ];
 
-// Value Set lattice
 
-/// A conservative abstract value for a register.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ValueSet {
-    /// Unreachable / not yet set.
+    /// Unreachable.
     Empty,
-    /// Exactly one known value.
     Constant(i64),
-    /// A small finite set of known values.
     Multiple(BTreeSet<i64>),
-    /// Any value in the closed range [min, max].
     Interval { min: i64, max: i64 },
-    /// Completely unknown.
     Top,
 }
 
 impl ValueSet {
-    /// Maximum cardinality before we widen `Multiple` to `Top`.
+    /// Cardinality beyond which `Multiple` widens to `Top`.
     const MAX_SET_SIZE: usize = 64;
 
-    /// Lattice join (least upper bound).
+    /// Lattice join.
     pub fn join(&self, other: &ValueSet) -> ValueSet {
         match (self, other) {
             (ValueSet::Empty, x) | (x, ValueSet::Empty) => x.clone(),
@@ -132,12 +114,11 @@ impl ValueSet {
                 min: (*a_min).min(*b_min),
                 max: (*a_max).max(*b_max),
             },
-            // Widening: Mixed Interval + other -> Top (conservative)
+            // Mixed interval + other: widen to Top.
             _ => ValueSet::Top,
         }
     }
 
-    /// Abstract addition.
     pub fn abstract_add(&self, other: &ValueSet) -> ValueSet {
         match (self, other) {
             (ValueSet::Empty, _) | (_, ValueSet::Empty) => ValueSet::Empty,
@@ -172,7 +153,6 @@ impl ValueSet {
         }
     }
 
-    /// Abstract subtraction.
     pub fn abstract_sub(&self, other: &ValueSet) -> ValueSet {
         match (self, other) {
             (ValueSet::Empty, _) | (_, ValueSet::Empty) => ValueSet::Empty,
@@ -188,11 +168,10 @@ impl ValueSet {
         }
     }
 
-    /// Abstract AND (useful for masking patterns).
     pub fn abstract_and(&self, other: &ValueSet) -> ValueSet {
         match (self, other) {
             (ValueSet::Empty, _) | (_, ValueSet::Empty) => ValueSet::Empty,
-            // x & 0 = 0 for all x (including Top).
+            // x & 0 = 0 for all x.
             (ValueSet::Constant(0), _) | (_, ValueSet::Constant(0)) => ValueSet::Constant(0),
             (ValueSet::Top, _) | (_, ValueSet::Top) => ValueSet::Top,
             (ValueSet::Constant(a), ValueSet::Constant(b)) => ValueSet::Constant(a & b),
@@ -200,7 +179,6 @@ impl ValueSet {
         }
     }
 
-    /// Abstract XOR (e.g., `xor rax, rax` -> 0).
     pub fn abstract_xor(&self, other: &ValueSet) -> ValueSet {
         match (self, other) {
             (ValueSet::Empty, _) | (_, ValueSet::Empty) => ValueSet::Empty,
@@ -210,12 +188,8 @@ impl ValueSet {
         }
     }
 
-    /// Keep only the low `bits` bits of every concrete value, zero-extending the
-    /// result. Models a narrow (sub-register) read/zero-extending write: e.g. the
-    /// low 32 bits of a value for `mov ecx, eax` or `mov eax, imm32`.
-    ///
-    /// Only `Constant`/`Multiple` can be truncated exactly; an `Interval`'s low
-    /// bits are not an interval in general, so we conservatively fall to `Top`.
+    /// Keeps the low `bits` bits, zero-extending (narrow read / zero-extending write).
+    /// Only `Constant`/`Multiple` are exact; an `Interval` falls to `Top`.
     pub fn low_bits(&self, bits: u32) -> ValueSet {
         if bits >= 64 {
             return self.clone();
@@ -226,7 +200,7 @@ impl ValueSet {
             ValueSet::Constant(c) => ValueSet::Constant((*c as u64 & mask) as i64),
             ValueSet::Multiple(s) => {
                 let m: BTreeSet<i64> = s.iter().map(|v| (*v as u64 & mask) as i64).collect();
-                // Masking can collapse the set to a single value.
+                // Masking can collapse the set.
                 if m.len() == 1 {
                     ValueSet::Constant(*m.iter().next().unwrap())
                 } else {
@@ -237,12 +211,8 @@ impl ValueSet {
         }
     }
 
-    /// Widening operator used at control-flow merges to guarantee the worklist
-    /// reaches a fixpoint in finite time. It behaves like [`join`](Self::join)
-    /// except that an `Interval` whose bounds would grow jumps straight to `Top`,
-    /// bounding the otherwise-unbounded ascending chain of intervals across a
-    /// loop back-edge. `self` is the existing (accumulated) value; `other` is the
-    /// newly arriving one.
+    /// Join that sends a growing `Interval` straight to `Top`, so loop back-edges reach a fixpoint.
+    /// `self` is the accumulated value, `other` the new one.
     pub fn widen(&self, other: &ValueSet) -> ValueSet {
         match (self, other) {
             (
@@ -268,12 +238,10 @@ impl ValueSet {
         }
     }
 
-    /// True if this value set has a bounded set of concrete targets.
     pub fn is_resolvable(&self) -> bool {
         matches!(self, ValueSet::Constant(_) | ValueSet::Multiple(_))
     }
 
-    /// Collect concrete target addresses from this value set.
     pub fn targets(&self) -> Vec<u64> {
         match self {
             ValueSet::Constant(c) => vec![*c as u64],
@@ -283,7 +251,6 @@ impl ValueSet {
     }
 }
 
-// Register value state at a program point
 
 #[derive(Clone, Debug, Default)]
 pub struct RegisterValueSet {
@@ -303,7 +270,6 @@ impl RegisterValueSet {
         self.values.insert(reg, vs);
     }
 
-    /// Join two register states (per-register lattice join).
     pub fn join(&self, other: &RegisterValueSet) -> RegisterValueSet {
         let mut result = self.clone();
         for (reg, vs) in &other.values {
@@ -313,8 +279,7 @@ impl RegisterValueSet {
         result
     }
 
-    /// Per-register [widening](ValueSet::widen) of two register states; used at
-    /// merges to keep the fixpoint iteration terminating.
+    /// Per-register [widening](ValueSet::widen); keeps merge iteration terminating.
     pub fn widen(&self, other: &RegisterValueSet) -> RegisterValueSet {
         let mut result = self.clone();
         for (reg, vs) in &other.values {
@@ -325,15 +290,9 @@ impl RegisterValueSet {
     }
 }
 
-/// Read a (possibly sub-width) register, canonicalizing to its 64-bit container
-/// and masking to the operand's width. Sub-register state is tracked on the full
-/// register, so `mov ecx, eax` must read the *low 32 bits* of RAX - not the whole
-/// 64-bit value.
+/// Reads a possibly sub-width register from its 64-bit container, masked to the operand width.
 fn read_reg(state: &RegisterValueSet, reg: Register) -> ValueSet {
-    // High-8 registers (AH/BH/CH/DH) alias bits 8..15 of their container, not
-    // the low byte, so `low_bits(8)` would read the wrong bits (AL for AH).
-    // Sub-register-of-high-byte tracking isn't modelled, so read them
-    // conservatively as `Top` rather than returning a wrong concrete value.
+    // AH/BH/CH/DH alias bits 8..15, not the low byte; read them as `Top`.
     if matches!(
         reg,
         Register::AH | Register::BH | Register::CH | Register::DH
@@ -347,12 +306,8 @@ fn read_reg(state: &RegisterValueSet, reg: Register) -> ValueSet {
     }
 }
 
-/// Write a (possibly sub-width) register, updating its 64-bit container so a
-/// later full-width read observes the write. x86-64 semantics:
-/// * a 64-bit write replaces the register outright;
-/// * a 32-bit write zero-extends into the full register (upper 32 bits cleared);
-/// * an 8/16-bit write preserves the untracked upper bits, so the combined
-///   64-bit value is unknown (`Top`).
+/// Writes a possibly sub-width register into its container: 64-bit replaces, 32-bit zero-extends,
+/// 8/16-bit leaves untracked upper bits so the result is `Top`.
 fn write_reg(out: &mut RegisterValueSet, reg: Register, vs: ValueSet) {
     let full = reg.full_register();
     match reg.size() {
@@ -362,9 +317,8 @@ fn write_reg(out: &mut RegisterValueSet, reg: Register, vs: ValueSet) {
     }
 }
 
-// Analyzer
 
-/// Lightweight dataflow-based Value Set Analyzer.
+/// Dataflow-based Value Set Analyzer.
 ///
 /// Usage:
 /// ```ignore
@@ -373,35 +327,19 @@ fn write_reg(out: &mut RegisterValueSet, reg: Register, vs: ValueSet) {
 /// let targets = vsa.indirect_jump_targets(&jmp_instruction);
 /// ```
 pub struct ValueSetAnalyzer {
-    /// Map from instruction IP -> inferred register value sets *before* that instruction.
+    /// IP -> register value sets before that instruction.
     pub value_sets: HashMap<u64, RegisterValueSet>,
     pub segments: Vec<MemorySegment>,
-    /// Memory addresses that should always be treated as `Top` when read,
-    /// regardless of what the segment data contains.
-    ///
-    /// Use this to mark GOT slots / PLT relocations that hold 0 before the
-    /// dynamic linker runs. Without this, VSA would infer that a
-    /// `JMP [GOT+off]` or `CALL [GOT+off]` targets address 0.
+    /// Addresses always read as `Top`, e.g. GOT slots holding 0 before the dynamic linker runs.
     pub relocation_addresses: HashSet<u64>,
-    /// When `true` (the default), VSA makes no ABI assumptions about which registers
-    /// survive a `CALL` or `SYSCALL`: every GPR is clobbered across those
-    /// boundaries, so no value set is carried across a call, syscall or VM exit.
-    /// This is the only choice that preserves runtime semantic equivalence whatever
-    /// the callee's convention or what the host does servicing an exit.
-    ///
-    /// Set to `false` (see [`with_standard_abi`](Self::with_standard_abi)) to opt
-    /// into ABI-aware precision, in which case `call_clobbers`/`syscall_clobbers`
-    /// take effect. Only for code known to honour the configured ABI.
+    /// `true` (default): every GPR is clobbered across `CALL`/`SYSCALL`, preserving runtime
+    /// equivalence whatever the callee does. `false` (see [`with_standard_abi`](Self::with_standard_abi))
+    /// uses `call_clobbers`/`syscall_clobbers`; only for code honouring the configured ABI.
     pub conservative: bool,
-    /// Registers assumed clobbered across a `CALL` when `conservative == false`
-    /// (the callee's caller-saved / volatile set). Registers **not** in this set
-    /// are assumed callee-preserved, which is sound *only if the analysed code
-    /// follows this ABI*. Ignored while `conservative` is `true`. Defaults to
-    /// [`DEFAULT_CALL_CLOBBERS`] (System V union Windows x64).
+    /// Caller-saved set clobbered across `CALL` when `conservative == false`; others are assumed
+    /// preserved. Defaults to [`DEFAULT_CALL_CLOBBERS`].
     pub call_clobbers: Vec<Register>,
-    /// Registers assumed clobbered by a `SYSCALL` when `conservative == false`.
-    /// Ignored while `conservative` is `true`. Defaults to
-    /// [`DEFAULT_SYSCALL_CLOBBERS`] (RAX/RCX/R11).
+    /// Registers clobbered by `SYSCALL` when `conservative == false`. Defaults to [`DEFAULT_SYSCALL_CLOBBERS`].
     pub syscall_clobbers: Vec<Register>,
     worklist: VecDeque<usize>,
 }
@@ -416,8 +354,7 @@ impl ValueSetAnalyzer {
             value_sets: HashMap::new(),
             segments,
             relocation_addresses: HashSet::new(),
-            // Safe by default: no ABI preservation assumptions across calls or
-            // syscalls. Opt into precision explicitly via `with_standard_abi`.
+            // Safe by default; opt into precision via `with_standard_abi`.
             conservative: true,
             call_clobbers: DEFAULT_CALL_CLOBBERS.to_vec(),
             syscall_clobbers: DEFAULT_SYSCALL_CLOBBERS.to_vec(),
@@ -425,74 +362,54 @@ impl ValueSetAnalyzer {
         }
     }
 
-    /// Mark a set of memory addresses as relocation slots.
-    ///
-    /// Any memory read from these addresses will be conservatively treated as
-    /// `Top` (completely unknown), preventing VSA from propagating stale
-    /// pre-relocation values (typically 0) through them.
+    /// Marks addresses as relocation slots, read as `Top` to avoid stale pre-relocation values.
     pub fn with_relocation_addresses(mut self, addrs: HashSet<u64>) -> Self {
         self.relocation_addresses = addrs;
         self
     }
 
-    /// Set the [`conservative`](Self::conservative) flag. `true` (the default)
-    /// clobbers every GPR across calls/syscalls; `false` enables ABI-aware
-    /// precision using `call_clobbers` / `syscall_clobbers`.
+    /// Sets [`conservative`](Self::conservative).
     pub fn with_conservative(mut self, conservative: bool) -> Self {
         self.conservative = conservative;
         self
     }
 
-    /// Opt into ABI-aware precision (`conservative = false`), keeping the current
-    /// `call_clobbers` / `syscall_clobbers` (the standard x86-64 C ABI by
-    /// default). Only sound for code that honours the configured ABI.
+    /// Opts into ABI-aware precision (`conservative = false`); sound only for code honouring the ABI.
     pub fn with_standard_abi(mut self) -> Self {
         self.conservative = false;
         self
     }
 
-    /// Override the registers assumed clobbered across a `CALL`, and switch to
-    /// ABI-aware mode (`conservative = false`). Registers omitted here are
-    /// assumed callee-preserved.
+    /// Overrides the `CALL` clobber set and switches to ABI-aware mode.
     pub fn with_call_clobbers(mut self, regs: Vec<Register>) -> Self {
         self.conservative = false;
         self.call_clobbers = regs;
         self
     }
 
-    /// Override the registers assumed clobbered by a `SYSCALL`, and switch to
-    /// ABI-aware mode (`conservative = false`).
+    /// Overrides the `SYSCALL` clobber set and switches to ABI-aware mode.
     pub fn with_syscall_clobbers(mut self, regs: Vec<Register>) -> Self {
         self.conservative = false;
         self.syscall_clobbers = regs;
         self
     }
 
-    /// The default `CALL` clobber set (System V union Windows x64 volatile GPRs).
     pub fn default_call_clobbers() -> Vec<Register> {
         DEFAULT_CALL_CLOBBERS.to_vec()
     }
 
-    /// Every GPR: the ABI-agnostic conservative `CALL` clobber set. Using this
-    /// makes no assumption about which registers a callee preserves, so VSA
-    /// never resolves an indirect transfer using a value carried across a call.
+    /// Every GPR: assumes nothing about callee preservation.
     pub fn all_gpr_clobbers() -> Vec<Register> {
         ALL_GPRS.to_vec()
     }
 
-    /// Run the analysis over a decoded instruction stream.
-    ///
-    /// The instructions should already be in decode order. An iterative worklist
-    /// analysis run to a fixpoint: a block is re-processed whenever a predecessor
-    /// changes its entry state, so values are widened across merges. The widening
-    /// operator ([`RegisterValueSet::widen`]) bounds the ascending chain, which
-    /// guarantees termination.
+    /// Runs a worklist analysis over decoded instructions to a fixpoint; merges widen
+    /// ([`RegisterValueSet::widen`]) to guarantee termination.
     pub fn analyze(&mut self, instructions: &[Instruction]) {
         if instructions.is_empty() {
             return;
         }
 
-        // Seed the entry state (all registers are Top - unknown on entry)
         let entry_ip = instructions[0].ip();
         self.value_sets
             .entry(entry_ip)
@@ -507,7 +424,6 @@ impl ValueSetAnalyzer {
             let instruction = &instructions[idx];
             let ip = instruction.ip();
 
-            // Get pre-instruction state
             let pre_state = self
                 .value_sets
                 .get(&ip)
@@ -516,14 +432,10 @@ impl ValueSetAnalyzer {
 
             let post_state = self.transfer(&pre_state, instruction);
 
-            // Propagate to successors
             let next_ip = instruction.next_ip();
 
-            // Successor edges come from the same classification the lifter's
-            // leader discovery uses. Sharing it is not a tidiness point: a
-            // cond-branch this pass fails to recognise loses a back-edge, and
-            // the fixpoint then under-approximates the value sets - unsound in
-            // the direction that resolves an indirect jump to too few targets.
+            // Successor edges come from the lifter's classification: a missed back-edge would
+            // under-approximate value sets and resolve indirect jumps to too few targets.
             let cf = crate::arch::x86_64::decode::control_flow(instruction);
             match cf.kind {
                 ControlFlowKind::DirectBranch => {
@@ -532,21 +444,16 @@ impl ValueSetAnalyzer {
                     }
                 }
                 ControlFlowKind::CondBranch => {
-                    // Both the taken target and the fallthrough are reachable.
                     for &target in &cf.static_targets {
                         self.propagate(target, &post_state, instructions);
                     }
                     self.propagate(next_ip, &post_state, instructions);
                 }
                 ControlFlowKind::IndirectBranch => {
-                    // Targets resolved by the caller via `indirect_jump_targets()`.
                 }
                 ControlFlowKind::Ret => {
-                    // Terminator; no fallthrough.
                 }
-                // A `CALL` returns, and an invalid encoding is left to the
-                // lifter to fault on; both keep the fallthrough edge they had
-                // when this pass classified mnemonics itself.
+                // A `CALL` returns and an invalid encoding is left to the lifter; both keep the fallthrough.
                 ControlFlowKind::Fallthrough
                 | ControlFlowKind::Call { .. }
                 | ControlFlowKind::Invalid => {
@@ -562,8 +469,7 @@ impl ValueSetAnalyzer {
         }
     }
 
-    /// Abstract transfer function - apply one instruction to a pre-state to
-    /// produce a post-state.
+    /// Transfer function: pre-state to post-state for one instruction.
     pub fn transfer(&self, state: &RegisterValueSet, inst: &Instruction) -> RegisterValueSet {
         let mut out = state.clone();
 
@@ -580,7 +486,6 @@ impl ValueSetAnalyzer {
                     && inst.op1_kind() == OpKind::Register
                     && inst.op0_register() == inst.op1_register()
                 {
-                    // `xor rax, rax` -> 0
                     write_reg(&mut out, inst.op0_register(), ValueSet::Constant(0));
                 } else if inst.op0_kind() == OpKind::Register {
                     let a = self.eval_operand(state, inst, 0);
@@ -611,13 +516,13 @@ impl ValueSetAnalyzer {
             }
             Mnemonic::Or => {
                 if inst.op0_kind() == OpKind::Register {
-                    // Conservative - don't try to track OR precisely
+                    // Not tracked precisely.
                     write_reg(&mut out, inst.op0_register(), ValueSet::Top);
                 }
             }
             Mnemonic::Lea => {
                 if inst.op0_kind() == OpKind::Register {
-                    // LEA with a constant displacement can propagate
+                    // LEA with a constant displacement propagates.
                     let base_reg = inst.memory_base();
                     let disp = inst.memory_displacement64() as i64;
                     let addr_vs =
@@ -632,12 +537,8 @@ impl ValueSetAnalyzer {
                 }
             }
             Mnemonic::Call => {
-                // A call (direct, indirect, or an imported call that becomes a
-                // VM exit) clobbers registers. In conservative mode every GPR is
-                // invalidated; no assumption about callee/host preservation.
-                // Otherwise only the configured caller-saved set is invalidated;
-                // registers left out are *assumed* callee-preserved, sound only
-                // if the callee follows that ABI.
+                // A call clobbers every GPR in conservative mode, else only the configured
+                // caller-saved set (others assumed callee-preserved).
                 let clobbers: &[Register] = if self.conservative {
                     ALL_GPRS
                 } else {
@@ -648,11 +549,7 @@ impl ValueSetAnalyzer {
                 }
             }
             Mnemonic::Syscall => {
-                // SYSCALL returns to the following instruction (it falls through
-                // in the analysis). iced does not report RAX as written, so the
-                // clobber is applied explicitly. Conservative mode invalidates
-                // every GPR (making no assumption about what the host's syscall
-                // service routine touches); otherwise only `syscall_clobbers`.
+                // Falls through; iced does not report RAX as written, so the clobber is explicit.
                 let clobbers: &[Register] = if self.conservative {
                     ALL_GPRS
                 } else {
@@ -663,22 +560,14 @@ impl ValueSetAnalyzer {
                 }
             }
             Mnemonic::Int | Mnemonic::Int1 | Mnemonic::Int3 if self.conservative => {
-                // A software interrupt transfers to a handler VSA does not
-                // analyse (and which becomes a host-serviced VM exit in the
-                // lifter). iced reports no GP-register writes for `INT`, but a
-                // handler may set any register (e.g. `int 0x80` returns in EAX),
-                // so in conservative mode invalidate every GPR. In ABI-aware mode
-                // this falls to the catch-all (iced's architectural write set).
+                // Software interrupt to an unanalysed handler (`int 0x80` returns in EAX):
+                // conservative mode clobbers every GPR; ABI-aware falls to the catch-all.
                 for &reg in ALL_GPRS {
                     out.set(reg, ValueSet::Top);
                 }
             }
-            // For all other instructions, kill *every* register the instruction
-            // writes - not just the first operand. Instructions like `mul`/`div`/
-            // `cpuid`/`rdtsc` write RAX/RDX implicitly, and `xchg` writes both
-            // operands; consulting iced's instruction-info database ensures none
-            // of those destinations keep a stale pre-instruction value that could
-            // later resolve an indirect transfer to the wrong target.
+            // Kill every register the instruction writes (implicit `mul`/`div`/`cpuid` operands,
+            // both `xchg` operands) via iced's info database, so none keeps a stale value.
             _ => {
                 let mut factory = InstructionInfoFactory::new();
                 let info = factory.info(inst);
@@ -703,7 +592,7 @@ impl ValueSetAnalyzer {
         out
     }
 
-    /// Evaluate the abstract value of operand `op_index`.
+    /// Abstract value of operand `op_index`.
     fn eval_operand(
         &self,
         state: &RegisterValueSet,
@@ -735,7 +624,7 @@ impl ValueSetAnalyzer {
             OpKind::Immediate8to64 => ValueSet::Constant(inst.immediate8to64()),
             OpKind::Immediate32to64 => ValueSet::Constant(inst.immediate32to64()),
 
-            // Memory operands: try to resolve if they point into a rodata segment
+            // Memory: resolve if it points into a read-only segment.
             OpKind::Memory => {
                 let base_reg = inst.memory_base();
                 let index_reg = inst.memory_index();
@@ -749,9 +638,7 @@ impl ValueSetAnalyzer {
                     if let ValueSet::Constant(c) = base_vs {
                         addr = addr.wrapping_add(c as u64);
                     } else if base_reg == Register::RIP {
-                        // RIP-relative addressing: iced-x86 already resolves the
-                        // displacement to an absolute address (disp = RIP + offset).
-                        // So 'addr' is already correct.
+                        // iced resolves RIP-relative displacements to absolute addresses.
                     } else {
                         return ValueSet::Top;
                     }
@@ -766,13 +653,11 @@ impl ValueSetAnalyzer {
                     }
                 }
 
-                // If this address is a known relocation slot, treat it as Top
-                // so VSA never propagates the pre-relocation value (often 0).
+                // Relocation slot: Top, never the pre-relocation value.
                 if self.relocation_addresses.contains(&addr) {
                     return ValueSet::Top;
                 }
 
-                // Address resolved to a constant. Check segments.
                 for segment in &self.segments {
                     if segment.contains(addr) {
                         if segment.writable {
@@ -788,7 +673,6 @@ impl ValueSetAnalyzer {
                         };
 
                         if let Some(val) = segment.read(addr, size) {
-                            // Sign extend if necessary
                             let val = match inst.memory_size() {
                                 MemorySize::Int8 => val as i8 as i64,
                                 MemorySize::Int16 => val as i16 as i64,
@@ -803,12 +687,10 @@ impl ValueSetAnalyzer {
                 ValueSet::Top
             }
 
-            // Other operands are unknown
             _ => ValueSet::Top,
         }
     }
 
-    /// Propagate `state` to the instruction at `target_ip`.
     fn propagate(
         &mut self,
         target_ip: u64,
@@ -823,11 +705,10 @@ impl ValueSetAnalyzer {
         }
     }
 
-    /// Merge `state` into the stored state at `ip`. Returns `true` if anything changed.
+    /// Merges `state` at `ip`; returns `true` if anything changed.
     fn merge(&mut self, ip: u64, state: &RegisterValueSet) -> bool {
         if let Some(existing) = self.value_sets.get_mut(&ip) {
-            // Widen (not just join) so the iteration terminates even when a loop
-            // back-edge keeps nudging an interval outward.
+            // Widen, not join, so loop back-edges terminate.
             let widened = existing.widen(state);
             if widened.values != existing.values {
                 *existing = widened;
@@ -840,11 +721,7 @@ impl ValueSetAnalyzer {
         }
     }
 
-    /// Given an indirect-jump instruction (`JMP reg`), return the set of possible
-    /// target addresses if it can be resolved, or `None` if not.
-    ///
-    /// Retained for backward compatibility; [`Self::indirect_targets`] is the
-    /// general form (it also resolves `JMP [mem]` and indirect `CALL`).
+    /// Targets of an indirect `JMP reg`, or `None`; superseded by [`Self::indirect_targets`].
     pub fn indirect_jump_targets(&self, instruction: &Instruction) -> Option<Vec<u64>> {
         if instruction.mnemonic() != Mnemonic::Jmp {
             return None;
@@ -855,13 +732,9 @@ impl ValueSetAnalyzer {
         self.indirect_targets(instruction)
     }
 
-    /// Resolve the possible targets of an indirect `JMP`/`CALL` whose operand is a
-    /// register or a memory reference. `None` for direct transfers, non-transfer
-    /// instructions, or a target that cannot be narrowed to a finite set.
-    ///
-    /// For a memory operand the resolved value is the *contents* of the pointed-to
-    /// location (read from a non-writable [`MemorySegment`]); for a register operand
-    /// it is the register's value set at the transfer.
+    /// Targets of an indirect `JMP`/`CALL` through a register (its value set) or memory operand
+    /// (the pointed-to contents, read from a non-writable [`MemorySegment`]); `None` for direct
+    /// transfers or when not narrowable to a finite set.
     pub fn indirect_targets(&self, instruction: &Instruction) -> Option<Vec<u64>> {
         match instruction.mnemonic() {
             Mnemonic::Jmp | Mnemonic::Call => {}
@@ -871,26 +744,21 @@ impl ValueSetAnalyzer {
         let vs = match instruction.op0_kind() {
             OpKind::Register => pre_state.get(instruction.op0_register()),
             OpKind::Memory => self.eval_operand(pre_state, instruction, 0),
-            // Anything else (a near-branch immediate) is a *direct* transfer.
+            // Near-branch immediate: a direct transfer.
             _ => return None,
         };
         vs.is_resolvable().then(|| vs.targets())
     }
 }
 
-/// Whether `inst` transfers control through a register or memory operand (an
-/// *indirect* `JMP`/`CALL`), as opposed to a direct near-branch immediate.
+/// Whether `inst` transfers control through a register or memory operand.
 fn is_indirect_transfer(inst: &Instruction) -> bool {
     matches!(inst.op0_kind(), OpKind::Register | OpKind::Memory)
 }
 
-/// Run VSA over a region of raw x86-64 code (mapped at `base`) and resolve the
-/// targets of every indirect `JMP`/`CALL` it contains.
-///
-/// The region-level convenience behind [`crate::cfg::resolved_indirect_targets`]:
-/// it decodes `bytes`, exposes the region itself as a read-only segment (so
-/// in-region jump tables and RIP-relative constant loads resolve), and consults
-/// any caller-supplied `segments` for reads that leave the region.
+/// Runs VSA over raw x86-64 code mapped at `base` and resolves every indirect `JMP`/`CALL`
+/// (behind [`crate::cfg::resolved_indirect_targets`]). The region counts as a read-only segment;
+/// `segments` serve reads that leave it.
 pub fn resolved_indirect_targets(
     bytes: &[u8],
     base: u64,
@@ -902,7 +770,6 @@ pub fn resolved_indirect_targets(
         instructions.push(decoder.decode());
     }
 
-    // The region is itself readable, non-writable backing store.
     let mut all_segments = Vec::with_capacity(segments.len() + 1);
     all_segments.push(MemorySegment::new(base, bytes.to_vec(), false));
     all_segments.extend(segments.iter().cloned());
@@ -949,12 +816,9 @@ mod read_reg_tests {
         let mut state = RegisterValueSet::new();
         state.set(Register::RAX, ValueSet::Constant(0x1234));
 
-        // AL aliases bits 0..7 -> exact low byte.
         assert_eq!(read_reg(&state, Register::AL), ValueSet::Constant(0x34));
-        // EAX aliases bits 0..31 -> exact.
         assert_eq!(read_reg(&state, Register::EAX), ValueSet::Constant(0x1234));
-        // AH aliases bits 8..15, which this analysis does not track: it must NOT
-        // report the low byte (0x34) as if it were AH. Conservative `Top`.
+        // AH aliases untracked bits 8..15: must be `Top`, not the low byte.
         assert_eq!(read_reg(&state, Register::AH), ValueSet::Top);
         assert_eq!(read_reg(&state, Register::BH), ValueSet::Top);
     }

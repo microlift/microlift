@@ -1,11 +1,5 @@
-//! The host side of block linking: [`microlift::runtime`].
-//!
-//! What is under test is the *contract* the crate has so far only stated in
-//! prose - a translation cache, a per-thread link table, and a dispatch loop
-//! that between them make a published row true. The load-bearing assertions are
-//! the ones about [`CacheStats`], because the entire claim of block linking is
-//! that the host stops being asked, and a dispatcher that never links passes
-//! every behavioural test.
+//! Host side of block linking ([`microlift::runtime`]): cache, link table, dispatch loop.
+//! The load-bearing assertions are on [`CacheStats`]: a dispatcher that never links passes every behavioural test.
 
 use std::sync::{Arc, RwLock};
 
@@ -15,8 +9,7 @@ use microlift::runtime::{CodeCache, Step, ThreadRuntime, Translation};
 use microlift::testkit::prelude::*;
 use microlift::testkit::{DEFAULT_LIFT_BASE, EXIT_TRAMPOLINE};
 
-/// Where the second region lives - far enough from the first that no test can
-/// confuse one for the other.
+/// Far from the first region so tests cannot confuse them.
 const CALLEE: u64 = 0x2000;
 const ROWS: u32 = 256;
 
@@ -24,7 +17,7 @@ fn link_config() -> BlockLinkConfig {
     BlockLinkConfig::new(ROWS)
 }
 
-/// `mov rax, 1 ; ret` at [`DEFAULT_LIFT_BASE`] - the region that exits.
+/// `mov rax, 1 ; ret` at [`DEFAULT_LIFT_BASE`]: the region that exits.
 fn caller() -> Translation {
     LiftTest::new(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00, 0xC3])
         .with_config(|c| c.block_link = Some(link_config()))
@@ -32,7 +25,7 @@ fn caller() -> Translation {
         .expect("the caller region compiles")
 }
 
-/// `mov rbx, 7 ; ret` at [`CALLEE`] - the region a link lands in.
+/// `mov rbx, 7 ; ret` at [`CALLEE`]: the region a link lands in.
 fn callee() -> Translation {
     LiftTest::new(&[0x48, 0xC7, 0xC3, 0x07, 0x00, 0x00, 0x00, 0xC3])
         .at(CALLEE)
@@ -42,29 +35,23 @@ fn callee() -> Translation {
         .expect("the callee region compiles")
 }
 
-/// A guest stack, plus the thread that runs on it.
-///
-/// The stack is a `Vec` the harness owns: `rsp` is a raw address into it, so it
-/// must outlive every entry. Kept together in one struct so a test cannot drop
-/// one and keep the other.
+/// A guest stack and its thread; the harness-owned `Vec` must outlive every entry.
 struct Guest {
     runtime: ThreadRuntime,
     _stack: Vec<u64>,
 }
 
 impl Guest {
-    /// A thread whose guest stack holds `returns` (innermost first) with the
-    /// exit trampoline underneath, so the last `RET` leaves for the host.
+    /// Stack holds `returns` (innermost first) over the exit trampoline.
     fn new(cache: &Arc<RwLock<CodeCache>>, returns: &[u64]) -> Self {
         let stack = vec![0u64; 1024];
         let top = stack.as_ptr() as u64 + (stack.len() as u64) * 8;
 
         let mut runtime = ThreadRuntime::new(link_config(), Arc::clone(cache));
-        // One word per return address plus the trampoline, laid out so the
-        // first `RET` pops `returns[0]`.
+        // First `RET` pops `returns[0]`.
         let depth = returns.len() as u64 + 1;
         runtime.ctx.rsp = top - depth * 8;
-        // SAFETY: every word written is inside `stack`, which this struct owns.
+        // SAFETY: every word written is inside `stack`.
         unsafe {
             for (i, &addr) in returns.iter().enumerate() {
                 *((runtime.ctx.rsp + (i as u64) * 8) as *mut u64) = addr;
@@ -96,8 +83,7 @@ fn a_published_translation_is_entered_and_its_successor_is_followed() {
     // SAFETY: both translations were compiled by this test for this context.
     let step = unsafe { guest.runtime.step() };
 
-    // One `step` ran *both* regions: the caller's `RET` resolved its own
-    // successor out of the table and the loop followed it without a lookup.
+    // One `step` ran both regions: the `RET` resolved its successor from the table.
     assert_eq!(step, Step::Exit(ExitReason::Return));
     assert_eq!(guest.runtime.ctx.rax, 1, "the caller ran");
     assert_eq!(guest.runtime.ctx.rbx, 7, "and so did the callee");
@@ -109,10 +95,7 @@ fn a_published_translation_is_entered_and_its_successor_is_followed() {
 
 #[test]
 fn the_host_is_asked_once_per_entry_when_nothing_is_published() {
-    // **The control for the test above.** Everything is in the cache, so both
-    // regions still run and every behavioural assertion above still holds - but
-    // with an empty table the host is consulted for each one. Without this, a
-    // runtime that never linked would pass.
+    // Control: with an empty table the host is consulted per region.
     let cache = Arc::new(RwLock::new(CodeCache::new()));
     let mut guest = Guest::new(&cache, &[CALLEE]);
     for translation in [caller(), callee()] {
@@ -156,10 +139,7 @@ fn an_untranslated_address_asks_for_a_translation_rather_than_guessing() {
 
 #[test]
 fn publishing_uses_the_link_target_and_not_the_host_entry() {
-    // With no pinned ABI the two addresses coincide, so this cannot be checked
-    // by comparing them - what it checks is that `row()` is the only thing
-    // deciding, and that it names an address the region can actually be entered
-    // at. `pinned_link_tests` is where the two differ.
+    // Addresses coincide without a pinned ABI; this checks `row()` alone decides and names an enterable address (`pinned_link_tests` covers the difference).
     let cache = Arc::new(RwLock::new(CodeCache::new()));
     let mut guest = Guest::new(&cache, &[CALLEE]);
     seeded(&mut guest, &cache);
@@ -182,9 +162,7 @@ fn publishing_uses_the_link_target_and_not_the_host_entry() {
 
 #[test]
 fn a_translation_is_published_at_every_address_it_can_be_entered_at() {
-    // The rule that makes a cache keyed by address correct: publishing only the
-    // region's own entry would leave a link to a resume point inside it
-    // permanently missing.
+    // Publishing only the entry would leave links to inner resume points permanently missing.
     let cache = Arc::new(RwLock::new(CodeCache::new()));
     let mut guest = Guest::new(&cache, &[]);
     let translation = cache.write().unwrap().insert(caller());
@@ -209,8 +187,7 @@ fn a_translation_is_published_at_every_address_it_can_be_entered_at() {
 
 #[test]
 fn detaching_the_table_forces_every_exit_through_the_host() {
-    // The documented way to end a chain. Same cache, same rows, one null
-    // pointer: the caller's `RET` stops resolving itself.
+    // The documented way to end a chain: one null pointer stops the `RET` resolving.
     let cache = Arc::new(RwLock::new(CodeCache::new()));
     let mut guest = Guest::new(&cache, &[CALLEE]);
     seeded(&mut guest, &cache);
@@ -224,7 +201,7 @@ fn detaching_the_table_forces_every_exit_through_the_host() {
     assert_eq!(guest.runtime.ctx.rbx, 0, "the callee did not run");
     assert_eq!(guest.runtime.stats().links_followed, 0);
 
-    // And re-attaching restores it, so the state is the pointer and nothing else.
+    // Re-attaching restores it; the state is the pointer alone.
     guest.runtime.attach_table();
     // SAFETY: as above.
     assert_eq!(
@@ -236,14 +213,12 @@ fn detaching_the_table_forces_every_exit_through_the_host() {
 
 #[test]
 fn a_colliding_row_is_a_miss_rather_than_a_wrong_jump() {
-    // The table is direct-mapped and evicts silently, so two addresses sharing a
-    // slot must degrade to a host lookup - never to entering the wrong code.
+    // Direct-mapped eviction must degrade to a host lookup, never the wrong code.
     let cache = Arc::new(RwLock::new(CodeCache::new()));
     let mut guest = Guest::new(&cache, &[CALLEE]);
     seeded(&mut guest, &cache);
 
-    // Same slot as CALLEE (indexed on `pc >> 4`, masked to ROWS), different
-    // address. Publishing it evicts the callee's row.
+    // Same slot as CALLEE (`pc >> 4` masked to ROWS); publishing evicts its row.
     let colliding = CALLEE + (ROWS as u64) * 16;
     assert_eq!(link_config().slot(colliding), link_config().slot(CALLEE));
     let evictor = LiftTest::new(&[0xC3])
@@ -267,9 +242,7 @@ fn a_colliding_row_is_a_miss_rather_than_a_wrong_jump() {
     assert_eq!(guest.runtime.stats().links_followed, 0);
 }
 
-// ---------------------------------------------------------------------------
-// ThreadLinks: the per-thread half, for a host with a dispatch loop of its own
-// ---------------------------------------------------------------------------
+// ThreadLinks: the per-thread half
 
 use microlift::arch::x86_64::context::RegisterContext;
 use microlift::core::callret::CallRetConfig;
@@ -277,9 +250,7 @@ use microlift::runtime::{Entered, ThreadLinks};
 
 #[test]
 fn attaching_points_a_context_at_both_tables() {
-    // The reason this is one call and not two stores at the call site: a host with
-    // several ways into guest code should not have to remember the pair, and a
-    // field added to it should not be a store every such host has to add.
+    // One call, not two stores, so hosts need not remember the pair.
     let mut links = ThreadLinks::new(link_config(), Some(CallRetConfig::new(16)));
     let mut ctx = RegisterContext::default();
     assert!(ctx.link_table.is_null());
@@ -293,9 +264,7 @@ fn attaching_points_a_context_at_both_tables() {
 
 #[test]
 fn a_thread_without_a_ring_attaches_a_null_one() {
-    // Not a degraded mode and not a special case: null is the first thing every
-    // emitted push and pop tests, so "do not predict returns" needs no branch
-    // anywhere in the host.
+    // Null is the first thing every push and pop tests, so disabling prediction needs no host branch.
     let mut links = ThreadLinks::new(link_config(), None);
     let mut ctx = RegisterContext::default();
     links.attach(&mut ctx);
@@ -307,9 +276,7 @@ fn a_thread_without_a_ring_attaches_a_null_one() {
 
 #[test]
 fn detaching_leaves_the_ring_alone() {
-    // `detach` ends a chain of pinned tail calls by nulling the *table* - the ring
-    // is per thread and outlives any one chain, so clearing it here would throw
-    // away frames belonging to calls that have not returned.
+    // `detach` nulls the table only; the per-thread ring outlives chains and holds frames of unreturned calls.
     let mut links = ThreadLinks::new(link_config(), Some(CallRetConfig::new(16)));
     let mut ctx = RegisterContext::default();
     links.attach(&mut ctx);
@@ -322,11 +289,7 @@ fn detaching_leaves_the_ring_alone() {
 
 #[test]
 fn a_nested_entry_resumes_below_the_one_that_called_it() {
-    // The ring is per *thread* and a context is per *entry*, so a host callback
-    // into guest code that started at zero would push its first frame over the
-    // outermost frame of the entry that called it. Not a correctness problem - a
-    // clobbered frame fails its compare and falls back to the probe - but it costs
-    // the outer chain its predictions for nothing.
+    // The ring is per thread, a context per entry: a nested entry starting at zero would clobber the outer frame (costs predictions, not correctness).
     let mut outer = RegisterContext::default();
     outer.callret_off = 0x40;
 
@@ -334,8 +297,7 @@ fn a_nested_entry_resumes_below_the_one_that_called_it() {
     ThreadLinks::resume_call_return(&mut inner, Some(&outer));
     assert_eq!(inner.callret_off, 0x40);
 
-    // And the outermost entry, which has nobody to resume below, starts where an
-    // untouched ring starts.
+    // The outermost entry starts where an untouched ring starts.
     let mut first = RegisterContext::default();
     first.callret_off = 0xdead;
     ThreadLinks::resume_call_return(&mut first, None);
@@ -374,8 +336,7 @@ fn retracting_reports_only_the_rows_this_thread_held() {
 
     let held = translation.resume_points.clone();
     let mut asked = held.clone();
-    // An address this thread never published: another thread's table may have had
-    // it, and the count has to say what *this* one lost.
+    // An address this thread never published must not count as lost, even if another thread's table had it.
     asked.push(0xdead_0000);
 
     assert_eq!(links.retract_all(&asked), held.len());
@@ -385,9 +346,7 @@ fn retracting_reports_only_the_rows_this_thread_held() {
 
 #[test]
 fn each_link_is_reported_once_with_the_exit_that_resolved_it() {
-    // What a host profiling *which kinds of exit are being linked* needs, and the
-    // reason the observer gets the context as well as the reason: a linked exit is
-    // almost always `UnknownJump`, and which transfer it was is in `exit_code`.
+    // Observer gets the context too: a linked exit is almost always `UnknownJump`, and the transfer kind is in `exit_code`.
     let cache = Arc::new(RwLock::new(CodeCache::new()));
     let mut guest = Guest::new(&cache, &[CALLEE]);
     seeded(&mut guest, &cache);

@@ -1,7 +1,6 @@
-//! Semantics layer - maps x86-64 instructions to Cranelift IR.
+//! Semantics layer: maps x86-64 instructions to Cranelift IR.
 //!
-//! This module is the dispatch hub. The actual implementations live in the
-//! sub-modules below, each focused on a specific instruction category.
+//! Dispatch hub; implementations live in the category sub-modules.
 
 pub mod aes;
 pub mod arith_spec;
@@ -37,15 +36,12 @@ use iced_x86::{Instruction, Mnemonic, OpKind, Register};
 
 impl<'a> Lifter<'a> {
     pub fn handle_instruction(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        // LOCK-prefixed instructions require atomic semantics; dispatch them
-        // before the main match so that ADD, SUB, etc. only see non-locked ops.
+        // LOCK-prefixed instructions dispatch first so ADD, SUB, etc. only see unlocked forms.
         if instruction.has_lock_prefix() {
             return self.handle_locked_instruction(instruction);
         }
 
-        // Most SSE integer opcodes have an MMX encoding operating on MM0..MM7, an
-        // aliased view of the x87 stack this frontend does not model. Exit to the host
-        // rather than failing the lift on an operand no handler can resolve.
+        // MMX encodings alias the unmodelled x87 stack: exit to the host.
         if uses_mmx_register(instruction) {
             return self.handle_unimplemented_instruction(instruction);
         }
@@ -75,13 +71,11 @@ impl<'a> Lifter<'a> {
                 self.handle_mfence(instruction)
             }
             Mnemonic::Pause => self.handle_pause(instruction),
-            // Cache maintenance. The guest shares the host's coherent view of memory,
-            // so a flush has nothing to do; ordering comes from the surrounding fences.
+            // Cache flushes: nothing to do under a coherent view; ordering comes from fences.
             Mnemonic::Clflush | Mnemonic::Clflushopt | Mnemonic::Clwb => {
                 self.handle_nop(instruction)
             }
-            // Prefetch hints, pure performance advice with no architectural
-            // effect. Common in the lock-free code that surrounds a CAS loop.
+            // Prefetch hints: no architectural effect.
             Mnemonic::Prefetch
             | Mnemonic::Prefetcht0
             | Mnemonic::Prefetcht1
@@ -102,13 +96,11 @@ impl<'a> Lifter<'a> {
             | Mnemonic::Movupd
             | Mnemonic::Movdqa
             | Mnemonic::Movdqu
-            // The non-temporal stores differ only in cache hint, which this
-            // lifter does not model.
+            // Non-temporal stores differ only in cache hint, which is not modelled.
             | Mnemonic::Movntps
             | Mnemonic::Movntpd
             | Mnemonic::Movntdq
-            // LDDQU and the non-temporal load MOVNTDQA differ from an ordinary
-            // 128-bit load only in cache/split-load hints.
+            // LDDQU and MOVNTDQA differ from a 128-bit load only in cache hints.
             | Mnemonic::Lddqu
             | Mnemonic::Movntdqa => self.handle_movaps(instruction),
             Mnemonic::Movq => self.handle_movq_sse(instruction),
@@ -149,8 +141,7 @@ impl<'a> Lifter<'a> {
             Mnemonic::Pslldq => self.handle_byte_shift_dq(instruction, true),
             Mnemonic::Psrldq => self.handle_byte_shift_dq(instruction, false),
 
-            // SSE / SSE2 - unpack / interleave. The `pd`/`ps` forms are exact
-            // aliases of the integer ones at the same lane width.
+            // SSE / SSE2 - unpack / interleave; the `pd`/`ps` forms alias the integer ones.
             Mnemonic::Punpcklbw => {
                 self.handle_punpck(instruction, "punpcklbw", PackedWidth::Byte, false)
             }
@@ -244,8 +235,7 @@ impl<'a> Lifter<'a> {
             Mnemonic::Cmpps => self.handle_cmpps(instruction),
             Mnemonic::Cmppd => self.handle_cmppd(instruction),
             Mnemonic::Cmpss => self.handle_cmpss(instruction),
-            // CMPSD is shared between the string compare and the SSE2 scalar-double
-            // compare, the same collision MOVSD has below.
+            // CMPSD is shared between string compare and SSE2 scalar compare, like MOVSD.
             Mnemonic::Cmpsd if matches!(instruction.op0_kind(), OpKind::Register) => {
                 self.handle_cmpsd_sse(instruction)
             }
@@ -306,8 +296,7 @@ impl<'a> Lifter<'a> {
                 PackedLaneOp::CmpEq,
                 PackedWidth::Dword,
             ),
-            // PCMPEQQ / PCMPGTQ are SSE4.1 / SSE4.2, but are the same lane-wise
-            // op one width up.
+            // PCMPEQQ / PCMPGTQ: SSE4.1 / SSE4.2, lane-wise one width up.
             Mnemonic::Pcmpeqq => self.handle_packed_lane_op(
                 instruction,
                 "pcmpeqq",
@@ -339,8 +328,7 @@ impl<'a> Lifter<'a> {
                 PackedWidth::Qword,
             ),
 
-            // AES-NI. The four round instructions differ only in direction and in
-            // whether MixColumns runs; all six share one bitsliced kernel family.
+            // AES-NI: one kernel family.
             Mnemonic::Aesenc => self.handle_aes_round(instruction, AesKernel::Enc),
             Mnemonic::Aesenclast => self.handle_aes_round(instruction, AesKernel::EncLast),
             Mnemonic::Aesdec => self.handle_aes_round(instruction, AesKernel::Dec),
@@ -348,9 +336,7 @@ impl<'a> Lifter<'a> {
             Mnemonic::Aesimc => self.handle_aesimc(instruction),
             Mnemonic::Aeskeygenassist => self.handle_aeskeygenassist(instruction),
 
-            // SSE4.2 packed string compares. All four share one handler; which it is
-            // decides only where the lengths come from and where the result goes. The
-            // `REX.W` spellings are separate mnemonics in iced.
+            // SSE4.2 packed string compares share one handler; the `REX.W` spellings are separate mnemonics.
             Mnemonic::Pcmpistri
             | Mnemonic::Pcmpistrm
             | Mnemonic::Pcmpestri
@@ -358,8 +344,7 @@ impl<'a> Lifter<'a> {
             | Mnemonic::Pcmpestri64
             | Mnemonic::Pcmpestrm64 => match PcmpstrForm::of(instruction) {
                 Some(form) => self.handle_pcmpstr(instruction, form),
-                // The mnemonic is one of the four but the encoding is a VEX spelling this
-                // frontend does not decode. Exit rather than lift it wrongly.
+                // A VEX spelling this frontend does not decode: exit rather than lift wrongly.
                 None => self.handle_unimplemented_instruction(instruction),
             },
 
@@ -475,8 +460,7 @@ impl<'a> Lifter<'a> {
                 PackedWidth::Dword,
             ),
 
-            // SSSE3 - byte shuffle, concat-rotate, sign ops and horizontal
-            // arithmetic.
+            // SSSE3 - byte shuffle, concat-rotate, sign ops and horizontal arithmetic.
             Mnemonic::Pshufb => self.handle_pshufb(instruction),
             Mnemonic::Palignr => self.handle_palignr(instruction),
             Mnemonic::Pabsb => self.handle_pabs(instruction, PackedWidth::Byte),
@@ -567,8 +551,7 @@ impl<'a> Lifter<'a> {
             // String Operations
             Mnemonic::Movsb => self.handle_movsb(instruction),
             Mnemonic::Movsw => self.handle_movsw(instruction),
-            // MOVSD is shared between the string op and SSE2 scalar-double.
-            // Disambiguate on whether op0 is a memory-string kind.
+            // MOVSD is shared with SSE2 scalar-double; disambiguate on a memory-string op0.
             Mnemonic::Movsd => {
                 if matches!(
                     instruction.op0_kind(),
@@ -658,8 +641,7 @@ impl<'a> Lifter<'a> {
             Mnemonic::Loope => self.handle_loope(instruction),
             Mnemonic::Loopne => self.handle_loopne(instruction),
 
-            // Conditional Jumps - the flag condition is `Cond`; JRCXZ and
-            // the LOOP forms test a register instead and stay separate.
+            // Conditional jumps via `Cond`; JRCXZ and LOOP test a register and stay separate.
             Mnemonic::Jb => self.handle_jcc(instruction, Cond::B),
             Mnemonic::Jbe => self.handle_jcc(instruction, Cond::Be),
             Mnemonic::Ja => self.handle_jcc(instruction, Cond::A),
@@ -795,16 +777,14 @@ impl<'a> Lifter<'a> {
             Mnemonic::Fdecstp => self.handle_fdecstp(instruction),
             Mnemonic::Ffree => self.handle_ffree(instruction),
             Mnemonic::Emms => self.handle_emms(instruction),
-            // `FNOP` does nothing; `WAIT`/`FWAIT` has nothing to wait for, and is the
-            // `9B` prefix byte iced splits off `FSTENV`/`FCLEX`/`FINIT`.
+            // `FNOP`/`WAIT` do nothing (`9B` is the prefix iced splits off `FSTENV`/`FCLEX`/`FINIT`).
             Mnemonic::Fnop | Mnemonic::Wait => self.handle_fpu_nop(instruction),
             Mnemonic::Fnstenv => self.handle_fnstenv(instruction),
             Mnemonic::Fldenv => self.handle_fldenv(instruction),
             Mnemonic::Fnclex => self.handle_fnclex(instruction),
             Mnemonic::Fninit => self.handle_fninit(instruction),
 
-            // SSE control/status register. The AVX spellings are the same
-            // instruction with a VEX prefix and identical semantics.
+            // SSE control/status; the AVX spellings are identical.
             Mnemonic::Stmxcsr | Mnemonic::Vstmxcsr => self.handle_stmxcsr(instruction),
             Mnemonic::Ldmxcsr | Mnemonic::Vldmxcsr => self.handle_ldmxcsr(instruction),
 

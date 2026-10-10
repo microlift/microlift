@@ -6,42 +6,29 @@ use microlift::testkit::prelude::*;
 
 const BASE: u64 = 0x1000;
 
-/// `inc r15` - the progress marker. Every exit instruction under test clobbers
-/// some of the low registers (`CPUID` alone writes four), and `r15` is touched
-/// by none of them, so a resumed region can be caught having run it.
+/// Progress marker: no exit instruction under test clobbers r15.
 const INC_R15: [u8; 3] = [0x49, 0xFF, 0xC7];
 
-/// Where the exit reports RIP: past the instruction, or at it.
-///
-/// Not a detail of this file's plumbing - it is the exit's contract with the
-/// host. `CPUID` has already happened when it exits, so RIP is past it; `INT3`
-/// and the port-I/O string ops report their own address because the host is
-/// expected to inspect or emulate the instruction and advance RIP itself. Both
-/// kinds *resume* at the following instruction, which is the address that has to
-/// be in the dispatch either way.
+/// Where the exit reports RIP: CPUID is past the instruction; INT3 and port string ops are at it. Both resume at the next instruction.
 #[derive(Clone, Copy)]
 enum ExitRip {
     Past,
     AtInstruction,
 }
 
-/// Lift `<exit instruction> ; inc r15 ; ret` under the default resumption mode
-/// and check both halves of the obligation.
+/// Lift `<exit insn> ; inc r15 ; ret`; the resume point must be offered and re-entering it must run the `inc`.
 fn assert_exit_resumes(exit_insn: &[u8], expect: ExitReason, rip: ExitRip) {
     let mut bytes = exit_insn.to_vec();
     bytes.extend_from_slice(&INC_R15);
     bytes.push(0xC3);
     let resume = BASE + exit_insn.len() as u64;
 
-    // The trampoline sentinel is the harness default, but a whole config passed
-    // to `.config()` replaces it, and the closing `RET` has to exit with
-    // `Return` for the resumed-region check to mean anything.
+    // A passed config replaces the harness sentinel; the closing RET must still exit `Return`.
     let config = LifterConfig {
         exit_trampoline_address: Some(EXIT_TRAMPOLINE),
         ..Default::default()
     };
 
-    // Static half: the address the host will come back to is offered.
     let lifted = lift_to_code::<X86_64>(&bytes, BASE, config.clone()).unwrap();
     assert!(
         lifted.resume_points.contains(&resume),
@@ -49,7 +36,6 @@ fn assert_exit_resumes(exit_insn: &[u8], expect: ExitReason, rip: ExitRip) {
         lifted.resume_points
     );
 
-    // Dynamic half: re-entering there runs the instruction after the exit.
     let out = LiftTest::new(&bytes)
         .at(BASE)
         .image_base(BASE)
@@ -68,7 +54,6 @@ fn assert_exit_resumes(exit_insn: &[u8], expect: ExitReason, rip: ExitRip) {
         }
     }
 
-    // The host services the exit and re-enters where it resumes.
     let out = out.resume_with(|c| c.rip = resume);
     assert_ne!(
         out.exit,
@@ -103,7 +88,6 @@ fn xgetbv_resumes() {
 
 #[test]
 fn int_imm8_resumes() {
-    // int 0x80
     assert_exit_resumes(&[0xCD, 0x80], ExitReason::Interrupt, ExitRip::Past);
 }
 
@@ -114,21 +98,17 @@ fn int3_resumes() {
 
 #[test]
 fn port_input_resumes() {
-    // insb - RIP at the instruction, since the host emulates the access itself.
+    // insb: RIP at the instruction, host emulates the access.
     assert_exit_resumes(&[0x6C], ExitReason::PortInput, ExitRip::AtInstruction);
 }
 
 #[test]
 fn port_output_resumes() {
-    // outsb
     assert_exit_resumes(&[0x6E], ExitReason::PortOutput, ExitRip::AtInstruction);
 }
 
-/// A call that leaves the region is the other kind of departure the host cannot
-/// name for itself, and it is offered for the same reason.
 #[test]
 fn a_call_out_of_region_resumes_at_its_return_address() {
-    // call rel32 (far out of region) ; inc r15 ; ret
     let mut bytes = vec![0xE8, 0x00, 0x10, 0x00, 0x00];
     bytes.extend_from_slice(&INC_R15);
     bytes.push(0xC3);
@@ -156,8 +136,7 @@ fn a_call_out_of_region_resumes_at_its_return_address() {
         "the call leaves the region"
     );
 
-    // The host runs the callee, whose own `RET` pops the return address the
-    // `CALL` pushed, and re-enters at that address.
+    // The host re-enters at the pushed return address.
     let out = out.resume_with(|c| {
         c.rip = resume;
         c.rsp += 8;
@@ -166,12 +145,9 @@ fn a_call_out_of_region_resumes_at_its_return_address() {
     assert_eq!(out.ctx.r15, 1);
 }
 
-/// Several exits in one region, resumed in sequence - the property a real
-/// emulator actually depends on, since a translation is entered far more often
-/// than it is built.
+/// Several exits in one region resumed in sequence.
 #[test]
 fn a_region_resumes_through_every_exit_in_turn() {
-    // rdtsc ; inc r15 ; cpuid ; inc r15 ; int3 ; inc r15 ; ret
     let mut bytes = vec![0x0F, 0x31];
     bytes.extend_from_slice(&INC_R15);
     bytes.extend_from_slice(&[0x0F, 0xA2]);
@@ -213,21 +189,15 @@ fn a_region_resumes_through_every_exit_in_turn() {
     assert_eq!(out.ctx.r15, 2);
     assert_eq!(out.ctx.rip, BASE + 10, "INT3 reports its own address");
 
-    // The host steps past the breakpoint itself.
     let out = out.resume_with(|c| c.rip = BASE + 11);
     assert_eq!(out.exit, ExitReason::Return);
     assert_eq!(out.ctx.r15, 3);
 }
 
-/// The other half of the mode's claim: an address control never *leaves* the
-/// region at is not offered, however much of a block leader it is. This is the
-/// saving the mode exists for, so it has to be checked as directly as the
-/// coverage is.
+/// A leader that control never leaves the region at is not offered.
 #[test]
 fn an_ordinary_branch_target_is_not_offered() {
-    // cpuid ; jmp +0 ; inc r15 ; ret - the `jmp` target is a leader, the `cpuid`
-    // resume point is the instruction after it, and only one of them is a
-    // departure the host can come back from.
+    // The `jmp` target is a leader; only the cpuid resume point is a departure.
     let mut bytes = vec![0x0F, 0xA2, 0xEB, 0x00];
     bytes.extend_from_slice(&INC_R15);
     bytes.push(0xC3);
@@ -240,7 +210,7 @@ fn an_ordinary_branch_target_is_not_offered() {
         BASE + 4
     );
 
-    // And an unoffered address is refused rather than guessed at.
+    // Unoffered addresses are refused.
     let out = LiftTest::new(&bytes)
         .at(BASE)
         .image_base(BASE)

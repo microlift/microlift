@@ -1,6 +1,5 @@
-//! x86-64 guest frontend: register file, context struct, decoder/leader
-//! classification, state sync, and instruction semantics. Wires them together
-//! through the [`GuestArch`] impl for [`X86_64`].
+//! x86-64 guest frontend: registers, context, iced-x86 decode, sync and semantics,
+//! wired together through the [`GuestArch`] impl for [`X86_64`].
 
 pub mod abi;
 pub mod context;
@@ -24,16 +23,13 @@ use regs::{
     XMM_HI_NAMES, XMM_NAMES,
 };
 
-/// x86-64 guest architecture marker.
 pub struct X86_64;
 
-/// The historical `Lifter` type, now the x86-64 monomorphization of the generic
-/// engine. Instruction semantics are inherent methods on this type.
+/// The x86-64 monomorphization of the generic engine; semantics are inherent methods.
 pub type Lifter<'a> = LiftEngine<'a, X86_64>;
 
 impl GuestArch for X86_64 {
-    /// The architectural limit: no legal x86-64 encoding exceeds fifteen bytes,
-    /// however many prefixes it carries, and a decoder rejects anything longer.
+    /// No legal x86-64 encoding exceeds fifteen bytes.
     const MAX_INSTRUCTION_LEN: u64 = 15;
 
     type Instr = Instruction;
@@ -89,12 +85,9 @@ impl GuestArch for X86_64 {
         })
     }
 
-    /// x86-64 pins a GPR as an `I64` and an XMM register as an `I64X2`.
-    ///
-    /// The XMM answer is `None` without
-    /// [`LifterConfig::use_vector_xmm`](crate::core::LifterConfig::use_vector_xmm),
-    /// because the scalar representation splits that register into two variables
-    /// and a slot carries one value. An index past either bank is `None`.
+    /// `I64` for a GPR, `I64X2` for an XMM; XMM is `None` without
+    /// [`LifterConfig::use_vector_xmm`](crate::core::LifterConfig::use_vector_xmm) (scalar mode
+    /// splits it in two). Out-of-range indices are `None`.
     fn pinned_slot_type(
         reg: crate::core::pin::PinnedReg,
         config: &LifterConfig,
@@ -144,13 +137,8 @@ impl GuestArch for X86_64 {
         RegisterState::from_config(builder, config)
     }
 
-    /// Every constant-offset `RegisterContext` field, one alias region each.
-    ///
-    /// The `fpr` array is deliberately absent: `ST(i)` is `TOP`-relative, so the
-    /// same bytes are reached through a computed pointer and through the
-    /// context at a constant offset (`fpu_expand_tag_word`), and both must share
-    /// the one whole-array region. The segment selectors are absent because they
-    /// are read and written in place with no SSA variable.
+    /// One alias region per constant-offset field. `fpr` is absent: `ST(i)` is `TOP`-relative, so
+    /// it needs one whole-array region; segment selectors have no SSA variable.
     fn context_fields(config: &LifterConfig) -> Vec<(i32, &'static str)> {
         let mut fields: Vec<(i32, &'static str)> = Vec::with_capacity(64);
 
@@ -166,8 +154,7 @@ impl GuestArch for X86_64 {
                 name,
             ));
         }
-        // One 16-byte field per XMM in vector mode, two 8-byte halves in scalar
-        // mode. Reporting both shapes would claim two regions for one address.
+        // Vector mode: one 16-byte field per XMM; scalar mode: two 8-byte halves.
         for i in 0u8..16 {
             if config.use_vector_xmm {
                 fields.push((RegisterState::get_xmm_vec_offset(i), XMM_NAMES[i as usize]));
@@ -184,8 +171,7 @@ impl GuestArch for X86_64 {
         }
         fields.push((RegisterState::get_fs_base_offset(), "fs_base"));
         fields.push((RegisterState::get_gs_base_offset(), "gs_base"));
-        // The six selectors have no SSA variable - they are read and written in
-        // place - but they are still context fields and still need a region.
+        // Selectors have no SSA variable but still need a region.
         for (&reg, &name) in SEGMENT_ORDER.iter().zip(SEGMENT_NAMES.iter()) {
             fields.push((
                 RegisterState::get_segment_offset(reg).expect("SEGMENT_ORDER holds only selectors"),
@@ -193,8 +179,7 @@ impl GuestArch for X86_64 {
             ));
         }
 
-        // Non-register context state: the control header, the host hooks, and
-        // the x87/SSE control words.
+        // Control header, host hooks, x87/SSE control words.
         fields.push((Self::pc_offset(), "rip"));
         fields.push((Self::image_base_offset(), "image_base"));
         fields.push((Self::exit_reason_offset(), "exit_reason"));

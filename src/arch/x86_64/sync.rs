@@ -1,8 +1,4 @@
-//! x86-64 context state synchronisation: loading guest state from the
-//! `RegisterContext` on entry and writing it back on VM exits.
-//!
-//! These are inherent methods on the concrete `Lifter<'a>` (=
-//! `LiftEngine<'a, X86_64>`); the `GuestArch` trait impl delegates to them.
+//! x86-64 context sync: inherent methods on `Lifter<'a>` that the `GuestArch` impl delegates to.
 
 use crate::arch::x86_64::Lifter;
 use crate::arch::x86_64::regs::{FLAG_ORDER, GPR_ORDER, RegisterState};
@@ -13,14 +9,11 @@ use crate::core::regsync::RegSlot;
 use cranelift::prelude::*;
 use iced_x86::Register;
 
-/// `fs_base`'s [`RegSlot`], in this frontend's `Extra` numbering.
 pub const FS_BASE_SLOT: RegSlot = RegSlot::Extra(0);
-/// `gs_base`'s [`RegSlot`].
 pub const GS_BASE_SLOT: RegSlot = RegSlot::Extra(1);
 
 impl<'a> Lifter<'a> {
-    /// Store exactly the registers in `mask` into the `RegisterContext`, and
-    /// nothing else - no PC, no `exit_reason`, no `exit_code`.
+    /// Stores exactly the registers in `mask`; no PC, `exit_reason` or `exit_code`.
     pub fn sync_regs_masked(&mut self, mask: RegMask) -> crate::Result<()> {
         if self.config.analysis_mode || mask.is_empty() {
             return Ok(());
@@ -71,13 +64,8 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Reload exactly the registers in `mask` from the `RegisterContext` into their
-    /// SSA variables. The read half of a
-    /// [`BridgeEffects`](crate::core::bridge::BridgeEffects) mask; registers
-    /// outside `mask` keep the values they had before the call.
-    ///
-    /// `image_base` is deliberately not reloaded: it is fixed for the lifetime of a
-    /// region.
+    /// Reloads exactly the registers in `mask` (the read half of a
+    /// [`BridgeEffects`](crate::core::bridge::BridgeEffects) mask); `image_base` is never reloaded.
     pub fn load_regs_masked(&mut self, mask: RegMask) -> crate::Result<()> {
         if self.config.analysis_mode || mask.is_empty() {
             return Ok(());
@@ -139,12 +127,8 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Whether `reg` is carried out of the region in a machine register rather than
-    /// through the `RegisterContext`, and so must be skipped by the full sync and
-    /// the entry load.
-    ///
-    /// Not by the masked ones: those serve a call the host makes while this region
-    /// is still running, and the host reads the context then.
+    /// Whether `reg` travels in a machine register, so full sync and entry load skip it
+    /// (masked syncs do not: the host reads the context then).
     fn pinned_gpr(&self, reg: Register) -> bool {
         match crate::arch::x86_64::regs::gpr_index(reg) {
             Some(i) => self.is_pinned(PinnedReg::gpr(i as u16)),
@@ -152,28 +136,21 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// Whether XMM `idx` is pinned. Only ever true in vector mode - the scalar
-    /// pair cannot be a slot, and `pinned_slot_type` refuses it there.
+    /// Whether XMM `idx` is pinned; vector mode only.
     fn pinned_xmm(&self, idx: u8) -> bool {
         self.is_pinned(PinnedReg::vector(idx as u16))
     }
 
-    /// Full sync - writes all GPRs, flags, XMMs and segment bases back to the
-    /// `RegisterContext`. Used on context reload paths and unvisited exit stubs.
-    ///
-    /// Except the pinned ones ([`crate::core::pin`]), which leave the region in
-    /// registers for the entry thunk to store once the chain ends. A store here
-    /// would be the very cost pinning exists to delete.
+    /// Full sync of GPRs, flags, XMMs and segment bases, except pinned registers
+    /// ([`crate::core::pin`]), which the entry thunk stores when the chain ends.
     pub fn sync_to_context(&mut self, pc: Option<Value>, reason: ExitReason) -> crate::Result<()> {
-        // Analysis mode produces inspection IR with no context write-back.
+        // Analysis IR never writes back.
         if self.config.analysis_mode {
             return Ok(());
         }
         let ctx_ptr = self.builder.use_var(self.state.context_ptr);
 
-        // Every store here is recorded against the register it writes, so the
-        // prune in [`crate::core::regsync`] can drop the ones whose register
-        // this region never defined.
+        // Each store is recorded so the prune ([`crate::core::regsync`]) can drop undefined registers.
         for (i, &reg) in GPR_ORDER.iter().enumerate() {
             if self.pinned_gpr(reg) {
                 continue;
@@ -225,14 +202,11 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Load the region's entry state out of the `RegisterContext`.
-    ///
-    /// Pinned registers are skipped: they arrive as function parameters, and the
-    /// engine defines their variables from those immediately after this returns.
+    /// Loads the region's entry state; pinned registers arrive as parameters and are skipped.
     pub fn load_state_from_context(&mut self) -> crate::Result<()> {
         let ctx_ptr = self.builder.use_var(self.state.context_ptr);
 
-        // RIP is materialised from current_ip on sync, not kept as a variable.
+        // RIP is materialised from current_ip on sync.
         for &reg in &GPR_ORDER {
             if self.pinned_gpr(reg) {
                 continue;

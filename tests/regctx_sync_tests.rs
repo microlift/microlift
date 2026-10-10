@@ -33,7 +33,7 @@ fn code_len(bytes: &[u8], lazy: bool, opt: &str, triple: &str) -> usize {
         .len()
 }
 
-/// How many instructions with `op` a lift of `bytes` emits.
+/// Count of instructions with `op` in a lift of `bytes`.
 fn op_count(bytes: &[u8], lazy: bool, op: Opcode) -> usize {
     let code = lift_to_code::<X86_64>(bytes, DEFAULT_LIFT_BASE, config(lazy)).expect("lift");
     code.func
@@ -56,7 +56,7 @@ const LOOP_DEC: [u8; 12] = [
 
 fn writes_every_gpr() -> Vec<u8> {
     let mut out = Vec::new();
-    // xor r, r for each GPR (REX.W 31 /r, modrm = 0xC0 | r<<3 | r).
+    // xor r, r per GPR (REX.W 31 /r, modrm = 0xC0 | r<<3 | r).
     for r in 0u8..16 {
         if r == 4 {
             continue; // RSP
@@ -142,12 +142,11 @@ fn stores_to_field(ir: &str, field: &str) -> usize {
         .find(|l| l.ends_with(&format!("\"{field}\"")) && l.starts_with("region"))
         .unwrap_or_else(|| panic!("no alias region declared for {field}:\n{ir}"));
     let region = decl.split_whitespace().next().expect("region name");
-    // Lines carry a source-loc prefix (`@80000007  store notrap ... region0 ...`),
-    // so match `store` and the region as whole words rather than by position.
+    // Lines carry a srcloc prefix, so match `store` and the region as words.
     ir.lines()
         .filter(|l| {
             let mut words = l.split_whitespace();
-            // The opcode prints typed (`store.i64`) or bare (`store`).
+            // Opcode prints typed (`store.i64`) or bare.
             let is_store = words.any(|w| w == "store" || w.starts_with("store."));
             is_store && l.split_whitespace().any(|w| w == region)
         })
@@ -164,7 +163,7 @@ fn a_written_register_keeps_its_store_and_an_unwritten_one_does_not() {
         ir.contains("\"rax\"") && ir.contains("\"rbx\""),
         "alias regions should be named after their fields:\n{ir}"
     );
-    // `mov rax, 42 ; ret` writes RAX (and RSP, via the pop) and nothing else.
+    // Writes RAX (and RSP via the pop) only.
     assert!(
         stores_to_field(&ir, "rax") > 0,
         "RAX is written, so its store must survive:\n{ir}"
@@ -192,8 +191,7 @@ fn the_prune_is_selective_not_merely_enthusiastic() {
          {many_lean} vs {one_lean}"
     );
 
-    // The prune is still doing its job on that region - what it drops there is
-    // the sixteen untouched XMMs and the two segment bases, not the GPRs.
+    // Prune still drops the sixteen XMMs and two segment bases.
     let many_eager = op_count(&many, false, Opcode::Store);
     assert!(
         many_lean < many_eager,
@@ -227,18 +225,8 @@ fn alias_regions_let_cranelift_reach_the_same_answer() {
     }
 }
 
-/// At `speed` the prune is never *worse* than leaving it to the alias regions,
-/// and since the block-parameter pass it is sometimes better.
-///
-/// This used to assert the two were exactly equal, on the grounds that neither
-/// should leave traffic the other removes. That stopped being true when
-/// [`crate::core::dce`] arrived: deleting a sync store can leave a block
-/// parameter with no reader, and nothing in Cranelift removes one - so the prune
-/// now sheds a little that the alias analysis structurally cannot, and the
-/// numbers legitimately differ by a few bytes.
-///
-/// The property worth keeping is the direction. If the prune ever came out
-/// *larger* than the eager path, something it deleted was being paid for twice.
+/// At `speed` the prune is never worse than the alias regions, and sometimes better: deleting a sync store can leave dead block parameters that alias analysis cannot remove.
+/// If the prune ever came out larger, something it deleted was paid for twice.
 #[test]
 fn the_prune_is_never_worse_than_the_alias_regions() {
     for triple in TRIPLES {
@@ -274,8 +262,7 @@ fn the_default_is_on() {
 // Dead block parameters (`microlift::core::dce`)
 // ---------------------------------------------------------------------------
 
-/// How many block parameters a lift of `bytes` emits, across every block but the
-/// entry - whose parameters are the function's signature.
+/// Block parameters across every block but the entry.
 fn block_params(bytes: &[u8], lazy: bool) -> usize {
     let code = lift_to_code::<X86_64>(bytes, DEFAULT_LIFT_BASE, config(lazy)).expect("lift");
     let entry = code.func.layout.entry_block();
@@ -287,17 +274,8 @@ fn block_params(bytes: &[u8], lazy: bool) -> usize {
         .sum()
 }
 
-/// **The pass, and why it had to exist.**
-///
-/// A region's `RET` dispatch has an in-region arm back to its earlier blocks, so
-/// the SSA builder gives those blocks a parameter per guest register. The prune
-/// deletes the sync stores that were their only readers and stops there, which
-/// left the entry loads alive as arguments to parameters feeding nothing.
-///
-/// Checked on the IR rather than on compiled size, because the point is the
-/// parameters themselves: at `speed` Cranelift's register allocator hides much of
-/// the cost, and at `none` it does not, and neither number says whether the
-/// parameters are gone.
+/// A region's `RET` dispatch has an in-region arm back, so blocks get a parameter per register.
+/// The prune deletes their readers; the pass must then drop the parameters. Checked on IR, since regalloc hides the cost.
 #[test]
 fn the_prune_takes_the_block_parameters_with_it() {
     let lean = block_params(&MOV_RET, true);
@@ -309,19 +287,10 @@ fn the_prune_takes_the_block_parameters_with_it() {
     );
 }
 
-/// The control: a parameter something *does* read must survive.
-///
-/// Without this, a pass that removed every parameter it could reach would pass
-/// the test above - and would be a miscompile rather than an optimisation.
+/// Control: a parameter something reads must survive, or the pass would be a miscompile.
 #[test]
 fn a_parameter_something_reads_is_kept() {
-    // A loop, so the register carrying the counter is genuinely a block
-    // parameter that the loop body reads:
-    //   mov rcx, 3
-    // top:
-    //   dec rcx
-    //   jnz top
-    //   ret
+    // Loop so the counter register is a parameter the body reads: mov rcx, 3 ; top: dec rcx ; jnz top ; ret
     #[rustfmt::skip]
     let loop_bytes: &[u8] = &[
         0x48, 0xC7, 0xC1, 0x03, 0x00, 0x00, 0x00, // mov rcx, 3
@@ -334,21 +303,12 @@ fn a_parameter_something_reads_is_kept() {
         "a loop-carried register must still be a block parameter"
     );
 
-    // And the program still computes what it should, which is the assertion that
-    // would catch a parameter removed out from under a real reader.
+    // And the program still computes the right value.
     let out = LiftTest::new(loop_bytes).run();
     assert_eq!(out.ctx.rcx, 0);
 }
 
-/// A parameter that only ever feeds *itself* around a loop is dead, and the
-/// fixpoint is what sees that.
-///
-/// This is the case a one-pass "does any instruction name this value?" scan gets
-/// wrong: the value is named - by the branch that passes it back to its own
-/// parameter - so a naive scan keeps it, and every register a lifted loop carries
-/// stays alive forever. Asserted as a size claim on a region that loops, since
-/// the parameters in question are exactly the ones the loop carries and does not
-/// read.
+/// A parameter feeding only itself around a loop is dead; only the fixpoint sees it (a one-pass scan keeps it because the back-edge names it).
 #[test]
 fn a_parameter_that_only_feeds_itself_is_not_kept_alive_by_that() {
     #[rustfmt::skip]

@@ -1,61 +1,16 @@
-//! Tests targeting stack-pointer misalignment bugs and related stack
-//! correctness oversights in the lifter.
-//!
-//! # Bugs covered
-//!
-//! ## Bug 1 - Out-of-region direct CALL does not adjust RSP (critical)
-//!
-//! In `control_flow.rs:135-163`, when `CALL target` has a statically-known
-//! target outside the lifted region and is **not** a registered import, the
-//! lifter emits a `TransferKind::DirectCall` VM exit without:
-//!   - Decrementing RSP by 8, and
-//!   - Writing the return address to `[new RSP]`.
-//!
-//! `TransferKind::DirectCall` documentation states:
-//!   "A return address has already been pushed onto the guest stack"
-//! - this is false. The guest RSP is 8 bytes too high when the runtime
-//! dispatches the callee. If that callee executes a `RET`, it pops from
-//! the wrong location, corrupting control flow.
-//!
-//! Compare with the in-region CALL path (lines 165-183) which correctly
-//! adjusts RSP and pushes the return address.
-//!
-//! ## Bug 2 - PUSH imm8 sign-extension uses wrong accessor (medium)
-//!
-//! `handle_push` in `memory.rs:80-83` calls `immediate32to64()` for ALL
-//! immediate variants, including `Immediate8to64` (which covers
-//! `push imm8` in 64-bit mode). The VSA pass (`vsa.rs:460`) correctly
-//! uses `immediate8to64()` for this variant.
-//!
-//! In iced-x86, `immediate32to64()` sign-extends a **32-bit** field; for
-//! `Immediate8to64` instructions the stored 32-bit field may equal the raw
-//! unsigned 8-bit value (0–255). For negative 8-bit values (e.g. `push -1`
-//! = `6A FF`), this would push 255 instead of 0xFFFF_FFFF_FFFF_FFFF.
-//!
-//! ## IndirectCall exit reason - unregistered indirect CALL
-//!
-//! `emit_indirect_call_exit` emits `ExitReason::IndirectCall` (distinct from
-//! `ImportedFunctionCall`) and leaves RSP unchanged. The host must decide how
-//! to dispatch the callee:
-//! - **Native function**: call via C and resume at `ctx.rip` - no stack
-//!   adjustment needed.
-//! - **Guest code**: push `ctx.rip` onto `ctx.rsp` before re-entering the
-//!   guest so the callee's eventual `RET` finds the correct return address.
+//! Stack-pointer correctness of the lifter.
+//! - Out-of-region direct `CALL` must decrement RSP and push the return address before the `DirectCall` exit.
+//! - `push imm8` must sign-extend (`push -1` pushes all ones).
+//! - Unregistered indirect `CALL` exits `IndirectCall` with RSP unchanged; the host pushes `ctx.rip` for guest callees.
 
 use microlift::context::TransferKind;
 use microlift::testkit::prelude::*;
 
 // Test helpers
 
-/// Lift `bytes` at VA `0x1000`, compile with the JIT backend, run with `ctx`,
-/// and return the updated context.
-///
-/// Unlike the helpers in `stack_tests.rs` this does **not** touch `ctx.rsp`
-/// or `ctx.image_base`; the caller is responsible for setting them.
+/// Lift at `0x1000`, JIT, run with `ctx`. Unlike `stack_tests.rs`, leaves `ctx.rsp`/`ctx.image_base` to the caller.
 fn compile_and_run(bytes: &[u8], ctx: RegisterContext) -> RegisterContext {
-    // `RetAddr::None` + a caller-provided `rsp`/`image_base` reproduce this
-    // helper's "don't touch the stack" contract (the testkit harness leaves a
-    // preset non-zero `rsp`/`image_base` alone).
+    // `RetAddr::None` with caller-provided `rsp`/`image_base` keeps the stack untouched.
     LiftTest::new(bytes)
         .ctx(ctx)
         .ret_addr(RetAddr::None)
@@ -63,10 +18,7 @@ fn compile_and_run(bytes: &[u8], ctx: RegisterContext) -> RegisterContext {
         .ctx
 }
 
-/// Like `compile_and_run` but installs an automatic stack with an exit
-/// trampoline at the bottom (top-of-guest-stack) and sets `image_base = 0x1000`.
-/// Returns `(ctx_after, initial_rsp)` where `initial_rsp` is the value of
-/// `ctx.rsp` at the point the lifted function is entered.
+/// Like `compile_and_run` but with an automatic stack, exit trampoline and `image_base = 0x1000`; returns `(ctx_after, initial_rsp)`.
 fn compile_and_run_with_stack(bytes: &[u8], ctx: RegisterContext) -> (RegisterContext, u64) {
     let out = LiftTest::new(bytes).ctx(ctx).run();
     (out.ctx, out.initial_rsp)
@@ -74,32 +26,20 @@ fn compile_and_run_with_stack(bytes: &[u8], ctx: RegisterContext) -> (RegisterCo
 
 // Bug 1: out-of-region direct CALL does not push return address
 
-/// An out-of-region `CALL` must:
-///   1. Decrement RSP by 8.
-///   2. Write the return address (next_ip rebased via `image_base`) to [new RSP].
-///   3. Exit with `UnknownJump` / `DirectCall`.
-///
-/// Currently the lifter performs step 3 only (steps 1 and 2 are missing),
-/// leaving RSP 8 bytes too high.
-///
-/// Byte sequence at `0x1000`:
-///   `E8 FB 0F 00 00`  ->  `call 0x2000`
-///   (rel32 = 0x2000 − next_ip(0x1005) = 0xFFB)
-///
-/// image_base = 0x1000, so rebased return address = 0x1000 + (0x1005 − 0x1000) = 0x1005.
+/// An out-of-region `CALL` must decrement RSP by 8, write the rebased return address (`0x1005`) at [new RSP], and exit `UnknownJump`/`DirectCall`.
+/// `E8 FB 0F 00 00` -> `call 0x2000` (rel32 = 0x2000 - 0x1005).
 #[test]
 fn test_out_of_region_call_decrements_rsp() {
     // call 0x2000  (5 bytes, target is outside the 5-byte region)
     let bytes = [0xE8u8, 0xFB, 0x0F, 0x00, 0x00];
 
-    // Provide a stack buffer large enough for the expected return-address slot.
+    // Stack buffer large enough for the return-address slot.
     let mut stack = [0u64; 16];
     let stack_top = stack.as_mut_ptr() as u64 + 16 * 8;
 
     let mut ctx = RegisterContext::default();
     ctx.image_base = 0x1000;
-    // Point RSP just above the buffer; no trampoline needed - the code exits
-    // via DirectCall before reaching any RET.
+    // No trampoline: the code exits via DirectCall before any RET.
     ctx.rsp = stack_top;
     let initial_rsp = ctx.rsp;
 
@@ -109,7 +49,7 @@ fn test_out_of_region_call_decrements_rsp() {
     assert_eq!(ctx.exit_reason, ExitReason::UnknownJump as u32);
     assert_eq!(ctx.exit_code, TransferKind::DirectCall as u32);
 
-    // Bug 1 assertion: RSP must have been decremented by 8.
+    // RSP must have been decremented by 8.
     assert_eq!(
         ctx.rsp,
         initial_rsp - 8,
@@ -117,23 +57,14 @@ fn test_out_of_region_call_decrements_rsp() {
     );
 }
 
-/// Companion to the previous test: the word written at [new RSP] must equal
-/// the rebased return address (the instruction immediately after the CALL).
-///
-/// With `image_base = 0x1000` and `lift_base = 0x1000`, the return address is
-/// `image_base + (next_ip − lift_base) = 0x1000 + (0x1005 − 0x1000) = 0x1005`.
-///
-/// Note: we start `ctx.rsp` one slot below the top of the buffer so that
-/// even if Bug 1 is present and RSP is not decremented, reading from `ctx.rsp`
-/// is still within the allocated array (avoiding UB in the failing case).
+/// The word at [new RSP] must be the rebased return address `image_base + (next_ip - lift_base) = 0x1005`.
+/// RSP starts one slot below the top so reads stay in bounds even if the push is missing.
 #[test]
 fn test_out_of_region_call_writes_return_address() {
     let bytes = [0xE8u8, 0xFB, 0x0F, 0x00, 0x00]; // call 0x2000
 
     let mut stack = [0u64; 16];
-    // Start one slot below the top: slot 14 is the "initial RSP" slot.
-    // If Bug 1 is present RSP stays at stack[14]; if fixed it moves to stack[13].
-    // Either way the read is within bounds.
+    // Slot 14 is the initial RSP; after the push it is slot 13.
     let stack_base = stack.as_mut_ptr() as u64;
     let initial_rsp = stack_base + 14 * 8;
 
@@ -162,10 +93,7 @@ fn test_out_of_region_call_writes_return_address() {
     );
 }
 
-/// After a runtime `DirectCall` exit, the callee virtual address stored in
-/// `ctx.imported_function_va` must be the rebased target, and `ctx.rip`
-/// must be the rebased return address (resume point).  This validates the
-/// existing (correct) parts of the exit path.
+/// After a `DirectCall` exit, `imported_function_va` is the rebased target and `ctx.rip` the rebased return address.
 #[test]
 fn test_out_of_region_call_exit_metadata_is_correct() {
     let bytes = [0xE8u8, 0xFB, 0x0F, 0x00, 0x00]; // call 0x2000
@@ -183,27 +111,19 @@ fn test_out_of_region_call_exit_metadata_is_correct() {
     assert_eq!(ctx.exit_reason, ExitReason::UnknownJump as u32);
     assert_eq!(ctx.exit_code, TransferKind::DirectCall as u32);
 
-    // Callee VA: image_base + (0x2000 − lift_base) = 0x1000 + 0x1000 = 0x2000.
+    // Callee VA: 0x1000 + (0x2000 - 0x1000) = 0x2000.
     assert_eq!(ctx.imported_function_va, 0x2000);
 
-    // RIP (resume / return address): image_base + (0x1005 − 0x1000) = 0x1005.
+    // RIP: 0x1000 + (0x1005 - 0x1000) = 0x1005.
     assert_eq!(ctx.rip, 0x1005);
 }
 
 // Bug 2: PUSH imm8 (Immediate8to64) sign-extension
 
-/// `push imm8` (opcode `6A`) sign-extends the 8-bit operand to 64 bits.
-/// `push -1` (`6A FF`) must store `0xFFFF_FFFF_FFFF_FFFF` on the stack.
-///
-/// `handle_push` calls `immediate32to64()` for `Immediate8to64` operands.
-/// The VSA pass uses the dedicated `immediate8to64()` accessor.  If the
-/// iced-x86 `immediate32to64()` method does not correctly sign-extend 8->64
-/// for this operand kind, negative byte values will be wrong on the stack.
+/// `push imm8` (`6A`) sign-extends to 64 bits: `push -1` stores `0xFFFF_FFFF_FFFF_FFFF`.
 #[test]
 fn test_push_neg1_imm8_sign_extends() {
-    // 6A FF  push -1   (Immediate8to64: 0xFF as i8 = −1 -> 0xFFFF_FFFF_FFFF_FFFF)
-    // 58     pop rax
-    // C3     ret
+    // 6A FF push -1 ; 58 pop rax ; C3 ret
     let bytes = [0x6Au8, 0xFF, 0x58, 0xC3];
 
     let (ctx, _) = compile_and_run_with_stack(&bytes, RegisterContext::default());
@@ -215,13 +135,10 @@ fn test_push_neg1_imm8_sign_extends() {
     );
 }
 
-/// Boundary case: `push -128` (`6A 80`) - the most-negative 8-bit value.
-/// Sign-extended to 64 bits: `0xFFFF_FFFF_FFFF_FF80`.
+/// `push -128` (`6A 80`): most-negative 8-bit value -> `0xFFFF_FFFF_FFFF_FF80`.
 #[test]
 fn test_push_neg128_imm8_sign_extends() {
-    // 6A 80  push -128  (0x80 as i8 = −128 -> 0xFFFF_FFFF_FFFF_FF80)
-    // 58     pop rax
-    // C3     ret
+    // 6A 80 push -128 ; 58 pop rax ; C3 ret
     let bytes = [0x6Au8, 0x80, 0x58, 0xC3];
 
     let (ctx, _) = compile_and_run_with_stack(&bytes, RegisterContext::default());
@@ -232,13 +149,10 @@ fn test_push_neg128_imm8_sign_extends() {
     );
 }
 
-/// Non-boundary negative value: `push -100` (`6A 9C`).
-/// Sign-extended: `0xFFFF_FFFF_FFFF_FF9C`.
+/// `push -100` (`6A 9C`) -> `0xFFFF_FFFF_FFFF_FF9C`.
 #[test]
 fn test_push_neg100_imm8_sign_extends() {
-    // 6A 9C  push -100  (0x9C as i8 = −100 -> 0xFFFF_FFFF_FFFF_FF9C)
-    // 58     pop rax
-    // C3     ret
+    // 6A 9C push -100 ; 58 pop rax ; C3 ret
     let bytes = [0x6Au8, 0x9C, 0x58, 0xC3];
 
     let (ctx, _) = compile_and_run_with_stack(&bytes, RegisterContext::default());
@@ -249,15 +163,10 @@ fn test_push_neg100_imm8_sign_extends() {
     );
 }
 
-/// Sanity check: `push imm32` (opcode `68`, `Immediate32to64`) already uses
-/// `immediate32to64()` directly - this should be correct already.
-/// `push 0xFFFF_FFFF` sign-extends to `0xFFFF_FFFF_FFFF_FFFF`.
-/// Expected to pass regardless of whether Bug 2 is fixed.
+/// `push imm32` (`68`) sign-extends: `push 0xFFFF_FFFF` -> all ones.
 #[test]
 fn test_push_neg1_imm32_sign_extends_sanity() {
-    // 68 FF FF FF FF  push 0xFFFF_FFFF  (Immediate32to64 -> 0xFFFF_FFFF_FFFF_FFFF)
-    // 58              pop rax
-    // C3              ret
+    // 68 FF FF FF FF push ; 58 pop rax ; C3 ret
     let bytes = [0x68u8, 0xFF, 0xFF, 0xFF, 0xFF, 0x58, 0xC3];
 
     let (ctx, _) = compile_and_run_with_stack(&bytes, RegisterContext::default());
@@ -269,14 +178,10 @@ fn test_push_neg1_imm32_sign_extends_sanity() {
     );
 }
 
-/// Sanity check: small positive `push imm8` values work for both the
-/// correct and incorrect immediate accessor, so they don't distinguish
-/// the bug.  Verify that `push 1` (6A 01) gives rax = 1.
+/// Small positive `push 1` (6A 01) gives rax = 1 either way.
 #[test]
 fn test_push_positive_imm8_unaffected() {
-    // 6A 01  push 1
-    // 58     pop rax
-    // C3     ret
+    // 6A 01 push 1 ; 58 pop rax ; C3 ret
     let bytes = [0x6Au8, 0x01, 0x58, 0xC3];
 
     let (ctx, _) = compile_and_run_with_stack(&bytes, RegisterContext::default());
@@ -286,14 +191,9 @@ fn test_push_positive_imm8_unaffected() {
 
 // IndirectCall exit reason contract
 
-/// `CALL RAX` (indirect call via register) exits with `ExitReason::IndirectCall`.
-/// RSP is intentionally left unchanged - the host decides whether to dispatch
-/// the callee as a native function (no stack adjustment needed) or as guest
-/// code (host must push `ctx.rip` onto `ctx.rsp` before re-entering).
+/// `CALL RAX` exits `IndirectCall` with RSP unchanged; the host decides native vs guest dispatch (guest: push `ctx.rip`).
 ///
-/// Byte sequence at `0x1000`:
-///   `48 C7 C0 00 20 00 00`  ->  `mov rax, 0x2000`  (7 bytes)
-///   `FF D0`                 ->  `call rax`          (2 bytes, next_ip = 0x1009)
+/// `48 C7 C0 00 20 00 00` mov rax, 0x2000 ; `FF D0` call rax (next_ip = 0x1009)
 #[test]
 fn test_indirect_call_via_reg_exits_with_indirect_call_reason() {
     #[rustfmt::skip]
@@ -325,13 +225,10 @@ fn test_indirect_call_via_reg_exits_with_indirect_call_reason() {
     );
 }
 
-/// `CALL [mem]` (indirect call via memory) produces the same `IndirectCall`
-/// contract as `CALL reg`. This uses a stack slot as the pointer target.
+/// `CALL [mem]` gives the same `IndirectCall` contract as `CALL reg`.
 #[test]
 fn test_indirect_call_via_mem_exits_with_indirect_call_reason() {
-    // Store target address 0x3000 at [RSP-16], then CALL [RSP-16].
-    // mov qword [rsp-16], 0x3000   (48 C7 44 24 F0 00 30 00 00)  9 bytes
-    // call [rsp-16]                (FF 54 24 F0)                  4 bytes  next_ip = 0x100D
+    // mov qword [rsp-16], 0x3000 (48 C7 44 24 F0 00 30 00 00) ; call [rsp-16] (FF 54 24 F0), next_ip = 0x100D
     #[rustfmt::skip]
     let bytes = [
         0x48u8, 0xC7, 0x44, 0x24, 0xF0, 0x00, 0x30, 0x00, 0x00, // mov qword [rsp-16], 0x3000
@@ -359,16 +256,10 @@ fn test_indirect_call_via_mem_exits_with_indirect_call_reason() {
 
 // Baseline: in-region CALL/RET correctly maintains RSP (should always pass)
 
-/// An in-region `CALL` must decrement RSP and push the return address, and
-/// the matching `RET` must pop it.  RSP must be balanced across the pair.
-///
-/// This test verifies the correct baseline behaviour that out-of-region and
-/// indirect CALLs should also exhibit after their bugs are fixed.
+/// Baseline: an in-region `CALL` decrements RSP and pushes the return address; the matching `RET` pops it, balanced.
 #[test]
 fn test_in_region_call_ret_rsp_balance() {
-    // 0x1000: call 0x1006    E8 01 00 00 00  (5 bytes)
-    // 0x1005: ret            C3              (1 byte)  ← outer exit
-    // 0x1006: ret            C3              (1 byte)  ← inner: returns to 0x1005
+    // 0x1000 call 0x1006 (E8 01 00 00 00) ; 0x1005 ret (outer exit) ; 0x1006 ret (inner)
     #[rustfmt::skip]
     let bytes = [
         0xE8u8, 0x01, 0x00, 0x00, 0x00, // call 0x1006
@@ -379,8 +270,7 @@ fn test_in_region_call_ret_rsp_balance() {
     let (ctx, initial_rsp) = compile_and_run_with_stack(&bytes, RegisterContext::default());
     assert_eq!(ctx.exit_reason, ExitReason::Return as u32);
 
-    // The outer `ret` popped the trampoline from the initial stack slot, so
-    // RSP = initial_rsp + 8 after the function returns.
+    // The outer `ret` popped the trampoline: RSP = initial_rsp + 8.
     assert_eq!(
         ctx.rsp,
         initial_rsp + 8,
@@ -388,18 +278,11 @@ fn test_in_region_call_ret_rsp_balance() {
     );
 }
 
-/// After a `CALL` into an in-region callee, the callee sees RSP equal to
-/// (caller RSP − 8).  We capture this by saving RSP inside the callee.
-///
-/// Layout:
-///   0x1000: call 0x1007  (E8 02 00 00 00 - 5 bytes)
-///   0x1005: ret          (C3)
-///   0x1006: (padding)    (90 - nop, makes 0x1007 a distinct block leader)
-///   0x1007: mov rax, rsp (48 89 E0 - 3 bytes, saves RSP into RAX)
-///   0x100A: ret          (C3)
+/// The callee sees RSP = caller RSP - 8, captured by `mov rax, rsp`.
+/// 0x1000 call 0x1007 ; 0x1005 ret ; 0x1006 nop (makes 0x1007 a leader) ; 0x1007 mov rax, rsp ; 0x100A ret
 #[test]
 fn test_in_region_call_callee_rsp_is_decremented() {
-    // call to 0x1007 - rel32 = 0x1007 − (0x1000 + 5) = 2
+    // rel32 = 0x1007 - 0x1005 = 2
     #[rustfmt::skip]
     let bytes = [
         0xE8u8, 0x02, 0x00, 0x00, 0x00, // 0x1000: call 0x1007
@@ -412,8 +295,7 @@ fn test_in_region_call_callee_rsp_is_decremented() {
     let (ctx, initial_rsp) = compile_and_run_with_stack(&bytes, RegisterContext::default());
     assert_eq!(ctx.exit_reason, ExitReason::Return as u32);
 
-    // The CALL pushed 8 bytes; when the callee ran `mov rax, rsp`, RSP was
-    // initial_rsp − 8.
+    // Callee saw initial_rsp - 8.
     assert_eq!(
         ctx.rax,
         initial_rsp - 8,
@@ -421,11 +303,7 @@ fn test_in_region_call_callee_rsp_is_decremented() {
     );
 }
 
-// `AND/OR/ADD/... r/m64, imm8` encode the immediate as a sign-extended byte.
-// Reading it with `immediate64()` yields the raw unsigned byte (`0xf0` -> 240)
-// instead of the sign-extended value (`-16`); for `and rsp, -16` that masks only
-// the low byte of RSP and corrupts the stack pointer. Every SysV `_start` opens
-// with `and rsp, -16`, so this must round-trip exactly.
+// `AND/OR/ADD r/m64, imm8` sign-extend the byte: `immediate64()` would give 240 for `and rsp, -16` and corrupt RSP (every SysV `_start` does this).
 
 #[test]
 fn and_r64_imm8_sign_extends() {

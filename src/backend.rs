@@ -13,32 +13,17 @@ use object::{Object, ObjectSection};
 use std::sync::Arc;
 use target_lexicon::Triple;
 
-/// Metadata for one external function the lifted IR references via
-/// `ExternalName::user(0, i)`, produced by `Lifter::aot_imports()`.
-///
-/// `(symbol_name, host_fn_ptr, signature)`: the C symbol a relocation or JIT
-/// lookup resolves, the in-process address JIT backends register it at (AOT
-/// backends need only the name and signature), and its Cranelift signature.
+/// An external function the IR references as `ExternalName::user(0, i)`: `(symbol, host_fn_ptr, signature)`.
+/// AOT backends need only the name and signature.
 pub type AotImport = (&'static str, *const u8, Signature);
 
-/// A helper that has been declared but not yet compiled - see
-/// [`declare_externals`] / [`define_helpers`].
+/// A declared-but-uncompiled helper ([`declare_externals`] / [`define_helpers`]).
 type PendingHelper = (cranelift_module::FuncId, Function);
 
-/// Declare the ordered namespace-0 external functions a [`LiftedCode`]
-/// references, *before* the lifted function itself is declared.
+/// Declares the namespace-0 externals (imports `0..n`, then helpers) before the lifted function,
+/// so `FuncId(i) == i`. Helper bodies are compiled later by [`define_helpers`].
 ///
-/// The IR reaches both kinds through one dense index space: imports occupy
-/// `0..imports.len()`, helpers continue from there. Module `FuncId`s are handed
-/// out in declaration order, which is what makes `FuncId(i) == i` hold.
-///
-/// Helper *bodies* are not compiled here - the returned list goes to
-/// [`define_helpers`] after the lifted function is defined, keeping
-/// `lifted_func` first in the emitted `.text`.
-///
-/// The module must be fresh: helper symbols are per-body, so compiling two
-/// regions into one module would redefine them and shift the index space out
-/// from under the second region's IR.
+/// The module must be fresh: helper symbols are per-body.
 fn declare_externals<M: Module>(
     module: &mut M,
     imports: &[AotImport],
@@ -61,19 +46,14 @@ fn declare_externals<M: Module>(
         .collect()
 }
 
-/// Extract the guest-instruction map for a function just compiled into `ctx`,
-/// decoding the surviving `SourceLoc`s with the lift's `source_map`.
-///
-/// Empty when the lift ran with
-/// [`LifterConfig::emit_source_locs`](crate::core::LifterConfig::emit_source_locs)
-/// off, and - defensively - when the module reported no compiled code.
+/// The guest-instruction map for a function just compiled into `ctx`; empty when
+/// [`emit_source_locs`](crate::core::LifterConfig::emit_source_locs) is off.
 fn guest_code_map(ctx: &cranelift_codegen::Context, source_map: SourceLocMap) -> GuestCodeMap {
     ctx.compiled_code()
         .map(|compiled| GuestCodeMap::from_compiled(compiled, source_map))
         .unwrap_or_default()
 }
 
-/// Compile the helper bodies [`declare_externals`] set aside.
 fn define_helpers<M: Module>(module: &mut M, pending: Vec<PendingHelper>) -> Result<()> {
     for (id, func) in pending {
         let mut ctx = cranelift_codegen::Context::for_function(func);
@@ -84,20 +64,11 @@ fn define_helpers<M: Module>(module: &mut M, pending: Vec<PendingHelper>) -> Res
     Ok(())
 }
 
-/// Declare and define this region's link-cell array, if it has one.
+/// Declares and defines this region's zeroed link-cell array, if any.
 ///
-/// The array is `sites` rows of zeroed [`BlockLinkEntry`] - a
-/// [`LinkSite`](crate::core::link::LinkSite) each - which the host installs into
-/// after compiling their targets. Zero-initialised is the *correct* initial
-/// state, not merely a convenient one: the probe reads `code == 0` as "not
-/// installed", so an artifact restored from disk with a `.bss` array starts
-/// uninstalled and links nothing until the host says otherwise.
-///
-/// It must be `DataId(0)`, because the IR names it `ExternalName::user(1, 0)`
-/// and cannot know an index the module assigns. That holds because
-/// `compile_lifted*` requires a fresh module and this is declared before
-/// anything else in it - asserted here rather than assumed, since the failure
-/// mode is a relocation pointing at some other object.
+/// Zero is the uninstalled state (`code == 0`), so a `.bss` array links nothing. It must be
+/// `DataId(0)` because the IR names it `ExternalName::user(1, 0)`; asserted, as a violation
+/// is a relocation to the wrong object.
 fn define_cell_array<M: Module>(module: &mut M, sites: usize) -> Result<Option<DataId>> {
     if sites == 0 {
         return Ok(None);
@@ -114,7 +85,7 @@ fn define_cell_array<M: Module>(module: &mut M, sites: usize) -> Result<Option<D
 
     let mut description = DataDescription::new();
     description.define_zeroinit(sites * ENTRY_SIZE as usize);
-    // The probe's loads are `aligned`, and a row is 32 bytes.
+        // The probe's loads are `aligned`; a row is 32 bytes.
     description.set_align(ENTRY_SIZE);
     module
         .define_data(id, &description)
@@ -122,14 +93,9 @@ fn define_cell_array<M: Module>(module: &mut M, sites: usize) -> Result<Option<D
     Ok(Some(id))
 }
 
-/// Declare and define this region's namespace-1 data: the link-cell array, then
-/// its read-only constant tables.
+/// Declares and defines the namespace-1 data: the link-cell array, then read-only constant tables.
 ///
-/// One function because the two share an index space - the IR names a table by
-/// the `DataId` it will get, which depends on whether the cell array took index
-/// 0 in front of it. The module must be fresh, and this must run before any
-/// other data is declared in it; both are asserted rather than assumed, since
-/// the failure mode is a relocation pointing at the wrong object.
+/// Shares one index space (the cell array takes `DataId(0)`); the module must be fresh, asserted.
 fn define_module_data<M: Module>(
     module: &mut M,
     sites: usize,
@@ -159,19 +125,13 @@ fn define_module_data<M: Module>(
     Ok(cells)
 }
 
-/// Define a [`LiftedCode`]'s region body and, when it has one, the entry thunk
-/// that calls it - returning the `FuncId` the *host* enters through and the
-/// body's guest-instruction map.
+/// Defines the region body and, if pinned, the entry thunk; returns the host-entry `FuncId` and the body's map.
 ///
-/// - No thunk: the body is `extern "C" fn(*mut RegisterContext)` and is itself
-///   the entry, exported as `lifted_func`.
-/// - Thunk ([`crate::core::pin`]): the body carries the `tail` convention and a
-///   signature no host can call, so it is defined as a local `lifted_body` and
-///   `lifted_func` is the thunk. The body is declared *after* the helpers,
-///   continuing the namespace-0 index space the thunk's call was built against.
+/// - No thunk: the body is `extern "C"` and exported as `lifted_func`.
+/// - Thunk ([`crate::core::pin`]): the `tail`-convention body is local `lifted_body`, declared
+///   after the helpers, and `lifted_func` is the thunk.
 ///
-/// The body is **defined first** either way, so the map's offsets keep indexing
-/// from the start of the emitted `.text`.
+/// The body is defined first so map offsets index from the start of `.text`.
 fn define_region<M: Module>(
     module: &mut M,
     func: Function,
@@ -228,38 +188,23 @@ fn define_region<M: Module>(
     ))
 }
 
-/// The two ways into a compiled region, as module ids.
 struct DefinedRegion {
     entry: cranelift_module::FuncId,
     link_target: cranelift_module::FuncId,
 }
 
-/// The two ways into a compiled region, as addresses.
-///
-/// The same address for an ordinary region and two different ones for a pinned
-/// region ([`crate::core::pin`]) - which is why this type exists, since using
-/// one where the other belongs is a wrong-code bug nothing checks:
-///
-/// - [`entry`](Self::entry) is what a **host** calls. Always
-///   `extern "C" fn(*mut RegisterContext)`.
-/// - [`link_target`](Self::link_target) is what a host publishes in a
-///   [`BlockLinkEntry::code`](crate::core::link::BlockLinkEntry::code). Under a
-///   pinned ABI that is the region *body*, entered by a tail call with the guest
-///   registers already in place, and not callable from Rust.
+/// The two ways into a compiled region; equal for an ordinary region, different when pinned
+/// ([`crate::core::pin`]), where mixing them up is unchecked wrong code.
 #[derive(Debug, Clone, Copy)]
 pub struct CompiledRegion {
-    /// Entry point for a host call.
+    /// What a **host** calls: always `extern "C" fn(*mut RegisterContext)`.
     pub entry: *const u8,
-    /// Entry point for a link row.
+    /// What a link row ([`BlockLinkEntry::code`](crate::core::link::BlockLinkEntry::code)) names;
+    /// under a pinned ABI the tail-called body, not callable from Rust.
     pub link_target: *const u8,
-    /// This region's zeroed link-cell array, one
-    /// [`BlockLinkEntry`](crate::core::link::BlockLinkEntry) per
-    /// [`LiftedCode::link_sites`](crate::core::LiftedCode::link_sites) in the
-    /// same order, or null when the lift emitted none.
-    ///
-    /// The host installs cell `i` by writing the row for `link_sites[i].target`
-    /// into it, and retracts it by zeroing that row's `code`. Writable, unlike
-    /// the two code pointers beside it.
+    /// Zeroed link-cell array, one row per [`LiftedCode::link_sites`](crate::core::LiftedCode::link_sites)
+    /// in order; null if none. The host installs cell `i` with the row for `link_sites[i].target`
+    /// and retracts by zeroing `code`. Writable, unlike the code pointers.
     pub link_cells: *mut BlockLinkEntry,
 }
 
@@ -275,14 +220,8 @@ impl CraneliftBackend {
         Self::with_flags(settings::Flags::new(settings::builder()), &[])
     }
 
-    /// Build a `TargetIsa` for the host with the shared `flags`.
-    ///
-    /// `isa_settings` is a list of ISA-specific `(name, value)` pairs applied to the
-    /// builder before it is finished - e.g. the x86 target-feature knobs (`has_avx`,
-    /// `has_sse41`) that raise the recompiled code above the baseline `x86-64`
-    /// level. The builder starts from the *detected* host features, so these
-    /// override that detection rather than adding to a bare baseline. Each name must
-    /// be valid for the host architecture or an error is returned.
+    /// A `TargetIsa` for the host. `isa_settings` are `(name, value)` overrides applied over
+    /// detected features (e.g. `has_avx`); an invalid name errors.
     fn native_isa(
         flags: settings::Flags,
         isa_settings: &[(&str, &str)],
@@ -312,28 +251,18 @@ impl CraneliftBackend {
         Ok(Self { module })
     }
 
-    /// JIT-compile a full [`LiftedCode`] - the lifted region plus any outlined
-    /// helper functions it calls.
+    /// JIT-compiles a [`LiftedCode`] including outlined helpers (use for x87).
     ///
-    /// The entry point for `Jit`-mode output, and the one to use when the region
-    /// may contain x87 code; [`compile`](Self::compile) takes a bare `Function` and
-    /// cannot carry helper bodies.
-    ///
-    /// `code.imports` must be empty: a `RuntimeAssisted` region's imports need their
-    /// symbol addresses registered when the module is *built* - use
+    /// `code.imports` must be empty; for `RuntimeAssisted` use
     /// [`compile_lifted_with_fast_imports`](Self::compile_lifted_with_fast_imports).
     pub fn compile_lifted(&mut self, code: LiftedCode) -> Result<*const u8> {
         Ok(self.compile_lifted_with_map(code)?.0)
     }
 
-    /// [`compile_lifted`](Self::compile_lifted), additionally returning the
-    /// host-code -> guest-instruction map for the compiled region.
+    /// [`compile_lifted`](Self::compile_lifted) plus the host-code -> guest map.
     ///
-    /// Offsets are relative to the returned function pointer, so
-    /// [`GuestCodeMap::lookup_host_addr`] turns a host `RIP` sampled inside this
-    /// region into the guest address it is executing. Empty unless the lift ran with
-    /// [`LifterConfig::emit_source_locs`](crate::core::LifterConfig::emit_source_locs)
-    /// on (the default).
+    /// Offsets are relative to the function pointer ([`GuestCodeMap::lookup_host_addr`]); empty
+    /// unless `emit_source_locs` is on.
     pub fn compile_lifted_with_map(
         &mut self,
         code: LiftedCode,
@@ -342,12 +271,9 @@ impl CraneliftBackend {
         Ok((region.entry, map))
     }
 
-    /// [`compile_lifted_with_map`](Self::compile_lifted_with_map), reporting
-    /// both entry points.
+    /// [`compile_lifted_with_map`](Self::compile_lifted_with_map) reporting both entry points.
     ///
-    /// A host that publishes block-link rows must use this one: under a pinned
-    /// ABI the address to call and the address to link to are different
-    /// functions. See [`CompiledRegion`].
+    /// Required when publishing link rows: under a pinned ABI they differ ([`CompiledRegion`]).
     pub fn compile_lifted_region(
         &mut self,
         code: LiftedCode,
@@ -358,8 +284,7 @@ impl CraneliftBackend {
             ));
         }
         let source_map = code.source_map;
-        // Before anything else in this module, so it is `DataId(0)` - the index
-        // the IR's `ExternalName::user(1, 0)` names.
+        // First, so it is `DataId(0)` (`ExternalName::user(1, 0)`).
         let cells = define_module_data(
             &mut self.module,
             code.link_sites.len(),
@@ -367,8 +292,7 @@ impl CraneliftBackend {
         )?;
         let pending = declare_externals(&mut self.module, &[], code.helpers)?;
 
-        // The map is read out of the body's compiled buffer inside
-        // `define_region`, before the context that owns it is recycled.
+        // Read inside `define_region`, before the owning context is recycled.
         let (ids, map) = define_region(&mut self.module, code.func, code.entry_thunk, source_map)?;
 
         define_helpers(&mut self.module, pending)?;
@@ -388,23 +312,15 @@ impl CraneliftBackend {
         ))
     }
 
-    /// JIT-compile a single lifted `Function`.
-    ///
-    /// Note this cannot carry outlined helpers; see
-    /// [`compile_lifted`](Self::compile_lifted).
+    /// JIT-compiles a bare `Function`; cannot carry helpers ([`compile_lifted`](Self::compile_lifted)).
     pub fn compile(&mut self, func: Function) -> Result<*const u8> {
         self.compile_lifted(LiftedCode::from_function(func))
     }
 
-    /// JIT-compile a `RuntimeAssisted`-mode function that uses relocatable
-    /// fast-call imports.
+    /// JIT-compiles a `RuntimeAssisted` function with relocatable fast imports.
     ///
-    /// `imports` must be the slice returned by `Lifter::aot_imports()` - element `i`
-    /// must correspond to `ExternalName::user(0, i)` in the IR. Imports are declared
-    /// first so each receives `FuncId(i)`, which the JIT linker maps to the
-    /// registered symbol address at finalization.
-    ///
-    /// `isa_settings` carries host ISA feature overrides, as in `with_flags`.
+    /// `imports` is `Lifter::aot_imports()`: element `i` is `ExternalName::user(0, i)`, declared
+    /// first so it gets `FuncId(i)`.
     pub fn compile_with_fast_imports(
         func: Function,
         imports: &[AotImport],
@@ -418,9 +334,7 @@ impl CraneliftBackend {
         )
     }
 
-    /// [`compile_with_fast_imports`](Self::compile_with_fast_imports) for a full
-    /// [`LiftedCode`], so a `RuntimeAssisted` region may also carry outlined
-    /// helper functions.
+    /// [`compile_with_fast_imports`](Self::compile_with_fast_imports) for a full [`LiftedCode`] (with helpers).
     pub fn compile_lifted_with_fast_imports(
         code: LiftedCode,
         flags: settings::Flags,
@@ -429,9 +343,7 @@ impl CraneliftBackend {
         Ok(Self::compile_lifted_with_fast_imports_and_map(code, flags, isa_settings)?.0)
     }
 
-    /// [`compile_lifted_with_fast_imports`](Self::compile_lifted_with_fast_imports),
-    /// additionally returning the host-code -> guest-instruction map. See
-    /// [`compile_lifted_with_map`](Self::compile_lifted_with_map).
+    /// [`compile_lifted_with_fast_imports`](Self::compile_lifted_with_fast_imports) plus the map.
     pub fn compile_lifted_with_fast_imports_and_map(
         code: LiftedCode,
         flags: settings::Flags,
@@ -456,10 +368,7 @@ impl CraneliftBackend {
             .finalize_definitions()
             .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
 
-        // This path owns its module and hands back a bare pointer, so there is
-        // nothing to keep a second address alive against; a `RuntimeAssisted`
-        // region that also wants to be linked to should go through
-        // `compile_lifted_region` on a backend it keeps.
+        // Owns its module and returns a bare pointer; a linkable region wants `compile_lifted_region`.
         Ok((module.get_finalized_function(ids.entry), map))
     }
 }
@@ -476,7 +385,7 @@ fn missing_arch_feature(triple: &Triple) -> Option<&'static str> {
         | Architecture::Pulley64
         | Architecture::Pulley32be
         | Architecture::Pulley64be => "arch-pulley",
-        // Not a target Cranelift has a backend for at all - no feature helps.
+        // No Cranelift backend exists for this target.
         _ => return None,
     })
 }
@@ -484,11 +393,7 @@ fn missing_arch_feature(triple: &Triple) -> Option<&'static str> {
 pub struct ArtifactBackend;
 
 impl ArtifactBackend {
-    /// Build a `TargetIsa` for `triple` with the shared `flags`.
-    ///
-    /// `isa_settings` is a list of ISA-specific `(name, value)` pairs applied to the
-    /// builder before it is finished - e.g. the x86 target-feature knobs. Each name
-    /// must be valid for the resolved architecture or an error is returned.
+    /// A `TargetIsa` for `triple`; `isa_settings` as in the host variant.
     fn get_isa(
         triple: Option<&str>,
         flags: Option<settings::Flags>,
@@ -531,12 +436,8 @@ impl ArtifactBackend {
         Ok(isa)
     }
 
-    /// Compile a `RuntimeAssisted`-mode function to a relocatable object file,
-    /// emitting named external relocations for fast-call imports.
-    ///
-    /// `imports` must be the slice returned by `Lifter::aot_imports()` - element `i`
-    /// corresponds to `ExternalName::user(0, i)` and is declared as an imported
-    /// symbol before `lifted_func`, which is what makes `FuncId(i) == i` hold.
+    /// Compiles a `RuntimeAssisted` function to a relocatable object; `imports` is
+    /// `Lifter::aot_imports()`, declared before `lifted_func` so `FuncId(i) == i`.
     pub fn compile_to_object_with_fast_imports(
         func: Function,
         imports: &[AotImport],
@@ -552,9 +453,7 @@ impl ArtifactBackend {
         )
     }
 
-    /// Compile a full [`LiftedCode`] to a relocatable object file: the lifted
-    /// function, named relocations for its fast-call imports, and a local
-    /// definition of every outlined helper it calls.
+    /// Compiles a [`LiftedCode`] to a relocatable object: function, import relocations and local helpers.
     pub fn compile_lifted_to_object(
         code: LiftedCode,
         triple: Option<&str>,
@@ -564,12 +463,8 @@ impl ArtifactBackend {
         Ok(Self::compile_lifted_to_object_with_map(code, triple, flags, isa_settings)?.0)
     }
 
-    /// [`compile_lifted_to_object`](Self::compile_lifted_to_object), additionally
-    /// returning the host-code -> guest-instruction map for `lifted_func`.
-    ///
-    /// Offsets are relative to the start of `lifted_func`, not the object's
-    /// `.text` - though `lifted_func` is defined first, so it sits at offset 0 of
-    /// what [`compile_lifted_to_raw`](Self::compile_lifted_to_raw) extracts.
+    /// [`compile_lifted_to_object`](Self::compile_lifted_to_object) plus the map; offsets are
+    /// relative to `lifted_func` (which sits at 0).
     pub fn compile_lifted_to_object_with_map(
         code: LiftedCode,
         triple: Option<&str>,
@@ -583,9 +478,7 @@ impl ArtifactBackend {
                 .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
         let mut module = ObjectModule::new(obj_builder);
 
-        // As in the JIT path: first, so it is `DataId(0)`. In an object it
-        // lands in `.bss`, which is exactly the uninstalled state a cached
-        // artifact must load in.
+        // First, so it is `DataId(0)`; in an object it lands in `.bss` (the uninstalled state).
         define_module_data(&mut module, code.link_sites.len(), &code.data_objects)?;
         let pending = declare_externals(&mut module, &code.imports, code.helpers)?;
 
@@ -625,15 +518,10 @@ impl ArtifactBackend {
         )
     }
 
-    /// [`compile_to_raw`](Self::compile_to_raw) for a full [`LiftedCode`].
+    /// [`compile_to_raw`](Self::compile_to_raw) for a [`LiftedCode`].
     ///
-    /// The extracted `.text` holds the outlined helper bodies as well as the lifted
-    /// function, and raw extraction throws away the symbol table that says where
-    /// each begins. It also leaves behind everything that is not code - a region
-    /// carrying [`data_objects`](LiftedCode::data_objects) loses the tables it
-    /// loads from, and the relocations that reach them. Prefer
-    /// [`compile_lifted_to_object`](Self::compile_lifted_to_object) when the region
-    /// has helpers or data.
+    /// Raw extraction drops the symbol table and all non-code (data tables, their relocations);
+    /// prefer [`compile_lifted_to_object`](Self::compile_lifted_to_object) with helpers or data.
     pub fn compile_lifted_to_raw(
         code: LiftedCode,
         triple: Option<&str>,
@@ -642,12 +530,8 @@ impl ArtifactBackend {
         Ok(Self::compile_lifted_to_raw_with_map(code, triple, flags)?.0)
     }
 
-    /// [`compile_lifted_to_raw`](Self::compile_lifted_to_raw), additionally
-    /// returning the host-code -> guest-instruction map.
-    ///
-    /// `lifted_func` is defined before the helpers, so its code starts at offset 0
-    /// of the extracted `.text` and the map's offsets index the returned bytes
-    /// directly.
+    /// [`compile_lifted_to_raw`](Self::compile_lifted_to_raw) plus the map; `lifted_func` is at
+    /// offset 0, so map offsets index the bytes directly.
     pub fn compile_lifted_to_raw_with_map(
         code: LiftedCode,
         triple: Option<&str>,
@@ -671,7 +555,7 @@ impl ArtifactBackend {
         Ok((bytes.to_vec(), map))
     }
 
-    /// Build a Capstone engine for `triple` (host triple when `None`).
+    /// A Capstone engine for `triple` (host when `None`).
     #[cfg(feature = "disasm")]
     fn capstone_for(triple: Option<&str>) -> Result<Capstone> {
         use target_lexicon::Architecture;
@@ -726,15 +610,8 @@ impl ArtifactBackend {
         Ok(output)
     }
 
-    /// Disassemble compiled code, interleaving a header line each time the guest
-    /// instruction responsible for it changes.
-    ///
-    /// The lifted code for one guest instruction is not contiguous, not in guest
-    /// order, and heavily interleaved by scheduling, so a bare disassembly is very
-    /// hard to relate back to the guest program. Host instructions with no guest
-    /// origin are grouped under a `[no source]` header.
-    ///
-    /// `bytes` must start at the beginning of the function the map came from.
+    /// Disassembles `bytes` (the start of the mapped function), with a header whenever the
+    /// responsible guest instruction changes; code with no origin goes under `[no source]`.
     #[cfg(feature = "disasm")]
     pub fn disassemble_annotated(
         bytes: &[u8],
@@ -747,8 +624,7 @@ impl ArtifactBackend {
             .map_err(|e: capstone::Error| crate::MicroliftError::CraneliftError(e.to_string()))?;
 
         let mut output = String::new();
-        // `None` is a real state here ("no guest origin"), so the "have we
-        // printed a header yet" flag cannot be folded into the value itself.
+        // `None` is a real state ("no guest origin"), so the "header printed" flag stays separate.
         let mut current: Option<u64> = None;
         let mut started = false;
         for i in insns.as_ref() {

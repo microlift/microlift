@@ -1,4 +1,3 @@
-//! Retracting a translation when the guest bytes under it change.
 
 use std::sync::{Arc, RwLock};
 
@@ -15,7 +14,6 @@ fn link_config() -> BlockLinkConfig {
     BlockLinkConfig::new(ROWS)
 }
 
-/// `mov rax, 1 ; ret` - the region that exits to [`CALLEE`].
 fn caller() -> Translation {
     LiftTest::new(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00, 0xC3])
         .with_config(|c| c.block_link = Some(link_config()))
@@ -23,8 +21,6 @@ fn caller() -> Translation {
         .expect("compiles")
 }
 
-/// `mov rbx, imm32 ; ret` at [`CALLEE`] - the region whose bytes a test
-/// changes, so that re-lifting the same address yields a different answer.
 fn callee_writing(value: u32) -> Translation {
     let mut bytes = vec![0x48, 0xC7, 0xC3];
     bytes.extend_from_slice(&value.to_le_bytes());
@@ -59,7 +55,6 @@ impl Guest {
         }
     }
 
-    /// Reset the stack and PC for another run from the top.
     fn rewind(&mut self) {
         let top = self._stack.as_ptr() as u64 + (self._stack.len() as u64) * 8;
         self.runtime.ctx.rsp = top - 16;
@@ -78,8 +73,7 @@ fn install(guest: &mut Guest, cache: &Arc<RwLock<CodeCache>>, translation: Trans
     guest.runtime.publish(&translation);
 }
 
-/// The guest rewrites the callee, and a host that does not retract keeps running the translation of the bytes that
-/// are gone.
+/// A host that does not retract keeps running translations of bytes that are gone.
 #[test]
 fn a_stale_translation_is_not_run_after_its_bytes_change() {
     let cache = Arc::new(RwLock::new(CodeCache::new()));
@@ -95,13 +89,11 @@ fn a_stale_translation_is_not_run_after_its_bytes_change() {
     );
     assert_eq!(guest.runtime.ctx.rbx, 7);
 
-    // The guest rewrites the eight bytes at CALLEE. The host is told.
     let retracted = guest.runtime.invalidate_range(CALLEE, 8);
     assert_eq!(retracted, 1, "the callee's row should have been retracted");
 
     guest.rewind();
-    // Nothing is published for CALLEE any more, so the caller's `RET` cannot
-    // link and the host is asked - which is the whole observable effect.
+    // Nothing is published for CALLEE, so the caller's RET cannot link and the host is asked.
     // SAFETY: as above.
     assert_eq!(
         unsafe { guest.runtime.step() },
@@ -116,7 +108,6 @@ fn a_stale_translation_is_not_run_after_its_bytes_change() {
         Step::NeedsTranslation(CALLEE)
     );
 
-    // And once the host lifts the new bytes, the *new* answer is what runs.
     install(&mut guest, &cache, callee_writing(9));
     guest.rewind();
     // SAFETY: as above.
@@ -130,8 +121,7 @@ fn a_stale_translation_is_not_run_after_its_bytes_change() {
     );
 }
 
-/// **The negative-negative.** Without this, "retract everything, always" passes
-/// the test above - and would turn every invalidation into a full cache flush.
+/// Negative control: retract-everything must not pass.
 #[test]
 fn a_write_that_misses_the_covered_range_retracts_nothing() {
     let cache = Arc::new(RwLock::new(CodeCache::new()));
@@ -139,7 +129,6 @@ fn a_write_that_misses_the_covered_range_retracts_nothing() {
     install(&mut guest, &cache, caller());
     install(&mut guest, &cache, callee_writing(7));
 
-    // A page nothing was lifted from.
     let retracted = guest.runtime.invalidate_range(0x9000, 0x1000);
     assert_eq!(retracted, 0);
     assert_eq!(cache.read().unwrap().stats().retractions, 0);
@@ -154,9 +143,7 @@ fn a_write_that_misses_the_covered_range_retracts_nothing() {
     assert_eq!(guest.runtime.stats().links_followed, 1);
 }
 
-/// A write inside the *same page* as a translation, but outside the bytes it
-/// was lifted from, must also spare it. The page index narrows the sweep;
-/// `covered` is what decides.
+/// A write in the same page but outside `covered` spares the translation; the page index only narrows the sweep.
 #[test]
 fn the_page_index_narrows_the_sweep_but_does_not_decide_it() {
     let cache = Arc::new(RwLock::new(CodeCache::new()));
@@ -164,7 +151,6 @@ fn the_page_index_narrows_the_sweep_but_does_not_decide_it() {
     install(&mut guest, &cache, caller());
     install(&mut guest, &cache, callee_writing(7));
 
-    // CALLEE is 0x2000 and the region is eight bytes; 0x2800 is the same page.
     assert_eq!(0x2800 >> 12, CALLEE >> 12);
     let retracted = guest.runtime.invalidate_range(0x2800, 8);
 
@@ -178,8 +164,7 @@ fn the_page_index_narrows_the_sweep_but_does_not_decide_it() {
     assert_eq!(guest.runtime.ctx.rbx, 7);
 }
 
-/// A one-byte write anywhere inside `covered` is enough - the translation
-/// depends on all of it, not just its first instruction.
+/// A one-byte write anywhere in `covered` retracts.
 #[test]
 fn a_single_byte_inside_the_region_is_enough() {
     for offset in [0u64, 3, 7] {
@@ -195,8 +180,7 @@ fn a_single_byte_inside_the_region_is_enough() {
     }
 }
 
-/// Retiring is not freeing. The translation stays alive until the host says
-/// every thread has passed a safepoint, because another one may be inside it.
+/// Retiring is not freeing: another thread may still be inside until a safepoint.
 #[test]
 fn an_invalidated_translation_is_retired_before_it_is_freed() {
     let cache = Arc::new(RwLock::new(CodeCache::new()));
@@ -219,9 +203,7 @@ fn an_invalidated_translation_is_retired_before_it_is_freed() {
     assert_eq!(cache.read().unwrap().retired_count(), 0);
 }
 
-/// A translation is published at every resume point it has and must be
-/// retracted from all of them - not just the one the page index happened to
-/// name first.
+/// A translation is published at every resume point and must be retracted from all of them.
 #[test]
 fn every_resume_point_is_retracted_not_just_the_first() {
     let cache = Arc::new(RwLock::new(CodeCache::new()));

@@ -1,15 +1,11 @@
 use microlift::testkit::prelude::*;
 
-/// Extract AL from the context (low byte of RAX).
+/// AL from the context (low byte of RAX).
 fn al(ctx: &RegisterContext) -> u8 {
     (ctx.rax & 0xFF) as u8
 }
 
-// NOTE: `MOV RAX, imm32s` (C7 /0) uses immediate64() which returns the
-// zero-extended u64, so 0xFFFFFFFF -> 0x00000000FFFFFFFF, not -1.
-// To load -1 into RAX, use: xor eax,eax (31 C0) then dec rax (48 FF C8).
-//   xor eax,eax: clears RAX, sets ZF=1 CF=0 OF=0 SF=0
-//   dec rax:     RAX=-1, sets ZF=0 SF=1 OF=0 (CF unchanged = 0)
+// `MOV RAX, imm32s` zero-extends 0xFFFFFFFF; load -1 via xor eax,eax ; dec rax (ZF=0 SF=1 OF=0, CF unchanged).
 
 #[test]
 fn test_sete_true() {
@@ -203,10 +199,7 @@ fn test_seta_false_below() {
 
 #[test]
 fn test_setl_true() {
-    // rax=-1 (via xor+dec); cmp rax,1 -> result=-2, SF=1, OF=0 -> SF!=OF -> setl=1
-    // xor eax,eax: 31 C0 (rax=0, CF=0 OF=0 SF=0 ZF=1)
-    // dec rax:     48 FF C8 (rax=-1, SF=1 OF=0 ZF=0, CF unchanged=0)
-    // cmp rax, 1:  48 83 F8 01 -> result=-2, SF=1, OF=0
+    // rax=-1 (31 C0 ; 48 FF C8); cmp rax,1 (48 83 F8 01) -> -2, SF=1, OF=0 -> setl=1
     #[rustfmt::skip]
     let bytes = [
         0x31, 0xC0,             // xor eax, eax  -> rax=0
@@ -408,9 +401,7 @@ fn test_setns_false() {
 
 #[test]
 fn test_seto_true() {
-    // Build 0x7FFFFFFFFFFFFFFF in rax, add 1 -> signed overflow -> OF=1.
-    // xor eax,eax -> rax=0; dec rax -> rax=-1=0xFFFF...;
-    // shr rax,1   -> rax=0x7FFF...; add rax,1 -> 0x8000..., OF=1
+    // rax = 0x7FFF... (xor ; dec ; shr 1); add 1 -> OF=1
     #[rustfmt::skip]
     let bytes = [
         0x31, 0xC0,             // xor eax, eax  -> rax=0
@@ -468,7 +459,7 @@ fn test_setno_false() {
     assert_eq!(al(&ctx), 0);
 }
 
-// PF is not computed by our flag-update routines, so we pre-seed it in the context.
+// PF is not computed by the flag routines, so pre-seed it in the context.
 
 #[test]
 fn test_setp_true() {
@@ -524,9 +515,7 @@ fn test_setnp_false() {
 
 #[test]
 fn test_setne_to_memory() {
-    // mov rax,10; cmp rax,5 (ZF=0); setne [rsp-8]; movzx rax,byte [rsp-8]; ret
-    //   setne [rsp-8]:           0F 95 44 24 F8
-    //   movzx rax, byte [rsp-8]: 48 0F B6 44 24 F8
+    // mov rax,10; cmp rax,5; setne [rsp-8] (0F 95 44 24 F8); movzx rax,byte [rsp-8] (48 0F B6 44 24 F8); ret
     #[rustfmt::skip]
     let bytes = [
         0x48, 0xC7, 0xC0, 0x0A, 0x00, 0x00, 0x00, // mov rax, 10

@@ -34,7 +34,7 @@ fn test_compile_host_object() {
         .expect("failed to compile to object");
     assert!(!obj_bytes.is_empty());
 
-    // Check for some common object magic (ELF \x7fELF, Mach-O \xce\xfa\xed\xfe or \xcf\xfa\xed\xfe, PE MZ)
+    // ELF, Mach-O or PE magic
     let magic = &obj_bytes[0..4];
     let is_elf = magic == b"\x7fELF";
     let is_macho = magic == b"\xce\xfa\xed\xfe" || magic == b"\xcf\xfa\xed\xfe";
@@ -125,8 +125,7 @@ fn test_compile_aarch64_object() {
 
     #[cfg(feature = "disasm")]
     {
-        // Raw .text disassembly starts at address 0, so local PC-relative branches
-        // print as section-relative targets like `je 0x114` rather than runtime VAs.
+        // Raw .text starts at 0, so local branches print section-relative.
         let disasm =
             ArtifactBackend::disassemble(&raw_bytes, Some(triple)).expect("disassembly failed");
         println!("Disassembly:\n{}", disasm);
@@ -137,8 +136,7 @@ fn test_compile_aarch64_object() {
 fn test_execute_emitted_host_function() {
     let mut flag_builder = settings::builder();
     flag_builder.set("use_colocated_libcalls", "false").unwrap();
-    // `cranelift-jit` requires non-PIC code, so this runnable example uses
-    // JIT-compatible flags while the object test above verifies PIC emission.
+    // `cranelift-jit` requires non-PIC; the object test above covers PIC.
     flag_builder.set("is_pic", "false").unwrap();
     let flags = settings::Flags::new(flag_builder);
 
@@ -150,8 +148,7 @@ fn test_execute_emitted_host_function() {
 
     let mut func_ctx = cranelift_frontend::FunctionBuilderContext::new();
     let builder = cranelift_frontend::FunctionBuilder::new(&mut func, &mut func_ctx);
-    // The sentinel declared here is what makes the `ret` below a clean `Return`
-    // exit; without one the lifter has no exit trampoline to recognise.
+    // The sentinel makes `ret` a clean `Return` exit.
     let mut lifter = Lifter::with_config(
         builder,
         LifterConfig {
@@ -217,10 +214,7 @@ fn test_compile_runtime_assisted_syscall_object() {
     assert!(!raw_bytes.is_empty());
 }
 
-/// A `RuntimeAssisted`-mode function with one fast import compiles to an object
-/// that exports `lifted_func` and lists the import symbol as undefined, meaning
-/// the object module emitted a named relocation rather than an embedded
-/// absolute address.
+/// A `RuntimeAssisted` fast import is an undefined symbol with a relocation, not an absolute address.
 #[test]
 fn test_compile_runtime_assisted_fast_import_has_relocation() {
     unsafe extern "C" fn host_strlen(s: *const u8) -> u64 {
@@ -276,17 +270,16 @@ fn test_compile_runtime_assisted_fast_import_has_relocation() {
 
     let obj = object::File::parse(&*obj_bytes).expect("failed to parse object");
 
-    // Mach-O prepends an underscore to C symbol names; strip it for portability.
+    // Mach-O prepends an underscore.
     let bare: fn(&str) -> &str = |name| name.strip_prefix('_').unwrap_or(name);
 
-    // `lifted_func` must be a defined export.
+    // Defined export.
     let has_lifted_func = obj
         .symbols()
         .any(|s| !s.is_undefined() && s.name().map(|n| bare(n) == "lifted_func").unwrap_or(false));
     assert!(has_lifted_func, "object must export 'lifted_func'");
 
-    // `host_strlen` must appear as an undefined symbol so the linker can
-    // emit a relocation for it - not an embedded absolute address.
+    // Must be undefined so the linker emits a relocation.
     let has_undefined_strlen = obj
         .symbols()
         .any(|s| s.is_undefined() && s.name().map(|n| bare(n) == "host_strlen").unwrap_or(false));
@@ -299,9 +292,7 @@ fn test_compile_runtime_assisted_fast_import_has_relocation() {
     );
 }
 
-/// Two fast imports both appear as undefined symbols in the compiled object,
-/// verifying that the `ExternalName::user(0, i)` index ordering correctly maps
-/// each symbol to its own relocation entry regardless of `HashMap` iteration order.
+/// Two fast imports map to their own symbols via `ExternalName::user(0, i)`, independent of HashMap order.
 #[test]
 fn test_compile_runtime_assisted_two_fast_imports_have_relocations() {
     unsafe extern "C" fn host_strlen(s: *const u8) -> u64 {
@@ -392,7 +383,7 @@ fn test_compile_runtime_assisted_two_fast_imports_have_relocations() {
 
     let obj = object::File::parse(&*obj_bytes).expect("failed to parse object");
 
-    // Mach-O prepends an underscore to C symbol names; strip it for portability.
+    // Mach-O prepends an underscore.
     let bare: fn(&str) -> &str = |name| name.strip_prefix('_').unwrap_or(name);
 
     let undefined_bare_names: Vec<&str> = obj
@@ -411,7 +402,7 @@ fn test_compile_runtime_assisted_two_fast_imports_have_relocations() {
     );
 }
 
-/// `lock cmpxchg16b [rdi]` - the region used by the `Atomic128Mode` AOT tests.
+/// `lock cmpxchg16b [rdi]`, used by the `Atomic128Mode` AOT tests.
 const CMPXCHG16B_SNIPPET: [u8; 6] = [0xF0, 0x48, 0x0F, 0xC7, 0x0F, 0xC3];
 
 fn lift_cmpxchg16b(mode: Atomic128Mode) -> Function {
@@ -421,15 +412,12 @@ fn lift_cmpxchg16b(mode: Atomic128Mode) -> Function {
     };
     let mut func =
         lift_to_function::<X86_64>(&CMPXCHG16B_SNIPPET, 0x1000, config).expect("lift failed");
-    // The lifter bakes in the *host* calling convention; override it so these
-    // tests exercise instruction lowering rather than the target's ABI code.
+    // Override the host calling convention to test lowering, not ABI code.
     func.signature.call_conv = CallConv::SystemV;
     func
 }
 
-/// The default `Atomic128Mode::Emulated` lowering must reach every backend -
-/// that is the whole reason it is the default. Cranelift has no `atomic_cas` on
-/// `I128` outside x64, so a 128-bit CAS is only portable when it is emulated.
+/// Default `Emulated` must lower on every backend; Cranelift has no `atomic_cas.i128` outside x64.
 #[test]
 fn test_cmpxchg16b_emulated_lowers_everywhere() {
     for triple in [
@@ -446,9 +434,7 @@ fn test_cmpxchg16b_emulated_lowers_everywhere() {
     }
 }
 
-/// `Atomic128Mode::Native` must lower to an actual `lock cmpxchg16b` on x86-64.
-/// The ISA setting is required: `has_cmpxchg16b` is off in the baseline
-/// `x86-64` feature set, so AOT callers have to opt in explicitly.
+/// `Native` lowers to `lock cmpxchg16b` on x86-64; needs `has_cmpxchg16b` (off in baseline).
 #[test]
 fn test_cmpxchg16b_native_emits_the_instruction() {
     let obj = ArtifactBackend::compile_lifted_to_object(
@@ -474,10 +460,7 @@ fn test_cmpxchg16b_native_emits_the_instruction() {
     );
 }
 
-/// `Atomic128Mode::Native` is opt-in precisely because it does not lower
-/// everywhere: no non-x64 backend has a rule for `atomic_cas.i128`, and even x64
-/// needs `has_cmpxchg16b`. Both must fail as errors rather than succeed
-/// silently or panic.
+/// `Native` is opt-in: non-x64 backends lack `atomic_cas.i128` and x64 needs `has_cmpxchg16b`. Both must error.
 #[test]
 fn test_cmpxchg16b_native_requires_backend_support() {
     let err = ArtifactBackend::compile_to_raw(

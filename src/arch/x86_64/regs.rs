@@ -1,5 +1,4 @@
-//! x86-64 register file: SSA-variable mapping, flag set, dirty tracking, and
-//! `RegisterContext` field offsets.
+//! x86-64 register file: SSA-variable mapping, flags, dirty tracking, `RegisterContext` offsets.
 
 use crate::MicroliftError;
 use crate::arch::x86_64::context::RegisterContext;
@@ -17,16 +16,11 @@ pub enum X86Flag {
     Zero,
     Sign,
     Overflow,
-    /// Direction flag - controls string-operation pointer direction.
+    /// Controls string-operation pointer direction.
     Direction,
 }
 
-/// The seven modelled condition flags, in a fixed order.
-///
-/// Iterating this rather than `RegisterState::flags` is what makes the context
-/// sync deterministic: a `HashMap` walk emits the same stores in a different
-/// order under every process, which changes x86 displacement encodings and so
-/// changes `.text` between two lifts of identical bytes.
+/// The seven modelled flags in fixed order; iterate this, not a `HashMap`, which would change `.text` between lifts.
 pub const FLAG_ORDER: [X86Flag; 7] = [
     X86Flag::Carry,
     X86Flag::Parity,
@@ -37,10 +31,7 @@ pub const FLAG_ORDER: [X86Flag; 7] = [
     X86Flag::Direction,
 ];
 
-/// The 16 general-purpose registers in architectural encoding order.
-///
-/// This is also the bit order of [`RegMask::gprs`](crate::core::bridge::RegMask)
-/// for this guest: bit `i` selects `GPR_ORDER[i]`.
+/// The 16 GPRs in encoding order; also the bit order of [`RegMask::gprs`](crate::core::bridge::RegMask).
 pub const GPR_ORDER: [Register; 16] = [
     Register::RAX,
     Register::RCX,
@@ -60,30 +51,27 @@ pub const GPR_ORDER: [Register; 16] = [
     Register::R15,
 ];
 
-/// [`GPR_ORDER`]'s names, for the alias-region descriptions that appear in a
-/// `.clif` dump.
+/// Names of [`GPR_ORDER`], for alias-region descriptions.
 pub const GPR_NAMES: [&str; 16] = [
     "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13",
     "r14", "r15",
 ];
 
-/// [`FLAG_ORDER`]'s names, for the same reason.
+/// Names of [`FLAG_ORDER`].
 pub const FLAG_NAMES: [&str; 7] = ["cf", "pf", "af", "zf", "sf", "of", "df"];
 
-/// XMM register names, and the names of their high halves in scalar mode.
 pub const XMM_NAMES: [&str; 16] = [
     "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10",
     "xmm11", "xmm12", "xmm13", "xmm14", "xmm15",
 ];
 
-/// High halves of [`XMM_NAMES`], used only when `use_vector_xmm` is off.
+/// High halves of [`XMM_NAMES`]; scalar mode only.
 pub const XMM_HI_NAMES: [&str; 16] = [
     "xmm0.hi", "xmm1.hi", "xmm2.hi", "xmm3.hi", "xmm4.hi", "xmm5.hi", "xmm6.hi", "xmm7.hi",
     "xmm8.hi", "xmm9.hi", "xmm10.hi", "xmm11.hi", "xmm12.hi", "xmm13.hi", "xmm14.hi", "xmm15.hi",
 ];
 
-/// The six segment-selector registers, in architectural encoding order
-/// (`ES`=0, `CS`=1, `SS`=2, `DS`=3, `FS`=4, `GS`=5).
+/// Segment selectors in encoding order (`ES`=0 ... `GS`=5).
 pub const SEGMENT_ORDER: [Register; 6] = [
     Register::ES,
     Register::CS,
@@ -93,46 +81,34 @@ pub const SEGMENT_ORDER: [Register; 6] = [
     Register::GS,
 ];
 
-/// [`SEGMENT_ORDER`]'s names, for the alias-region descriptions in a `.clif`
-/// dump.
+/// Names of [`SEGMENT_ORDER`].
 pub const SEGMENT_NAMES: [&str; 6] = ["es", "cs", "ss", "ds", "fs", "gs"];
 
-/// Whether `reg` is one of the six segment-selector registers.
 pub fn is_segment_register(reg: Register) -> bool {
     SEGMENT_ORDER.contains(&reg)
 }
 
-/// The [`GPR_ORDER`] index of `reg`'s full 64-bit form, or `None` if `reg` is
-/// not a general-purpose register. Sub-registers map to their containing GPR
-/// (`EAX`, `AX`, `AL` and `AH` all give `RAX`'s index).
+/// [`GPR_ORDER`] index of `reg`'s 64-bit form; sub-registers map to their containing GPR.
 pub fn gpr_index(reg: Register) -> Option<u8> {
     let full = reg.full_register();
     GPR_ORDER.iter().position(|&r| r == full).map(|i| i as u8)
 }
 
-/// Mapping of x86 registers to Cranelift variables.
-///
-/// Which of them a region actually *wrote* is not tracked here: it is a
-/// property of the lift rather than of the register file, and it lives on the
-/// engine as [`LiftEngine::mark_written`](crate::core::LiftEngine::mark_written)
-/// - see [`crate::core::regsync`].
+/// Mapping of x86 registers to Cranelift variables. Written-register tracking lives on the engine
+/// ([`LiftEngine::mark_written`](crate::core::LiftEngine::mark_written)).
 pub struct RegisterState {
     pub gprs: HashMap<Register, Variable>,
     pub flags: HashMap<X86Flag, Variable>,
     pub context_ptr: Variable,
     pub image_base: Variable,
-    /// XMM0–XMM15 low 64 bits. Populated when `use_vector_xmm` is `false`.
+    /// XMM low halves; scalar mode only.
     pub xmms_lo: HashMap<u8, Variable>,
-    /// XMM0–XMM15 high 64 bits. Populated when `use_vector_xmm` is `false`.
+    /// XMM high halves; scalar mode only.
     pub xmms_hi: HashMap<u8, Variable>,
-    /// XMM0–XMM15 as a single `I64X2` variable. Populated when `use_vector_xmm`
-    /// is `true`.
+    /// XMMs as `I64X2`; vector mode only.
     pub xmms_vec: HashMap<u8, Variable>,
-    /// Selects between the scalar-pair and native vector representations.
     pub use_vector_xmm: bool,
-    /// FS segment base address SSA variable.
     pub fs_base: Variable,
-    /// GS segment base address SSA variable.
     pub gs_base: Variable,
 }
 
@@ -185,7 +161,6 @@ impl RegisterState {
         }
     }
 
-    /// Build the register state from a [`LifterConfig`].
     pub fn from_config(builder: &mut FunctionBuilder, config: &LifterConfig) -> Self {
         Self::new(builder, config.use_vector_xmm)
     }
@@ -224,27 +199,18 @@ impl RegisterState {
         }
     }
 
-    /// Byte offset of the low (`hi=false`) or high (`hi=true`) 64-bit half of
-    /// XMM register `idx` (0–15) within `RegisterContext`.
+    /// Offset of the low/high 64-bit half of XMM `idx`.
     pub fn get_xmm_offset(idx: u8, hi: bool) -> i32 {
         let base = std::mem::offset_of!(RegisterContext, xmm) as i32;
         base + (idx as i32) * 16 + if hi { 8 } else { 0 }
     }
 
-    /// Byte offset of the whole 128-bit XMM register `idx` (0–15).
     pub fn get_xmm_vec_offset(idx: u8) -> i32 {
         let base = std::mem::offset_of!(RegisterContext, xmm) as i32;
         base + (idx as i32) * 16
     }
 
-    /// Byte offset of a segment *selector* within `RegisterContext`.
-    ///
-    /// Unlike every other register accessor here this has no matching `Variable`:
-    /// the selectors are deliberately not part of the SSA register file and are
-    /// loaded/stored in place at each use. A guest reads them roughly once, into a
-    /// diagnostic struct and never into control flow, so an SSA variable would buy
-    /// nothing and cost six more values live across every block reachable from the
-    /// entry dispatch.
+    /// Offset of a segment selector. It has no `Variable`: selectors are read and written in place.
     pub fn get_segment_offset(reg: Register) -> crate::Result<i32> {
         match reg {
             Register::CS => Ok(std::mem::offset_of!(RegisterContext, cs) as i32),

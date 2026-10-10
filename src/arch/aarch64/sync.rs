@@ -1,8 +1,6 @@
-//! aarch64 context state synchronisation.
+//! aarch64 context sync: inherent methods on `Lifter64` that the `GuestArch` impl delegates to.
 //!
-//! Inherent methods on the concrete `Lifter64` (= `LiftEngine<'a, Aarch64>`);
-//! the `GuestArch` trait impl delegates to them. Integer state only for now
-//! (V registers are synced once FP/SIMD semantics land).
+//! Integer state only; V registers are not synced yet.
 
 use crate::arch::aarch64::Lifter64;
 use crate::arch::aarch64::regs::{Aarch64RegState, FLAG_ORDER, GPR_ORDER};
@@ -10,15 +8,12 @@ use crate::core::exit::ExitReason;
 use crate::core::regsync::RegSlot;
 use cranelift::prelude::*;
 
-/// `SP`'s [`RegSlot`], in this frontend's `Extra` numbering.
 pub const SP_SLOT: RegSlot = RegSlot::Extra(0);
-/// `TPIDR_EL0`'s [`RegSlot`].
 pub const TPIDR_SLOT: RegSlot = RegSlot::Extra(1);
 
 impl<'a> Lifter64<'a> {
-    /// Full sync - writes all GPRs, SP, flags and TPIDR back to the context.
     pub fn sync_to_context(&mut self, pc: Option<Value>, reason: ExitReason) -> crate::Result<()> {
-        // Analysis mode produces inspection IR with no context write-back.
+        // Analysis IR never writes back.
         if self.config.analysis_mode {
             return Ok(());
         }

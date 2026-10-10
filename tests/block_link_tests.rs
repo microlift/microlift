@@ -1,9 +1,5 @@
-//! Block linking: a region resolving its own successor out of the host's table.
-//!
-//! Every test here drives the same two-region program - one that `ret`s into
-//! another - and differs only in what the host put in the table. That is the
-//! whole mechanism: the *only* thing lifted code decides is whether a row
-//! matches, and these are the cases it has to get right.
+//! Block linking: the only thing lifted code decides is whether a table row matches.
+//! Each test drives the same two-region program and varies what the host published.
 
 use microlift::arch::x86_64::context::RegisterContext;
 use microlift::core::exit::{ExitReason, TransferKind};
@@ -11,24 +7,18 @@ use microlift::core::link::{BlockLinkConfig, BlockLinkEntry};
 use microlift::testkit::prelude::*;
 use microlift::testkit::{DEFAULT_LIFT_BASE, EXIT_TRAMPOLINE, Harness};
 
-/// Where the second region is lifted. Far enough from the first that no test
-/// can confuse one for the other.
 const CALLEE: u64 = 0x2000;
 
-/// A table big enough to make a collision between two addresses impossible to
-/// arrange by accident, and small enough to build in a test.
 const ROWS: u32 = 256;
 
 fn link_config() -> BlockLinkConfig {
     BlockLinkConfig::new(ROWS)
 }
 
-/// An empty table, and the geometry lifted code was compiled against.
 fn table() -> Vec<BlockLinkEntry> {
     vec![BlockLinkEntry::default(); ROWS as usize]
 }
 
-/// Publish `code`/`base` for `pc`, exactly as a host's own installer would.
 fn publish(table: &mut [BlockLinkEntry], pc: u64, code: *const u8, base: u64) {
     let slot = link_config().slot(pc);
     table[slot] = BlockLinkEntry {
@@ -39,7 +29,6 @@ fn publish(table: &mut [BlockLinkEntry], pc: u64, code: *const u8, base: u64) {
     };
 }
 
-/// `mov rax, 1 ; ret` - the region that exits, at [`DEFAULT_LIFT_BASE`].
 fn caller() -> Harness {
     LiftTest::new(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00, 0xC3])
         .with_config(|c| {
@@ -49,10 +38,6 @@ fn caller() -> Harness {
         .expect("the caller region compiles")
 }
 
-/// `mov rbx, 7 ; ret` at [`CALLEE`] - the region a link lands in.
-///
-/// Compiled with a stack of its own that nothing uses: this harness exists to
-/// own compiled code, and every entry into it goes through the caller's context.
 fn callee() -> Harness {
     LiftTest::new(&[0x48, 0xC7, 0xC3, 0x07, 0x00, 0x00, 0x00, 0xC3])
         .at(CALLEE)
@@ -64,38 +49,25 @@ fn callee() -> Harness {
         .expect("the callee region compiles")
 }
 
-/// One turn of the host dispatch loop: take the link the last exit resolved and
-/// enter it. Returns the exit reason of the region it entered.
-///
-/// This is deliberately the whole of what a host has to do on a hit - set
-/// `image_base`, clear `link_hit`, call - because that is the claim block
-/// linking makes.
+/// One host dispatch turn: set `image_base`, clear `link_hit`, enter the linked row.
 fn follow(ctx: &mut RegisterContext) -> ExitReason {
     assert_ne!(ctx.link_hit, 0, "expected a link to follow");
-    // SAFETY: `link_hit` is an address lifted code took out of the table this
-    // test built and still owns.
+    // SAFETY: `link_hit` points into the table this test owns.
     let entry = unsafe { *(ctx.link_hit as *const BlockLinkEntry) };
     ctx.image_base = entry.image_base;
     ctx.link_hit = 0;
     ctx.exit_reason = ExitReason::None as u32;
-    // SAFETY: `code` is the entry point of a region this test compiled, whose
-    // signature is `extern "C" fn(*mut RegisterContext)`.
+    // SAFETY: `code` is a compiled region entry with the context-only signature.
     let code: unsafe extern "C" fn(*mut RegisterContext) =
         unsafe { std::mem::transmute(entry.code as *const u8) };
     unsafe { code(ctx as *mut RegisterContext) };
     ExitReason::try_from(ctx.exit_reason).unwrap_or(ExitReason::None)
 }
 
-/// Arrange the caller's stack so its `RET` goes to `ret_to`, and enter.
 fn run_caller(harness: &mut Harness, ret_to: u64, table: &mut [BlockLinkEntry]) -> ExitReason {
-    // Two words, not one: the caller's `RET` pops `ret_to`, and whatever the
-    // link lands in then finds the trampoline under it and can `ret` out to the
-    // host. The harness seeds `rsp` at the *top* word of its stack, so the
-    // second word has to be made by moving `rsp` down rather than by writing
-    // above it - which is off the end of the allocation.
+    // Two stack words: the caller's RET pops `ret_to`, then the callee's RET pops the trampoline.
     harness.ctx.rsp -= 8;
-    // SAFETY: both words are inside the harness's own stack allocation, which
-    // it owns for as long as it is alive.
+    // SAFETY: both words are inside the harness stack.
     unsafe {
         *(harness.ctx.rsp as *mut u64) = ret_to;
         *((harness.ctx.rsp + 8) as *mut u64) = EXIT_TRAMPOLINE;
@@ -105,8 +77,6 @@ fn run_caller(harness: &mut Harness, ret_to: u64, table: &mut [BlockLinkEntry]) 
     harness.enter()
 }
 
-/// The base case: a `RET` out of the region finds its successor and the host
-/// does no lookup at all.
 #[test]
 fn a_ret_out_of_the_region_links_to_the_region_that_covers_it() {
     let mut caller = caller();
@@ -116,8 +86,6 @@ fn a_ret_out_of_the_region_links_to_the_region_that_covers_it() {
 
     let exit = run_caller(&mut caller, CALLEE, &mut table);
 
-    // The exit is the same one the host has always seen - linking adds an
-    // answer, it does not change the question.
     assert_eq!(exit, ExitReason::UnknownJump);
     assert_eq!(
         TransferKind::try_from(caller.ctx.exit_code),
@@ -131,23 +99,17 @@ fn a_ret_out_of_the_region_links_to_the_region_that_covers_it() {
         "the probe should name the row it matched"
     );
 
-    // And the row is enterable: following it runs the callee against the same
-    // context, which is the entire point.
     let exit = follow(&mut caller.ctx);
     assert_eq!(caller.ctx.rbx, 7);
     assert_eq!(caller.ctx.rax, 1, "the callee inherits the caller's state");
     assert_eq!(exit, ExitReason::Return, "the callee ret'd to the sentinel");
 }
 
-/// A host that has published nothing for the address gets the behaviour it had
-/// before linking existed.
 #[test]
 fn an_address_with_no_row_does_not_link() {
     let mut caller = caller();
     let callee = callee();
     let mut table = table();
-    // A row for a *different* address, in a different slot: a populated table
-    // is not the same as a matching one.
     publish(&mut table, CALLEE + 0x1000, callee.code_ptr, CALLEE);
 
     let exit = run_caller(&mut caller, CALLEE, &mut table);
@@ -157,16 +119,13 @@ fn an_address_with_no_row_does_not_link() {
     assert_eq!(caller.ctx.link_hit, 0);
 }
 
-/// A collision - the right slot holding the wrong address - is a miss and not a
-/// wrong answer. This is what makes a direct-mapped table with no eviction
-/// policy sound.
+/// A collision is a miss, never a wrong answer (what makes the direct-mapped table sound).
 #[test]
 fn a_colliding_row_is_a_miss_rather_than_a_wrong_jump() {
     let mut caller = caller();
     let callee = callee();
     let mut table = table();
-    // Same slot (the table is indexed on `pc >> 4`, masked to 256 rows), a
-    // different address.
+    // Table is indexed on `pc >> 4`; this shares the slot.
     let colliding = CALLEE + (ROWS as u64) * 16;
     assert_eq!(link_config().slot(colliding), link_config().slot(CALLEE));
     publish(&mut table, colliding, callee.code_ptr, CALLEE);
@@ -178,13 +137,11 @@ fn a_colliding_row_is_a_miss_rather_than_a_wrong_jump() {
     assert_eq!(caller.ctx.rbx, 0, "and the callee must not have run");
 }
 
-/// A thread with no table published runs exactly as it did before.
 #[test]
 fn a_null_table_is_not_a_special_case() {
     let mut untabled = caller();
     // SAFETY: as in `run_caller`.
     unsafe { *(untabled.ctx.rsp as *mut u64) = CALLEE };
-    // No table: the field is what a `RegisterContext::new` leaves it as.
     untabled.ctx.link_table = std::ptr::null_mut();
     untabled.ctx.link_hit = 0;
     assert_eq!(untabled.enter(), ExitReason::UnknownJump);
@@ -192,11 +149,7 @@ fn a_null_table_is_not_a_special_case() {
     assert_eq!(untabled.ctx.link_hit, 0);
 }
 
-/// **The exclusion that matters.** A `RET` to the host's exit trampoline means
-/// "the call you made is finished", and the trampoline address is not a guest
-/// address at all. Even with a row published for it - which a host would never
-/// do, but which is exactly the mistake that would be silent - the region must
-/// return to the host.
+/// A RET to the exit trampoline must return to the host even if a row is published for it.
 #[test]
 fn a_return_to_the_exit_trampoline_never_links() {
     let mut caller = caller();
@@ -211,14 +164,9 @@ fn a_return_to_the_exit_trampoline_never_links() {
     assert_eq!(caller.ctx.rbx, 0, "the callee must not have run");
 }
 
-/// A direct `CALL` to an address outside the region leaves `rip` at the *return*
-/// address and the callee in `imported_function_va` - so a link there has to
-/// commit the callee as the PC, or the host would resume past the call it never
-/// made.
+/// A direct out-of-region CALL leaves `rip` at the return address; a link must commit the callee as PC.
 #[test]
 fn a_direct_call_out_of_region_links_on_the_callee_and_commits_it() {
-    // 0x1000: e8 fb 0f 00 00   call 0x2000
-    // 0x1005: 90               nop - the return address, never reached here
     let mut caller = LiftTest::new(&[0xE8, 0xFB, 0x0F, 0x00, 0x00, 0x90])
         .with_config(|c| {
             c.block_link = Some(link_config());
@@ -245,18 +193,15 @@ fn a_direct_call_out_of_region_links_on_the_callee_and_commits_it() {
         "the link must commit the callee as the PC, not the return address"
     );
 
-    // The return address the `CALL` pushed is still on the stack, so the
-    // callee's own `ret` goes back to the instruction after it.
     let return_address = DEFAULT_LIFT_BASE + 5;
-    // SAFETY: `rsp` points into the caller harness's own stack.
+    // SAFETY: `rsp` is inside the caller harness stack.
     assert_eq!(unsafe { *(caller.ctx.rsp as *const u64) }, return_address);
     follow(&mut caller.ctx);
     assert_eq!(caller.ctx.rbx, 7);
     assert_eq!(caller.ctx.rip, return_address);
 }
 
-/// Linking is off by default, and a lift that did not ask for it emits nothing:
-/// the same program leaves `link_hit` alone even with a matching table.
+/// Linking off by default: no probe is emitted.
 #[test]
 fn without_the_config_nothing_probes() {
     let mut caller = LiftTest::new(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00, 0xC3])
@@ -266,23 +211,19 @@ fn without_the_config_nothing_probes() {
     let mut table = table();
     publish(&mut table, CALLEE, callee.code_ptr, CALLEE);
 
-    // SAFETY: `rsp` is inside the harness's own stack allocation.
+    // SAFETY: `rsp` is inside the harness stack.
     unsafe { *(caller.ctx.rsp as *mut u64) = CALLEE };
     caller.ctx.link_table = table.as_mut_ptr();
-    // A sentinel a host would never write, to prove nothing wrote over it.
     caller.ctx.link_hit = 0xDEAD;
 
     assert_eq!(caller.enter(), ExitReason::UnknownJump);
     assert_eq!(caller.ctx.link_hit, 0xDEAD);
 }
 
-/// `mov rax, CALLEE` followed by `insn` - a transfer through a register whose
-/// target is a run-time value the lifter never sees.
 fn through_rax(insn: &[u8]) -> Harness {
     let mut bytes = vec![0x48, 0xB8];
     bytes.extend_from_slice(&CALLEE.to_le_bytes());
     bytes.extend_from_slice(insn);
-    // A `nop`, so the return address of a `call` is an address in the region.
     bytes.push(0x90);
     LiftTest::new(&bytes)
         .with_config(|c| {
@@ -292,17 +233,12 @@ fn through_rax(insn: &[u8]) -> Harness {
         .expect("the region compiles")
 }
 
-/// `call rax` - the instruction after `mov rax, imm64`.
 const CALL_RAX: &[u8] = &[0xFF, 0xD0];
-/// `jmp rax`, same place.
 const JMP_RAX: &[u8] = &[0xFF, 0xE0];
 
-/// The address after the `call`: ten bytes of `mov` and two of `call`.
 const AFTER_CALL: u64 = DEFAULT_LIFT_BASE + 12;
 
-/// An indirect call is the one exit whose servicing is a *decision* - native
-/// function or guest code - so it cannot push the return address before it knows
-/// the answer. A matching row is the answer, and the push belongs there.
+/// An indirect CALL is a host decision, so the return-address push belongs only in the hit arm.
 #[test]
 fn an_indirect_call_links_on_the_resolved_callee_and_pushes_the_return_address() {
     let mut caller = through_rax(CALL_RAX);
@@ -327,7 +263,7 @@ fn an_indirect_call_links_on_the_resolved_callee_and_pushes_the_return_address()
     );
     assert_eq!(caller.ctx.imported_function_va, CALLEE);
     assert_eq!(caller.ctx.rsp, entry_rsp - 8, "the link performed the push");
-    // SAFETY: `rsp` points into the caller harness's own stack.
+    // SAFETY: `rsp` is inside the caller harness stack.
     assert_eq!(unsafe { *(caller.ctx.rsp as *const u64) }, AFTER_CALL);
 
     follow(&mut caller.ctx);
@@ -339,9 +275,7 @@ fn an_indirect_call_links_on_the_resolved_callee_and_pushes_the_return_address()
     assert_eq!(caller.ctx.rsp, entry_rsp, "and pops it");
 }
 
-/// The miss keeps the contract the host has always been given: nothing is
-/// pushed, the PC is the resume point, and the reason is the one that asks the
-/// host to dispatch. A row that is not there cannot change what an exit means.
+/// On a miss nothing is pushed and the exit means what it always did.
 #[test]
 fn an_indirect_call_that_does_not_link_leaves_the_stack_alone() {
     let mut caller = through_rax(CALL_RAX);
@@ -359,8 +293,6 @@ fn an_indirect_call_that_does_not_link_leaves_the_stack_alone() {
     assert_eq!(caller.ctx.link_hit, 0);
 }
 
-/// A lift that never asked to link emits none of this: the same program is the
-/// exit it has always been, with a matching table in place.
 #[test]
 fn an_indirect_call_without_linking_is_unchanged() {
     let mut bytes = vec![0x48, 0xB8];
@@ -373,7 +305,6 @@ fn an_indirect_call_without_linking_is_unchanged() {
     publish(&mut table, CALLEE, callee.code_ptr, CALLEE);
 
     caller.ctx.link_table = table.as_mut_ptr();
-    // A sentinel a host would never write, to prove nothing wrote over it.
     caller.ctx.link_hit = 0xDEAD;
     let entry_rsp = caller.ctx.rsp;
 
@@ -382,8 +313,6 @@ fn an_indirect_call_without_linking_is_unchanged() {
     assert_eq!(caller.ctx.rsp, entry_rsp);
 }
 
-/// An indirect `JMP` has nothing to decide: the exit already means "continue at
-/// this address", so it links through the ordinary probe like any other.
 #[test]
 fn an_indirect_jump_links_to_the_region_that_covers_it() {
     let mut caller = through_rax(JMP_RAX);
@@ -403,21 +332,15 @@ fn an_indirect_jump_links_to_the_region_that_covers_it() {
     assert_ne!(caller.ctx.link_hit, 0, "an indirect jump links");
     assert_eq!(caller.ctx.rip, CALLEE);
 
-    // The jump is a tail transfer: the callee's `ret` pops what the harness
-    // seeded, which is the trampoline, and the program is done.
     assert_eq!(follow(&mut caller.ctx), ExitReason::Return);
     assert_eq!(caller.ctx.rbx, 7);
 }
 
-/// A row for an address the guest never jumps to is not a row for this one: the
-/// indirect call falls back rather than entering the wrong translation.
 #[test]
 fn an_indirect_call_does_not_take_a_row_about_another_address() {
     let mut caller = through_rax(CALL_RAX);
     let callee = callee();
     let mut table = table();
-    // The same slot the callee would occupy, but about an address sixteen bytes
-    // away - the collision case, which must be a miss.
     publish(&mut table, CALLEE + 1, callee.code_ptr, CALLEE);
 
     caller.ctx.link_table = table.as_mut_ptr();

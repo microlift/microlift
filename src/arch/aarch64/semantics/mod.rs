@@ -1,16 +1,7 @@
-//! aarch64 instruction semantics (vertical slice).
+//! aarch64 instruction semantics, as inherent methods on `Lifter64` reached via `GuestArch::lift_instruction`.
 //!
-//! Covers a representative subset proving the `GuestArch` abstraction
-//! end-to-end: moves (MOVZ/MOVK/MOVN, MOV-via-ORR), integer data-processing
-//! (ADD/SUB/ADDS/SUBS incl. CMP, AND/ORR/EOR/ANDS, ORN/EON/BIC incl. MVN),
-//! multiply (MUL/MADD/MSUB), division (UDIV/SDIV with A64's non-trapping
-//! semantics), variable shifts (LSLV/LSRV/ASRV/RORV), bit ops (CLZ/RBIT/REV),
-//! conditional select family (CSEL/CSINC/CSINV/CSNEG), PC-relative addressing
-//! (ADR/ADRP), base+offset and pair loads/stores (LDR/STR/LDP/STP), branches
-//! (B/B.cond/CBZ/CBNZ/TBZ/TBNZ), RET, NOP, and SVC.
-//!
-//! Implemented as inherent methods on the concrete `Lifter64`; the dispatch
-//! entry point is reached from `GuestArch::lift_instruction`.
+//! Subset: moves, integer ALU/logic, multiply/divide, shifts, CLZ/RBIT/REV, CSEL family,
+//! ADR/ADRP, LDR/STR/LDP/STP, branches, RET, NOP, SVC.
 
 use crate::MicroliftError;
 use crate::arch::aarch64::Aarch64;
@@ -24,8 +15,7 @@ use crate::core::regsync::RegSlot;
 use cranelift::prelude::*;
 use yaxpeax_arm::armv8::a64::{Opcode, Operand, ShiftStyle, SizeCode};
 
-/// Decode a register operand into `(reg_number, size, sp_form)`.
-/// `sp_form` is `true` when register 31 denotes SP rather than the zero register.
+/// Decodes a register operand to `(reg_number, size, sp_form)`; `sp_form` means register 31 is SP, not XZR.
 fn decode_reg(op: Operand) -> Option<(u16, SizeCode, bool)> {
     match op {
         Operand::Register(sz, n) => Some((n, sz, false)),
@@ -59,11 +49,11 @@ impl<'a> Lifter64<'a> {
             Opcode::AND => self.handle_logical(op0, op1, op2, LogicOp::And),
             Opcode::ORR => self.handle_logical(op0, op1, op2, LogicOp::Or),
             Opcode::EOR => self.handle_logical(op0, op1, op2, LogicOp::Xor),
-            // ANDS also covers the TST alias (ANDS to the zero register).
+            // TST is ANDS to the zero register.
             Opcode::ANDS => self.handle_ands(op0, op1, op2),
             Opcode::ORN => self.handle_logical_neg(op0, op1, op2, LogicOp::Or),
             Opcode::EON => self.handle_logical_neg(op0, op1, op2, LogicOp::Xor),
-            // BIC/BICS: AND with the inverted second operand; BICS also sets NZ.
+            // BICS also sets NZ.
             Opcode::BIC => self.handle_logical_neg(op0, op1, op2, LogicOp::And),
             Opcode::CSEL => self.handle_csel(op0, op1, op2, op3),
             Opcode::CSINC => self.handle_cs_variant(op0, op1, op2, op3, CsVariant::Inc),
@@ -97,9 +87,7 @@ impl<'a> Lifter64<'a> {
             Opcode::RET => self.handle_ret(op0),
             Opcode::SVC => self.handle_svc(),
             Opcode::HINT => Ok(()),
-            // Pointer authentication: without a PAC-enforcing environment the
-            // sign/authenticate pair round-trips to identity, so we model both
-            // as no-ops (the link register is left unchanged).
+            // Without PAC enforcement sign/authenticate round-trips; modelled as no-ops.
             Opcode::PACIASP | Opcode::AUTIASP => Ok(()),
             other => {
                 if self.config.interpreter_fallback {
@@ -113,8 +101,7 @@ impl<'a> Lifter64<'a> {
         }
     }
 
-    /// Read register `num` at width `ty`. Register 31 is the zero register
-    /// (yields 0) unless `sp_form` is set, in which case it is SP.
+    /// Reads register `num`; 31 is XZR (0) unless `sp_form`.
     fn read_reg_val(&mut self, num: u16, sp_form: bool, ty: Type) -> Value {
         if num == ZR && !sp_form {
             return self.builder.ins().iconst(ty, 0);
@@ -132,9 +119,7 @@ impl<'a> Lifter64<'a> {
         }
     }
 
-    /// Write `val` (of width `ty`) to register `num`. A W-width write
-    /// zero-extends into the full 64-bit register. Writes to the zero register
-    /// are discarded.
+    /// Writes `val`; W-width writes zero-extend, XZR writes are discarded.
     fn write_reg_val(&mut self, num: u16, sp_form: bool, ty: Type, val: Value) {
         if num == ZR && !sp_form {
             return;
@@ -153,8 +138,7 @@ impl<'a> Lifter64<'a> {
         }
     }
 
-    /// Read a source operand (register, immediate, or shifted register) as a
-    /// value of width `ty`.
+    /// Reads a register, immediate, or shifted-register source at width `ty`.
     fn read_source(&mut self, op: Operand, ty: Type) -> crate::Result<Value> {
         match op {
             Operand::Register(_, n) => Ok(self.read_reg_val(n, false, ty)),
@@ -203,7 +187,7 @@ impl<'a> Lifter64<'a> {
         self.builder.use_var(self.state.flags[&flag])
     }
 
-    /// Set N and Z from a result value of width `ty`.
+    /// Sets N and Z from `result`.
     fn set_nz(&mut self, result: Value, ty: Type) {
         let n = self
             .builder
@@ -215,27 +199,22 @@ impl<'a> Lifter64<'a> {
         let _ = ty;
     }
 
-    /// Set all of NZCV for an add (`is_sub=false`) or subtract (`is_sub=true`)
-    /// of `a` and `b` producing `result`, all of width `ty`.
+    /// Sets NZCV for `a + b` (or `a - b` when `is_sub`) producing `result`.
     fn set_nzcv(&mut self, a: Value, b: Value, result: Value, ty: Type, is_sub: bool) {
         self.set_nz(result, ty);
 
         let shift = if ty == types::I64 { 63 } else { 31 };
 
-        // Carry.
         let c = if is_sub {
-            // No borrow: a >=u b.
             self.builder
                 .ins()
                 .icmp(IntCC::UnsignedGreaterThanOrEqual, a, b)
         } else {
-            // Unsigned wrap: result <u a.
             self.builder.ins().icmp(IntCC::UnsignedLessThan, result, a)
         };
         self.set_flag(Nzcv::C, c);
 
-        // Overflow: top bit of ((a^b') & (a^result)), where b' = b for sub and
-        // ~b for add (i.e. add uses ~(a^b)).
+        // OF: top bit of (a^b') & (a^result), b' = b for sub, ~b for add.
         let a_xor_r = self.builder.ins().bxor(a, result);
         let v_term = if is_sub {
             let a_xor_b = self.builder.ins().bxor(a, b);
@@ -311,8 +290,7 @@ impl<'a> Lifter64<'a> {
         if set_flags {
             self.set_nzcv(a, b, result, ty, is_sub);
         }
-        // For flag-setting forms (e.g. CMP = SUBS to XZR) the destination may be
-        // the zero register, in which case the write is discarded.
+        // The destination may be XZR (CMP); the write is then discarded.
         self.write_reg_val(d, d_sp, ty, result);
         Ok(())
     }
@@ -338,9 +316,7 @@ impl<'a> Lifter64<'a> {
         Ok(())
     }
 
-    /// `ANDS` (and its `TST` alias): bitwise AND that sets NZ from the result
-    /// and clears C and V. `TST` decodes as `ANDS` to the zero register, so the
-    /// discarded-write path in `write_reg_val` handles it transparently.
+    /// `ANDS` (and `TST`): AND that sets NZ and clears C and V.
     fn handle_ands(&mut self, op0: Operand, op1: Operand, op2: Operand) -> crate::Result<()> {
         let (d, sz, _) = decode_reg(op0).ok_or_else(|| Self::bad_operand("ands", op0))?;
         let ty = size_ty(sz);
@@ -356,7 +332,7 @@ impl<'a> Lifter64<'a> {
         Ok(())
     }
 
-    /// `CSEL Rd, Rn, Rm, cond`: write `Rn` if `cond` holds, otherwise `Rm`.
+    /// `CSEL Rd, Rn, Rm, cond`: `Rn` if `cond` holds, else `Rm`.
     fn handle_csel(
         &mut self,
         op0: Operand,
@@ -378,9 +354,7 @@ impl<'a> Lifter64<'a> {
         Ok(())
     }
 
-    /// `ORN`/`EON`/`BIC` (and the `MVN` alias of `ORN`): a logical op whose
-    /// second operand is bitwise-inverted before combining. `MVN Rd, Rm` decodes
-    /// as `ORN Rd, XZR, Rm`, which the zero-register read handles transparently.
+    /// `ORN`/`EON`/`BIC` (and `MVN`): logical op with the second operand inverted.
     fn handle_logical_neg(
         &mut self,
         op0: Operand,
@@ -403,9 +377,8 @@ impl<'a> Lifter64<'a> {
         Ok(())
     }
 
-    /// `CSINC`/`CSINV`/`CSNEG Rd, Rn, Rm, cond`: write `Rn` when `cond` holds,
-    /// otherwise a transformed `Rm` (`Rm+1`, `~Rm`, or `-Rm`). These also back the
-    /// `CSET`/`CSETM`/`CINC`/`CINV`/`CNEG` aliases.
+    /// `CSINC`/`CSINV`/`CSNEG Rd, Rn, Rm, cond`: `Rn` if `cond`, else `Rm+1`, `~Rm`, `-Rm`.
+    /// Also backs `CSET`/`CSETM`/`CINC`/`CINV`/`CNEG`.
     fn handle_cs_variant(
         &mut self,
         op0: Operand,
@@ -433,8 +406,7 @@ impl<'a> Lifter64<'a> {
         Ok(())
     }
 
-    /// `MADD`/`MSUB Rd, Rn, Rm, Ra`: `Ra ± (Rn * Rm)`. `MUL Rd, Rn, Rm` decodes
-    /// as `MADD` with `Ra = XZR`, so the multiply-only form needs no special case.
+    /// `MADD`/`MSUB Rd, Rn, Rm, Ra`: `Ra ± (Rn * Rm)`; `MUL` is `MADD` with `Ra = XZR`.
     fn handle_madd(
         &mut self,
         op0: Operand,
@@ -458,11 +430,8 @@ impl<'a> Lifter64<'a> {
         Ok(())
     }
 
-    /// `UDIV`/`SDIV Rd, Rn, Rm`: integer division that, per the A64 spec, yields
-    /// zero on divide-by-zero instead of trapping. Signed division additionally
-    /// returns `INT_MIN` for the `INT_MIN / -1` overflow case rather than
-    /// trapping. Cranelift's `udiv`/`sdiv` trap on both, so the divisor is forced
-    /// to a safe non-trapping value and the spec result is selected back in.
+    /// `UDIV`/`SDIV Rd, Rn, Rm`: A64 yields 0 on divide-by-zero and `INT_MIN` for
+    /// `INT_MIN / -1`, where Cranelift traps, so the divisor is forced safe and the result patched.
     fn handle_div(
         &mut self,
         op0: Operand,
@@ -478,7 +447,7 @@ impl<'a> Lifter64<'a> {
         let div_by_zero = self.builder.ins().icmp_imm_s(IntCC::Equal, m, 0);
 
         if signed {
-            // Detect the INT_MIN / -1 overflow: numerator == INT_MIN && divisor == -1.
+            // INT_MIN / -1 overflow.
             let int_min = if ty == types::I64 {
                 i64::MIN
             } else {
@@ -487,8 +456,7 @@ impl<'a> Lifter64<'a> {
             let n_is_min = self.builder.ins().icmp_imm_s(IntCC::Equal, n, int_min);
             let m_is_neg1 = self.builder.ins().icmp_imm_s(IntCC::Equal, m, -1);
             let overflow = self.builder.ins().band(n_is_min, m_is_neg1);
-            // Force the divisor to 1 whenever dividing would trap, then patch the
-            // result: 0 for divide-by-zero, INT_MIN for the overflow case.
+            // Force divisor to 1 where it would trap; patch the result.
             let trap = self.builder.ins().bor(div_by_zero, overflow);
             let one = self.builder.ins().iconst(ty, 1);
             let safe_m = self.builder.ins().select(trap, one, m);
@@ -509,10 +477,7 @@ impl<'a> Lifter64<'a> {
         Ok(())
     }
 
-    /// `LSLV`/`LSRV`/`ASRV`/`RORV Rd, Rn, Rm`: shift `Rn` by a variable amount
-    /// taken from `Rm`. A64 masks the shift amount modulo the datasize, which is
-    /// exactly how Cranelift's shift instructions interpret their amount operand,
-    /// so the mapping is direct.
+    /// `LSLV`/`LSRV`/`ASRV`/`RORV Rd, Rn, Rm`: shift by `Rm`; the datasize masking matches Cranelift's.
     fn handle_shift_var(
         &mut self,
         op0: Operand,
@@ -539,8 +504,7 @@ impl<'a> Lifter64<'a> {
         Ok(())
     }
 
-    /// `CLZ`/`RBIT`/`REV Rd, Rn`: count-leading-zeros, bit-reverse, and byte-swap
-    /// of a single source register.
+    /// `CLZ`/`RBIT`/`REV Rd, Rn`: count leading zeros, bit-reverse, byte-swap.
     fn handle_bit_unary(
         &mut self,
         op0: Operand,
@@ -559,9 +523,7 @@ impl<'a> Lifter64<'a> {
         Ok(())
     }
 
-    /// `ADR Rd, label`: form the runtime byte address `PC + imm`. Like `ADRP`
-    /// (but without page alignment) the PC is the runtime value so the result
-    /// survives ASLR. See [`Self::handle_adrp`].
+    /// `ADR Rd, label`: runtime `PC + imm` (ASLR-safe). See [`Self::handle_adrp`].
     fn handle_adr(&mut self, instr: &A64Instr, op0: Operand) -> crate::Result<()> {
         let (d, _, _) = decode_reg(op0).ok_or_else(|| Self::bad_operand("adr", op0))?;
         let off = self.branch_target_offset(instr)?;
@@ -571,13 +533,8 @@ impl<'a> Lifter64<'a> {
         Ok(())
     }
 
-    /// `ADRP Rd, label`: form the runtime address of the 4 KiB page that is
-    /// `imm` pages away from the page containing this instruction.
-    ///
-    /// The page is computed against the *runtime* PC, so under the default
-    /// [`AddressMode::ImageBaseRelative`](crate::core::AddressMode) the result
-    /// stays correct under ASLR rather than baking in the lift-time virtual
-    /// address.
+    /// `ADRP Rd, label`: runtime address of the 4 KiB page `imm` pages from this instruction's page.
+    /// Computed against the runtime PC so [`AddressMode::ImageBaseRelative`](crate::core::AddressMode) survives ASLR.
     fn handle_adrp(&mut self, instr: &A64Instr, op0: Operand) -> crate::Result<()> {
         let (d, _, _) = decode_reg(op0).ok_or_else(|| Self::bad_operand("adrp", op0))?;
         let off = self.branch_target_offset(instr)?;
@@ -588,12 +545,8 @@ impl<'a> Lifter64<'a> {
         Ok(())
     }
 
-    // --- memory ---------------------------------------------------------------
 
-    /// Resolve a memory operand to `(address, optional writeback)`.
-    ///
-    /// The writeback, if present, is the new base-register value to store after
-    /// the access (pre-index with `!`, or post-index).
+    /// Resolves a memory operand to `(address, optional writeback)`; the writeback is the new base value to store after the access.
     fn mem_address(&mut self, op: Operand) -> crate::Result<(Value, Option<(u16, Value)>)> {
         match op {
             Operand::RegPreIndex(base, imm, writeback) => {
@@ -605,7 +558,7 @@ impl<'a> Lifter64<'a> {
             Operand::RegPostIndex(base, imm) => {
                 let base_val = self.read_addr_base(base);
                 let new_base = self.builder.ins().iadd_imm_s(base_val, imm as i64);
-                // Access happens at the original base; writeback updates it.
+                // Access uses the original base.
                 Ok((base_val, Some((base, new_base))))
             }
             Operand::RegRegOffset(base, index, _idx_sz, style, amount) => {
@@ -622,7 +575,7 @@ impl<'a> Lifter64<'a> {
         }
     }
 
-    /// Read a memory base register (register 31 is SP, never the zero register).
+    /// Reads a memory base register; 31 is SP, never XZR.
     fn read_addr_base(&mut self, num: u16) -> Value {
         self.read_reg_val(num, true, types::I64)
     }
@@ -653,9 +606,7 @@ impl<'a> Lifter64<'a> {
         Ok(())
     }
 
-    /// `STP Rt, Rt2, [addr]`: store a register pair to consecutive slots. The
-    /// second register goes one element-width above the first. Any pre/post-index
-    /// writeback on the address operand is applied once, after both stores.
+    /// `STP Rt, Rt2, [addr]`: store a pair to consecutive slots; writeback applied once after both.
     fn handle_stp(&mut self, op0: Operand, op1: Operand, op2: Operand) -> crate::Result<()> {
         let (t1, sz, _) = decode_reg(op0).ok_or_else(|| Self::bad_operand("stp", op0))?;
         let (t2, _, _) = decode_reg(op1).ok_or_else(|| Self::bad_operand("stp", op1))?;
@@ -670,9 +621,7 @@ impl<'a> Lifter64<'a> {
         Ok(())
     }
 
-    /// `LDP Rt, Rt2, [addr]`: load a register pair from consecutive slots, the
-    /// complement of [`Self::handle_stp`]. Both loads use the original address;
-    /// any pre/post-index writeback is applied once afterwards.
+    /// `LDP Rt, Rt2, [addr]`: load a pair from consecutive slots, original address; writeback applied once after. See [`Self::handle_stp`].
     fn handle_ldp(&mut self, op0: Operand, op1: Operand, op2: Operand) -> crate::Result<()> {
         let (t1, sz, _) = decode_reg(op0).ok_or_else(|| Self::bad_operand("ldp", op0))?;
         let (t2, _, _) = decode_reg(op1).ok_or_else(|| Self::bad_operand("ldp", op1))?;
@@ -705,8 +654,7 @@ impl<'a> Lifter64<'a> {
         Ok(())
     }
 
-    /// `CBZ`/`CBNZ Rt, label`: branch when `Rt` is zero (`branch_if_zero`) or
-    /// non-zero. The register is compared at its operand width (W or X).
+    /// `CBZ`/`CBNZ Rt, label`: branch if `Rt` is zero (`branch_if_zero`) or non-zero, at operand width.
     fn handle_cb(
         &mut self,
         instr: &A64Instr,
@@ -730,9 +678,7 @@ impl<'a> Lifter64<'a> {
         Ok(())
     }
 
-    /// `TBZ`/`TBNZ Rt, #bit, label`: branch when the selected bit of `Rt` is
-    /// zero (`branch_if_zero`) or non-zero. The test register is read at full
-    /// 64-bit width so any tested bit position is valid.
+    /// `TBZ`/`TBNZ Rt, #bit, label`: branch on the selected bit of `Rt` (read at 64 bits).
     fn handle_tb(
         &mut self,
         instr: &A64Instr,
@@ -762,10 +708,7 @@ impl<'a> Lifter64<'a> {
         Ok(())
     }
 
-    /// `BL label`: direct call. In analysis mode this emits a real Cranelift
-    /// `call` to an external function representing the callee and falls through
-    /// (see the x86 `handle_call_analysis` for rationale). Execution-mode `BL`
-    /// is not yet implemented.
+    /// `BL label`: direct call. Analysis mode emits a `call` to an external callee; execution mode is unimplemented.
     fn handle_bl(&mut self, instr: &A64Instr) -> crate::Result<()> {
         if self.config.analysis_mode {
             let target = self.branch_target(instr)?;
@@ -779,13 +722,10 @@ impl<'a> Lifter64<'a> {
         })
     }
 
-    /// `BLR Rn`: indirect call through a register. Sets the link register (X30)
-    /// to the return address and exits with `IndirectCall` so the host can
-    /// dispatch the runtime-resolved callee. See [`ExitReason::IndirectCall`].
+    /// `BLR Rn`: sets X30 to the return address and exits with [`ExitReason::IndirectCall`].
     fn handle_blr(&mut self, op0: Operand) -> crate::Result<()> {
         if self.config.analysis_mode {
-            // Indirect call: emit `call_indirect` on the runtime target and fall
-            // through; no statically-known callee to record.
+            // No statically-known callee to record.
             let target_reg = match op0 {
                 Operand::Register(_, n) => n,
                 _ => return Err(Self::bad_operand("blr", op0)),
@@ -802,12 +742,10 @@ impl<'a> Lifter64<'a> {
         };
         let target = self.read_reg_val(target_reg, false, types::I64);
 
-        // The return address (and PC resume point) is the next instruction:
-        // current_ip already points there.
+        // `current_ip` already points at the return address.
         let ret_addr = self.runtime_current_ip();
         self.write_reg_val(30, false, types::I64, ret_addr);
 
-        // Ensure the resume block exists so the entry dispatch can route back.
         self.get_block(self.current_ip);
 
         let ctx_ptr = self.builder.use_var(self.state.context_ptr);
@@ -822,15 +760,13 @@ impl<'a> Lifter64<'a> {
 
     fn handle_ret(&mut self, op0: Operand) -> crate::Result<()> {
         if self.config.analysis_mode {
-            // Inspection IR: a return terminates the function (see the x86 RET
-            // handler for rationale).
+            // Inspection IR: a return terminates the function.
             self.emit_host_return();
             self.block_terminated = true;
             return Ok(());
         }
 
-        // RET branches to the link register (X30) by default, or to an explicit
-        // register operand. The target is runtime-only, so we exit like x86 RET.
+        // Target is X30 or an explicit register; runtime-only, so exit like x86 RET.
         let target_reg = match op0 {
             Operand::Register(_, n) => n,
             _ => 30,
@@ -843,22 +779,18 @@ impl<'a> Lifter64<'a> {
         Ok(())
     }
 
-    /// `SVC` calls the host's syscall callback inline; see
-    /// [`crate::core::callback`]. `current_ip` is already the next instruction,
-    /// which is the address the callback returns to.
+    /// `SVC`: calls the host syscall callback inline ([`crate::core::callback`]); resumes at `current_ip`.
     fn handle_svc(&mut self) -> crate::Result<()> {
         self.emit_syscall_callback(None)
     }
 
-    /// Hand an instruction this frontend does not lift to the host's
-    /// interpreter, inline; see [`crate::core::callback`].
+    /// Hands an unlifted instruction to the host interpreter inline ([`crate::core::callback`]).
     fn interpret_unimplemented(&mut self, instr: &A64Instr) -> crate::Result<()> {
         let pc = self.runtime_addr(instr.ip);
         let resume = self.runtime_addr(instr.ip + 4);
         self.emit_interpreter_callback(Some(pc), Some(resume), 1)
     }
 
-    /// Resolve an instruction's PC-relative branch target.
     fn branch_target(&self, instr: &A64Instr) -> crate::Result<u64> {
         for op in &instr.inst.operands {
             if let Operand::PCOffset(off) = op {
@@ -870,8 +802,7 @@ impl<'a> Lifter64<'a> {
         })
     }
 
-    /// The raw PC-relative offset operand of an instruction, *not* added to the
-    /// IP. Used by `ADRP`, whose offset is a page delta applied to the masked PC.
+    /// Raw PC-relative offset operand, not added to the IP (`ADRP` applies it as a page delta).
     fn branch_target_offset(&self, instr: &A64Instr) -> crate::Result<i64> {
         for op in &instr.inst.operands {
             if let Operand::PCOffset(off) = op {
@@ -883,14 +814,13 @@ impl<'a> Lifter64<'a> {
         })
     }
 
-    /// Evaluate an A64 condition code (0–15) into an I8 boolean.
+    /// Evaluates an A64 condition code (0-15) to an I8 boolean.
     fn eval_condition(&mut self, cond: u8) -> Value {
         let n = self.get_flag(Nzcv::N);
         let z = self.get_flag(Nzcv::Z);
         let c = self.get_flag(Nzcv::C);
         let v = self.get_flag(Nzcv::V);
-        // Condition codes come in pairs differing only by their low bit, which
-        // inverts the result.
+        // Codes pair up; the low bit inverts.
         let base = cond >> 1;
         let result = match base {
             0 => z, // EQ: Z==1

@@ -6,14 +6,8 @@ use crate::lifter::{Lifter, X86Flag};
 use cranelift::prelude::*;
 use iced_x86::{Instruction, OpKind, Register};
 
-// Type helpers
 
-/// A resolved operand location: a guest register, or the already-computed
-/// effective address of a memory operand.
-///
-/// Exists so a read-modify-write instruction forms its address once. Going
-/// through `read_operand`/`write_operand` calls `get_mem_ptr` twice, emitting
-/// the base/index/displacement arithmetic twice.
+/// A resolved operand: a guest register, or a memory operand's already-computed effective address (so RMW forms it once).
 #[derive(Debug, Clone, Copy)]
 pub enum Place {
     Reg(Register),
@@ -30,8 +24,7 @@ pub fn size_to_type(size: usize) -> Type {
     }
 }
 
-/// Returns the XMM register index (0-15) for an XMM register, or `None` if
-/// the register is not an XMM register.
+/// The XMM register index (0-15), or `None` if not an XMM register.
 pub fn xmm_register_index(reg: Register) -> Option<u8> {
     match reg {
         Register::XMM0 => Some(0),
@@ -83,15 +76,9 @@ pub fn get_base_reg_64(reg: Register) -> Register {
     }
 }
 
-// Register and flag accessors on Lifter
 
 impl<'a> Lifter<'a> {
-    /// Narrow `val` to `ty`, or return it unchanged if it is already that wide.
-    ///
-    /// `ireduce` requires a *strictly* wider source, so an unconditional narrowing
-    /// is malformed IR when the value already has the target type - and the
-    /// verifier rejects the whole function. Every caller here reads a value whose
-    /// width depends on an operand size, so "already narrow" is the ordinary case.
+    /// Narrow `val` to `ty`, or return it unchanged; `ireduce` requires a strictly wider source.
     pub fn narrow_to(&mut self, ty: Type, val: Value) -> Value {
         if self.builder.func.dfg.value_type(val) == ty {
             val
@@ -101,8 +88,7 @@ impl<'a> Lifter<'a> {
     }
 
     pub fn get_reg_val(&mut self, reg: Register) -> crate::Result<Value> {
-        // RIP is handled specially: it names the address of the next
-        // instruction, materialized per the configured `AddressMode`.
+        // RIP is the next instruction's address, per the configured `AddressMode`.
         if reg == Register::RIP {
             return Ok(self.runtime_current_ip());
         }
@@ -187,29 +173,17 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// Read a segment selector (`CS`/`SS`/`DS`/`ES`/`FS`/`GS`) as an `I16`.
-    ///
-    /// The selectors live in the `RegisterContext` and are read in place rather
-    /// than through an SSA variable. The load is emitted in analysis mode too:
-    /// there is no SSA value for it to be pure over, and the point of the
-    /// instruction is that it reads state the host supplied.
+    /// Read a segment selector as an `I16` straight from the `RegisterContext` (also in analysis mode).
     fn get_segment_selector(&mut self, reg: Register) -> crate::Result<Value> {
         let offset = RegisterState::get_segment_offset(reg)?;
         let ctx_ptr = self.builder.use_var(self.state.context_ptr);
         Ok(self.ctx_load(types::I16, ctx_ptr, offset))
     }
 
-    /// Write a segment selector, storing it straight into the `RegisterContext`.
-    ///
-    /// Selector storage only: the `FS`/`GS` *bases* the lifter forms addresses with
-    /// are separate fields and are deliberately left alone, where hardware would
-    /// reload each from the loaded descriptor.
+    /// Write a segment selector into the `RegisterContext`; the `FS`/`GS` bases are separate fields and are left alone.
     fn set_segment_selector(&mut self, reg: Register, val: Value) -> crate::Result<()> {
         if reg == Register::CS {
-            // `MOV CS, r/m16` does not encode - the only architectural writes
-            // to CS are far transfers, which are not lifted. Reaching here
-            // means a decode produced something impossible, so say so rather
-            // than silently storing.
+            // `MOV CS, r/m16` does not encode; reaching here is a decode bug.
             return Err(MicroliftError::UnsupportedInstruction {
                 mnemonic: "set-CS (CS is not writable by MOV in x86-64)".into(),
             });
@@ -221,16 +195,12 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Flag math is always emitted. The finished SSA pass removes computations
-    /// whose results have no observable use.
+    /// Flag math is always emitted; the finished SSA pass removes unused computations.
     pub fn flag_needed(&self, flag: X86Flag) -> bool {
         self.flag_live(flag as u8)
     }
 
-    /// Whether `flag` is stored as a *source* to derive it from, rather than as
-    /// the 0/1 boolean it logically is. See [`Self::get_flag`].
-    ///
-    /// Only the two flags whose computation costs more than their storage.
+    /// Whether `flag` is stored as a *source* to derive it from (see [`Self::get_flag`]): only the two flags whose computation outweighs their storage.
     pub(super) fn deferred(flag: X86Flag) -> bool {
         matches!(flag, X86Flag::Parity | X86Flag::Auxiliary)
     }
@@ -239,10 +209,7 @@ impl<'a> Lifter<'a> {
     pub fn get_flag(&mut self, flag: X86Flag) -> Value {
         let raw = self.builder.use_var(self.state.flags[&flag]);
         match flag {
-            // PF is the even parity of the low byte: fold the byte down to its
-            // parity in bit 0, then invert. A xor-fold rather than a `popcnt`
-            // because aarch64 lowers a narrow `popcnt` through the vector unit,
-            // and the two cross-unit transfers cost more than the count.
+            // PF is the even parity of the low byte: xor-fold then invert (`popcnt` is slow on aarch64's vector unit).
             X86Flag::Parity => {
                 let mut folded = raw;
                 for shift in [4, 2, 1] {
@@ -260,18 +227,11 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// Assign a [deferred](Self::deferred) flag's *source* directly.
-    ///
-    /// The point of the whole scheme: a writer that already holds the value the
-    /// flag is derived from stores it as-is and computes nothing. For `Parity`
-    /// that is the low byte of the result; for `Auxiliary`, `lhs ^ rhs ^ res`,
-    /// whose bit 4 is the carry out of bit 3.
+    /// Assign a [deferred](Self::deferred) flag's *source* directly: the result's low byte for `Parity`, `lhs ^ rhs ^ res` for `Auxiliary`.
     ///
     /// # Panics
     ///
-    /// If `flag` is not deferred - passing a boolean flag here would store it
-    /// under an encoding [`Self::get_flag`] does not apply, which is a silent
-    /// wrong answer rather than a failure.
+    /// If `flag` is not deferred: a boolean stored under a source encoding is a silent wrong answer.
     pub fn set_flag_source(&mut self, flag: X86Flag, src: Value) -> crate::Result<()> {
         assert!(
             Self::deferred(flag),
@@ -280,13 +240,7 @@ impl<'a> Lifter<'a> {
         self.store_flag(flag, src)
     }
 
-    /// Assign `flag` from the logical 0/1 value it is defined to be, encoding it
-    /// for the two flags that are stored as a source.
-    ///
-    /// The encodings are chosen so that a constant stays a constant: parity of
-    /// `0` is even, so `val ^ 1` maps PF=1 to a byte of even parity and PF=0 to
-    /// one of odd; and `val << 4` puts AF straight into the bit
-    /// [`Self::get_flag`] reads.
+    /// Assign `flag` from its logical 0/1 value, encoding the two source-stored flags: `val ^ 1` for PF, `val << 4` for AF.
     pub fn set_flag(&mut self, flag: X86Flag, val: Value) -> crate::Result<()> {
         let encoded = match flag {
             X86Flag::Parity | X86Flag::Auxiliary if self.state.flags.contains_key(&flag) => {
@@ -295,8 +249,7 @@ impl<'a> Lifter<'a> {
                 } else {
                     self.builder.ins().ireduce(types::I8, val)
                 };
-                // Mask first: callers pass "any nonzero is true" values in
-                // places, and an encoding is only reversible from a clean bit.
+                // Mask first: callers pass any-nonzero-is-true values.
                 let bit = self.builder.ins().band_imm_u(val_i8, 1);
                 match flag {
                     X86Flag::Parity => self.builder.ins().bxor_imm_u(bit, 1),
@@ -308,12 +261,9 @@ impl<'a> Lifter<'a> {
         self.store_flag(flag, encoded)
     }
 
-    /// Write `val` into `flag`'s variable verbatim, in whatever encoding that
-    /// flag uses. The common tail of [`Self::set_flag`] and
-    /// [`Self::set_flag_source`].
+    /// Write `val` into `flag`'s variable verbatim; the tail of [`Self::set_flag`] and [`Self::set_flag_source`].
     fn store_flag(&mut self, flag: X86Flag, val: Value) -> crate::Result<()> {
         if let Some(&var) = self.state.flags.get(&flag) {
-            // Ensure flag is I8
             let val_i8 = if self.builder.func.dfg.value_type(val) == types::I8 {
                 val
             } else {
@@ -334,7 +284,6 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    // Operand accessors
 
     pub fn operand_kind(&self, instruction: &Instruction, op_index: u32) -> OpKind {
         match op_index {
@@ -404,16 +353,9 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// Read both operands of a binary `r/m, r/m/imm` instruction, at the width of
-    /// the destination.
-    ///
-    /// Returns `(dst, src)` but reads **src first**, which is the order the
-    /// operands' side effects must appear in. `size` comes from operand 0 and is
-    /// applied to operand 1 too, so a sign-extended immediate materialises at full
-    /// width rather than at its encoded width.
-    ///
-    /// For a read-modify-*write* instruction use
-    /// [`read_binary_rmw`](Self::read_binary_rmw) instead.
+    /// Read both operands of a binary `r/m, r/m/imm` instruction at the destination's width, returning `(dst, src)`.
+    /// Reads **src first**, the order its side effects must appear in; `size` from operand 0 also widens a sign-extended immediate.
+    /// For read-modify-*write* use [`read_binary_rmw`](Self::read_binary_rmw).
     pub fn read_binary_operands(
         &mut self,
         instruction: &Instruction,
@@ -424,11 +366,7 @@ impl<'a> Lifter<'a> {
         Ok((dst, src))
     }
 
-    /// [`read_binary_operands`](Self::read_binary_operands) for an instruction that
-    /// writes its destination back, returning `(place, dst, src)`.
-    ///
-    /// The destination is resolved to a [`Place`] once and read through it, so
-    /// [`write_place`](Self::write_place) stores to the address the load computed.
+    /// [`read_binary_operands`](Self::read_binary_operands) for a write-back instruction, returning `(place, dst, src)`.
     pub fn read_binary_rmw(
         &mut self,
         instruction: &Instruction,
@@ -440,9 +378,7 @@ impl<'a> Lifter<'a> {
         Ok((place, dst, src))
     }
 
-    /// read-modify-write of a unary instruction (`INC`, `NEG`,
-    /// `NOT`, the shifts and rotates): returns `(size, place, value)` for
-    /// operand 0, resolved once so the write-back reuses the load's address.
+    /// Read-modify-write of a unary instruction (`INC`, `NEG`, `NOT`, shifts, rotates): `(size, place, value)` for operand 0.
     pub fn read_unary_rmw(
         &mut self,
         instruction: &Instruction,
@@ -453,8 +389,7 @@ impl<'a> Lifter<'a> {
         Ok((size, place, val))
     }
 
-    /// Resolve an operand to the location it names, computing a memory
-    /// operand's effective address exactly once.
+    /// Resolve an operand to its location, computing a memory effective address once.
     pub fn resolve_place(
         &mut self,
         instruction: &Instruction,
@@ -490,8 +425,7 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// Read `CF` as the carry/borrow input of an `ADC`/`SBB`, widened to an
-    /// operand of `size` bytes.
+    /// Read `CF` as the `ADC`/`SBB` carry input, widened to `size` bytes.
     pub fn carry_in(&mut self, size: usize) -> Value {
         let ty = size_to_type(size);
         let cf = self.builder.use_var(self.state.flags[&X86Flag::Carry]);
@@ -533,10 +467,7 @@ impl<'a> Lifter<'a> {
         let disp = instruction.memory_displacement64();
         let segment = instruction.memory_segment();
 
-        // A 0x67 prefix selects 32-bit addressing: iced reports 32-bit base and
-        // index registers. Compute in I64 (widening each component) and
-        // truncate the final sum to 32 bits, matching hardware's wrap-around,
-        // so the load/store below always sees a 64-bit address.
+        // A `0x67` prefix gives 32-bit base/index: compute in I64 and truncate the sum to 32 bits.
         let addr32 =
             (base_reg != Register::None && base_reg != Register::RIP && base_reg.size() == 4)
                 || (index_reg != Register::None && index_reg.size() == 4);
@@ -549,9 +480,7 @@ impl<'a> Lifter<'a> {
         };
 
         let mut ptr = if base_reg == Register::RIP {
-            // RIP-relative: iced-x86 sets 'disp' to the absolute target address
-            // (as decoded), i.e. a lift-time VA. Materialize it per the
-            // configured `AddressMode`.
+            // RIP-relative: iced's `disp` is the absolute lift-time VA; materialize per `AddressMode`.
             self.runtime_addr(disp)
         } else if base_reg != Register::None {
             let v = self.get_reg_val(base_reg)?;
@@ -571,20 +500,17 @@ impl<'a> Lifter<'a> {
             ptr = self.builder.ins().iadd(ptr, scaled_index);
         }
 
-        // Only add displacement if it was NOT RIP-relative.
-        // For RIP-relative, the target address is already our 'ptr'.
+        // Add the displacement only if not RIP-relative (already in `ptr`).
         if base_reg != Register::RIP && disp != 0 {
             ptr = self.builder.ins().iadd_imm_s(ptr, disp as i64);
         }
 
-        // 32-bit addressing truncates the effective address to 32 bits (then
-        // zero-extends) before any segment base is applied.
+        // 32-bit addressing truncates the effective address before any segment base.
         if addr32 {
             ptr = self.builder.ins().band_imm_u(ptr, 0xFFFF_FFFF);
         }
 
-        // Add FS or GS segment base. In x86-64 long mode DS/ES/SS/CS have
-        // base 0 and are ignored; only FS and GS carry non-zero bases.
+        // Only FS and GS carry non-zero bases in long mode.
         match segment {
             Register::FS => {
                 let fs_base = self.get_fs_base();
@@ -600,13 +526,8 @@ impl<'a> Lifter<'a> {
         Ok(ptr)
     }
 
-    /// Read an instruction's immediate operand as an `i64`, honouring x86
-    /// sign-extension of `imm8`/`imm32` immediates into wider operands.
-    ///
-    /// iced-x86's [`Instruction::immediate64`] returns the *raw, unsigned* bits, so
-    /// the sign-extended operand kinds must go through their matching
-    /// sign-extending accessors - otherwise `and rax, -16` (`imm8 = 0xf0`) would be
-    /// read as `+240` and mask only the low byte.
+    /// Read an immediate as an `i64`, sign-extending `imm8`/`imm32` as x86 does.
+    /// [`Instruction::immediate64`] returns raw bits, so `and rax, -16` would otherwise read as `+240`.
     pub fn read_imm64(instruction: &Instruction) -> i64 {
         for i in 0..instruction.op_count() {
             match instruction.op_kind(i) {
@@ -624,12 +545,7 @@ impl<'a> Lifter<'a> {
         instruction.immediate64() as i64
     }
 
-    // XMM accessors.
-    //
-    // The lo/hi accessors work under both backing representations; in vector mode
-    // they synthesize lane access via `extractlane`/`insertlane`. Use the native
-    // `get_xmm_vec`/`set_xmm_vec` when a whole 128-bit value is moved, so vector
-    // mode avoids the lane-shuffle round trip.
+    // XMM accessors: lo/hi work in both representations; use `get_xmm_vec`/`set_xmm_vec` to move a whole 128-bit value.
 
     /// Return the low 64 bits of XMM register `idx` (0-15).
     pub fn get_xmm_lo(&mut self, idx: u8) -> Value {
@@ -666,8 +582,7 @@ impl<'a> Lifter<'a> {
             let var = *self.state.xmms_lo.get(&idx).unwrap();
             self.builder.def_var(var, val);
         }
-        // In vector mode both halves are the one variable, so writing either
-        // defines the whole register.
+        // In vector mode both halves are one variable.
         self.mark_written(RegSlot::Vec(idx));
         if self.state.use_vector_xmm {
             self.mark_written(RegSlot::VecHi(idx));
@@ -691,11 +606,7 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// Return the full 128-bit value of XMM register `idx` (0-15) as a
-    /// native `I64X2` value.
-    ///
-    /// In vector mode this is a direct `use_var`. In scalar mode it
-    /// assembles the two halves with `scalar_to_vector` + `insertlane`.
+    /// Return the full 128-bit value of XMM `idx` as `I64X2`.
     pub fn get_xmm_vec(&mut self, idx: u8) -> Value {
         if self.state.use_vector_xmm {
             let var = *self.state.xmms_vec.get(&idx).unwrap();
@@ -710,11 +621,7 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// Write a full 128-bit `I64X2` value to XMM register `idx` (0-15)
-    /// and mark dirty.
-    ///
-    /// In vector mode this is a direct `def_var`. In scalar mode it
-    /// splits the lanes back into the two scalar halves.
+    /// Write a full 128-bit `I64X2` value to XMM `idx` and mark dirty.
     pub fn set_xmm_vec(&mut self, idx: u8, val: Value) {
         if self.state.use_vector_xmm {
             let var = *self.state.xmms_vec.get(&idx).unwrap();

@@ -31,9 +31,7 @@ impl<'a> Lifter<'a> {
         self.logical_op(instruction, LogicalOp::Or)
     }
 
-    /// Shared implementation of `AND`/`OR`/`XOR`: all three write the destination
-    /// and then set the logical flag set (CF and OF cleared, ZF/SF/PF from the
-    /// result, AF left alone); only the Cranelift opcode differs.
+    /// Shared `AND`/`OR`/`XOR`: write the destination, then set the logical flags (CF/OF cleared, ZF/SF/PF from the result, AF untouched).
     fn logical_op(&mut self, instruction: &Instruction, op: LogicalOp) -> crate::Result<()> {
         let size = self.operand_size(instruction, 0)?;
         let (place, dst, src) = self.read_binary_rmw(instruction, size)?;
@@ -51,7 +49,6 @@ impl<'a> Lifter<'a> {
         let ty = size_to_type(size);
         let all_ones = self.builder.ins().iconst(ty, -1);
         let result = self.builder.ins().bxor(dst_val, all_ones);
-        // NOT does not affect flags
         self.write_place(place, result)
     }
 
@@ -63,14 +60,12 @@ impl<'a> Lifter<'a> {
         self.update_flags_logical(result, size)
     }
 
-    // Shift instructions
 
     /// Resolve the shift count to a value of the given type.
     fn shift_count(&mut self, instruction: &Instruction, ty: Type) -> crate::Result<Value> {
         let op1 = instruction.op1_kind();
         let count = match op1 {
             OpKind::Register => {
-                // get_reg_val(CL) already returns I8; just extend to the target type.
                 let cl_val = self.get_reg_val(iced_x86::Register::CL)?;
                 if ty == types::I8 {
                     cl_val
@@ -113,25 +108,18 @@ impl<'a> Lifter<'a> {
     }
 
     /// Shared SHL/SHR/SAR lowering.
-    ///
-    /// x86 masks the shift count to 5 bits (6 for 64-bit operands) and *then*
-    /// shifts, so a masked count `>=` the operand width is legal and yields 0
-    /// (SHL/SHR) or the sign fill (SAR). Cranelift's shift ops instead re-mask
-    /// modulo the operand width, which would corrupt 8/16-bit shifts whose masked
-    /// count reaches 8..31. So the shift runs in a working type at least 32 bits
-    /// wide, where the 5-bit count is always `<` the width, then truncates back.
+    /// x86 masks the count (5 bits, 6 for 64-bit) and a masked count `>=` the width is legal (0 or sign fill);
+    /// Cranelift re-masks modulo the width, so the shift runs in a working type of at least 32 bits.
     fn emit_shift(&mut self, instruction: &Instruction, kind: ShiftKind) -> crate::Result<()> {
         let (size, place, val) = self.read_unary_rmw(instruction)?;
         let ty = size_to_type(size);
         let bit_width = (size * 8) as i64;
         let count = self.shift_count(instruction, ty)?;
 
-        // Working type: widen sub-32-bit operands so the masked count fits.
         let work_ty = if size < 4 { types::I32 } else { ty };
         let widen = work_ty != ty;
 
-        // Extend the value into the working type. SAR needs sign extension so
-        // both the arithmetic shift and the CF (sign) bit are correct.
+        // SAR needs sign extension so the shift and the CF (sign) bit are right.
         let val_w = if !widen {
             val
         } else if matches!(kind, ShiftKind::RightArithmetic) {
@@ -149,10 +137,7 @@ impl<'a> Lifter<'a> {
         let (shifted_w, cf_bit) = match kind {
             ShiftKind::Left => {
                 let shifted = self.builder.ins().ishl(val_w, count_w);
-                // CF = the last bit shifted out of the MSB = bit (width - count) of the
-                // original. In the working type a masked count > width makes `width - count`
-                // wrap, and the shift's modulo masking lands the read on a zero bit - which
-                // is the correct CF for an over-wide shift.
+                // CF = bit (width - count) of the original; for an over-wide count the wrap lands on a zero bit, which is correct.
                 let bw = self.builder.ins().iconst(work_ty, bit_width);
                 let cf_shift = self.builder.ins().isub(bw, count_w);
                 let cf_raw = self.builder.ins().ushr(val_w, cf_shift);
@@ -169,8 +154,7 @@ impl<'a> Lifter<'a> {
             }
             ShiftKind::RightArithmetic => {
                 let shifted = self.builder.ins().sshr(val_w, count_w);
-                // CF = bit (count-1) of the sign-extended value (so counts past
-                // the width read back the sign bit, matching hardware).
+                // CF = bit (count-1) of the sign-extended value; counts past the width read the sign bit.
                 let cf_shift = self.builder.ins().isub(count_w, one_w);
                 let cf_raw = self.builder.ins().ushr(val_w, cf_shift);
                 let cf = self.builder.ins().band(cf_raw, one_w);
@@ -231,9 +215,7 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Set CF from a rotate's carried-out bit, but leave CF untouched when the
-    /// masked rotate `count` is 0 (per x86: a zero masked count affects no
-    /// flags). `cf_bit` is in the operand type; `count` is the masked count.
+    /// Set CF from a rotate's carried-out bit, unless the masked `count` is 0 (no flags affected).
     fn set_rotate_cf(&mut self, cf_bit: Value, count: Value) -> crate::Result<()> {
         let old_cf = self.builder.use_var(self.state.flags[&X86Flag::Carry]);
         let new_cf = if self.builder.func.dfg.value_type(cf_bit) == types::I8 {
@@ -246,10 +228,7 @@ impl<'a> Lifter<'a> {
         self.set_flag(X86Flag::Carry, final_cf)
     }
 
-    /// Set OF from a rotate's single-bit-rotate value when the masked `count`
-    /// is 1; otherwise leave OF untouched (a zero count affects no flags, and
-    /// OF is architecturally undefined for counts > 1). `of_bit` is in the
-    /// operand type; `count` is the masked count.
+    /// Set OF from a single-bit rotate when the masked `count` is 1; otherwise untouched (undefined for counts > 1).
     fn set_rotate_of(&mut self, of_bit: Value, count: Value) -> crate::Result<()> {
         let old_of = self.builder.use_var(self.state.flags[&X86Flag::Overflow]);
         let new_of = if self.builder.func.dfg.value_type(of_bit) == types::I8 {
@@ -262,9 +241,7 @@ impl<'a> Lifter<'a> {
         self.set_flag(X86Flag::Overflow, final_of)
     }
 
-    /// Build a constant of width `ty` from a (non-negative, <= 64-bit) value.
-    /// `iconst` only supports integer types up to I64, so I128 constants are
-    /// materialised by zero-extending an I64 constant.
+    /// A constant of width `ty` (value <= 64 bits); `I128` is a zero-extended `I64`.
     fn wide_const(&mut self, ty: Type, value: i64) -> Value {
         if ty == types::I128 {
             let lo = self.builder.ins().iconst(types::I64, value);
@@ -276,12 +253,7 @@ impl<'a> Lifter<'a> {
 
     /// RCR - Rotate through Carry Right.
     ///
-    /// Treats `CF:dst` as a single `(N+1)`-bit value (CF the most-significant bit)
-    /// and rotates it right by the masked count. The whole computation runs in a
-    /// working type at least two bits wider than the operand, so Cranelift's
-    /// shift-amount-modulo-width semantics cannot clobber a rotate that crosses the
-    /// operand boundary:
-    ///
+    /// Rotates the `(N+1)`-bit value `CF:dst` right by the masked count, in a working type at least two bits wider than the operand:
     /// ```text
     ///   x          = (cf << N) | dst                (the N+1-bit value)
     ///   rotated     = (x >> c) | (cf << (N-c)) | (x << (N+1-c))
@@ -289,10 +261,7 @@ impl<'a> Lifter<'a> {
     ///   CF'         = rotated[N]
     /// ```
     ///
-    /// The count is masked to 5 bits (6 for 64-bit operands) then reduced modulo
-    /// `N+1`, as the hardware does. OF is architecturally defined only for
-    /// single-bit rotates, where it is the XOR of the result's two
-    /// most-significant bits; otherwise it is left unchanged.
+    /// The count is reduced modulo `N+1`. OF is defined only for single-bit rotates (XOR of the result's top two bits), else unchanged.
     pub(super) fn handle_rcr(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let size = self.operand_size(instruction, 0)?;
         let ty = size_to_type(size);
@@ -314,17 +283,13 @@ impl<'a> Lifter<'a> {
         let place = self.resolve_place(instruction, 0)?;
         let val = self.read_place(place, size)?;
         let cf = self.builder.use_var(self.state.flags[&X86Flag::Carry]);
-        // Masked count (5/6 bits) in the operand type.
         let count = self.shift_count(instruction, ty)?;
 
-        // Promote everything into the wider working type.
         let xval = self.builder.ins().uextend(work_ty, val);
         let cfw = self.builder.ins().uextend(work_ty, cf);
         let count_w = self.builder.ins().uextend(work_ty, count);
 
-        // c = count mod (N+1)  (in [0, N]). For 32/64-bit operands the 5/6-bit
-        // mask already guarantees count < N+1, so the modulo is a no-op there -
-        // which is fortunate, since the backend has no `urem.i128`.
+        // c = count mod N+1; a no-op for 32/64-bit (the mask suffices), which matters as there is no `urem.i128`.
         let np1 = self.wide_const(work_ty, n + 1);
         let c = if size <= 2 {
             self.builder.ins().urem(count_w, np1)
@@ -344,19 +309,16 @@ impl<'a> Lifter<'a> {
             self.builder.ins().bor(lo, t_left)
         };
 
-        // dst' = low N bits of the rotated value.
         let result = self.builder.ins().ireduce(ty, rotated);
         self.write_place(place, result)?;
 
-        // CF' = bit N of the rotated value. This is also correct for c == 0
-        // (a masked count of 0), where bit N still holds the original CF.
+        // CF' = bit N of the rotated value; also right for c == 0.
         let cf_shifted = self.builder.ins().ushr(rotated, n_w);
         let one_w = self.wide_const(work_ty, 1);
         let cf_bit = self.builder.ins().band(cf_shifted, one_w);
         self.set_flag(X86Flag::Carry, cf_bit)?;
 
-        // OF (defined only for count == 1): XOR of the two most-significant bits
-        // of the result. set_rotate_of leaves OF unchanged for any other count.
+        // OF for count == 1; `set_rotate_of` leaves it unchanged otherwise.
         let msb = self.builder.ins().ushr_imm_u(result, n - 1);
         let next = self.builder.ins().ushr_imm_u(result, n - 2);
         let one = self.builder.ins().iconst(ty, 1);
@@ -371,7 +333,6 @@ impl<'a> Lifter<'a> {
         let ty = size_to_type(size);
         let n = (size * 8) as i64;
 
-        // Working type, at least N+2 bits wide so no shift reaches its width.
         let work_ty = match size {
             1 => types::I16,
             2 => types::I32,
@@ -387,10 +348,8 @@ impl<'a> Lifter<'a> {
         let place = self.resolve_place(instruction, 0)?;
         let val = self.read_place(place, size)?;
         let cf = self.builder.use_var(self.state.flags[&X86Flag::Carry]);
-        // Masked count (5/6 bits) in the operand type.
         let count = self.shift_count(instruction, ty)?;
 
-        // Promote everything into the wider working type.
         let xval = {
             let v = self.builder.ins().uextend(work_ty, val);
             let cfw = self.builder.ins().uextend(work_ty, cf);
@@ -399,9 +358,7 @@ impl<'a> Lifter<'a> {
         };
         let count_w = self.builder.ins().uextend(work_ty, count);
 
-        // c = count mod (N+1)  (in [0, N]). For 32/64-bit operands the 5/6-bit
-        // mask already guarantees count < N+1, so the modulo is a no-op there -
-        // which is fortunate, since the backend has no `urem.i128`.
+        // c = count mod N+1; a no-op for 32/64-bit (the mask suffices), which matters as there is no `urem.i128`.
         let np1 = self.wide_const(work_ty, n + 1);
         let c = if size <= 2 {
             self.builder.ins().urem(count_w, np1)
@@ -415,20 +372,17 @@ impl<'a> Lifter<'a> {
         let t_right = self.builder.ins().ushr(xval, np1_minus_c);
         let rotated = self.builder.ins().bor(t_left, t_right);
 
-        // dst' = low N bits of the rotated value.
         let result = self.builder.ins().ireduce(ty, rotated);
         self.write_place(place, result)?;
 
-        // CF' = bit N of the rotated value. This is also correct for c == 0
-        // (a masked count of 0), where bit N still holds the original CF.
+        // CF' = bit N of the rotated value; also right for c == 0.
         let n_w = self.wide_const(work_ty, n);
         let cf_shifted = self.builder.ins().ushr(rotated, n_w);
         let one_w = self.wide_const(work_ty, 1);
         let cf_bit = self.builder.ins().band(cf_shifted, one_w);
         self.set_flag(X86Flag::Carry, cf_bit)?;
 
-        // OF (defined only for count == 1): MSB(result) XOR CF (the CF after the
-        // rotate). set_rotate_of leaves OF unchanged for any other count.
+        // OF for count == 1: MSB(result) ^ CF; `set_rotate_of` leaves it unchanged otherwise.
         let msb = self.builder.ins().ushr_imm_u(result, n - 1);
         let cf_ty = self.builder.ins().ireduce(ty, cf_bit);
         let of1 = self.builder.ins().bxor(msb, cf_ty);
@@ -436,14 +390,10 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Resolve the shift count for a double-shift instruction (SHLD/SHRD).
-    ///
-    /// The count is op2: either an `imm8` or the `CL` register, masked to
-    /// 5 bits for 8/16/32-bit operands or 6 bits for 64-bit operands.
+    /// Resolve the SHLD/SHRD count: `imm8` or `CL`, masked to 5 bits (6 for 64-bit).
     fn double_shift_count(&mut self, instruction: &Instruction, ty: Type) -> crate::Result<Value> {
         let count_raw = match instruction.op2_kind() {
             OpKind::Register => {
-                // get_reg_val(CL) already returns I8; just extend to the target type.
                 let cl = self.get_reg_val(Register::CL)?;
                 self.builder.ins().uextend(ty, cl)
             }
@@ -469,9 +419,7 @@ impl<'a> Lifter<'a> {
 
     /// SHLD - Shift Left Double.
     ///
-    /// `SHLD dst, src, count`
-    /// result = (dst << count) | (src >> (N - count))
-    /// CF = last bit shifted out of dst's MSB side.
+    /// `SHLD dst, src, count`: result = (dst << count) | (src >> (N - count)); CF = last bit shifted out of dst's MSB.
     pub(super) fn handle_shld(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let size = self.operand_size(instruction, 0)?;
         let ty = size_to_type(size);
@@ -480,25 +428,19 @@ impl<'a> Lifter<'a> {
         let place = self.resolve_place(instruction, 0)?;
         let dst = self.read_place(place, size)?;
         let src = self.get_reg_val(instruction.op1_register())?;
-        // get_reg_val returns the natural width of the register, which matches
-        // the destination size for well-formed SHLD.
         let count = self.double_shift_count(instruction, ty)?;
 
-        // result = (dst << count) | (src >> (N - count))
         let right_count = self.builder.ins().isub(bits, count);
         let shifted_dst = self.builder.ins().ishl(dst, count);
         let shifted_src = self.builder.ins().ushr(src, right_count);
         let combined = self.builder.ins().bor(shifted_dst, shifted_src);
 
-        // A masked count of 0 leaves the destination unchanged. The formula
-        // above would compute `dst | src` there, because `src >> N` re-masks
-        // the shift amount modulo the operand width and becomes `src >> 0`.
+        // A masked count of 0 leaves dst unchanged; the formula would give `dst | src` since `src >> N` re-masks to 0.
         let is_zero = self.builder.ins().icmp_imm_s(IntCC::Equal, count, 0);
         let result = self.builder.ins().select(is_zero, dst, combined);
 
         self.write_place(place, result)?;
 
-        // CF = (dst >> (N - count)) & 1  (last bit shifted out of dst's MSB)
         let cf_raw = self.builder.ins().ushr(dst, right_count);
         let one = self.builder.ins().iconst(ty, 1);
         let cf_bit = self.builder.ins().band(cf_raw, one);
@@ -508,9 +450,7 @@ impl<'a> Lifter<'a> {
 
     /// SHRD - Shift Right Double.
     ///
-    /// `SHRD dst, src, count`
-    /// result = (src << (N - count)) | (dst >> count)
-    /// CF = last bit shifted out of dst's LSB side.
+    /// `SHRD dst, src, count`: result = (src << (N - count)) | (dst >> count); CF = last bit shifted out of dst's LSB.
     pub(super) fn handle_shrd(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let size = self.operand_size(instruction, 0)?;
         let ty = size_to_type(size);
@@ -521,7 +461,6 @@ impl<'a> Lifter<'a> {
         let src = self.get_reg_val(instruction.op1_register())?;
         let count = self.double_shift_count(instruction, ty)?;
 
-        // result = (src << (N - count)) | (dst >> count)
         let left_count = self.builder.ins().isub(bits, count);
         let shifted_src = self.builder.ins().ishl(src, left_count);
         let shifted_dst = self.builder.ins().ushr(dst, count);
@@ -533,7 +472,6 @@ impl<'a> Lifter<'a> {
 
         self.write_place(place, result)?;
 
-        // CF = (dst >> (count - 1)) & 1  (last bit shifted out of dst's LSB)
         let one = self.builder.ins().iconst(ty, 1);
         let cf_shift = self.builder.ins().isub(count, one);
         let cf_raw = self.builder.ins().ushr(dst, cf_shift);
@@ -542,20 +480,11 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    // Bit test instructions
 
-    /// Compute the `(loaded value, in-word bit index, effective pointer)` triple
-    /// for a BT-family instruction, handling the *bit string* form.
-    ///
-    /// For a register destination the bit index is masked to the operand width. For
-    /// a memory destination with a **register** bit index, hardware treats the
-    /// operand as the base of a bit string: the accessed word is at
-    /// `EA + (signed_bit_index div width) * size` and the tested bit is
-    /// `bit_index mod width`. An **immediate** index is masked to the operand width
-    /// with no extra addressing.
-    ///
-    /// The returned pointer is `Some` for memory destinations, already adjusted, so
-    /// the read-modify-write handlers store to the word that was tested.
+    /// The `(loaded value, in-word bit index, effective pointer)` triple for a BT-family instruction.
+    /// A register destination masks the index to the width; a memory destination with a register index is a bit string:
+    /// word at `EA + (signed_index div width) * size`, bit `index mod width`. An immediate is masked.
+    /// The pointer is `Some` for memory destinations, already adjusted for the write-back.
     fn bt_operand(
         &mut self,
         instruction: &Instruction,
@@ -566,8 +495,6 @@ impl<'a> Lifter<'a> {
 
         let bit_idx = match instruction.op1_kind() {
             OpKind::Register => {
-                // get_reg_val returns the natural type of the register, which for BT
-                // always matches the operand size - no reduction needed.
                 Some(self.get_reg_val(instruction.op1_register())?)
             }
             OpKind::Immediate8 => None,
@@ -597,8 +524,7 @@ impl<'a> Lifter<'a> {
                 let mut ptr = self.get_mem_ptr(instruction, 0)?;
                 let masked = match bit_idx {
                     Some(idx) => {
-                        // Word offset = floor(signed_index / width). An arithmetic shift by
-                        // log2(width) is exactly that, and handles negative indices too.
+                        // Word offset = signed_index >> log2(width); the arithmetic shift handles negatives.
                         let idx64 = if size == 8 {
                             idx
                         } else {
@@ -627,15 +553,13 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// Shared front half of BT/BTS/BTR/BTC: resolve the operand, set CF from
-    /// the addressed bit, and hand back what the write-back needs.
+    /// Shared front half of BT/BTS/BTR/BTC: resolve the operand and set CF from the addressed bit.
     fn bt_common(
         &mut self,
         instruction: &Instruction,
     ) -> crate::Result<(Value, Value, usize, Option<Value>)> {
         let (base, masked, size, ptr) = self.bt_operand(instruction)?;
         let ty = size_to_type(size);
-        // CF = (base >> bit_idx) & 1
         let shifted = self.builder.ins().ushr(base, masked);
         let one = self.builder.ins().iconst(ty, 1);
         let cf_bit = self.builder.ins().band(shifted, one);
@@ -643,8 +567,7 @@ impl<'a> Lifter<'a> {
         Ok((base, masked, size, ptr))
     }
 
-    /// Write a BT-family result either to the adjusted memory word or back to
-    /// the register destination.
+    /// Write a BT-family result to the adjusted memory word or the register.
     fn bt_write_result(
         &mut self,
         instruction: &Instruction,
@@ -697,28 +620,15 @@ impl<'a> Lifter<'a> {
     pub(super) fn handle_bsf(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let size = self.operand_size(instruction, 1)?;
         let src = self.read_operand(instruction, 1, size)?;
-        // ZF = 1 if src == 0
         let zf = self.builder.ins().icmp_imm_s(IntCC::Equal, src, 0);
         self.set_flag(X86Flag::Zero, zf)?;
-        // For src == 0 the destination is architecturally undefined on Intel but left
-        // unchanged on AMD (and in practice on modern Intel); code in the wild relies
-        // on dest-unchanged, so model that.
+        // `src == 0`: destination undefined on Intel but unchanged on AMD (and in practice on Intel); code relies on unchanged.
         let ctz = self.builder.ins().ctz(src);
         self.write_bit_scan_result(instruction, ctz, zf)
     }
 
-    /// TZCNT - count trailing zeros, **defined** for a zero source.
-    ///
-    /// The BMI1 replacement for `BSF`: `BSF` leaves the destination alone when the
-    /// source is zero, `TZCNT` writes the operand's bit width. Cranelift's `ctz`
-    /// has exactly that definition, so only the flags need fixing up.
-    ///
-    /// `CF = (src == 0)` and `ZF = (result == 0)`; the rest are undefined and left
-    /// alone. `ZF` comes from the *result*, not the source as `BSF` sets it, so the
-    /// two cannot share a helper despite computing the same number.
-    ///
-    /// Without BMI1 this encoding decodes as `REP BSF`, correct for every input but
-    /// zero, which is why compilers emit it freely.
+    /// TZCNT - count trailing zeros; a zero source yields the bit width (BMI1; decodes as `REP BSF` without it).
+    /// `CF = (src == 0)`, `ZF = (result == 0)`, unlike `BSF`'s ZF from the source; other flags are left alone.
     pub(super) fn handle_tzcnt(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let size = self.operand_size(instruction, 1)?;
         let src = self.read_operand(instruction, 1, size)?;
@@ -726,11 +636,7 @@ impl<'a> Lifter<'a> {
         self.write_count_zeros_result(instruction, src, result)
     }
 
-    /// LZCNT - count leading zeros, the mirror of [`Self::handle_tzcnt`].
-    ///
-    /// `BSR` returns the *index* of the highest set bit; `LZCNT` returns the count
-    /// of zeros above it, `width - 1 - index`. Cranelift's `clz` is the second, so
-    /// this is a different number, not `BSR` with different flags.
+    /// LZCNT - count leading zeros (`width - 1 - index`, unlike `BSR`'s index); mirror of [`Self::handle_tzcnt`].
     pub(super) fn handle_lzcnt(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let size = self.operand_size(instruction, 1)?;
         let src = self.read_operand(instruction, 1, size)?;
@@ -760,8 +666,7 @@ impl<'a> Lifter<'a> {
         self.write_operand(instruction, 0, result)
     }
 
-    /// The shared tail of `TZCNT` and `LZCNT`: write the result and set the two
-    /// flags they define.
+    /// The shared tail of `TZCNT`/`LZCNT`: write the result and set CF/ZF.
     fn write_count_zeros_result(
         &mut self,
         instruction: &Instruction,
@@ -772,19 +677,12 @@ impl<'a> Lifter<'a> {
         self.set_flag(X86Flag::Carry, cf)?;
         let zf = self.builder.ins().icmp_imm_s(IntCC::Equal, result, 0);
         self.set_flag(X86Flag::Zero, zf)?;
-        // The ordinary destination write: unlike `BSF`/`BSR` there is no
-        // "leave the register alone" case to preserve, so the x86-64 rule that a
-        // 32-bit write zeroes the upper half applies as it does everywhere else.
+        // Ordinary write: no keep-old case, so a 32-bit write zeroes the upper half.
         self.write_operand(instruction, 0, result)
     }
 
-    /// Write a BSF/BSR result to the register destination, leaving the entire
-    /// 64-bit register unchanged when `keep_old` (source was zero) is set.
-    ///
-    /// A `select` at the operand width followed by a normal write would zero the
-    /// upper 32 bits for a 32-bit destination (the x86-64 write rule), whereas the
-    /// source-zero case must leave the register truly untouched. Selecting at full
-    /// register width preserves it.
+    /// Write a BSF/BSR result, leaving the whole 64-bit register unchanged when `keep_old` (source zero).
+    /// Selecting at full register width avoids the 32-bit write rule zeroing the upper half.
     fn write_bit_scan_result(
         &mut self,
         instruction: &Instruction,
@@ -793,8 +691,6 @@ impl<'a> Lifter<'a> {
     ) -> crate::Result<()> {
         let dst_reg = instruction.op0_register();
         let base_reg = get_base_reg_64(dst_reg);
-        // Snapshot the full register, apply the normal (extending) write for the
-        // computed result, then pick between the two at 64-bit width.
         let old_full = self.get_reg_val(base_reg)?;
         self.write_operand(instruction, 0, result)?;
         let new_full = self.get_reg_val(base_reg)?;
@@ -802,10 +698,7 @@ impl<'a> Lifter<'a> {
         self.set_reg_val(base_reg, selected)
     }
 
-    /// BSWAP - reverse byte order of a 32- or 64-bit register.
-    ///
-    /// For 16-bit operands the result is architecturally undefined; this follows
-    /// the common convention of zeroing the destination.
+    /// BSWAP - reverse byte order of a 32- or 64-bit register; 16-bit is undefined and zeroes the destination here.
     pub(super) fn handle_bswap(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let reg = instruction.op0_register();
         let size = reg.size();
@@ -816,7 +709,6 @@ impl<'a> Lifter<'a> {
                 self.set_reg_val(reg, result)?;
             }
             2 => {
-                // Undefined per Intel SDM; zero the register.
                 let zero = self.builder.ins().iconst(size_to_type(size), 0);
                 self.set_reg_val(reg, zero)?;
             }
@@ -832,11 +724,9 @@ impl<'a> Lifter<'a> {
     pub(super) fn handle_bsr(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let size = self.operand_size(instruction, 1)?;
         let src = self.read_operand(instruction, 1, size)?;
-        // ZF = 1 if src == 0
         let zf = self.builder.ins().icmp_imm_s(IntCC::Equal, src, 0);
         self.set_flag(X86Flag::Zero, zf)?;
-        // BSR: index of highest set bit = (size*8-1) - clz(src). For src == 0
-        // leave the destination unchanged (see handle_bsf).
+        // BSR: index = (size*8-1) - clz(src); destination unchanged for a zero source.
         let clz = self.builder.ins().clz(src);
         let bit_width = self
             .builder

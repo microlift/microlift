@@ -1,24 +1,16 @@
-//! Dead block parameters, and the branch arguments that feed them.
+//! Dead block parameters and the branch arguments that feed them.
 //!
-//! Cranelift's own optimizer does not remove a block parameter nothing reads,
-//! and the SSA builder produces a great many of them here: a lifted region's
-//! `RET` dispatch has an in-region arm back to the region's earlier blocks, so
-//! every guest register is a parameter of those blocks. That is harmless
-//! while something consumes them, and the register file's exit sync did.
+//! Cranelift does not remove unread block parameters; the SSA builder makes many.
 
 use cranelift_codegen::entity::{EntitySet, SecondaryMap};
 use cranelift_codegen::ir::{Block, Function, Inst, Value};
 
-/// Remove every block parameter nothing reads, and the branch arguments that
-/// were feeding them. Returns whether anything changed.
+/// Removes unread block parameters and their branch arguments; returns whether anything changed.
 ///
-/// The entry block is never touched: its parameters are the function's
-/// signature.
+/// The entry block is skipped (its parameters are the signature).
 pub fn remove_dead_block_params(func: &mut Function) -> bool {
     let live = live_values(func);
 
-    // Descending within a block, so removing one parameter does not shift the
-    // index of the next one to go.
     let mut doomed: Vec<(Block, Vec<usize>)> = Vec::new();
     let entry = func.layout.entry_block();
     for block in func.layout.blocks() {
@@ -54,17 +46,11 @@ pub fn remove_dead_block_params(func: &mut Function) -> bool {
     true
 }
 
-/// Every value something actually reads.
-///
-/// Seeded with the direct operands of every instruction - a `brif`'s condition
-/// counts, its block arguments do not.
+/// Values something reads; a branch argument counts only if its parameter is live.
 fn live_values(func: &Function) -> EntitySet<Value> {
     let mut live: EntitySet<Value> = EntitySet::with_capacity(func.dfg.num_values());
 
-    // `(parameter, argument)`, both resolved: the argument is live as soon as
-    // the parameter is. Collected in the same walk that seeds the direct
-    // operands, so the IR is traversed exactly once however many rounds the
-    // fixpoint below takes.
+    // (parameter, argument), both resolved.
     let mut edges: Vec<(Value, Value)> = Vec::new();
     for block in func.layout.blocks() {
         for inst in func.layout.block_insts(block) {
@@ -92,9 +78,6 @@ fn live_values(func: &Function) -> EntitySet<Value> {
         }
     }
 
-    // A round is now a scan of a flat vector against a bitset. Converges in as
-    // many rounds as the longest chain of parameters feeding parameters, which
-    // in this lifter's output is short.
     loop {
         let mut grew = false;
         for &(param, value) in &edges {
@@ -108,11 +91,7 @@ fn live_values(func: &Function) -> EntitySet<Value> {
     }
 }
 
-/// Which instructions branch to each block, de-duplicated.
-///
-/// De-duplicated because one instruction may name a block twice - a `brif` whose
-/// arms both go to the same place is common in this lifter's output - and
-/// [`remove_argument`] already visits every call of an instruction.
+/// Branching instructions per block, de-duplicated (a `brif` may name a block twice).
 fn predecessors(func: &Function) -> SecondaryMap<Block, Vec<Inst>> {
     let mut preds: SecondaryMap<Block, Vec<Inst>> = SecondaryMap::new();
     for block in func.layout.blocks() {
@@ -131,10 +110,7 @@ fn predecessors(func: &Function) -> SecondaryMap<Block, Vec<Inst>> {
     preds
 }
 
-/// Drop argument `index` from every call `inst` makes to `block`.
-///
-/// Every call, not the first: a `brif` with both arms on one block has two, and
-/// leaving either behind is an arity mismatch the verifier would catch.
+/// Drops argument `index` from every call `inst` makes to `block` (a `brif` may have two).
 fn remove_argument(func: &mut Function, inst: Inst, block: Block, index: usize) {
     let dfg = &mut func.dfg;
     let pool = &mut dfg.value_lists;

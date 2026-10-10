@@ -1,15 +1,8 @@
 //! SSE / SSE2 / XMM instruction semantics.
 //!
-//! XMM registers have two backing representations, selected by
-//! [`crate::lifter::LifterConfig::use_vector_xmm`]: scalar (default) is two
-//! `I64` SSA variables per register, portable to AOT targets without vector
-//! lowering; vector is one native `I64X2`.
-//!
-//! The scalar expansion is the authority on semantics and always works; with
-//! the vector representation most handlers take a native fast path instead -
-//! see [`sse_vec`](super::sse_vec) and `tests/sse_vec_equiv_tests.rs`. Lane
-//! access goes through [`crate::lifter::Lifter::get_xmm_lo`]/`get_xmm_hi`,
-//! which handle both representations.
+//! XMM is two `I64` SSA variables (scalar, default, AOT-portable) or one native `I64X2`
+//! ([`crate::lifter::LifterConfig::use_vector_xmm`]). The scalar expansion is the semantic authority;
+//! vector mode takes fast paths from [`sse_vec`](super::sse_vec). Lane access: [`crate::lifter::Lifter::get_xmm_lo`]/`get_xmm_hi`.
 
 use crate::MicroliftError;
 use crate::arch::x86_64::context::{MXCSR_MASK, RegisterContext};
@@ -21,30 +14,15 @@ use cranelift::codegen::ir::immediates::{Ieee32, Ieee64};
 use cranelift::prelude::*;
 use iced_x86::{Instruction, OpKind};
 
-/// x86's single-precision *floating indefinite*: the QNaN an SSE instruction
-/// produces when it generates a NaN of its own (as opposed to propagating an
-/// operand's). Note the set sign bit - that is what distinguishes it from the
-/// AArch64 default NaN, and why it cannot be left to the host FPU.
+/// x86's single-precision *floating indefinite*: the sign-set QNaN generated for invalid operations (aarch64's default NaN is positive).
 pub(super) const F32_INDEFINITE: Ieee32 = Ieee32::with_bits(0xFFC0_0000);
 
 /// The double-precision [`F32_INDEFINITE`].
 pub(super) const F64_INDEFINITE: Ieee64 = Ieee64::with_bits(0xFFF8_0000_0000_0000);
 
 /// Square root of one `F32` or `F64` with x86's NaN behaviour.
-///
-/// A negative operand *generates* a NaN rather than propagating one, and the
-/// ISAs disagree on its sign: x86 yields the floating indefinite (see
-/// [`F32_INDEFINITE`]) where AArch64's default NaN is positive. A bare
-/// Cranelift `sqrt` lets the host FPU pick, so the indefinite is materialised
-/// explicitly.
-///
-/// Only the strict `x < 0` case is patched, which is exactly the NaN-generating
-/// input set: `-0.0` still gives `-0.0`, and a NaN operand falls through to
-/// `sqrt`, which propagates it with sign and payload intact as x86 does.
-/// [`GeneratedNan::HostDefault`] skips the patch entirely.
-///
-/// A free function rather than a [`Lifter`] method so it can be passed as the
-/// `op` closure of the packed lane plumbing, which is handed only the builder.
+/// A negative operand generates the floating indefinite (see [`F32_INDEFINITE`]); only strict `x < 0` is patched
+/// (`-0.0` stays `-0.0`, NaN operands propagate). [`GeneratedNan::HostDefault`] skips the patch. A free function so it can be a lane `op` closure.
 pub(super) fn fp_sqrt_x86(nan: GeneratedNan, b: &mut FunctionBuilder, x: Value) -> Value {
     let r = b.ins().sqrt(x);
     if nan == GeneratedNan::HostDefault {
@@ -59,18 +37,9 @@ pub(super) fn fp_sqrt_x86(nan: GeneratedNan, b: &mut FunctionBuilder, x: Value) 
     b.ins().select(negative, indefinite, r)
 }
 
-/// One `F32`/`F64` arithmetic lane with x86's *generated*-NaN bits.
-///
-/// The binary companion of [`fp_sqrt_x86`]: `inf + -inf`, `inf - inf`,
-/// `0 * inf`, `0 / 0` and `inf / inf` are invalid operations whose NaN the
-/// instruction generates rather than propagates, so it must be x86's sign-set
-/// floating indefinite rather than the host's default.
-///
-/// The condition is stated once for all four operations rather than enumerated:
-/// a NaN result neither operand supplied *is* the invalid case, and is exactly
-/// that set. An operand that is already a NaN is propagated correctly by the
-/// host, so `Ordered(x, y)` leaves that path untouched - which is what
-/// [`GeneratedNan::HostDefault`] buys out of.
+/// One `F32`/`F64` arithmetic lane with x86's *generated*-NaN bits (binary companion of [`fp_sqrt_x86`]).
+/// A NaN result neither operand supplied is the invalid case (`inf - inf`, `0 * inf`, `0 / 0`, ...) and must be the sign-set indefinite;
+/// NaN operands propagate correctly on the host. [`GeneratedNan::HostDefault`] opts out.
 pub(super) fn fp_arith_x86(
     nan: GeneratedNan,
     b: &mut FunctionBuilder,
@@ -93,11 +62,7 @@ pub(super) fn fp_arith_x86(
     b.ins().select(invalid, indefinite, r)
 }
 
-/// [`fp_arith_x86`] over `FADD`, as the lane closure the packed and scalar
-/// plumbing expects, with `nan` bound in.
-///
-/// Curried because that plumbing hands its `op` only the builder, while the
-/// generated-NaN policy is a property of the lift.
+/// [`fp_arith_x86`] over `FADD` as the lane closure the plumbing expects, with `nan` bound in (curried: `op` gets only the builder).
 pub(super) fn fadd_x86<'a>(
     nan: GeneratedNan,
 ) -> impl Fn(&mut FunctionBuilder<'a>, Value, Value) -> Value + Copy {
@@ -139,12 +104,7 @@ pub(super) enum RoundMode {
 }
 
 /// Decode `imm8[2:0]` of a `ROUND*` instruction.
-///
-/// Bit 2 means "use MXCSR's current rounding mode". The register exists
-/// ([`crate::context::RegisterContext::mxcsr`]) but no arithmetic consults it:
-/// every SSE operation here rounds nearest-even, so that is what bit 2
-/// resolves to. Bit 3 suppresses the precision exception, unobservable here
-/// since no FP exception is raised in the first place.
+/// Bit 2 ("use MXCSR") resolves to nearest-even since no arithmetic consults MXCSR; bit 3 (precision exception) is unobservable.
 pub(super) fn round_mode(imm: u8) -> RoundMode {
     if imm & 0b100 != 0 {
         return RoundMode::Nearest;
@@ -157,10 +117,7 @@ pub(super) fn round_mode(imm: u8) -> RoundMode {
     }
 }
 
-/// Apply `mode` to one float value.
-///
-/// A free function for the reason [`fp_sqrt_x86`] is: the packed lane plumbing
-/// hands its `op` closure only the builder.
+/// Apply `mode` to one float value; a free function like [`fp_sqrt_x86`].
 pub(super) fn apply_round(b: &mut FunctionBuilder, mode: RoundMode, x: Value) -> Value {
     match mode {
         RoundMode::Nearest => b.ins().nearest(x),
@@ -181,7 +138,6 @@ pub(super) enum PackedWidth {
 }
 
 impl PackedWidth {
-    /// Lane width in bits.
     pub(super) fn bits(self) -> u32 {
         match self {
             PackedWidth::Byte => 8,
@@ -191,7 +147,6 @@ impl PackedWidth {
         }
     }
 
-    /// The 128-bit Cranelift vector type with these lanes.
     pub(super) fn vector_type(self) -> Type {
         match self {
             PackedWidth::Byte => types::I8X16,
@@ -201,10 +156,7 @@ impl PackedWidth {
         }
     }
 
-    /// A 64-bit mask with the most significant bit of every lane set
-    /// (`0x8080..` for byte lanes, `0x8000_8000..` for word lanes, ...).
-    ///
-    /// This is the "carry barrier" used by the SWAR add/sub in scalar mode.
+    /// A 64-bit mask with the MSB of every lane set (`0x8080..` for bytes); the SWAR add/sub carry barrier.
     fn lane_sign_mask(self) -> i64 {
         let bits = self.bits();
         let mut mask = 0u64;
@@ -216,7 +168,6 @@ impl PackedWidth {
         mask as i64
     }
 
-    /// A 64-bit mask with all bits of the lowest lane set.
     fn lane_mask(self) -> i64 {
         match self.bits() {
             64 => -1,
@@ -243,7 +194,6 @@ impl PackedShiftOp {
         self != PackedShiftOp::Sra
     }
 
-    /// The mnemonic this op/width pair came from, for error messages.
     fn mnemonic(self, width: PackedWidth) -> &'static str {
         match (self, width) {
             (PackedShiftOp::Srl, PackedWidth::Word) => "psrlw",
@@ -297,11 +247,8 @@ pub(super) enum PackedIntOp {
     SubSatUnsigned,
 }
 
-/// A lane-wise packed-integer operation whose lanes are independent and fit in
-/// a widened `I64` - compares, min/max, average and multiply.
-///
-/// These share one expansion ([`Lifter::lanewise_64`]) in scalar mode and, for
-/// most of them, a single native Cranelift vector op in vector mode.
+/// A lane-wise packed-integer op whose lanes are independent and fit a widened `I64` (compares, min/max, average, multiply);
+/// one scalar expansion ([`Lifter::lanewise_64`]) and, mostly, a single native vector op in vector mode.
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub(super) enum PackedLaneOp {
     /// `PCMPEQB`/`PCMPEQW`/`PCMPEQD`/`PCMPEQQ` - lanes equal -> all-ones mask.
@@ -327,8 +274,7 @@ pub(super) enum PackedLaneOp {
 }
 
 impl PackedLaneOp {
-    /// True when lanes must be *sign*-extended as they are widened to `I64` for
-    /// the scalar expansion.
+    /// True when lanes are *sign*-extended as they widen to `I64`.
     fn is_signed(self) -> bool {
         matches!(
             self,
@@ -336,11 +282,7 @@ impl PackedLaneOp {
         )
     }
 
-    /// True when Cranelift has a single native vector instruction for this op,
-    /// so vector mode can take the fast path instead of expanding lanes.
-    ///
-    /// Every [`PackedLaneOp`] now has one - the high-multiply forms map onto
-    /// the vector-polymorphic `smulhi` / `umulhi`.
+    /// True when Cranelift has a single native vector instruction for this op.
     fn has_vector_form(self) -> bool {
         true
     }
@@ -353,7 +295,6 @@ impl PackedIntOp {
         matches!(self, PackedIntOp::AddSatSigned | PackedIntOp::SubSatSigned)
     }
 
-    /// True for the subtracting ops.
     fn is_subtract(self) -> bool {
         matches!(
             self,
@@ -363,12 +304,7 @@ impl PackedIntOp {
 }
 
 impl<'a> Lifter<'a> {
-    /// Load a 128-bit XMM source operand as a `(lo, hi)` scalar pair.
-    ///
-    /// Supports:
-    ///  - XMM register source
-    ///  - GPR source (zero-extends 64-bit value into lo; hi = 0)
-    ///  - Memory source (two 8-byte loads)
+    /// Load a 128-bit XMM source as a `(lo, hi)` pair: XMM register, GPR (zero-extended into lo, hi = 0) or memory (two 8-byte loads).
     pub(super) fn read_xmm_src(
         &mut self,
         instruction: &Instruction,
@@ -380,7 +316,6 @@ impl<'a> Lifter<'a> {
                 if let Some(idx) = xmm_register_index(reg) {
                     Ok((self.get_xmm_lo(idx), self.get_xmm_hi(idx)))
                 } else {
-                    // GPR source (e.g. MOVQ xmm, r64): zero-extend to 128 bits.
                     let lo = self.get_reg_val(reg)?;
                     let hi = self.builder.ins().iconst(types::I64, 0);
                     Ok((lo, hi))
@@ -404,12 +339,7 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// Write a `(lo, hi)` scalar pair to an XMM destination operand.
-    ///
-    /// Supports:
-    ///  - XMM register destination
-    ///  - GPR destination (uses lo bits only)
-    ///  - Memory destination (two 8-byte stores)
+    /// Write a `(lo, hi)` pair to an XMM destination: XMM register, GPR (lo only) or memory (two 8-byte stores).
     fn write_xmm_dst(
         &mut self,
         instruction: &Instruction,
@@ -425,7 +355,6 @@ impl<'a> Lifter<'a> {
                     self.set_xmm_hi(idx, hi);
                     Ok(())
                 } else {
-                    // GPR destination: use lo (low 64 bits).
                     self.set_reg_val(reg, lo)
                 }
             }
@@ -441,11 +370,7 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// Load a 128-bit XMM source operand as a native `I64X2` value.
-    ///
-    /// - XMM register: direct vec read (or assembled from lo/hi in scalar mode).
-    /// - GPR (e.g. `MOVQ xmm, r64`): zero-extended into lane 0, lane 1 = 0.
-    /// - Memory: one 128-bit unaligned load.
+    /// Load a 128-bit XMM source as a native `I64X2`: XMM register, GPR (zero-extended into lane 0) or one unaligned 128-bit load.
     pub(super) fn read_xmm_src_vec(
         &mut self,
         instruction: &Instruction,
@@ -476,12 +401,7 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// Write a 128-bit `I64X2` value to an XMM destination operand.
-    ///
-    /// - XMM register destination: direct vec write (or split into
-    ///   lo/hi in scalar mode).
-    /// - GPR destination: uses lane 0 (low 64 bits).
-    /// - Memory destination: single 128-bit unaligned store.
+    /// Write an `I64X2` to an XMM destination: XMM register, GPR (lane 0) or one unaligned 128-bit store.
     fn write_xmm_dst_vec(
         &mut self,
         instruction: &Instruction,
@@ -525,10 +445,7 @@ impl<'a> Lifter<'a> {
         self.write_xmm_dst(instruction, 0, lo, hi)
     }
 
-    /// MOVQ (SSE2 form) - move 64 bits to/from an XMM register.
-    ///
-    /// When the destination is an XMM register the high 64 bits are zeroed
-    /// (matching real hardware behaviour).
+    /// MOVQ (SSE2 form) - move 64 bits to/from an XMM register; an XMM destination zeroes the high 64 bits.
     pub(super) fn handle_movq_sse(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let zero = self.builder.ins().iconst(types::I64, 0);
 
@@ -536,7 +453,6 @@ impl<'a> Lifter<'a> {
             OpKind::Register => {
                 let dst_reg = self.operand_register(instruction, 0);
                 if let Some(dst_idx) = xmm_register_index(dst_reg) {
-                    // MOVQ xmm, xmm/r64/m64 - move 64 bits, zero high 64.
                     let lo = match self.operand_kind(instruction, 1) {
                         OpKind::Register => {
                             let src = self.operand_register(instruction, 1);
@@ -561,7 +477,6 @@ impl<'a> Lifter<'a> {
                     self.set_xmm_lo(dst_idx, lo);
                     self.set_xmm_hi(dst_idx, zero);
                 } else {
-                    // MOVQ r64, xmm - extract low 64 bits to GPR.
                     let src_xmm = self.operand_register(instruction, 1);
                     let src_idx = xmm_register_index(src_xmm).ok_or_else(|| {
                         MicroliftError::UnsupportedInstruction {
@@ -573,7 +488,6 @@ impl<'a> Lifter<'a> {
                 }
             }
             OpKind::Memory => {
-                // MOVQ m64, xmm - store low 64 bits.
                 let src_xmm = self.operand_register(instruction, 1);
                 let src_idx = xmm_register_index(src_xmm).ok_or_else(|| {
                     MicroliftError::UnsupportedInstruction {
@@ -677,7 +591,6 @@ impl<'a> Lifter<'a> {
         if self.config.use_vector_xmm {
             let dst = self.get_xmm_vec(dst_idx);
             let src = self.read_xmm_src_vec(instruction, 1)?;
-            // band_not(a, b) = a & !b - so band_not(src, dst) = src & !dst = ~dst & src
             let res = self.builder.ins().band_not(src, dst);
             self.set_xmm_vec(dst_idx, res);
             return Ok(());
@@ -710,7 +623,6 @@ impl<'a> Lifter<'a> {
 
                 match self.operand_kind(instruction, 1) {
                     OpKind::Register => {
-                        // MOVSS xmm1, xmm2 - merge low 32 bits, preserve upper 96.
                         let src_reg = self.operand_register(instruction, 1);
                         let src_idx = xmm_register_index(src_reg).ok_or_else(|| {
                             MicroliftError::UnsupportedInstruction {
@@ -719,16 +631,13 @@ impl<'a> Lifter<'a> {
                         })?;
                         let src_lo = self.get_xmm_lo(src_idx);
                         let dst_lo = self.get_xmm_lo(dst_idx);
-                        // Replace bits[31:0] of dst_lo with src_lo[31:0]; preserve bits[63:32].
                         let mask = self.builder.ins().iconst(types::I64, !0xFFFF_FFFFi64);
                         let cleared = self.builder.ins().band(dst_lo, mask);
                         let src32 = self.builder.ins().band_imm_u(src_lo, 0xFFFF_FFFF);
                         let merged_lo = self.builder.ins().bor(cleared, src32);
-                        // hi 64 bits of dst are preserved (no write needed).
                         self.set_xmm_lo(dst_idx, merged_lo);
                     }
                     OpKind::Memory => {
-                        // MOVSS xmm, m32 - load 32 bits, zero upper 96 bits.
                         let ptr = self.get_mem_ptr(instruction, 1)?;
                         let val32 = self
                             .builder
@@ -747,7 +656,6 @@ impl<'a> Lifter<'a> {
                 }
             }
             OpKind::Memory => {
-                // MOVSS m32, xmm - store low 32 bits.
                 let src_reg = self.operand_register(instruction, 1);
                 let src_idx = xmm_register_index(src_reg).ok_or_else(|| {
                     MicroliftError::UnsupportedInstruction {
@@ -780,7 +688,6 @@ impl<'a> Lifter<'a> {
             OpKind::Register => {
                 let dst_reg = self.operand_register(instruction, 0);
                 if let Some(dst_idx) = xmm_register_index(dst_reg) {
-                    // MOVD xmm, r/m32 - load low dword, zero the upper 96 bits.
                     let val32 = match self.operand_kind(instruction, 1) {
                         OpKind::Register => {
                             let src = self.operand_register(instruction, 1);
@@ -803,7 +710,6 @@ impl<'a> Lifter<'a> {
                     self.set_xmm_lo(dst_idx, lo);
                     self.set_xmm_hi(dst_idx, zero);
                 } else {
-                    // MOVD r32, xmm - extract low dword into a GPR (zero-extended).
                     let src_idx = self.xmm_operand_index(instruction, 1, "movd")?;
                     let lo = self.get_xmm_lo(src_idx);
                     let val32 = self.builder.ins().ireduce(types::I32, lo);
@@ -811,7 +717,6 @@ impl<'a> Lifter<'a> {
                 }
             }
             OpKind::Memory => {
-                // MOVD m32, xmm - store the low dword.
                 let src_idx = self.xmm_operand_index(instruction, 1, "movd")?;
                 let lo = self.get_xmm_lo(src_idx);
                 let val32 = self.builder.ins().ireduce(types::I32, lo);
@@ -834,7 +739,6 @@ impl<'a> Lifter<'a> {
     pub(super) fn handle_movhps(&mut self, instruction: &Instruction) -> crate::Result<()> {
         match self.operand_kind(instruction, 0) {
             OpKind::Register => {
-                // Load form: dst is XMM, src must be m64.
                 let dst_idx = self.xmm_operand_index(instruction, 0, "movhps")?;
                 if self.operand_kind(instruction, 1) != OpKind::Memory {
                     return Err(MicroliftError::UnsupportedInstruction {
@@ -849,7 +753,6 @@ impl<'a> Lifter<'a> {
                 self.set_xmm_hi(dst_idx, hi);
             }
             OpKind::Memory => {
-                // Store form: dst is m64, src is XMM.
                 let src_idx = self.xmm_operand_index(instruction, 1, "movhps")?;
                 let hi = self.get_xmm_hi(src_idx);
                 let ptr = self.get_mem_ptr(instruction, 0)?;
@@ -868,13 +771,10 @@ impl<'a> Lifter<'a> {
     ///
     /// - `MOVLPS xmm, m64`: low 64 bits = `[mem]`, high 64 preserved.
     /// - `MOVLPS m64, xmm`: store the low 64 bits of `xmm`.
-    ///
-    /// A merging load, unlike `MOVSD xmm, m64`. There is no register-to-register
-    /// form - those encodings decode as `MOVHLPS`/`MOVLHPS`.
+    /// A merging load, unlike `MOVSD xmm, m64`; the register forms decode as `MOVHLPS`/`MOVLHPS`.
     pub(super) fn handle_movlps(&mut self, instruction: &Instruction) -> crate::Result<()> {
         match self.operand_kind(instruction, 0) {
             OpKind::Register => {
-                // Load form: dst is XMM, src must be m64.
                 let dst_idx = self.xmm_operand_index(instruction, 0, "movlps")?;
                 if self.operand_kind(instruction, 1) != OpKind::Memory {
                     return Err(MicroliftError::UnsupportedInstruction {
@@ -889,7 +789,6 @@ impl<'a> Lifter<'a> {
                 self.set_xmm_lo(dst_idx, lo);
             }
             OpKind::Memory => {
-                // Store form: dst is m64, src is XMM.
                 let src_idx = self.xmm_operand_index(instruction, 1, "movlps")?;
                 let lo = self.get_xmm_lo(src_idx);
                 let ptr = self.get_mem_ptr(instruction, 0)?;
@@ -950,16 +849,10 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// PSRLW/PSRLD/PSRLQ, PSLLW/PSLLD/PSLLQ, PSRAW/PSRAD - packed per-lane shift
-    /// by a scalar count.
-    ///
+    /// PSRLW/PSRLD/PSRLQ, PSLLW/PSLLD/PSLLQ, PSRAW/PSRAD - packed per-lane shift by a scalar count.
     /// - `<op> xmm, imm8`: every lane shifts by the immediate.
-    /// - `<op> xmm, xmm/m128`: the count is the low 64 bits of the source, all of
-    ///   which participate, so a huge count is out of range rather than truncated.
-    ///
-    /// An out-of-range count (>= the lane width) is *not* modulo-width: the
-    /// zero-filling shifts produce all-zero lanes, `PSRA*` saturates to each lane's
-    /// sign.
+    /// - `<op> xmm, xmm/m128`: the count is the low 64 bits of the source, so a huge count is out of range, not truncated.
+    /// An out-of-range count (>= lane width) is not modulo: zero-filling shifts give zero, `PSRA*` gives the sign.
     pub(super) fn handle_packed_shift(
         &mut self,
         instruction: &Instruction,
@@ -1012,12 +905,8 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// Packed shift in vector mode: bitcast to the lane type and use Cranelift's
-    /// native lane-wise shift, one host SIMD instruction.
-    ///
-    /// Cranelift masks the shift amount to the lane width, so out-of-range counts
-    /// are handled explicitly: `PSRA*` clamps the count, the zero-filling shifts
-    /// mask the result away.
+    /// Packed shift in vector mode via Cranelift's lane-wise shift; out-of-range counts are explicit
+    /// (`PSRA*` clamps the count, zero-filling shifts mask the result).
     fn packed_shift_vec(
         &mut self,
         dst: Value,
@@ -1053,9 +942,7 @@ impl<'a> Lifter<'a> {
                         } else {
                             self.builder.ins().ushr(a, clamped)
                         };
-                        // Zero every lane when the count was out of range. A
-                        // splat of a scalar select keeps the mask off the
-                        // vector unit's critical path.
+                        // Zero every lane for an out-of-range count; a splat of a scalar select keeps the mask off the vector critical path.
                         let too_big =
                             self.builder
                                 .ins()
@@ -1084,10 +971,7 @@ impl<'a> Lifter<'a> {
         let bits = width.bits() as u64;
 
         if op == PackedShiftOp::Sra {
-            // Per lane, `sra(x, c) == srl(x ^ S, c) - srl(S, c)` where `S` is
-            // the lane's sign bit: the xor turns the sign-fill into a
-            // zero-fill, and subtracting the shifted sign bit restores it.
-            // `swar_sub` keeps the subtraction from borrowing across lanes.
+            // `sra(x, c) == srl(x ^ S, c) - srl(S, c)` with `S` the lane sign bit; `swar_sub` avoids cross-lane borrow.
             // A count >= bits saturates to the sign, i.e. a shift by bits - 1.
             let clamped = self.clamp_shift_count(count, bits - 1);
             let sign_imm = width.lane_sign_mask();
@@ -1125,12 +1009,8 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// Lane-wise logical shift of one 64-bit lane pack by a count that must
-    /// already be in range (`< lane width`).
-    ///
-    /// The raw 64-bit shift lets bits cross lane boundaries, so the result is
-    /// masked with the shifted lane mask replicated across every lane - e.g.
-    /// for `PSRLD` by 4 the mask is `0x0FFF_FFFF_0FFF_FFFF`.
+    /// Lane-wise logical shift of one 64-bit pack by an in-range count (`< lane width`); the raw shift is masked with
+    /// the shifted lane mask replicated per lane (`PSRLD` by 4: `0x0FFF_FFFF_0FFF_FFFF`).
     fn packed_logical_shift_64(
         &mut self,
         a: Value,
@@ -1154,8 +1034,7 @@ impl<'a> Lifter<'a> {
                 self.builder.ins().band_imm_u(shifted, mask)
             }
             ShiftCount::Dynamic(cv) => {
-                // Build the same mask at runtime: shift the lowest lane's mask,
-                // then double it up into every lane.
+                // Build the mask at runtime: shift the lowest lane's mask, then double it up.
                 let lane_const = self.builder.ins().iconst(types::I64, lane as i64);
                 let mut mask = if left {
                     let s = self.builder.ins().ishl(lane_const, cv);
@@ -1186,9 +1065,7 @@ impl<'a> Lifter<'a> {
         let imm = instruction.immediate8();
 
         if self.vec_mode() {
-            // Every result dword comes from the source, so the shuffle's second
-            // operand is unused - pass the source again rather than materialize
-            // a dead value.
+            // Every dword comes from the source, so the second shuffle operand is unused.
             let src = self.read_xmm_src_vec(instruction, 1)?;
             let mask = Self::lane_shuffle_mask(32, |j| u32::from((imm >> (2 * j)) & 0b11));
             let r = self.vec_shuffle(src, src, mask);
@@ -1219,8 +1096,7 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Resolve operand `op_index` to an XMM register index, or error with a
-    /// handler-specific mnemonic tag.
+    /// Resolve operand `op_index` to an XMM register index, or error with a mnemonic tag.
     pub(super) fn xmm_operand_index(
         &self,
         instruction: &Instruction,
@@ -1251,7 +1127,6 @@ impl<'a> Lifter<'a> {
 
                 match self.operand_kind(instruction, 1) {
                     OpKind::Register => {
-                        // MOVSD xmm1, xmm2 - copy lo of src, preserve hi of dst.
                         let src_reg = self.operand_register(instruction, 1);
                         let src_idx = xmm_register_index(src_reg).ok_or_else(|| {
                             MicroliftError::UnsupportedInstruction {
@@ -1259,11 +1134,9 @@ impl<'a> Lifter<'a> {
                             }
                         })?;
                         let src_lo = self.get_xmm_lo(src_idx);
-                        // hi of dst is preserved (no write needed).
                         self.set_xmm_lo(dst_idx, src_lo);
                     }
                     OpKind::Memory => {
-                        // MOVSD xmm, m64 - load 64 bits, zero hi.
                         let ptr = self.get_mem_ptr(instruction, 1)?;
                         let lo = self
                             .builder
@@ -1281,7 +1154,6 @@ impl<'a> Lifter<'a> {
                 }
             }
             OpKind::Memory => {
-                // MOVSD m64, xmm - store lo.
                 let src_reg = self.operand_register(instruction, 1);
                 let src_idx = xmm_register_index(src_reg).ok_or_else(|| {
                     MicroliftError::UnsupportedInstruction {
@@ -1301,11 +1173,7 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Read the low 64 bits (a scalar `f64`'s raw bits) of a source operand.
-    ///
-    /// Unlike [`Self::read_xmm_src`], memory sources load only 8 bytes, which is
-    /// correct for the `m64` operands of scalar-double instructions (`ADDSD`,
-    /// `UCOMISD`, ...).
+    /// Read the low 64 bits (a scalar `f64`'s bits) of a source; unlike [`Self::read_xmm_src`], memory loads only 8 bytes.
     fn read_scalar_f64_bits(
         &mut self,
         instruction: &Instruction,
@@ -1333,12 +1201,7 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// Read the low 32 bits (a scalar `f32`'s raw bits, as an `I32`) of a source
-    /// operand.
-    ///
-    /// Memory sources load only 4 bytes, which is correct for the `m32` operands
-    /// of scalar-single instructions (`ADDSS`, `MULSS`, ...). Register sources
-    /// must be XMM - no scalar-single instruction takes a GPR operand.
+    /// Read the low 32 bits (a scalar `f32`'s bits, `I32`) of a source; memory loads only 4 bytes and register sources must be XMM.
     fn read_scalar_f32_bits(
         &mut self,
         instruction: &Instruction,
@@ -1364,26 +1227,19 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// Replace bits[31:0] of XMM `idx` with `bits32` (an `I32`), leaving
-    /// bits[127:32] untouched - the merge behaviour every scalar-single
-    /// destination write shares.
+    /// Replace bits[31:0] of XMM `idx` with `bits32`, preserving bits[127:32] (the scalar-single merge).
     fn merge_xmm_dword0(&mut self, idx: u8, bits32: Value) {
         let bits = self.builder.ins().uextend(types::I64, bits32);
         let dst_lo = self.get_xmm_lo(idx);
         let mask = self.builder.ins().iconst(types::I64, !0xFFFF_FFFFi64);
         let cleared = self.builder.ins().band(dst_lo, mask);
         let merged = self.builder.ins().bor(cleared, bits);
-        // The high quadword is preserved (no write needed).
         self.set_xmm_lo(idx, merged);
     }
 
-    /// The whole `PUNPCK{L,H}{BW,WD,DQ,QDQ}` family and its FP aliases
-    /// `UNPCK{L,H}P{S,D}`.
-    ///
-    /// Interleaves `width`-wide lanes from one 64-bit half of each operand - low
-    /// for `PUNPCKL*`, high for `PUNPCKH*`. Result lane `2i` comes from the
-    /// destination, `2i+1` from the source, so the selected half of each expands
-    /// to fill all 128 bits. `PUNPCKLDQ` yields `[dst.d0, src.d0, dst.d1, src.d1]`.
+    /// The `PUNPCK{L,H}{BW,WD,DQ,QDQ}` family and its FP aliases `UNPCK{L,H}P{S,D}`.
+    /// Interleaves `width`-wide lanes from the low (`PUNPCKL*`) or high (`PUNPCKH*`) half of each operand: result lane `2i` is
+    /// the destination's, `2i+1` the source's; `PUNPCKLDQ` yields `[dst.d0, src.d0, dst.d1, src.d1]`.
     pub(super) fn handle_punpck(
         &mut self,
         instruction: &Instruction,
@@ -1395,9 +1251,7 @@ impl<'a> Lifter<'a> {
         let lane_bits = width.bits();
 
         if self.vec_mode() {
-            // Result lane `2i` is destination lane `off + i`, lane `2i+1` the
-            // source's - `off` selecting which half of each operand feeds the
-            // interleave. Source lanes are numbered past the first operand's.
+            // Result lane `2i` is destination lane `off + i`, `2i+1` the source's; source lanes are numbered past the first operand's.
             let lanes = 128 / lane_bits;
             let off = if high { lanes / 2 } else { 0 };
             let dst = self.get_xmm_vec(dst_idx);
@@ -1425,8 +1279,6 @@ impl<'a> Lifter<'a> {
             return Ok(());
         }
 
-        // `n` lanes per source half expand into `2n` result lanes, i.e. exactly
-        // the two 64-bit halves of the destination.
         let n = 64 / lane_bits;
         let mut acc = [
             self.builder.ins().iconst(types::I64, 0),
@@ -1453,8 +1305,7 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Apply `op` to two `f64` values given as raw `I64` bit patterns, returning
-    /// the result's bits.
+    /// Apply `op` to two `f64` raw `I64` bit patterns, returning the result's bits.
     fn f64_bits_arith(
         &mut self,
         a_bits: Value,
@@ -1475,9 +1326,7 @@ impl<'a> Lifter<'a> {
             .bitcast(types::I64, MemFlagsData::new(), r)
     }
 
-    /// Apply `op` to the two packed `f32` lanes held in a 64-bit half of an XMM
-    /// register (lane 0 = bits[31:0], lane 1 = bits[63:32]), returning the
-    /// repacked 64-bit result.
+    /// Apply `op` to the two packed `f32` lanes of a 64-bit half (lane 0 = bits[31:0]), returning the repacked half.
     fn f32_pair_arith(
         &mut self,
         a_bits: Value,
@@ -1500,8 +1349,7 @@ impl<'a> Lifter<'a> {
         self.builder.ins().bor(r0_64, r1_shifted)
     }
 
-    /// Apply `op` to two `f32` values given as raw `I32` bit patterns, returning
-    /// the result's bits.
+    /// Apply `op` to two `f32` raw `I32` bit patterns, returning the result's bits.
     fn f32_bits_arith(
         &mut self,
         a_bits: Value,
@@ -1522,12 +1370,7 @@ impl<'a> Lifter<'a> {
             .bitcast(types::I32, MemFlagsData::new(), r)
     }
 
-    /// Shared implementation for the scalar double-precision arithmetic
-    /// instructions (`ADDSD` / `SUBSD` / `MULSD` / `DIVSD`): apply `op` to the
-    /// low 64-bit lanes of dst and src, preserving the high 64 bits of dst.
-    ///
-    /// `op` receives the two operands as `F64` values and returns the `F64`
-    /// result.
+    /// Shared scalar double arithmetic (`ADDSD` / `SUBSD` / `MULSD` / `DIVSD`): `op` on the low 64-bit lanes, high 64 bits of dst preserved.
     fn scalar_double_arith(
         &mut self,
         instruction: &Instruction,
@@ -1542,18 +1385,12 @@ impl<'a> Lifter<'a> {
         let src_lo = self.read_scalar_f64_bits(instruction, 1)?;
         let res_lo = self.f64_bits_arith(dst_lo, src_lo, &op);
 
-        // hi 64 bits are preserved (no write needed).
         self.set_xmm_lo(dst_idx, res_lo);
         Ok(())
     }
 
-    /// Shared implementation of the SSE3 horizontal double-precision instructions
-    /// (`HADDPD`/`HSUBPD`): the destination's two lanes combine into the result's
-    /// low lane, the source's two into its high one.
-    ///
-    /// Both operands are read before either result is written, because the source
-    /// is very often the destination (`haddpd xmm0, xmm0`) and a lane written early
-    /// would then be an input to the other half.
+    /// Shared SSE3 horizontal double ops (`HADDPD`/`HSUBPD`): dst's two lanes combine into the low lane, src's into the high.
+    /// Both operands are read before either result is written (`haddpd xmm0, xmm0`).
     fn horizontal_double_arith(
         &mut self,
         instruction: &Instruction,
@@ -1573,10 +1410,7 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Shared implementation for the SSE3 horizontal single-precision
-    /// instructions (`HADDPS` / `HSUBPS`): each 64-bit half contributes one
-    /// 32-bit result lane, the destination's two halves filling the low half of
-    /// the result and the source's two the high half.
+    /// Shared SSE3 horizontal single ops (`HADDPS`/`HSUBPS`): each 64-bit half gives one lane; dst's halves fill the low half, src's the high.
     fn horizontal_single_arith(
         &mut self,
         instruction: &Instruction,
@@ -1601,8 +1435,7 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Apply `op` to the two packed `f32` lanes held in one 64-bit half of an
-    /// XMM register, returning the single 32-bit result's bits.
+    /// Apply `op` to the two packed `f32` lanes of a 64-bit half, returning the single 32-bit result's bits.
     fn f32_pair_horizontal(
         &mut self,
         bits: Value,
@@ -1622,17 +1455,10 @@ impl<'a> Lifter<'a> {
         self.builder.ins().bor(lo64, hi_shifted)
     }
 
-    /// DPPS - single-precision dot product, broadcast into the destination lanes
-    /// `imm8[3:0]` selects.
-    ///
-    /// `imm8[7:4]` is the *multiply* mask: a lane it clears contributes `+0.0`
-    /// rather than a product, so a NaN or infinity in a masked-off lane cannot
-    /// reach the sum. `imm8[3:0]` is the *broadcast* mask: a lane it clears is
-    /// written `+0.0`.
-    ///
-    /// The summation order is architectural: the SDM specifies the pairwise tree
-    /// `(t0 + t1) + (t2 + t3)`, each step rounded to single precision, so it is
-    /// written out literally. Every step goes through [`fadd_x86`]/[`fmul_x86`].
+    /// DPPS - single-precision dot product broadcast into the destination lanes `imm8[3:0]` selects.
+    /// `imm8[7:4]` masks the multiplies (a cleared lane contributes `+0.0`, so NaN/inf in it cannot reach the sum);
+    /// `imm8[3:0]` masks the broadcast (a cleared lane is `+0.0`).
+    /// The sum order is architectural, `(t0 + t1) + (t2 + t3)` each rounded to single, via [`fadd_x86`]/[`fmul_x86`].
     pub(super) fn handle_dpps(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let dst_idx = self.xmm_operand_index(instruction, 0, "dpps")?;
         let dst_lo = self.get_xmm_lo(dst_idx);
@@ -1674,12 +1500,7 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// DPPD - double-precision dot product, the two-lane companion of
-    /// [`handle_dpps`](Self::handle_dpps).
-    ///
-    /// `imm8[5:4]` masks the multiplies and `imm8[1:0]` the broadcast; bits
-    /// `[7:6]` and `[3:2]` are ignored, there being only two lanes. With one
-    /// addition there is no summation order to get wrong.
+    /// DPPD - double-precision dot product, companion of [`handle_dpps`](Self::handle_dpps); `imm8[5:4]` masks the multiplies, `imm8[1:0]` the broadcast.
     pub(super) fn handle_dppd(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let dst_idx = self.xmm_operand_index(instruction, 0, "dppd")?;
         let dst_lo = self.get_xmm_lo(dst_idx);
@@ -1745,12 +1566,8 @@ impl<'a> Lifter<'a> {
         self.horizontal_single_arith(instruction, "hsubps", fsub_x86(nan))
     }
 
-    /// ADDSUBPS - subtract in the even single-precision lanes, add in the odd:
-    /// `dst[2i] -= src[2i]`, `dst[2i+1] += src[2i+1]`.
-    ///
-    /// *Not* expressible as "negate the even source lanes, then add": a NaN source
-    /// lane must propagate with the sign bit x86 gives it, and pre-negating would
-    /// flip that bit. Both lanes really do perform their own operation.
+    /// ADDSUBPS - subtract in the even single lanes, add in the odd: `dst[2i] -= src[2i]`, `dst[2i+1] += src[2i+1]`.
+    /// Not "negate even source lanes, then add": pre-negating would flip a NaN lane's sign.
     pub(super) fn handle_addsubps(&mut self, instruction: &Instruction) -> crate::Result<()> {
         if self.try_addsub_vec(instruction, "addsubps", true)? {
             return Ok(());
@@ -1760,8 +1577,7 @@ impl<'a> Lifter<'a> {
         let dst_hi = self.get_xmm_hi(dst_idx);
         let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
 
-        // Both 64-bit halves hold an even lane below an odd one, so the same
-        // sub-then-add pair covers lanes 0/1 and lanes 2/3.
+        // Both halves hold an even lane below an odd one, so one sub-then-add pair covers both.
         let nan = self.generated_nan();
         let half = |s: &mut Self, d: Value, x: Value| {
             let (d0, d1) = s.split_dwords(d);
@@ -1778,9 +1594,7 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// ADDSUBPD - the double-precision companion of
-    /// [`handle_addsubps`](Self::handle_addsubps): the low lane subtracts and
-    /// the high lane adds.
+    /// ADDSUBPD - double companion of [`handle_addsubps`](Self::handle_addsubps): low lane subtracts, high lane adds.
     pub(super) fn handle_addsubpd(&mut self, instruction: &Instruction) -> crate::Result<()> {
         if self.try_addsub_vec(instruction, "addsubpd", false)? {
             return Ok(());
@@ -1799,8 +1613,7 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Shared implementation for the packed double-precision arithmetic
-    /// instructions (`ADDPD` / `SUBPD` / ...): apply `op` to both 64-bit lanes.
+    /// Shared packed double arithmetic (`ADDPD` / `SUBPD` / ...): `op` on both 64-bit lanes.
     fn packed_double_arith(
         &mut self,
         instruction: &Instruction,
@@ -1820,12 +1633,7 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Shared implementation for the scalar single-precision arithmetic
-    /// instructions (`ADDSS` / `SUBSS` / `MULSS` / `DIVSS`): apply `op` to the
-    /// low 32-bit lanes of dst and src, preserving bits[127:32] of dst.
-    ///
-    /// `op` receives the two operands as `F32` values and returns the `F32`
-    /// result.
+    /// Shared scalar single arithmetic (`ADDSS` / `SUBSS` / `MULSS` / `DIVSS`): `op` on the low 32-bit lanes, bits[127:32] of dst preserved.
     fn scalar_single_arith(
         &mut self,
         instruction: &Instruction,
@@ -1845,9 +1653,7 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Shared implementation for the packed single-precision arithmetic
-    /// instructions (`MULPS` / `ADDPS` / ...): apply `op` to all four 32-bit
-    /// lanes.
+    /// Shared packed single arithmetic (`MULPS` / `ADDPS` / ...): `op` on all four 32-bit lanes.
     fn packed_single_arith(
         &mut self,
         instruction: &Instruction,
@@ -1976,12 +1782,8 @@ impl<'a> Lifter<'a> {
         self.scalar_fp_to_si(instruction, types::F32, truncate, who)
     }
 
-    /// UCOMISD / COMISD - compare the low scalar doubles of two operands and set
-    /// the integer flags (ZF/PF/CF); OF/SF/AF are cleared.
-    ///
-    /// The ordered (`COMISD`) and unordered (`UCOMISD`) forms differ only in
-    /// which operands raise an invalid-operation exception, which this lifter
-    /// does not model, so both are handled identically.
+    /// UCOMISD / COMISD - compare the low scalar doubles and set ZF/PF/CF (OF/SF/AF cleared).
+    /// Ordered and unordered forms differ only in exception behaviour, which is not modelled.
     pub(super) fn handle_ucomisd(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let dst_idx = self.xmm_operand_index(instruction, 0, "ucomisd")?;
         let a_bits = self.get_xmm_lo(dst_idx);
@@ -2012,17 +1814,10 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    //  Packed integer add / subtract (PADDB..PADDQ, PSUBB..PSUBQ and the
-    //  saturating PADDS*/PADDUS*/PSUBS*/PSUBUS* forms).
 
-    /// Shared implementation of every packed-integer add/sub form.
-    ///
-    /// In vector mode the value is bitcast to the lane type and handed to
-    /// Cranelift's native `iadd`/`isub`/`*_sat`. In scalar mode each 64-bit half is
-    /// processed independently: wrapping ops use a SWAR sequence that blocks
-    /// carries at the lane boundaries, saturating ops expand per lane.
-    ///
-    /// `dst` is always the XMM register operand 0; the source may be XMM or `m128`.
+    /// Shared implementation of every packed-integer add/sub form: native `iadd`/`isub`/`*_sat` in vector mode; in scalar mode each
+    /// 64-bit half uses a carry-blocking SWAR sequence (wrapping) or a per-lane expansion (saturating).
+    /// `dst` is XMM operand 0; the source may be XMM or `m128`.
     fn packed_int_arith(
         &mut self,
         instruction: &Instruction,
@@ -2061,8 +1856,7 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Reinterpret a 128-bit vector value as `ty` (a no-op if it already has
-    /// that type). Lane-count changes require an explicit byte order.
+    /// Reinterpret a 128-bit vector as `ty` (no-op if already so); lane-count changes need an explicit byte order.
     pub(super) fn vec_bitcast(&mut self, v: Value, ty: Type) -> Value {
         if self.builder.func.dfg.value_type(v) == ty {
             return v;
@@ -2071,8 +1865,7 @@ impl<'a> Lifter<'a> {
         self.builder.ins().bitcast(ty, flags, v)
     }
 
-    /// Apply one packed-integer op to a single 64-bit half of an XMM register
-    /// (scalar mode).
+    /// Apply one packed-integer op to a 64-bit half of an XMM register (scalar mode).
     fn packed_int_arith_64(
         &mut self,
         a: Value,
@@ -2087,12 +1880,7 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// Lane-wise wrapping add of two 64-bit lane packs, without cross-lane
-    /// carry propagation.
-    ///
-    /// Adds the lanes with their high bits cleared (so no carry can escape a
-    /// lane) and then re-applies each lane's high bit as `a ^ b`, which is the
-    /// correct high bit of the sum.
+    /// Lane-wise wrapping add of two 64-bit packs without cross-lane carry: add with high bits cleared, then high bit = `a ^ b`.
     fn swar_add(&mut self, a: Value, b: Value, width: PackedWidth) -> Value {
         if width == PackedWidth::Qword {
             return self.builder.ins().iadd(a, b);
@@ -2106,12 +1894,7 @@ impl<'a> Lifter<'a> {
         self.builder.ins().bxor(sum, high_bits)
     }
 
-    /// Lane-wise wrapping subtract of two 64-bit lane packs, without cross-lane
-    /// borrow propagation.
-    ///
-    /// The mirror of [`Self::swar_add`]: setting every lane's high bit in `a`
-    /// guarantees each lane can absorb its own borrow, and the high bits are
-    /// then corrected to `~(a ^ b)`.
+    /// Lane-wise wrapping subtract without cross-lane borrow; mirror of [`Self::swar_add`]: high bits set in `a`, then corrected to `~(a ^ b)`.
     fn swar_sub(&mut self, a: Value, b: Value, width: PackedWidth) -> Value {
         if width == PackedWidth::Qword {
             return self.builder.ins().isub(a, b);
@@ -2267,14 +2050,8 @@ impl<'a> Lifter<'a> {
         self.packed_int_arith(instruction, "psubus", PackedIntOp::SubSatUnsigned, width)
     }
 
-    //  Lane-wise packed integer compare / min / max / average / multiply.
 
-    /// Shared implementation of every [`PackedLaneOp`] form.
-    ///
-    /// Vector mode maps most ops straight onto a native Cranelift vector
-    /// instruction; the high-multiply forms (which have no such instruction)
-    /// and scalar mode both fall back to the per-lane expansion in
-    /// [`Self::lanewise_64`].
+    /// Shared implementation of every [`PackedLaneOp`] form: a native vector op in vector mode, else (and for the high-multiply forms) [`Self::lanewise_64`].
     pub(super) fn handle_packed_lane_op(
         &mut self,
         instruction: &Instruction,
@@ -2289,8 +2066,7 @@ impl<'a> Lifter<'a> {
             let dst = self.get_xmm_vec(dst_idx);
             let src = self.read_xmm_src_vec(instruction, 1)?;
 
-            // The high-multiply forms are 16-bit-lane only and need their own
-            // expansion; everything else is a single native vector op.
+            // High-multiply forms are 16-bit-lane only and need their own expansion.
             if let PackedLaneOp::MulHighS | PackedLaneOp::MulHighU = op {
                 let signed = op == PackedLaneOp::MulHighS;
                 let r = self.vec_mulhi_word(dst, src, signed);
@@ -2326,8 +2102,7 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Apply a [`PackedLaneOp`] to every lane of one 64-bit half, by widening
-    /// each lane to a full `I64`, operating there, and repacking.
+    /// Apply a [`PackedLaneOp`] to every lane of one 64-bit half: widen to `I64`, operate, repack.
     fn lanewise_64(&mut self, a: Value, b: Value, op: PackedLaneOp, width: PackedWidth) -> Value {
         let lane_bits = width.bits();
         let lane_mask = width.lane_mask();
@@ -2350,12 +2125,7 @@ impl<'a> Lifter<'a> {
         acc
     }
 
-    /// Apply a [`PackedLaneOp`] to a single pair of already-widened lanes.
-    ///
-    /// Only the low `lane_bits` of the result matter - the caller masks it back
-    /// into place - so the multiply forms need no overflow care beyond keeping
-    /// the (at most 64-bit) product exact, which holds for every lane width x86
-    /// defines these ops at.
+    /// Apply a [`PackedLaneOp`] to one pair of widened lanes; only the low `lane_bits` matter (the caller masks).
     fn lane_op_64(&mut self, x: Value, y: Value, op: PackedLaneOp, lane_bits: u32) -> Value {
         match op {
             PackedLaneOp::CmpEq | PackedLaneOp::CmpGt => {
@@ -2369,9 +2139,7 @@ impl<'a> Lifter<'a> {
                 let zero = self.builder.ins().iconst(types::I64, 0);
                 self.builder.ins().select(c, ones, zero)
             }
-            // Lanes are zero-extended for the unsigned forms and sign-extended
-            // for the signed ones, so a signed min/max on the widened values is
-            // correct in both cases - but use the matching op for clarity.
+            // Unsigned forms zero-extend and signed ones sign-extend, so the matching op is right on the widened values.
             PackedLaneOp::MinU => self.builder.ins().umin(x, y),
             PackedLaneOp::MinS => self.builder.ins().smin(x, y),
             PackedLaneOp::MaxU => self.builder.ins().umax(x, y),
@@ -2393,12 +2161,7 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// PMOVMSKB / MOVMSKPS / MOVMSKPD - gather the sign bit of every `width`
-    /// lane into the low bits of a GPR, zeroing the rest of the destination.
-    ///
-    /// The lane width is what distinguishes the three: byte lanes give the 16
-    /// bits of `PMOVMSKB`, dword lanes the 4 of `MOVMSKPS`, qword lanes the 2
-    /// of `MOVMSKPD`.
+    /// PMOVMSKB / MOVMSKPS / MOVMSKPD - gather the sign bit of every lane into the low bits of a GPR (16 / 4 / 2 bits), zeroing the rest.
     pub(super) fn handle_movmsk(
         &mut self,
         instruction: &Instruction,
@@ -2409,8 +2172,6 @@ impl<'a> Lifter<'a> {
         let src_idx = self.xmm_operand_index(instruction, 1, who)?;
 
         if self.vec_mode() {
-            // `vhigh_bits` is precisely this instruction: the concatenated sign
-            // bits of every lane.
             let src = self.get_xmm_vec(src_idx);
             let v = self.vec_bitcast(src, width.vector_type());
             let acc = self.builder.ins().vhigh_bits(types::I64, v);
@@ -2440,10 +2201,7 @@ impl<'a> Lifter<'a> {
         self.write_movmsk_dst(dst_reg, acc)
     }
 
-    /// Write a gathered `MOVMSK` bitmask (an `I64`) to its GPR destination.
-    ///
-    /// The 32-bit destination form zero-extends to the full GPR anyway, so both
-    /// widths just write the same value at their own type.
+    /// Write a gathered `MOVMSK` bitmask (`I64`) to its GPR destination at the destination's type.
     fn write_movmsk_dst(&mut self, dst_reg: iced_x86::Register, acc: Value) -> crate::Result<()> {
         if dst_reg.size() == 8 {
             self.set_reg_val(dst_reg, acc)
@@ -2453,11 +2211,7 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// PSLLDQ / PSRLDQ - shift the whole 128-bit register left/right by an
-    /// *byte* count, zero-filling. A count above 15 clears the register.
-    ///
-    /// Only the `imm8` form exists, so the count is a lift-time constant and
-    /// this compiles down to at most a couple of shifts and an OR.
+    /// PSLLDQ / PSRLDQ - shift the whole register left/right by a *byte* count (`imm8` only), zero-filling; a count above 15 clears it.
     pub(super) fn handle_byte_shift_dq(
         &mut self,
         instruction: &Instruction,
@@ -2470,9 +2224,7 @@ impl<'a> Lifter<'a> {
             let count = i32::from(instruction.immediate8());
             let dst = self.get_xmm_vec(dst_idx);
             let zero = self.vec_zero();
-            // Result byte `i` is destination byte `i -/+ count`, or a zero
-            // byte - byte 0 of the zero operand - when that falls outside the
-            // register. A count above 15 leaves every byte pointing at zero.
+            // Result byte `i` is destination byte `i -/+ count`, or zero (byte 0 of the zero operand) outside the register.
             let mut mask = [B; 16];
             for (i, m) in mask.iter_mut().enumerate() {
                 let from = if left {
@@ -2529,8 +2281,6 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    //  Floating-point: the remaining scalar/packed arithmetic, MIN/MAX, SQRT,
-    //  the single-precision compare and the SSE2 conversions.
 
     /// SUBSD - scalar double-precision subtract of the low 64 bits (`dst - src`);
     /// the high 64 bits of the destination are preserved.
@@ -2585,13 +2335,8 @@ impl<'a> Lifter<'a> {
     }
 
     /// MINSS / MINSD / MINPS / MINPD, MAXSS / MAXSD / MAXPS / MAXPD.
-    ///
-    /// x86's MIN/MAX are **not** IEEE `minNum`/`maxNum` and are not commutative:
-    /// the result is the destination only when the strict comparison holds, and the
-    /// *source* otherwise. That one rule covers all three special cases - a NaN
-    /// operand makes the comparison false and returns the source, and
-    /// `min(+0.0, -0.0)` likewise. So `select(dst < src, dst, src)` is exact, which
-    /// is why Cranelift's NaN-propagating `fmin`/`fmax` cannot be used.
+    /// Not IEEE `minNum`/`maxNum` and not commutative: the result is the destination only when the strict compare holds, else the
+    /// *source* (covers NaN operands and `min(+0.0, -0.0)`), so `select(dst < src, dst, src)` is exact; Cranelift's `fmin`/`fmax` cannot be used.
     fn fp_min_max(min: bool) -> impl Fn(&mut FunctionBuilder<'a>, Value, Value) -> Value {
         move |b, x, y| {
             let cc = if min {
@@ -2662,11 +2407,7 @@ impl<'a> Lifter<'a> {
         self.packed_single_arith(instruction, who, Self::fp_min_max(min))
     }
 
-    /// SQRTSD - scalar double-precision square root.
-    ///
-    /// Note the shape difference from the binary forms: the operand read is the
-    /// *source*, not the destination, and only the destination's low lane is
-    /// written (bits[127:64] are preserved).
+    /// SQRTSD - scalar double-precision square root of the *source*; only the destination's low lane is written (bits[127:64] preserved).
     pub(super) fn handle_sqrtsd(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let dst_idx = self.xmm_operand_index(instruction, 0, "sqrtsd")?;
         let src_bits = self.read_scalar_f64_bits(instruction, 1)?;
@@ -2711,10 +2452,7 @@ impl<'a> Lifter<'a> {
         }
         let dst_idx = self.xmm_operand_index(instruction, 0, "sqrtpd")?;
         let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
-        // The unary op is expressed as a binary one that ignores its second
-        // argument, reusing the shared bit-level plumbing.
-        // The unary op is expressed as a binary one that ignores its second
-        // argument, reusing the shared bit-level plumbing.
+        // Unary op as a binary one ignoring its second argument.
         let nan = self.generated_nan();
         let sqrt = move |b: &mut FunctionBuilder<'a>, x: Value, _y: Value| fp_sqrt_x86(nan, b, x);
         let res_lo = self.f64_bits_arith(src_lo, src_lo, &sqrt);
@@ -2741,11 +2479,8 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// ROUNDSD / ROUNDSS / ROUNDPD / ROUNDPS - SSE4.1 rounding with the mode
-    /// chosen by `imm8` rather than by MXCSR.
-    ///
-    /// The scalar forms preserve the destination's upper bits exactly as `SQRTSD`
-    /// and `SQRTSS` do, so they reuse the same two writers.
+    /// ROUNDSD / ROUNDSS / ROUNDPD / ROUNDPS - SSE4.1 rounding with the mode chosen by `imm8`, not MXCSR;
+    /// scalar forms preserve upper bits like `SQRTSD`/`SQRTSS`.
     pub(super) fn handle_roundsd(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let dst_idx = self.xmm_operand_index(instruction, 0, "roundsd")?;
         let mode = round_mode(instruction.immediate8());
@@ -2789,8 +2524,6 @@ impl<'a> Lifter<'a> {
         }
         let dst_idx = self.xmm_operand_index(instruction, 0, "roundpd")?;
         let (src_lo, src_hi) = self.read_xmm_src(instruction, 1)?;
-        // The unary op as a binary one that ignores its second argument, the
-        // shape `SQRTPD` already established for this plumbing.
         let round = |b: &mut FunctionBuilder<'a>, x: Value, _y: Value| apply_round(b, mode, x);
         let res_lo = self.f64_bits_arith(src_lo, src_lo, &round);
         let res_hi = self.f64_bits_arith(src_hi, src_hi, &round);
@@ -2848,8 +2581,7 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Read an `r/m32` or `r/m64` integer source operand, as used by the
-    /// `CVTSI2S*` conversions.
+    /// Read an `r/m32` or `r/m64` integer source for `CVTSI2S*`.
     fn read_int32_or_64_src(
         &mut self,
         instruction: &Instruction,
@@ -2957,8 +2689,6 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    //  Packed conversions (CVTPD2PS and friends) plus the lane shuffles,
-    //  compares and approximate reciprocals compilers emit around them.
 
     /// Split a 64-bit XMM half into its two dwords, as `I32` values.
     pub(super) fn split_dwords(&mut self, half: Value) -> (Value, Value) {
@@ -2976,17 +2706,10 @@ impl<'a> Lifter<'a> {
         self.builder.ins().bor(d0, d1)
     }
 
-    /// Convert one float to a signed integer with x86's out-of-range behaviour.
-    ///
-    /// `x` is `F32`/`F64`, `ty` is `I32`/`I64`. For an unrepresentable result - NaN,
-    /// infinity, or out of range - x86 produces the *integer indefinite*
-    /// (`INT_MIN`) rather than saturating. Cranelift's `fcvt_to_sint_sat` already
-    /// yields `INT_MIN` on the too-negative side, so only "NaN or too positive"
-    /// needs patching - exactly the `UnorderedOrGreaterThanOrEqual` predicate
-    /// against `2^(width-1)`.
-    ///
-    /// `truncate` selects the `CVTT*` (toward zero) forms; the plain `CVT*` forms
-    /// round per MXCSR.RC, whose reset value is the only mode this lifter models.
+    /// Convert one float (`F32`/`F64`) to a signed integer (`I32`/`I64`) with x86's out-of-range behaviour:
+    /// NaN, infinity or out of range gives the *integer indefinite* (`INT_MIN`). `fcvt_to_sint_sat` already does so on the negative
+    /// side, so only `UnorderedOrGreaterThanOrEqual` against `2^(width-1)` is patched.
+    /// `truncate` selects `CVTT*`; plain `CVT*` rounds per MXCSR.RC, whose reset value is the only mode modelled.
     fn fp_to_sint_x86(&mut self, x: Value, ty: Type, truncate: bool) -> Value {
         let src_ty = self.builder.func.dfg.value_type(x);
         let x = if truncate {
@@ -3049,8 +2772,7 @@ impl<'a> Lifter<'a> {
         self.set_reg_val(dst_reg, res)
     }
 
-    /// Convert the `f64` in `bits` (an `I64`) to an `f32`, returning its `I32`
-    /// bit pattern.
+    /// Convert the `f64` in `bits` (`I64`) to an `f32`'s `I32` bit pattern.
     fn f64_bits_to_f32_bits(&mut self, bits: Value) -> Value {
         let x = self
             .builder
@@ -3062,8 +2784,7 @@ impl<'a> Lifter<'a> {
             .bitcast(types::I32, MemFlagsData::new(), r)
     }
 
-    /// Convert the `f32` in `bits` (an `I32`) to an `f64`, returning its `I64`
-    /// bit pattern.
+    /// Convert the `f32` in `bits` (`I32`) to an `f64`'s `I64` bit pattern.
     fn f32_bits_to_f64_bits(&mut self, bits: Value) -> Value {
         let x = self
             .builder
@@ -3075,8 +2796,7 @@ impl<'a> Lifter<'a> {
             .bitcast(types::I64, MemFlagsData::new(), r)
     }
 
-    /// Read the low 64 bits of the `xmm/m64` source of the "half-width source"
-    /// conversions (`CVTPS2PD`, `CVTDQ2PD`), which touch only 8 bytes of memory.
+    /// Read the low 64 bits of the `xmm/m64` source of `CVTPS2PD`/`CVTDQ2PD`, which touch only 8 bytes of memory.
     fn read_low_qword_src(&mut self, instruction: &Instruction, who: &str) -> crate::Result<Value> {
         match self.operand_kind(instruction, 1) {
             OpKind::Register => {
@@ -3096,12 +2816,7 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// [`Self::read_low_qword_src`] as a 128-bit vector, the consumed quadword in
-    /// lane 0 and lane 1 zeroed.
-    ///
-    /// For the half-width-source conversions in vector mode: their `xmm/m64`
-    /// operand must not be read with a full `m128` load, and every vector op that
-    /// consumes it looks only at the low half anyway.
+    /// [`Self::read_low_qword_src`] as a 128-bit vector (quadword in lane 0, lane 1 zeroed); avoids a full `m128` load.
     fn read_low_qword_src_vec(
         &mut self,
         instruction: &Instruction,
@@ -3119,17 +2834,12 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// CVTPD2PS - narrow two packed doubles to two singles in `dst[63:0]`.
-    ///
-    /// Note the asymmetry with the scalar `CVTSD2SS`: because the result is
-    /// narrower than the source, bits[127:64] of the destination are **zeroed**,
-    /// not preserved.
+    /// CVTPD2PS - narrow two packed doubles to two singles in `dst[63:0]`; unlike scalar `CVTSD2SS`, bits[127:64] are **zeroed**.
     pub(super) fn handle_cvtpd2ps(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let dst_idx = self.xmm_operand_index(instruction, 0, "cvtpd2ps")?;
 
         if self.vec_mode() {
-            // `fvdemote` narrows `F64X2` into the low two lanes of an `F32X4`
-            // and zeroes the upper half - exactly this instruction.
+            // `fvdemote` narrows into the low two lanes and zeroes the upper half.
             let src = self.read_xmm_src_vec(instruction, 1)?;
             let x = self.vec_bitcast(src, types::F64X2);
             let f = self.builder.ins().fvdemote(x);
@@ -3262,8 +2972,7 @@ impl<'a> Lifter<'a> {
         if self.vec_mode() {
             let src = self.read_low_qword_src_vec(instruction, "cvtdq2pd")?;
             let a = self.vec_bitcast(src, types::I32X4);
-            // Widen the low two dwords to qwords, then convert - `fcvt_from_sint`
-            // is lane-preserving, so the widening is what selects the low half.
+            // Widen the low two dwords first: `fcvt_from_sint` is lane-preserving.
             let w = self.builder.ins().swiden_low(a);
             let f = self.builder.ins().fcvt_from_sint(types::F64X2, w);
             let r = self.vec_bitcast(f, types::I64X2);
@@ -3288,11 +2997,8 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// CVTPD2DQ / CVTTPD2DQ - convert two packed doubles to two signed dwords in
-    /// `dst[63:0]`, rounding to nearest-even or truncating toward zero.
-    ///
-    /// As with [`Self::handle_cvtpd2ps`], the narrowing result zeroes
-    /// bits[127:64] of the destination.
+    /// CVTPD2DQ / CVTTPD2DQ - convert two packed doubles to two signed dwords in `dst[63:0]` (nearest-even / truncating);
+    /// bits[127:64] are zeroed, as in [`Self::handle_cvtpd2ps`].
     pub(super) fn handle_cvtpd2dq(
         &mut self,
         instruction: &Instruction,
@@ -3318,12 +3024,7 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// The comparison predicate of a `CMPPS` / `CMPPD` / `CMPSS` / `CMPSD`
-    /// `imm8`, as a Cranelift condition.
-    ///
-    /// Only the low three bits are defined for the legacy SSE encodings. The
-    /// negated predicates (`NEQ`, `NLT`, `NLE`) are true for unordered operands,
-    /// which is exactly what Cranelift's `Unordered*` conditions express.
+    /// The comparison predicate of a `CMP*` `imm8` as a Cranelift condition; the negated predicates are true for unordered operands.
     fn cmp_predicate(imm: u8) -> FloatCC {
         match imm & 0b111 {
             0 => FloatCC::Equal,                         // EQ  (ordered)
@@ -3337,12 +3038,7 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// The lane operation of the `CMP*` family: an all-ones mask when the
-    /// predicate holds, all-zeros otherwise.
-    ///
-    /// The mask is bitcast back to the lane's float type so this can reuse the
-    /// shared `f32`/`f64` lane plumbing, which expects a float result and
-    /// bitcasts it to bits again; the round trip folds away.
+    /// The `CMP*` lane op: all-ones when the predicate holds, else zero; the mask is bitcast to a float to reuse the shared lane plumbing.
     fn fp_cmp_mask(cc: FloatCC) -> impl Fn(&mut FunctionBuilder<'a>, Value, Value) -> Value {
         move |b, x, y| {
             let fty = b.func.dfg.value_type(x);
@@ -3401,9 +3097,7 @@ impl<'a> Lifter<'a> {
             let imm = instruction.immediate8();
             let dst = self.get_xmm_vec(dst_idx);
             let src = self.read_xmm_src_vec(instruction, 1)?;
-            // The low two dwords are selected from the destination, the high
-            // two from the source (lane numbers 4..7 in the shared mask
-            // builder's cross-operand numbering).
+            // Low two dwords from the destination, high two from the source (lanes 4..7 in the cross-operand numbering).
             let mask = Self::lane_shuffle_mask(32, |j| {
                 let sel = u32::from((imm >> (2 * j)) & 0b11);
                 if j < 2 { sel } else { 4 + sel }
@@ -3444,8 +3138,7 @@ impl<'a> Lifter<'a> {
             let imm = instruction.immediate8();
             let dst = self.get_xmm_vec(dst_idx);
             let src = self.read_xmm_src_vec(instruction, 1)?;
-            // Low qword from the destination by imm[0], high qword from the
-            // source by imm[1] (source qwords are lanes 2 and 3).
+            // Low qword from the destination by imm[0], high from the source by imm[1] (lanes 2 and 3).
             let mask = Self::lane_shuffle_mask(64, |j| {
                 if j == 0 {
                     u32::from(imm & 1)
@@ -3485,8 +3178,7 @@ impl<'a> Lifter<'a> {
         if self.vec_mode() {
             let imm = instruction.immediate8();
             let src = self.read_xmm_src_vec(instruction, 1)?;
-            // Only the shuffled half is permuted; the other half is copied
-            // through from the source unchanged. Both come from operand `a`.
+            // Only the shuffled half is permuted; the other is copied from operand `a`.
             let base = if high { 4 } else { 0 };
             let mask = Self::lane_shuffle_mask(16, |j| {
                 if (j >= 4) == high {
@@ -3529,17 +3221,9 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// The lane operation of `RCP*`/`RSQRT*`, applied to the *source* lane (`y`) -
-    /// these are unary instructions expressed through the shared binary lane
-    /// plumbing, so the destination lane `x` is ignored.
-    ///
-    /// Hardware computes an approximation with relative error up to `1.5 * 2^-12`;
-    /// the exact quotient emitted here is within that bound but not bit-identical.
-    /// Compilers only emit these under fast-math.
-    ///
-    /// The square root goes through [`fp_sqrt_x86`] rather than a bare `sqrt`: a
-    /// negative lane makes `RSQRT*` *generate* a NaN, which must be x86's sign-set
-    /// indefinite. The following `fdiv` merely propagates it.
+    /// The `RCP*`/`RSQRT*` lane op, applied to the *source* lane `y` (the destination lane `x` is ignored).
+    /// Hardware's approximation has relative error up to `1.5 * 2^-12`; the exact quotient here is within that but not bit-identical.
+    /// The square root goes through [`fp_sqrt_x86`]: a negative lane *generates* the sign-set indefinite.
     fn fp_reciprocal(
         nan: GeneratedNan,
         sqrt: bool,
@@ -3590,7 +3274,6 @@ impl<'a> Lifter<'a> {
 
         if self.vec_mode() {
             let src = self.read_xmm_src_vec(instruction, 1)?;
-            // [d0,d0,d2,d2] or [d1,d1,d3,d3].
             let mask = Self::lane_shuffle_mask(32, |j| (j & !1) + u32::from(odd));
             let r = self.vec_shuffle(src, src, mask);
             self.set_xmm_vec(dst_idx, r);
@@ -3611,11 +3294,7 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// STMXCSR m32 (and its AVX alias `VSTMXCSR`) - store `MXCSR` to memory.
-    ///
-    /// A plain 32-bit copy out of the context. The register form of the opcode
-    /// (`0F AE /3` with `mod = 11`) is `#UD` on hardware and iced never decodes
-    /// one, so a non-memory operand is rejected rather than guessed at.
+    /// STMXCSR m32 (and AVX alias `VSTMXCSR`) - store `MXCSR` to memory; the register form is `#UD`, so a non-memory operand is rejected.
     pub(super) fn handle_stmxcsr(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let ctx = self.builder.use_var(self.state.context_ptr);
         let off = std::mem::offset_of!(RegisterContext, mxcsr) as i32;
@@ -3625,14 +3304,8 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// LDMXCSR m32 (and its AVX alias `VLDMXCSR`) - load `MXCSR` from memory.
-    ///
-    /// Hardware raises `#GP(0)` if any reserved bit (31:16) of the source is set.
-    /// Microlift models no faults of that class, so the reserved bits are dropped:
-    /// bits 31:16 stay zero, which is what a subsequent `STMXCSR` would see on a
-    /// machine where the `LDMXCSR` had been legal. Every defined bit is stored
-    /// verbatim - see [`RegisterContext::mxcsr`] for which the lifted arithmetic
-    /// actually honours.
+    /// LDMXCSR m32 (and AVX alias `VLDMXCSR`) - load `MXCSR` from memory; reserved bits 31:16 are dropped (no `#GP` modelled).
+    /// Defined bits are stored verbatim; see [`RegisterContext::mxcsr`] for which the lifted arithmetic honours.
     pub(super) fn handle_ldmxcsr(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let ptr = self.mxcsr_mem_ptr(instruction, "ldmxcsr")?;
         let val = self

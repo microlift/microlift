@@ -1,11 +1,8 @@
-//! AES-NI. The per-instruction vectors and the round keys come from FIPS-197's
-//! AES-128 example, which the end-to-end tests below run through the
-//! instructions themselves.
+//! AES-NI vectors from FIPS-197's AES-128 example, plus end-to-end rounds.
 
 use microlift::testkit::prelude::*;
 
-/// FIPS-197 appendix A.1 / B: the eleven AES-128 round keys for key
-/// `000102...0f`, as they sit in an XMM register.
+/// FIPS-197 A.1 round keys for key `000102...0f`.
 const ROUND_KEYS: [[u64; 2]; 11] = [
     [0x0706050403020100, 0x0f0e0d0c0b0a0908],
     [0xfa72afd2fd74aad6, 0xfe76abd6f178a6da],
@@ -23,13 +20,10 @@ const ROUND_KEYS: [[u64; 2]; 11] = [
 const PLAINTEXT: [u64; 2] = [0x7766554433221100, 0xffeeddccbbaa9988];
 const CIPHERTEXT: [u64; 2] = [0x30047b6ad8e0c469, 0x5ac5b47080b7cdd8];
 
-/// Two arbitrary but fixed operands, the "Try/Sate Vector" and "Hi There"
-/// strings the SDM's own AES examples use.
 const A: [u64; 2] = [0x6556747365545b7b, 0x5d47535d726f7463];
 const B: [u64; 2] = [0x2979616853286948, 0x5d6e6f726575475b];
 
-/// `66 [REX] 0F 38 <op> <modrm>` - the encoding shared by every AES round
-/// instruction and `AESIMC`.
+/// `66 [REX] 0F 38 <op> <modrm>`.
 fn aes(op: u8, dst: u8, src: u8) -> Vec<u8> {
     let mut out = vec![0x66];
     if dst >= 8 || src >= 8 {
@@ -55,7 +49,6 @@ fn aesimc(dst: u8, src: u8) -> Vec<u8> {
     aes(0xDB, dst, src)
 }
 
-/// `MOVDQA xmm_dst, xmm_src`, for staging a round key before `AESIMC` rewrites it.
 fn movdqa(dst: u8, src: u8) -> Vec<u8> {
     let mut out = vec![0x66];
     if dst >= 8 || src >= 8 {
@@ -65,7 +58,6 @@ fn movdqa(dst: u8, src: u8) -> Vec<u8> {
     out
 }
 
-/// `PXOR xmm_dst, xmm_src`.
 fn pxor(dst: u8, src: u8) -> Vec<u8> {
     let mut out = vec![0x66];
     if dst >= 8 || src >= 8 {
@@ -75,7 +67,6 @@ fn pxor(dst: u8, src: u8) -> Vec<u8> {
     out
 }
 
-/// `AESKEYGENASSIST xmm_dst, xmm_src, imm8`.
 fn aeskeygenassist(dst: u8, src: u8, rcon: u8) -> Vec<u8> {
     let mut out = vec![0x66];
     if dst >= 8 || src >= 8 {
@@ -85,8 +76,7 @@ fn aeskeygenassist(dst: u8, src: u8, rcon: u8) -> Vec<u8> {
     out
 }
 
-/// Run `code` under every configuration that is supposed to make no difference
-/// to the answer: both XMM backings, and the kernels inline as well as outlined.
+/// Runs under every config that must not change the answer: XMM backing, inline vs outlined kernels.
 fn run(code: &[u8], seed: impl Fn(&mut RegisterContext) + Copy) -> RunOutcome {
     let mut first: Option<[[u64; 2]; 16]> = None;
     let mut last = None;
@@ -108,7 +98,6 @@ fn run(code: &[u8], seed: impl Fn(&mut RegisterContext) + Copy) -> RunOutcome {
     last.unwrap()
 }
 
-/// One instruction over `(xmm0, xmm1) = (A, B)`.
 fn one(code: Vec<u8>) -> [u64; 2] {
     let mut program = code;
     program.push(0xC3);
@@ -138,9 +127,7 @@ fn aesimc_matches_its_reference_value() {
     assert_eq!(one(aesimc(0, 1)), [0x373acd9931f9bf2d, 0x8e3de07dfd81c7b7]);
 }
 
-/// Every `imm8` reaches the same kernel, so the round constant is a parameter
-/// rather than part of the helper; these three pin down that it lands in the
-/// right two dwords.
+/// The round constant must land in the right two dwords.
 #[test]
 fn aeskeygenassist_applies_rcon_to_the_rotated_words() {
     let go = |rcon: u8| {
@@ -158,7 +145,6 @@ fn aeskeygenassist_applies_rcon_to_the_rotated_words() {
     assert_eq!(go(0x8b), [0x45a5b664a5b6ef45, 0x404c9f234c9fa840]);
 }
 
-/// A round key operand straight out of memory, the form real cipher loops use.
 #[test]
 fn a_round_key_can_come_from_memory() {
     let program = [0x66, 0x0F, 0x38, 0xDC, 0x07, 0xC3]; // aesenc xmm0, [rdi] ; ret
@@ -171,15 +157,12 @@ fn a_round_key_can_come_from_memory() {
     assert_eq!(out.ctx.xmm[0], [0x0be8672d9204d843, 0x81a2d95024f450f7]);
 }
 
-/// State and round key in the same register: the source has to be read before
-/// the destination is redefined.
+// Source must be read before the destination is redefined.
 #[test]
 fn the_state_can_also_be_the_round_key() {
     assert_eq!(one(aesenc(0, 0)), [0x47c77236a478ea70, 0x818be57f33ee63cf]);
 }
 
-/// The full FIPS-197 AES-128 encryption, ten rounds of it, with the round keys
-/// preloaded into XMM1..XMM10.
 #[test]
 fn fips_197_aes128_encrypts() {
     let mut code = pxor(0, 11);
@@ -199,8 +182,6 @@ fn fips_197_aes128_encrypts() {
     assert_eq!(out.ctx.xmm[0], CIPHERTEXT);
 }
 
-/// The equivalent inverse cipher, which is what `AESIMC` exists for: each
-/// round key is passed through it on the way into `AESDEC`.
 #[test]
 fn fips_197_aes128_decrypts() {
     let mut code = pxor(0, 10);
@@ -222,10 +203,7 @@ fn fips_197_aes128_decrypts() {
     assert_eq!(out.ctx.xmm[0], PLAINTEXT);
 }
 
-/// `AESKEYGENASSIST` in its actual role: dword 3 of its result is the word the
-/// AES-128 schedule XORs into the previous key. Running the expansion over the
-/// published round keys checks the `SubWord`, `RotWord` and `RCON` halves
-/// together.
+/// Dword 3 is the word the key schedule XORs in; checks SubWord, RotWord and RCON together.
 #[test]
 fn aeskeygenassist_drives_the_key_schedule() {
     const RCONS: [u8; 10] = [1, 2, 4, 8, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36];
@@ -255,9 +233,6 @@ fn aeskeygenassist_drives_the_key_schedule() {
     }
 }
 
-/// Random operands through every AES instruction, cross-checked against
-/// Unicorn where the feature is on. Blanket coverage the fixed vectors above
-/// cannot give: 0 and 0xFF bytes in every lane, both halves of the S-box.
 #[test]
 fn random_operands_agree_across_configurations() {
     let mut state = 0x243F_6A88_85A3_08D3u64;
@@ -290,9 +265,7 @@ fn random_operands_agree_across_configurations() {
     }
 }
 
-/// Ten rounds share one helper body, and each instruction gets its own: a
-/// symbol collision between, say, `AESENC` and `AESDEC` would otherwise be
-/// invisible until a program used both.
+/// Each instruction gets its own helper; a symbol collision would otherwise go unnoticed.
 #[test]
 fn each_instruction_outlines_exactly_one_shared_kernel() {
     use microlift::arch::x86_64::X86_64;
@@ -331,8 +304,7 @@ fn each_instruction_outlines_exactly_one_shared_kernel() {
     );
 }
 
-/// The tables are a build-time constant emitted into the artifact once, however
-/// many AES instructions reference them.
+/// Tables are emitted once however many AES instructions reference them.
 #[test]
 fn the_aes_tables_are_emitted_once_as_data() {
     use microlift::arch::x86_64::X86_64;
@@ -357,8 +329,6 @@ fn the_aes_tables_are_emitted_once_as_data() {
     let (sbox, rest) = tables.bytes.split_at(256);
     let (inv_sbox, xtime) = rest.split_at(256);
 
-    // FIPS-197's own S-box entries, at the corners and either side of the
-    // affine constant.
     assert_eq!(sbox[0x00], 0x63);
     assert_eq!(sbox[0x01], 0x7c);
     assert_eq!(sbox[0x53], 0xed);
@@ -366,16 +336,13 @@ fn the_aes_tables_are_emitted_once_as_data() {
 
     for i in 0..256 {
         assert_eq!(inv_sbox[sbox[i] as usize] as usize, i);
-        // xtime is a shift with the reduction folded in, which is the one thing
-        // it may not be derived from here.
+        // xtime must not be derived from the shift-and-reduce it implements.
         let expected = ((i as u8) << 1) ^ if i & 0x80 != 0 { 0x1B } else { 0 };
         assert_eq!(xtime[i], expected, "xtime[{i:#04x}]");
     }
 }
 
-/// A region using both AES and `CRC32` carries two tables, and each site must
-/// reach its own: they share one `DataId` space and are told apart only by the
-/// index the backend assigns.
+/// AES and CRC32 tables share a DataId space; each site must reach its own.
 #[test]
 fn aes_and_crc32_tables_coexist_in_one_region() {
     use microlift::arch::x86_64::X86_64;
@@ -383,7 +350,6 @@ fn aes_and_crc32_tables_coexist_in_one_region() {
     use microlift::testkit::DEFAULT_LIFT_BASE;
 
     let mut bytes = aesenc(0, 1);
-    // crc32 eax, cl
     bytes.extend_from_slice(&[0xF2, 0x0F, 0x38, 0xF0, 0xC1]);
     bytes.push(0xC3);
 

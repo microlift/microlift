@@ -1,10 +1,7 @@
-//! Atomic instruction semantics: the fences, `PAUSE`, the `CMPXCHG` family and
-//! the LOCK-prefixed arithmetic and bit operations.
+//! Atomic semantics: fences, `PAUSE`, the `CMPXCHG` family and LOCK-prefixed arithmetic/bit ops.
 //!
-//! Everything up to 64 bits maps onto Cranelift's `atomic_cas`/`atomic_rmw`, so
-//! the LOCK prefix costs nothing extra and the handler is shared with the
-//! unlocked form. `CMPXCHG16B` is the exception: only the x64 backend can
-//! express a 128-bit CAS, so its lowering is an [`Atomic128Mode`] choice.
+//! Up to 64 bits maps onto `atomic_cas`/`atomic_rmw`, shared with the unlocked form.
+//! `CMPXCHG16B` is an [`Atomic128Mode`] choice: only the x64 backend can express a 128-bit CAS.
 
 use crate::MicroliftError;
 use crate::arch::x86_64::semantics::helpers::size_to_type;
@@ -27,10 +24,7 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// PAUSE - spin-wait hint.
-    ///
-    /// The instruction has no architectural effect whatever, so discarding it is
-    /// correct everywhere and is what happens by default.
+    /// PAUSE - spin-wait hint; no architectural effect, discarded by default.
     pub(super) fn handle_pause(&mut self, _instruction: &Instruction) -> crate::Result<()> {
         if self.specialized(Spec::SpinLoopHint) {
             self.builder.ins().spin_hint();
@@ -40,12 +34,8 @@ impl<'a> Lifter<'a> {
 
     /// CMPXCHG dst, src
     ///
-    /// Compares AL/AX/EAX/RAX with `dst`. Equal: ZF=1, dst <- src. Otherwise:
-    /// ZF=0, accumulator <- dst. All comparison flags are updated as if
-    /// `CMP acc, dst` had run.
-    ///
-    /// A memory `dst` goes through Cranelift's `atomic_cas`, so the LOCK prefix is
-    /// handled transparently here.
+    /// Compares AL/AX/EAX/RAX with `dst`. Equal: ZF=1, dst <- src. Otherwise: ZF=0, accumulator <- dst.
+    /// Flags as `CMP acc, dst`. A memory `dst` uses `atomic_cas`, so LOCK needs no separate path.
     pub(super) fn handle_cmpxchg(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let size = self.operand_size(instruction, 0)?;
         let ty = size_to_type(size);
@@ -58,8 +48,7 @@ impl<'a> Lifter<'a> {
             _ => unreachable!(),
         };
         let acc_val = self.get_reg_val(acc_reg)?;
-        // acc_val may be wider than ty (e.g. RAX used for an 8-bit cmpxchg is
-        // impossible, but for safety reduce when types don't match).
+        // Narrow `acc_val` when its type differs from `ty`.
         let acc_narrow = if self.builder.func.dfg.value_type(acc_val) != ty {
             self.builder.ins().ireduce(ty, acc_val)
         } else {
@@ -71,16 +60,13 @@ impl<'a> Lifter<'a> {
         match instruction.op0_kind() {
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, 0)?;
-                // atomic_cas: if *ptr == acc_narrow { *ptr = src_val }; returns old *ptr
                 let old = self
                     .builder
                     .ins()
                     .atomic_cas(self.guest_flags, ptr, acc_narrow, src_val);
 
-                // Update flags as CMP acc, old  (acc - old)
                 self.sub_with_flags(acc_narrow, old, size)?;
 
-                // If CAS failed (old != acc), write old into accumulator.
                 let succeeded = self.builder.ins().icmp(IntCC::Equal, old, acc_narrow);
                 let new_acc = self.builder.ins().select(succeeded, acc_narrow, old);
                 self.set_reg_val(acc_reg, new_acc)?;
@@ -88,16 +74,13 @@ impl<'a> Lifter<'a> {
             OpKind::Register => {
                 let dst_val = self.read_operand(instruction, 0, size)?;
 
-                // Update flags as CMP acc, dst  (acc - dst)
                 self.sub_with_flags(acc_narrow, dst_val, size)?;
 
                 let equal = self.builder.ins().icmp(IntCC::Equal, acc_narrow, dst_val);
 
-                // dst <- src if equal, else unchanged
                 let new_dst = self.builder.ins().select(equal, src_val, dst_val);
                 self.write_operand(instruction, 0, new_dst)?;
 
-                // acc <- dst (original) if not equal, else unchanged
                 let new_acc = self.builder.ins().select(equal, acc_narrow, dst_val);
                 self.set_reg_val(acc_reg, new_acc)?;
             }
@@ -118,7 +101,6 @@ impl<'a> Lifter<'a> {
     pub(super) fn handle_cmpxchg8b(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let ptr = self.get_mem_ptr(instruction, 0)?;
 
-        // Build expected (EDX:EAX) as a single I64.
         let eax = self.get_reg_val(Register::EAX)?; // I32
         let edx = self.get_reg_val(Register::EDX)?; // I32
         let eax64 = self.builder.ins().uextend(types::I64, eax);
@@ -126,7 +108,6 @@ impl<'a> Lifter<'a> {
         let edx_hi = self.builder.ins().ishl_imm_u(edx64, 32);
         let expected = self.builder.ins().bor(edx_hi, eax64);
 
-        // Build replacement (ECX:EBX) as a single I64.
         let ebx = self.get_reg_val(Register::EBX)?; // I32
         let ecx = self.get_reg_val(Register::ECX)?; // I32
         let ebx64 = self.builder.ins().uextend(types::I64, ebx);
@@ -142,7 +123,6 @@ impl<'a> Lifter<'a> {
         let succeeded = self.builder.ins().icmp(IntCC::Equal, old, expected);
         self.set_flag(X86Flag::Zero, succeeded)?;
 
-        // On failure, load old value into EDX:EAX.
         let old_eax32 = self.builder.ins().ireduce(types::I32, old);
         let old_edx_shifted = self.builder.ins().ushr_imm_u(old, 32);
         let old_edx32 = self.builder.ins().ireduce(types::I32, old_edx_shifted);
@@ -156,17 +136,9 @@ impl<'a> Lifter<'a> {
 
     /// CMPXCHG16B [mem]
     ///
-    /// Atomically compares RDX:RAX with the 128-bit value at [mem]. Equal: ZF=1,
-    /// [mem] <- RCX:RBX. Otherwise: ZF=0, RDX:RAX <- [mem].
-    ///
-    /// Only ZF is affected, unlike `CMPXCHG` which updates all of them.
-    ///
-    /// A real CPU raises `#GP` for a misaligned operand; this lifter models no
-    /// alignment faults, so a misaligned operand is simply performed.
-    ///
-    /// How the 128-bit RMW is realized is an [`Atomic128Mode`] decision, since only
-    /// the x64 backend can express one. The default is a portable but non-atomic
-    /// load/compare/store.
+    /// Compares RDX:RAX with the 128-bit value at [mem]. Equal: ZF=1, [mem] <- RCX:RBX. Otherwise: ZF=0, RDX:RAX <- [mem].
+    /// Only ZF is affected; misaligned operands do not fault.
+    /// Realization is an [`Atomic128Mode`] choice; the default is portable and non-atomic.
     pub(super) fn handle_cmpxchg16b(&mut self, instruction: &Instruction) -> crate::Result<()> {
         if instruction.op0_kind() != OpKind::Memory {
             return Err(MicroliftError::UnsupportedInstruction {
@@ -175,8 +147,7 @@ impl<'a> Lifter<'a> {
         }
 
         if self.config.atomic128 == Atomic128Mode::Interpret {
-            // The host performs the whole operation inline, per the ordinary
-            // unimplemented-instruction contract.
+            // The host performs the whole operation, per the unimplemented-instruction contract.
             return self.handle_unimplemented_instruction(instruction);
         }
 
@@ -188,8 +159,7 @@ impl<'a> Lifter<'a> {
 
         let (old_lo, old_hi, succeeded) = match self.config.atomic128 {
             Atomic128Mode::Native => {
-                // `iconcat` takes (low, high); the x64 backend lowers an I128
-                // `atomic_cas` straight to `lock cmpxchg16b`.
+                // `iconcat` takes (low, high); x64 lowers I128 `atomic_cas` to `lock cmpxchg16b`.
                 let expected = self.builder.ins().iconcat(rax, rdx);
                 let replacement = self.builder.ins().iconcat(rbx, rcx);
                 let old =
@@ -200,10 +170,7 @@ impl<'a> Lifter<'a> {
                 let (lo, hi) = self.builder.ins().isplit(old);
                 (lo, hi, succeeded)
             }
-            // Emulated: a plain 128-bit read-modify-write as two 64-bit halves.
-            // The store is unconditional, which matches the architectural
-            // behaviour - `CMPXCHG16B` writes the destination even when the
-            // comparison fails (it writes the value back unchanged).
+            // Emulated: two 64-bit halves; the store is unconditional since `CMPXCHG16B` writes the destination back on failure.
             _ => {
                 let flags = self.guest_flags;
                 let lo = self.builder.ins().load(types::I64, flags, ptr, 0);
@@ -220,8 +187,7 @@ impl<'a> Lifter<'a> {
         };
 
         self.set_flag(X86Flag::Zero, succeeded)?;
-        // On failure the observed value lands in RDX:RAX; on success they keep
-        // the expected value they already held.
+        // On failure RDX:RAX takes the observed value.
         let new_rax = self.builder.ins().select(succeeded, rax, old_lo);
         let new_rdx = self.builder.ins().select(succeeded, rdx, old_hi);
         self.set_reg_val(Register::RAX, new_rax)?;
@@ -230,10 +196,7 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Dispatcher for instructions carrying a LOCK prefix.
-    ///
-    /// LOCK is only architecturally valid when the destination is a memory
-    /// operand, so every handler below assumes op0 is Memory.
+    /// Dispatcher for LOCK-prefixed instructions; LOCK is only valid with a memory destination, so handlers assume op0 is Memory.
     pub(super) fn handle_locked_instruction(
         &mut self,
         instruction: &Instruction,
@@ -250,7 +213,6 @@ impl<'a> Lifter<'a> {
             Mnemonic::Dec => self.handle_lock_dec(instruction),
             Mnemonic::Xadd => self.handle_lock_xadd(instruction),
             Mnemonic::Xchg => self.handle_lock_xchg(instruction),
-            // LOCK CMPXCHG reuses handle_cmpxchg which already uses atomic_cas.
             Mnemonic::Cmpxchg => self.handle_cmpxchg(instruction),
             Mnemonic::Cmpxchg8b => self.handle_cmpxchg8b(instruction),
             Mnemonic::Cmpxchg16b => self.handle_cmpxchg16b(instruction),
@@ -293,13 +255,8 @@ impl<'a> Lifter<'a> {
 
     /// LOCK ADC / LOCK SBB [mem], src
     ///
-    /// Neither has an atomic-RMW opcode - the operation depends on the incoming CF
-    /// as well as the memory value - so both lower to the compare-and-swap retry
-    /// loop `LOCK NEG` uses.
-    ///
-    /// The incoming CF is loop-invariant and read once in the entry block, which
-    /// dominates the loop, so a retry reuses it rather than the CF a previous
-    /// iteration computed - matching the single-execution semantics.
+    /// No atomic-RMW opcode (the result depends on CF), so a compare-and-swap retry loop like `LOCK NEG`.
+    /// CF is read once in the entry block, so retries reuse it.
     fn handle_lock_adc_sbb(
         &mut self,
         instruction: &Instruction,
@@ -317,8 +274,7 @@ impl<'a> Lifter<'a> {
             self.builder.ins().uextend(ty, cf_i8)
         };
 
-        // As in `handle_lock_neg`, the loop state is carried in block params so
-        // no `Variable` sealing beyond the engine's final pass is needed.
+        // Loop state is carried in block params, as in `handle_lock_neg`.
         let loop_b = self.builder.create_block();
         self.builder.append_block_param(loop_b, ty); // observed current value
         let done_b = self.builder.create_block();
@@ -329,8 +285,7 @@ impl<'a> Lifter<'a> {
 
         self.builder.switch_to_block(loop_b);
         let cur = self.builder.block_params(loop_b)[0];
-        // The speculative iterations want the value only; the flags belong to
-        // the iteration whose `atomic_cas` won, and are computed once below.
+        // Speculative iterations want the value only; flags are computed once for the winning `atomic_cas`.
         let result = self.adc_sbb_value(cur, src, cf, is_adc);
         let observed = self
             .builder
@@ -423,18 +378,15 @@ impl<'a> Lifter<'a> {
         let ptr = self.get_mem_ptr(instruction, 0)?;
         let src_reg = instruction.op1_register();
         let src_val = self.get_reg_val(src_reg)?;
-        // Narrow to the memory operand size if the register is wider.
         let src = if self.builder.func.dfg.value_type(src_val) != ty {
             self.builder.ins().ireduce(ty, src_val)
         } else {
             src_val
         };
-        // atomic fetch-add: returns old *ptr, then *ptr += src
         let old = self
             .builder
             .ins()
             .atomic_rmw(ty, self.guest_flags, AtomicRmwOp::Add, ptr, src);
-        // src register gets the pre-add memory value
         self.set_reg_val(src_reg, old)?;
         self.add_with_flags(old, src, size)?;
         Ok(())
@@ -459,7 +411,6 @@ impl<'a> Lifter<'a> {
         } else {
             reg_val
         };
-        // atomic swap: returns old *ptr, writes reg_narrow to *ptr
         let old =
             self.builder
                 .ins()
@@ -471,17 +422,12 @@ impl<'a> Lifter<'a> {
 
     /// LOCK NEG [mem]: atomically negate memory.
     ///
-    /// `NEG` has no atomic-RMW opcode, so it is a compare-and-swap retry loop:
-    /// load, compute `0 - value`, `atomic_cas` back, retry on contention. The flag
-    /// update uses the value actually swapped, matching `NEG`'s "flags as if
-    /// `0 - dst`" semantics.
+    /// `atomic_cas` retry loop (no atomic-RMW opcode); flags come from the swapped value, as `0 - dst`.
     fn handle_lock_neg(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let size = self.operand_size(instruction, 0)?;
         let ty = size_to_type(size);
         let ptr = self.get_mem_ptr(instruction, 0)?;
 
-        // Blocks carry the loop state as explicit parameters (no `Variable`s), so
-        // they need no manual sealing beyond the engine's final `seal_all_blocks`.
         let loop_b = self.builder.create_block();
         self.builder.append_block_param(loop_b, ty); // observed current value
         let done_b = self.builder.create_block();
@@ -512,10 +458,7 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// LOCK NOT [mem]: atomically bitwise-NOT memory.
-    ///
-    /// `~x == x ^ -1`, so this fuses into a single atomic XOR-with-all-ones.
-    /// `NOT` affects no flags, so the returned old value is discarded.
+    /// LOCK NOT [mem]: atomic XOR with all ones; no flags.
     fn handle_lock_not(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let size = self.operand_size(instruction, 0)?;
         let ty = size_to_type(size);
@@ -548,10 +491,7 @@ impl<'a> Lifter<'a> {
         let bits = (size * 8) as i64;
         let mut ptr = self.get_mem_ptr(instruction, 0)?;
 
-        // A register bit index selects a bit *string* position: the word
-        // actually accessed is `EA + (signed_index div width) * size`, and the
-        // in-word bit is `index mod width` (matching the non-locked BT family).
-        // An immediate index is simply masked to the operand width.
+        // A register index selects a bit-string position: word at `EA + (signed_index div width) * size`, bit `index mod width`; an immediate is masked.
         let shift = match instruction.op1_kind() {
             OpKind::Register => {
                 let idx = self.get_reg_val(instruction.op1_register())?;
@@ -579,7 +519,6 @@ impl<'a> Lifter<'a> {
             }
         };
 
-        // mask = 1 << (bit_idx % bit_width)
         let one = self.builder.ins().iconst(ty, 1);
         let mask = self.builder.ins().ishl(one, shift);
 
@@ -603,7 +542,6 @@ impl<'a> Lifter<'a> {
             }
         };
 
-        // CF = original bit value at position `shift`
         let bit_val = self.builder.ins().band(old, mask);
         let cf_wide = self.builder.ins().ushr(bit_val, shift);
         let cf = self.builder.ins().ireduce(types::I8, cf_wide);

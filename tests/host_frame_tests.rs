@@ -1,11 +1,5 @@
-//! Host call frames: a guest `CALL`/`RET` pair as a real host call and return.
-//!
-//! See [`microlift::core::hostframe`] for why this has no shadow stack and how a
-//! return that nobody expected unwinds. What is checked here is that it *happens*
-//! and that the unwinding is correct, and the control that carries the file is the
-//! same one the cell tests use: with `ctx.link_table` null and the ring off, a
-//! guest that gets all the way back to `main` can only have done it through host
-//! frames.
+//! Host call frames: guest CALL/RET as a real host call and return (see [`microlift::core::hostframe`]).
+//! Control: with `link_table` null and the ring off, getting back to the caller can only be via host frames.
 
 use std::sync::{Arc, RwLock};
 
@@ -19,12 +13,9 @@ use microlift::testkit::prelude::*;
 use microlift::testkit::{DEFAULT_LIFT_BASE, EXIT_TRAMPOLINE};
 
 const CALLEE: u64 = 0x2000;
-/// The address the call comes back to: `DEFAULT_LIFT_BASE` plus the `call`'s five
-/// bytes.
 const RETURN_TO: u64 = DEFAULT_LIFT_BASE + 5;
 const ROWS: u32 = 256;
 
-/// `call 0x2000 ; mov rax, 1 ; ret`
 #[rustfmt::skip]
 const CALLER: &[u8] = &[
     0xE8, 0xFB, 0x0F, 0x00, 0x00,              // call 0x2000
@@ -32,7 +23,6 @@ const CALLER: &[u8] = &[
     0xC3,                                      // ret
 ];
 
-/// `mov rbx, 7 ; ret`
 const CALLEE_CODE: &[u8] = &[0x48, 0xC7, 0xC3, 0x07, 0x00, 0x00, 0x00, 0xC3];
 
 fn link_config() -> BlockLinkConfig {
@@ -73,7 +63,7 @@ impl Guest {
         let stack = vec![0u64; 1024];
         let top = stack.as_ptr() as u64 + (stack.len() as u64) * 8;
         let mut runtime = ThreadRuntime::new(link_config(), Arc::clone(cache));
-        // The guest `call` pushes below this, so leave it a word of headroom.
+        // Headroom for the guest `call`'s push.
         runtime.ctx.rsp = top - 8;
         // SAFETY: inside `stack`, which this struct owns.
         unsafe { *(runtime.ctx.rsp as *mut u64) = EXIT_TRAMPOLINE };
@@ -85,7 +75,6 @@ impl Guest {
     }
 }
 
-/// Both regions in the cache, the caller published, the callee's cell installed.
 fn seeded(frames: bool) -> (Arc<RwLock<CodeCache>>, Guest) {
     let cache = Arc::new(RwLock::new(CodeCache::new()));
     let mut guest = Guest::new(&cache);
@@ -110,8 +99,7 @@ fn an_out_of_region_call_becomes_a_host_call() {
         ir.contains("call_indirect"),
         "no nested call was emitted:\n{ir}"
     );
-    // The address it comes back to is still a resume point: the fallback path,
-    // taken until the callee is compiled, re-enters this region there.
+    // Still a resume point: the fallback path re-enters there until the callee is compiled.
     assert!(code.resume_points.contains(&RETURN_TO));
 }
 
@@ -130,8 +118,7 @@ fn the_switch_being_off_emits_no_nested_call() {
 
 #[test]
 fn nesting_needs_cells_to_have_an_address_to_call() {
-    // The callee's address comes from a cell, so this is inert without them -
-    // the same silent-fallback shape as every other gate here.
+    // The callee address comes from a cell, so this is inert without cells.
     let config = LifterConfig {
         block_link: Some(link_config()),
         link_cells: false,
@@ -144,9 +131,7 @@ fn nesting_needs_cells_to_have_an_address_to_call() {
     assert!(code.link_sites.is_empty());
 }
 
-/// **The control that carries this file.** With no table and no ring, a `RET`
-/// from the callee can only get back into the caller through the host frame the
-/// call left on the stack.
+/// With no table and no ring, only the host frame can get a callee's `RET` back to the caller.
 #[test]
 fn a_guest_call_and_return_run_on_the_host_stack() {
     let (_cache, mut guest) = seeded(true);
@@ -169,8 +154,7 @@ fn a_guest_call_and_return_run_on_the_host_stack() {
 
 #[test]
 fn without_nesting_the_same_return_needs_a_link() {
-    // The other half of the control: identical program, nesting off, no table.
-    // The callee's `RET` has nothing to return to and must exit.
+    // Nesting off: the callee's RET has nothing to return to and must exit.
     let (_cache, mut guest) = seeded(false);
     guest.runtime.detach_table();
 
@@ -185,8 +169,7 @@ fn without_nesting_the_same_return_needs_a_link() {
 
 #[test]
 fn an_uninstalled_cell_falls_back_to_the_ordinary_exit() {
-    // A call whose target has not been translated cannot be a host call, and the
-    // fallback arm is what serves it until it has.
+    // An untranslated target cannot be a host call; the fallback arm serves it.
     let cache = Arc::new(RwLock::new(CodeCache::new()));
     let mut guest = Guest::new(&cache);
     let caller = cache.write().unwrap().insert(caller(true));
@@ -197,22 +180,17 @@ fn an_uninstalled_cell_falls_back_to_the_ordinary_exit() {
     let step = unsafe { guest.runtime.step() };
 
     assert_eq!(step, Step::Exit(ExitReason::UnknownJump));
-    // The ordinary out-of-region-call exit, unchanged: `rip` is the *return*
-    // address and the callee is in `imported_function_va`, which is the shape a
-    // host already services by swapping the two.
+    // Ordinary out-of-region call exit: `rip` is the return address, callee in `imported_function_va`.
     assert_eq!(guest.runtime.ctx.rip, RETURN_TO);
     assert_eq!(guest.runtime.ctx.imported_function_va, CALLEE);
     assert_eq!(guest.runtime.ctx.host_frame_depth, 0);
 }
 
-/// A return to an address no frame is waiting for unwinds instead of resuming
-/// the wrong place - the property that makes "always return, let the caller
-/// decide" correct rather than merely cheap.
+/// A return nobody expected unwinds instead of resuming the wrong place.
 #[test]
 fn a_return_the_caller_did_not_expect_unwinds() {
     const ELSEWHERE: u64 = 0x3000;
-    // `mov rbx, 7 ; mov qword ptr [rsp], 0x3000 ; ret` - returns somewhere the
-    // caller is not waiting for.
+    // Returns to an address the caller is not waiting for.
     #[rustfmt::skip]
     let rogue: &[u8] = &[
         0x48, 0xC7, 0xC3, 0x07, 0x00, 0x00, 0x00,
@@ -249,20 +227,13 @@ fn a_return_the_caller_did_not_expect_unwinds() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Depth: the part that is not one call
-// ---------------------------------------------------------------------------
 
-/// `DEPTH` regions, each calling the next and adding one on the way back, with
-/// the innermost just adding one. A run that gets `rax == DEPTH` executed every
-/// level exactly once, in order, and unwound through every one of them.
+/// `DEPTH` regions each calling the next; `rax == DEPTH` means every level ran once and unwound.
 const DEPTH: u64 = 5;
 
 fn chain(frames: bool, max_depth: u32) -> (Arc<RwLock<CodeCache>>, Guest) {
     let cache = Arc::new(RwLock::new(CodeCache::new()));
-    // `Guest::new` puts the trampoline *at* `rsp`, so the guest's own pushes go
-    // below it and the outermost `ret` finds it last. The stack has ample room
-    // beneath for DEPTH return addresses.
+    // The trampoline sits at `rsp`, so the guest's pushes go below it.
     let mut guest = Guest::new(&cache);
 
     for i in 0..DEPTH {
@@ -272,10 +243,8 @@ fn chain(frames: bool, max_depth: u32) -> (Arc<RwLock<CodeCache>>, Guest) {
             (i + 1) * 0x1000
         };
         let bytes: Vec<u8> = if i + 1 == DEPTH {
-            // `add rax, 1 ; ret`
             vec![0x48, 0x83, 0xC0, 0x01, 0xC3]
         } else {
-            // `call next ; add rax, 1 ; ret`
             let next = (i + 2) * 0x1000;
             let disp = (next as i64 - (at as i64 + 5)) as i32;
             let mut v = vec![0xE8];
@@ -299,8 +268,6 @@ fn chain(frames: bool, max_depth: u32) -> (Arc<RwLock<CodeCache>>, Guest) {
     (cache, guest)
 }
 
-/// Drive the chain to completion, however many host dispatches it takes.
-///
 /// # Safety
 ///
 /// Every translation reachable was compiled by this test for this context.
@@ -334,9 +301,7 @@ fn a_chain_of_nested_calls_unwinds_through_every_level() {
     );
 }
 
-/// **The bound on the host stack, and the thing it must not cost.** A guest
-/// nesting deeper than the ceiling gets the same answer; the calls past it take
-/// the ordinary linked exit, which is a host dispatch and nothing else.
+/// Calls past the host-stack ceiling take the ordinary linked exit and give the same answer.
 #[test]
 fn a_guest_deeper_than_the_ceiling_still_gets_the_right_answer() {
     let (_cache, mut guest) = chain(true, 2);
@@ -359,7 +324,6 @@ fn a_guest_deeper_than_the_ceiling_still_gets_the_right_answer() {
 
 #[test]
 fn the_answer_is_the_same_with_nesting_off() {
-    // The control for both of the above: the same chain, no host frames at all.
     let (_cache, mut guest) = chain(false, 64);
 
     // SAFETY: as `drive`.
@@ -373,13 +337,7 @@ fn the_answer_is_the_same_with_nesting_off() {
     );
 }
 
-/// **An exit from a nested frame.** A `CPUID` four calls deep cannot return to
-/// the host directly - there are four host frames between it and the thunk - so
-/// it unwinds through all of them, each restoring its own depth on the way past.
-///
-/// This is the case that makes "always return, let the caller decide" load-bearing
-/// rather than merely tidy: the intermediate frames are not told what happened and
-/// do not need to be. They compare, fail, and return.
+/// A CPUID four calls deep unwinds through every host frame; intermediate frames just compare, fail and return.
 #[test]
 fn an_exit_from_a_nested_frame_unwinds_to_the_host_and_resumes() {
     let cache = Arc::new(RwLock::new(CodeCache::new()));
@@ -392,7 +350,6 @@ fn an_exit_from_a_nested_frame_unwinds_to_the_host_and_resumes() {
             (i + 1) * 0x1000
         };
         let bytes: Vec<u8> = if i + 1 == DEPTH {
-            // `cpuid ; add rax, 1 ; ret` - the exit happens at the bottom.
             vec![0x0F, 0xA2, 0x48, 0x83, 0xC0, 0x01, 0xC3]
         } else {
             let next = (i + 2) * 0x1000;
@@ -434,9 +391,7 @@ fn an_exit_from_a_nested_frame_unwinds_to_the_host_and_resumes() {
         "and it resumes after the cpuid, inside the innermost region"
     );
 
-    // Servicing it is the host's business; here it is a no-op. Resuming from the
-    // reported PC has to finish the program, which is what says the unwinding
-    // left the guest's own stack intact.
+    // Resuming from the reported PC must finish, proving the unwind left the guest stack intact.
     // SAFETY: as above.
     let (exit, _) = unsafe { drive(&mut guest) };
     assert_eq!(exit, ExitReason::Return);
@@ -444,8 +399,7 @@ fn an_exit_from_a_nested_frame_unwinds_to_the_host_and_resumes() {
     assert_eq!(guest.runtime.ctx.host_frame_depth, 0);
 }
 
-/// Nesting under a **pinned** register file, where a region's parameters and
-/// results are half the guest's registers and a call has to forward them.
+/// Nesting under a pinned register file, where a call must forward half the registers.
 #[test]
 fn a_nested_call_carries_a_pinned_register_file() {
     use microlift::arch::x86_64::pin;
@@ -494,21 +448,11 @@ fn a_nested_call_carries_a_pinned_register_file() {
     assert_eq!(guest.runtime.ctx.rax, 1, "and the caller resumed after it");
 }
 
-/// **The lazy-sync prune survives a nested call, and this is what says so.**
-///
-/// A caller that writes none of these registers still has to publish what the
-/// *callee* wrote to them. The prune deletes the sync store of a register nothing
-/// in the region wrote; the claim is that a nested call does not invalidate that,
-/// because after the post-call reload such a register holds exactly what the
-/// context holds and its store is idempotent either way.
-///
-/// Being wrong about that is a stale register and not a crash, so it is checked
-/// against every register a callee can plausibly write rather than the one or two
-/// the other tests here happen to use.
+/// The lazy-sync prune survives a nested call: a caller that writes none of these registers must still publish what the callee wrote.
+/// Wrong means a stale register, so every plausibly written register is checked.
 #[test]
 fn a_callee_s_writes_survive_a_caller_that_touches_nothing() {
-    // Callee: `mov rbx,0xb ; mov rcx,0xc ; mov rdx,0xd ; mov rsi,0x6 ;
-    //          mov rdi,0x7 ; mov r8,0x8 ; mov r9,0x9 ; ret`
+    // Callee writes rbx, rcx, rdx, rsi, rdi, r8, r9.
     #[rustfmt::skip]
     let callee_bytes: &[u8] = &[
         0x48, 0xC7, 0xC3, 0x0B, 0x00, 0x00, 0x00, // rbx
@@ -520,8 +464,7 @@ fn a_callee_s_writes_survive_a_caller_that_touches_nothing() {
         0x49, 0xC7, 0xC1, 0x09, 0x00, 0x00, 0x00, // r9
         0xC3,
     ];
-    // Caller: `call callee ; mov rax, 1 ; ret` - writes `rax` and nothing else,
-    // so every register above is one the prune would drop the store of.
+    // Caller writes only `rax`, so the prune would drop every other store.
     let caller_bytes = CALLER;
 
     let cache = Arc::new(RwLock::new(CodeCache::new()));
@@ -564,16 +507,9 @@ fn a_callee_s_writes_survive_a_caller_that_touches_nothing() {
     }
 }
 
-/// A call whose **resume point is past the end of the region** does not nest.
-///
-/// There is nowhere in this region for such a call to come back to: `finish`
-/// turns the address into an exit stub, and returning into one would sync the
-/// caller's pre-call register file over everything the callee wrote. Nesting is
-/// an optimisation, so it declines rather than working around it.
+/// A call whose resume point is past the region end does not nest: returning into the exit stub would sync stale caller state over the callee's writes.
 #[test]
 fn a_call_at_the_end_of_a_region_does_not_nest() {
-    // `call 0x9000` and nothing after it: the resume point is the byte past the
-    // region.
     let bytes: &[u8] = &[0xE8, 0xFB, 0x7F, 0x00, 0x00];
     let config = LifterConfig {
         block_link: Some(link_config()),
@@ -587,7 +523,6 @@ fn a_call_at_the_end_of_a_region_does_not_nest() {
         !code.func.display().to_string().contains("call_indirect"),
         "a call with no in-region resume point must take the ordinary exit"
     );
-    // It is still a *static edge*, so it still gets a cell - only the nesting is
-    // declined.
+    // Still a static edge, so it keeps its cell.
     assert!(code.link_sites.iter().any(|s| s.target == 0x9000));
 }

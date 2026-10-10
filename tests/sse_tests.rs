@@ -1,8 +1,4 @@
-//! SSE / SSE2 instruction tests.
-//!
-//! Each test lifts a small x86-64 snippet and verifies the resulting
-//! `RegisterContext` has the expected XMM (and where relevant GPR/memory)
-//! state after JIT execution.
+//! SSE / SSE2 instruction tests: lift a snippet, run it, check XMM/GPR/memory state.
 
 use microlift::testkit::prelude::*;
 
@@ -449,14 +445,7 @@ fn test_movq_roundtrip_gpr_xmm() {
     assert_eq!(ctx.xmm[0][1], 0, "movq must zero high lane");
 }
 
-//  Vector-mode (use_vector_xmm = true) regression tests.
-//
-//  Mirror a representative subset of the bitwise / move handlers above
-//  but flip on the I64X2 backing representation. This exercises the
-//  vector load/store paths in `load_state_from_context` /
-//  `sync_to_context` and the vector fast paths in
-//  handle_xorps / handle_andps / handle_orps / handle_andnps /
-//  handle_movaps.
+// Vector-mode (`use_vector_xmm = true`) mirror of the bitwise/move handlers above.
 
 #[test]
 fn test_vec_xorps_two_regs() {
@@ -615,10 +604,7 @@ fn test_movhps_store_high() {
     );
 }
 
-//  MOVLPS / MOVLPD - merging load / store of the low quadword.
-//
-//  Both XMM representations are exercised, since the lo/hi accessors take
-//  different paths in vector mode.
+// MOVLPS / MOVLPD - merging low-quadword load/store, in both XMM representations.
 
 #[test]
 fn test_movlps_load_low() {
@@ -679,8 +665,7 @@ fn test_movlps_store_low() {
     }
 }
 
-//  MOVHLPS / MOVLHPS - the register-to-register half moves that share the
-//  0F 12 / 0F 16 opcodes with MOVLPS / MOVHPS.
+// MOVHLPS / MOVLHPS - register half moves sharing 0F 12 / 0F 16 with MOVLPS / MOVHPS.
 
 #[test]
 fn test_movhlps() {
@@ -729,10 +714,7 @@ fn test_movlhps() {
 
 #[test]
 fn test_movhlps_movlhps_swap_halves() {
-    // A round trip through xmm2 swaps the halves of xmm0:
-    //   movhlps xmm2, xmm0   -> xmm2.lo = xmm0.hi   (0F 12 D0)
-    //   movlhps xmm2, xmm0   -> xmm2.hi = xmm0.lo   (0F 16 D0)
-    //   movaps  xmm0, xmm2                          (0F 28 C2)
+    // movhlps xmm2,xmm0 ; movlhps xmm2,xmm0 ; movaps xmm0,xmm2 swaps the halves (0F 12 D0, 0F 16 D0, 0F 28 C2)
     let bytes = [0x0F, 0x12, 0xD0, 0x0F, 0x16, 0xD0, 0x0F, 0x28, 0xC2, 0xC3];
     let mut ctx = RegisterContext::default();
     ctx.xmm[0] = [0xAAAA_AAAA_AAAA_AAAA, 0xBBBB_BBBB_BBBB_BBBB];
@@ -830,14 +812,9 @@ fn test_psrlq_xmm_count() {
     );
 }
 
-//  Packed per-lane shifts: PSRLW/PSRLD/PSRLQ, PSLLW/PSLLD/PSLLQ, PSRAW/PSRAD.
-//
-//  Every case is checked in both XMM representations (scalar lo/hi pair with
-//  lane masking vs native vector shifts) via `check_packed`, which puts the
-//  shifted value in xmm0 and the register-form count in xmm1.
+// Packed per-lane shifts, in both XMM representations via `check_packed` (xmm0 = value, xmm1 = register-form count).
 
-/// Word-lane test pattern: lanes cover 0x0001, all-ones, sign-bit-set and a
-/// mixed value, so lane-boundary bleed and sign fill are both visible.
+/// Word-lane pattern: 0x0001, all-ones, sign-set, mixed - shows lane bleed and sign fill.
 const SHIFT_W: [u64; 2] = [0x000F_FF00_0F00_FFFF, 0x8000_1234_FFFF_0001];
 /// Dword-lane test pattern.
 const SHIFT_D: [u64; 2] = [0x0000_000F_FF00_0000, 0xF000_0001_8000_0000];
@@ -1031,8 +1008,7 @@ fn test_psllq_imm_and_reg() {
     check_packed(&reg, SHIFT_Q, [64, 0], [0, 0], "psllq by >=64 (register)");
 }
 
-//  PSRAW / PSRAD - an out-of-range count saturates to each lane's sign
-//  instead of zeroing the lane.
+// PSRAW / PSRAD - out-of-range counts saturate to the sign, not zero.
 
 #[test]
 fn test_psraw_imm() {
@@ -1365,8 +1341,7 @@ fn test_movapd_reg_reg() {
 
 #[test]
 fn test_vec_pshufd_and_psrlq() {
-    // Same ops as the scalar tests, but in vector-xmm mode, to exercise the
-    // lo/hi accessors' insertlane/extractlane paths.
+    // Vector-xmm mode: exercises the insertlane/extractlane paths.
     // pshufd xmm0, xmm1, 0x1B; ret
     let bytes = [0x66, 0x0F, 0x70, 0xC1, 0x1B, 0xC3];
     let mut ctx = RegisterContext::default();
@@ -1382,14 +1357,9 @@ fn test_vec_pshufd_and_psrlq() {
     assert_eq!(ctx.xmm[0], [0x0000_0000_0000_0FF0, 0x0F00_0000_0000_0000]);
 }
 
-//  Packed integer add / subtract
-//
-//  PADDB/W/D/Q, PSUBB/W/D/Q and the saturating PADDS*/PADDUS*/PSUBS*/PSUBUS*
-//  forms. Every case is checked in both XMM representations: the scalar lo/hi
-//  pair (SWAR / per-lane expansion) and native vectors.
+// Packed integer add/sub incl. saturating forms, in both XMM representations.
 
-/// Set `xmm0 = dst`, `xmm1 = src`, run `bytes` in both scalar and vector XMM
-/// mode, and assert `xmm0 == expected` either way.
+/// Run `bytes` with xmm0 = dst, xmm1 = src in both XMM modes; assert xmm0 == expected.
 fn check_packed(bytes: &[u8], dst: [u64; 2], src: [u64; 2], expected: [u64; 2], what: &str) {
     for (mode, run) in [
         (
@@ -1748,8 +1718,7 @@ fn test_cvtsi2ss_r64() {
 
 #[test]
 fn test_cvtsi2ss_r64_rounds_to_nearest_even() {
-    // 2^24 + 1 is not representable in f32; the default rounding mode rounds it
-    // back down to 2^24.
+    // 2^24 + 1 is unrepresentable in f32 and rounds to 2^24.
     // cvtsi2ss xmm0, rax; ret
     let bytes = [0xF3, 0x48, 0x0F, 0x2A, 0xC0, 0xC3];
     let mut ctx = RegisterContext::default();
@@ -1802,10 +1771,7 @@ fn pack_f32(l0: f32, l1: f32) -> u64 {
     (l0.to_bits() as u64) | ((l1.to_bits() as u64) << 32)
 }
 
-/// Run a scalar-single op on `xmm0 <- xmm1` and return the resulting `xmm[0]`.
-///
-/// `xmm0` and `xmm1` are seeded so every bit outside lane 0 is distinctive,
-/// letting the caller assert bits[127:32] of the destination survive.
+/// Run a scalar-single op on `xmm0 <- xmm1`; bits outside lane 0 are distinctive so preservation is checkable.
 fn run_scalar_single(bytes: &[u8], a: f32, b: f32) -> [u64; 2] {
     let mut ctx = RegisterContext::default();
     ctx.xmm[0] = [
@@ -1819,8 +1785,7 @@ fn run_scalar_single(bytes: &[u8], a: f32, b: f32) -> [u64; 2] {
     run_test(bytes, ctx).xmm[0]
 }
 
-/// Assert a scalar-single op produced `expected` in lane 0 and touched nothing
-/// else in the destination.
+/// Assert lane 0 is `expected` and the rest of the destination is untouched.
 fn check_scalar_single(got: [u64; 2], expected: f32, what: &str) {
     assert_eq!(
         got[0],
@@ -1872,8 +1837,7 @@ fn test_divss_by_zero_is_infinity() {
 
 #[test]
 fn test_mulss_inexact_operands_round_like_f32() {
-    // 0.1 is not representable in binary; the product must match what native
-    // f32 multiplication produces, bit for bit.
+    // 0.1 is inexact; the product must match native f32 bit for bit.
     // mulss xmm0, xmm1; ret
     let got = run_scalar_single(&[0xF3, 0x0F, 0x59, 0xC1, 0xC3], 0.1, 3.0);
     check_scalar_single(got, 0.1f32 * 3.0f32, "mulss inexact operands");
@@ -1881,9 +1845,7 @@ fn test_mulss_inexact_operands_round_like_f32() {
 
 #[test]
 fn test_addss_rounds_at_single_precision() {
-    // 2^24 + 1 has no f32 representation: the add must saturate the 24-bit
-    // significand back to 2^24 rather than keeping the extra bit in a wider
-    // intermediate lane.
+    // 2^24 + 1 must round back to 2^24, not stay in a wider intermediate.
     // addss xmm0, xmm1; ret
     let got = run_scalar_single(&[0xF3, 0x0F, 0x58, 0xC1, 0xC3], 16_777_216.0, 1.0);
     check_scalar_single(got, 16_777_216.0, "addss single-precision rounding");
@@ -1921,10 +1883,7 @@ fn test_addss_vector_xmm() {
 
 //  Packed arithmetic: MULPS / ADDPD
 
-/// 16-byte-aligned backing store for an `m128` memory operand.
-///
-/// The payload is only ever read by the lifted code through its address, which
-/// Rust cannot see - hence the `dead_code` allowance.
+/// 16-byte-aligned `m128` backing, read only through its address (hence `dead_code`).
 #[repr(align(16))]
 struct Aligned128(#[allow(dead_code)] [u64; 2]);
 
@@ -2016,16 +1975,11 @@ fn test_addpd_subpd_roundtrip() {
 
 //  CVTTSS2SI
 
-/// x86's "integer indefinite" results, produced whenever a truncated float is
-/// unrepresentable in the destination.
+/// x86's integer indefinite for unrepresentable truncations.
 const INDEF32: u64 = 0x8000_0000;
 const INDEF64: u64 = 0x8000_0000_0000_0000;
 
-/// Run a `cvttss2si <reg>, xmm0` form with `v` in lane 0 of xmm0, returning rax.
-///
-/// rax is pre-seeded with garbage so the 32-bit form's zero-extension of the
-/// upper half is observable, and the unused parts of xmm0 are non-zero so a
-/// handler reading the wrong lane would show up.
+/// Run a `cvttss2si <reg>, xmm0` form with `v` in lane 0; rax is pre-seeded so zero-extension shows, other xmm0 lanes are non-zero.
 fn run_cvttss2si(bytes: &[u8], v: f32) -> u64 {
     let mut ctx = RegisterContext::default();
     ctx.rax = 0xDEAD_BEEF_DEAD_BEEF;
@@ -2070,8 +2024,7 @@ fn test_cvttss2si_r32_range_boundaries() {
 
 #[test]
 fn test_cvttss2si_r32_invalid_gives_integer_indefinite() {
-    // x86 returns INT_MIN for NaN and both infinities - it does *not* saturate
-    // the way Rust's `as` cast or Cranelift's fcvt_to_sint_sat would.
+    // x86 returns INT_MIN for NaN and infinities; it does not saturate.
     assert_eq!(run_cvttss2si(&CVTTSS2SI_EAX, f32::NAN), INDEF32);
     assert_eq!(run_cvttss2si(&CVTTSS2SI_EAX, -f32::NAN), INDEF32);
     assert_eq!(run_cvttss2si(&CVTTSS2SI_EAX, f32::INFINITY), INDEF32);
@@ -2104,8 +2057,7 @@ fn test_cvttss2si_r64_invalid_gives_integer_indefinite() {
     assert_eq!(run_cvttss2si(&CVTTSS2SI_RAX, f32::NEG_INFINITY), INDEF64);
     assert_eq!(run_cvttss2si(&CVTTSS2SI_RAX, 1e30), INDEF64);
     assert_eq!(run_cvttss2si(&CVTTSS2SI_RAX, -1e30), INDEF64);
-    // -2^63 is exactly representable but still one past the bottom of the range
-    // once truncated, so it too yields the indefinite value.
+    // -2^63 is exact but one past the range once truncated: indefinite.
     assert_eq!(
         run_cvttss2si(&CVTTSS2SI_RAX, -9223372036854775808.0),
         INDEF64
@@ -2166,8 +2118,7 @@ fn test_cvtsi2ss_cvttss2si_roundtrip() {
 
 //  Packed integer compare: PCMPEQB/W/D/Q and PCMPGTB/W/D/Q
 
-/// Run a `<op> xmm0, xmm1` snippet in both XMM representations and assert both
-/// agree on `xmm0`. Returns nothing - the assertion is the point.
+/// Run `<op> xmm0, xmm1` in both XMM representations; assert both agree.
 fn assert_packed_both(bytes: &[u8], xmm0: [u64; 2], xmm1: [u64; 2], expected: [u64; 2]) {
     let seed = || {
         let mut ctx = RegisterContext::default();
@@ -2198,8 +2149,7 @@ fn test_pcmpeqd() {
 
 #[test]
 fn test_pcmpeqd_self_is_all_ones() {
-    // The `pcmpeqd xmm0, xmm0` idiom compilers use to materialise an all-ones
-    // register.  ->  66 0F 76 C0  C3
+    // `pcmpeqd xmm0, xmm0`, the all-ones idiom  ->  66 0F 76 C0  C3
     let bytes = [0x66, 0x0F, 0x76, 0xC0, 0xC3];
     assert_packed_both(
         &bytes,
@@ -2459,8 +2409,7 @@ fn test_pmulhuw_unsigned() {
 
 //  Unpack / interleave: PUNPCK{L,H}{BW,WD,DQ,QDQ} and the ps/pd aliases
 
-/// dst/src seeds whose every byte is distinct, so an unpack test pins down the
-/// exact lane order: dst bytes are 0x00..0x0F, src bytes 0x10..0x1F.
+/// Distinct-byte seeds (dst 0x00..0x0F, src 0x10..0x1F) pin lane order.
 const UNPACK_DST: [u64; 2] = [0x0706_0504_0302_0100, 0x0F0E_0D0C_0B0A_0908];
 const UNPACK_SRC: [u64; 2] = [0x1716_1514_1312_1110, 0x1F1E_1D1C_1B1A_1918];
 
@@ -2723,9 +2672,7 @@ fn test_minsd_returns_source_on_nan() {
         ctx
     };
 
-    // A NaN in *either* operand makes the comparison false, so the source
-    // operand is returned - the documented x86 rule, and the reason this is not
-    // an IEEE minNum.
+    // A NaN in either operand returns the source (x86 rule, not IEEE minNum).
     let nan = f64::NAN.to_bits();
     assert_eq!(
         run_test(&min, seed(3.0f64.to_bits(), nan)).xmm[0][0],
@@ -2980,8 +2927,7 @@ fn test_cvtsd2ss_cvtss2sd_roundtrip() {
     }
 }
 
-//  Packed conversions: CVTPD2PS / CVTPS2PD / CVTDQ2PS / CVT[T]PS2DQ /
-//  CVTDQ2PD / CVT[T]PD2DQ.
+// Packed conversions: CVTPD2PS / CVTPS2PD / CVTDQ2PS / CVT[T]PS2DQ / CVTDQ2PD / CVT[T]PD2DQ.
 
 /// Split a 64-bit XMM half into its two `f32` lanes.
 fn unpack_f32(half: u64) -> (f32, f32) {
@@ -3364,8 +3310,7 @@ fn test_pinsrw_reg_all_lanes() {
 
 #[test]
 fn test_pinsrw_imm_selector_masks_to_three_bits() {
-    // pinsrw xmm0, ecx, 0x0A; ret - imm8 bits above [2:0] are ignored, so
-    // 0x0A selects word 2.
+    // pinsrw xmm0, ecx, 0x0A; ret - imm8 bits above [2:0] ignored: selects word 2.
     let bytes = [0x66, 0x0F, 0xC4, 0xC1, 0x0A, 0xC3];
     let mut ctx = RegisterContext::default();
     ctx.xmm[0] = [0x1111_2222_3333_4444, 0x5555_6666_7777_8888];
@@ -3413,8 +3358,7 @@ fn test_insertps_selects_source_and_destination_lanes() {
 
 #[test]
 fn test_insertps_zero_mask_overrides_insert_and_vector_mode_agrees() {
-    // Source lane 1 -> destination lane 2, but bit 2 of the zero mask clears
-    // that destination lane after the insert.
+    // Source lane 1 -> dest lane 2, then zero-mask bit 2 clears that lane.
     let bytes = [0x66, 0x0F, 0x3A, 0x21, 0xC1, 0x64, 0xC3];
     let mut ctx = RegisterContext::default();
     ctx.xmm[0] = [0x3333_3333_2222_2222, 0x5555_5555_4444_4444];
@@ -3440,10 +3384,7 @@ fn test_insertps_memory_source_reads_one_dword() {
     assert_eq!(out.xmm[0], [0xAABB_CCDD_2222_2222, 0x5555_5555_4444_4444]);
 }
 
-//  HADDPD / HSUBPD / HADDPS / HSUBPS - SSE3 horizontal arithmetic. The lanes
-//  combined are *adjacent within one operand*, which is the whole difference
-//  from ADDPD, and reading them the vertical way is a result that is plausible
-//  rather than wrong-looking - so every case below uses four distinct values.
+// HADDPD / HSUBPD / HADDPS / HSUBPS - combine adjacent lanes within one operand; distinct values catch vertical reads.
 
 #[test]
 fn test_haddpd_adds_adjacent_lanes_of_each_operand() {
@@ -3460,9 +3401,7 @@ fn test_haddpd_adds_adjacent_lanes_of_each_operand() {
 
 #[test]
 fn test_haddpd_with_the_destination_as_its_own_source() {
-    // haddpd xmm0, xmm0; ret - the shape a compiler emits to sum a pair, and
-    // the one that goes wrong if a result lane is written before both operands
-    // have been read.
+    // haddpd xmm0, xmm0; ret - the pair-sum shape; breaks if a lane is written before both operands are read.
     let bytes = [0x66, 0x0F, 0x7C, 0xC0, 0xC3];
     let mut ctx = RegisterContext::default();
     ctx.xmm[0] = [0x3FF8_0000_0000_0000, 0x4002_0000_0000_0000];
@@ -3527,8 +3466,7 @@ fn xmm_f32(lanes: [f32; 4]) -> [u64; 2] {
     [w(0) | (w(1) << 32), w(2) | (w(3) << 32)]
 }
 
-/// The raw-bits form of [`xmm_f32`], for the NaN cases where a literal would
-/// not survive the round trip.
+/// Raw-bits form of [`xmm_f32`], for NaN cases a literal would not preserve.
 fn xmm_bits32(lanes: [u32; 4]) -> [u64; 2] {
     let w = |i: usize| u64::from(lanes[i]);
     [w(0) | (w(1) << 32), w(2) | (w(3) << 32)]
@@ -3584,10 +3522,7 @@ fn test_addsubpd_memory_source() {
     assert_eq!(out.xmm[0], [(-0.75f64).to_bits(), 7.0f64.to_bits()]);
 }
 
-/// An invalid operation in either kind of lane must produce x86's floating
-/// indefinite (`0xFFC0_0000`), not whatever default NaN the host FPU picks -
-/// and, crucially, the *even* lanes must trap `inf - inf` while the odd ones
-/// trap `inf + -inf`, which is what proves each lane runs its own operation.
+/// Invalid ops produce x86's indefinite (`0xFFC0_0000`); even lanes trap `inf - inf`, odd `inf + -inf`, proving per-lane operations.
 #[test]
 fn test_addsubps_invalid_operations_yield_the_floating_indefinite() {
     const INF: u32 = 0x7F80_0000;
@@ -3606,9 +3541,7 @@ fn test_addsubps_invalid_operations_yield_the_floating_indefinite() {
     assert_eq!(out.xmm[0], xmm_bits32([INDEF, INDEF, INF, INF]));
 }
 
-/// A NaN operand must reach the result with its own bits, which is why the
-/// even lanes cannot be implemented by negating the source and adding: a
-/// pre-negated NaN would arrive with its sign bit flipped.
+/// A NaN operand keeps its own bits, so even lanes cannot negate-and-add (the sign would flip).
 #[test]
 fn test_addsubps_propagates_source_nan_without_flipping_its_sign() {
     // A quiet NaN with the sign bit set and a distinguishing payload.
@@ -3621,16 +3554,14 @@ fn test_addsubps_propagates_source_nan_without_flipping_its_sign() {
     ctx.xmm[0] = xmm_f32([1.0, 1.0, 1.0, 1.0]);
     ctx.xmm[1] = xmm_bits32([NEG_QNAN, NEG_QNAN, POS_QNAN, POS_QNAN]);
     let out = run_test(&bytes, ctx);
-    // Every lane takes the source QNaN through unchanged - the subtract lanes
-    // (0 and 2) included.
+    // Every lane passes the source QNaN through, subtract lanes included.
     assert_eq!(
         out.xmm[0],
         xmm_bits32([NEG_QNAN, NEG_QNAN, POS_QNAN, POS_QNAN])
     );
 }
 
-/// The double-precision twin of
-/// `test_addsubps_propagates_source_nan_without_flipping_its_sign`.
+/// Double-precision twin of the test above.
 #[test]
 fn test_addsubpd_propagates_source_nan_without_flipping_its_sign() {
     const NEG_QNAN: u64 = 0xFFF8_0000_0000_1234;
@@ -3644,10 +3575,7 @@ fn test_addsubpd_propagates_source_nan_without_flipping_its_sign() {
     assert_eq!(out.xmm[0], [NEG_QNAN, NEG_QNAN]);
 }
 
-/// Signed zeros distinguish add from subtract where nothing else does:
-/// `+0.0 - +0.0` is `+0.0` but `-0.0 - +0.0` is `-0.0`, and `-0.0 + -0.0` is
-/// `-0.0` while `-0.0 + +0.0` is `+0.0`. A lane running the wrong operation
-/// shows up here as a sign bit.
+/// Signed zeros separate add from subtract: a wrong per-lane op shows as a sign bit.
 #[test]
 fn test_addsubps_signed_zero_lanes() {
     // addsubps xmm0, xmm1; ret
@@ -3661,10 +3589,7 @@ fn test_addsubps_signed_zero_lanes() {
     assert_eq!(out.xmm[0], xmm_f32([-0.0, 0.0, 0.0, 0.0]));
 }
 
-/// The shape a compiler actually emits: one complex multiply,
-/// `(a+bi)(c+di) = (ac-bd) + (ad+bc)i`, built from MOVSLDUP / MOVSHDUP /
-/// SHUFPS / MULPS / ADDSUBPS. This is the reason ADDSUBPS exists, and it
-/// exercises the instruction against neighbours rather than in isolation.
+/// Complex multiply `(a+bi)(c+di)` via MOVSLDUP/MOVSHDUP/SHUFPS/MULPS/ADDSUBPS: ADDSUBPS among neighbours.
 #[test]
 fn test_complex_multiply_sequence() {
     // xmm0 = [a, b, ...] (one complex number in the low pair)
@@ -3710,17 +3635,8 @@ fn test_complex_multiply_sequence() {
 
 #[test]
 fn test_addsub_agrees_in_vector_mode() {
-    // The vector-XMM lift is a different path through the same semantics, so it
-    // has to produce the same registers - NaN and infinity lanes included.
-    //
-    // The third field opts a state out of the automatic Unicorn cross-check.
-    // It is off for the state whose lanes pair *two* QNaNs, because the two
-    // engines legitimately disagree there: SSE returns the NaN in SRC1 (so the
-    // destination's payload wins), while QEMU - and so Unicorn - applies the
-    // x87 rule to SSE as well and returns whichever NaN has the larger
-    // significand. Nothing about ADDSUB* provokes it; plain ADDPS/MULPS
-    // diverge the same way whenever the source operand carries the larger
-    // payload. The other states keep the oracle.
+    // Vector-XMM lift must produce the same registers, NaN/inf lanes included.
+    // Third field disables the Unicorn check for the two-QNaN state: SSE returns SRC1's NaN, QEMU applies the x87 larger-significand rule.
     let states: &[([u64; 2], [u64; 2], bool)] = &[
         (
             xmm_f32([1.5, 2.5, 3.0, 4.0]),
@@ -3769,8 +3685,7 @@ fn test_addsub_agrees_in_vector_mode() {
 
 #[test]
 fn test_horizontal_arithmetic_agrees_in_vector_mode() {
-    // The vector-XMM lift is a different path through the same semantics, so it
-    // has to produce the same registers.
+    // Vector-XMM lift must produce the same registers.
     let mut ctx = RegisterContext::default();
     ctx.xmm[0] = [0x3FF8_0000_0000_0000, 0x4002_0000_0000_0000];
     ctx.xmm[1] = [0x4008_0000_0000_0000, 0x4010_0000_0000_0000];
@@ -3786,8 +3701,7 @@ fn test_horizontal_arithmetic_agrees_in_vector_mode() {
 
 //  ROUNDSD / ROUNDSS / ROUNDPD / ROUNDPS
 
-/// Every mode of the scalar double form, against the same input, with the upper
-/// quadword of the destination checked to be untouched.
+/// Every mode of the scalar double form; upper quadword untouched.
 #[test]
 fn test_roundsd_modes() {
     for (imm, expected) in [
@@ -3819,8 +3733,7 @@ fn test_roundsd_negative_floor_and_truncate_differ() {
     }
 }
 
-/// Bit 2 means "use MXCSR", whose reset mode is round-to-nearest-even; see
-/// `round_mode`.
+/// Bit 2 means "use MXCSR" (reset mode: nearest-even); see `round_mode`.
 #[test]
 fn test_roundsd_mxcsr_bit_rounds_to_nearest_even() {
     let bytes = [0x66, 0x0F, 0x3A, 0x0B, 0xC1, 0x04, 0xC3];
@@ -3889,8 +3802,7 @@ fn test_roundsd_memory_source() {
     assert_eq!(f64::from_bits(out.xmm[0][0]), 8.0);
 }
 
-//  RCPPS / RSQRTPS / RCPSS / RSQRTSS - approximate, so compared with a
-//  tolerance well inside the architectural 1.5 * 2^-12 relative error bound.
+// RCPPS / RSQRTPS / RCPSS / RSQRTSS - approximate; tolerance well inside 1.5 * 2^-12.
 
 #[test]
 fn test_rcpps_and_rsqrtps() {
@@ -3975,8 +3887,7 @@ fn test_movntdq_store() {
     assert_eq!(buf, [0x1234_5678_9ABC_DEF0, 0xFEED_FACE_CAFE_F00D]);
 }
 
-/// The new packed conversions and shuffles under the vector XMM representation,
-/// where the lo/hi accessors take a different path.
+/// Packed conversions and shuffles under the vector XMM representation.
 #[test]
 fn test_conversions_and_shuffles_vector_xmm() {
     // cvtpd2ps xmm0, xmm1
@@ -4010,10 +3921,7 @@ fn test_conversions_and_shuffles_vector_xmm() {
     assert_eq!(ctx.xmm[0], [T32, T32]);
 }
 
-//  SSSE3 / SSE4.1 packed integer ops
-//
-//  These pin down concrete results (and the vector-XMM representation); the
-//  exhaustive hardware cross-check lives in `tests/unicorn_oracle_tests.rs`.
+// SSSE3 / SSE4.1 packed integer ops; exhaustive hardware checks are in `unicorn_oracle_tests.rs`.
 
 /// Bytes 0x00..0x0F laid out lane 0 first.
 const IDENTITY_BYTES: [u64; 2] = [0x0706_0504_0302_0100, 0x0F0E_0D0C_0B0A_0908];
@@ -4024,8 +3932,7 @@ fn test_pshufb_selects_zeroes_and_masks() {
     let bytes = [0x66, 0x0F, 0x38, 0x00, 0xC1, 0xC3];
     let mut ctx = RegisterContext::default();
     ctx.xmm[0] = IDENTITY_BYTES;
-    // Control bytes, lane 0 first: 0x0F..0x08 reverse the low half from the
-    // destination's high bytes; 0x80 zeroes; 0x31 must be masked to index 1.
+    // Control bytes: 0x0F..0x08 reverse the low half from dst's high bytes; 0x80 zeroes; 0x31 masks to index 1.
     ctx.xmm[1] = [0x0809_0A0B_0C0D_0E0F, 0x3180_0000_0000_0007];
     let ctx = run_test(&bytes, ctx);
     assert_eq!(ctx.xmm[0][0], 0x0809_0A0B_0C0D_0E0F, "reversed high bytes");
@@ -4088,9 +3995,7 @@ fn test_palignr_shifts_across_the_pair() {
 
 #[test]
 fn test_packsswb_and_packuswb_saturate() {
-    // The destination's eight words, lane 0 first: 0, -128, 127, 128,
-    // -1, 1, 32767, -32768. The source is zero, so the result's high half is
-    // whatever those words saturate zero to.
+    // dst words: 0, -128, 127, 128, -1, 1, 32767, -32768; src zero, so the high half is zero saturated.
     let dst = [0x0080_007F_FF80_0000u64, 0x8000_7FFF_0001_FFFF];
 
     // packsswb xmm0, xmm1 ; ret  ->  66 0F 63 C1  C3  (signed, clamps to i8)
@@ -4199,8 +4104,7 @@ fn test_pblendvb_uses_xmm0_mask() {
     assert_eq!(ctx.xmm[2][1], 0x2222_2222_2222_2222, "zero mask keeps dst");
 }
 
-/// The scalar lo/hi and native-vector XMM representations must agree on every
-/// new op - the lane plumbing is shared, but the reads and writes are not.
+/// Scalar lo/hi and vector XMM must agree on every new op.
 #[test]
 fn test_new_packed_ops_match_in_vector_mode() {
     let progs: &[(&str, &[u8])] = &[
@@ -4258,10 +4162,7 @@ fn test_new_packed_ops_match_in_vector_mode() {
     }
 }
 
-/// The MMX encodings of the SSE integer opcodes (same mnemonic, no 0x66
-/// prefix) operate on `MM0..MM7`, which this frontend does not model. They must
-/// reach the host's interpreter callback - and let the region carry on - rather
-/// than failing the lift of the whole region.
+/// MMX encodings (no 0x66) operate on unmodelled `MM0..MM7`: they must reach the interpreter callback and let the region continue.
 #[test]
 fn test_mmx_encodings_reach_the_interpreter_callback() {
     use microlift::arch::x86_64::context::X86_64Callbacks;
@@ -4269,8 +4170,7 @@ fn test_mmx_encodings_reach_the_interpreter_callback() {
 
     static CALLS: AtomicU64 = AtomicU64::new(0);
 
-    /// Steps over whatever it was handed; the operands are MMX state no test
-    /// here inspects.
+    /// Steps over the instruction; MMX state is not inspected.
     unsafe extern "C" fn skip(ctx: *mut RegisterContext, _n: u64) {
         let ctx = unsafe { &mut *ctx };
         CALLS.fetch_add(1, Ordering::SeqCst);
@@ -4299,9 +4199,7 @@ fn test_mmx_encodings_reach_the_interpreter_callback() {
     }
 }
 
-//  EXTRACTPS - SSE4.1 single-precision lane extract into a GPR or m32. Despite
-//  the floating-point name it is a bit copy, so every case below checks raw
-//  bits rather than float values.
+// EXTRACTPS is a bit copy, so cases check raw bits.
 
 /// The four lanes of the fixture XMM used by the EXTRACTPS tests, as a
 /// `(lo, hi)` pair: lane `i` is `0x1111_1111 * (i + 1)`.
@@ -4349,12 +4247,7 @@ fn test_extractps_imm_selector_masks_to_two_bits() {
 fn test_extractps_to_memory_writes_one_dword() {
     // extractps dword ptr [rax], xmm1, 3; ret  ->  66 0F 3A 17 08 03  C3
     let bytes = [0x66, 0x0F, 0x3A, 0x17, 0x08, 0x03, 0xC3];
-    // `mut`, and reached through `as_mut_ptr`: the lifted code stores into this
-    // array, and a shared reference to an immutable local tells LLVM the bytes
-    // never change. In release it then folds the reads below to the initializer
-    // - which showed up as `assert_eq!` failing between two values that print
-    // identically, the comparison seeing the constant and the panic message
-    // re-reading the (correctly stored) memory.
+    // `mut` via `as_mut_ptr`: the lifted code stores into the array, and a shared ref lets LLVM fold the reads to the initializer in release.
     let mut mem = [0xAAAA_AAAAu32, 0xBBBB_BBBB];
     let mut ctx = RegisterContext::default();
     ctx.xmm[1] = EXTRACTPS_SRC;
@@ -4374,8 +4267,7 @@ fn test_extractps_vector_mode_agrees() {
     assert_eq!(run_test_vec(&bytes, ctx).rax, 0x2222_2222);
 }
 
-//  DPPS / DPPD - SSE4.1 dot products. `imm8`'s high nibble masks the
-//  multiplies and its low nibble the broadcast; both masks substitute +0.0.
+// DPPS / DPPD - imm8 high nibble masks the multiplies, low nibble the broadcast; masked lanes become +0.0.
 
 /// f32 bit patterns for 1.0 .. 8.0, used to build the DPPS fixtures.
 const F32_1: u64 = 0x3F80_0000;
@@ -4443,16 +4335,8 @@ fn test_dpps_masked_off_lane_cannot_propagate_nan() {
 
 #[test]
 fn test_dpps_sums_as_a_pairwise_tree_not_left_to_right() {
-    // Products are [1.0, 2^-24, 2^-24, 2^-24]. The SDM's tree
-    // ((t0+t1) + (t2+t3)) gives 1.0 + 2^-23 = 0x3F800001, while a left-to-right
-    // fold gives 1.0 - each 2^-24 vanishing into the running sum on its own.
-    //
-    // `no_unicorn` because this is the one case where the oracle is behind the
-    // architecture: unicorn 2.x carries a pre-fix QEMU `helper_dpps` that folds
-    // into a running accumulator, so it answers 0x3F800000 here. Upstream QEMU
-    // has since been corrected to the tree, and the SDM's `DP_primitive`
-    // pseudocode has always specified it. See `dot_product_agrees` in
-    // `tests/unicorn_oracle_tests.rs` for what the oracle can still prove.
+    // Products [1.0, 2^-24, 2^-24, 2^-24]: the SDM tree sum gives 0x3F800001, a left-to-right fold 1.0.
+    // `no_unicorn`: unicorn 2.x's pre-fix QEMU `helper_dpps` accumulates linearly (see `dot_product_agrees` in `unicorn_oracle_tests.rs`).
     const F32_EPS: u64 = 0x3380_0000; // 2^-24
     let bytes = [0x66, 0x0F, 0x3A, 0x40, 0xC1, 0xF1, 0xC3];
     let mut ctx = RegisterContext::default();
@@ -4497,8 +4381,7 @@ fn test_dppd_lane_masks() {
 
 #[test]
 fn test_dppd_ignores_imm_bits_without_a_lane() {
-    // Only imm8[5:4] and imm8[1:0] are defined; 0xCC adds bits [7:6] and [3:2],
-    // which must change nothing relative to a bare 0x00.
+    // Only imm8[5:4] and [1:0] are defined; 0xCC must equal 0x00.
     assert_eq!(run_dppd(0xCC).xmm[0], [0, 0]);
 }
 
@@ -4580,9 +4463,7 @@ fn test_phminposuw_from_memory() {
 
 //  MPSADBW - eight overlapping 4-byte sums of absolute differences.
 
-/// `mpsadbw xmm0, xmm1, imm8; ret` with xmm0 bytes 0x00..0x0F and xmm1 bytes
-/// 0x10..0x1F, so every byte in the problem is distinct and the arithmetic
-/// stays easy to state.
+/// xmm0 bytes 0x00..0x0F, xmm1 bytes 0x10..0x1F: all bytes distinct.
 fn run_mpsadbw(imm: u8) -> RegisterContext {
     let bytes = [0x66, 0x0F, 0x3A, 0x42, 0xC1, imm, 0xC3];
     let mut ctx = RegisterContext::default();
@@ -4640,8 +4521,7 @@ fn test_mpsadbw_ignores_imm_bits_above_two() {
 #[test]
 fn test_mpsadbw_differences_are_unsigned_absolute_and_do_not_saturate() {
     let bytes = [0x66, 0x0F, 0x3A, 0x42, 0xC1, 0x00, 0xC3];
-    // Largest possible sum in both directions: 4 * 255 = 1020, which needs the
-    // full word and must not be taken modulo 256 or clamped.
+    // Max sum 4 * 255 = 1020 needs the full word: no mod-256 or clamping.
     let mut ctx = RegisterContext::default();
     ctx.xmm[0] = [u64::MAX, u64::MAX];
     ctx.xmm[1] = [0, 0];

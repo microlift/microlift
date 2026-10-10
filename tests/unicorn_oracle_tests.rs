@@ -1,12 +1,5 @@
-//! Differential tests: the Microlift JIT vs the Unicorn engine, sharing
-//! Microlift's guest VA == host VA memory model (Unicorn identity-maps each
-//! touched page onto its own host address; see `testkit::oracle::unicorn`).
-//!
-//! Every case runs the same program on both engines from an identical seed and
-//! asserts their architectural state matches. Divergence is a bug in one of the
-//! two engines - which is the whole point of the oracle.
-//!
-//! Run: `cargo test --features unicorn-oracle --test unicorn_oracle_tests`
+//! Differential tests: Microlift JIT vs Unicorn on the shared identity-mapped memory model (see `testkit::oracle::unicorn`).
+//! Same program, same seed; any architectural divergence is a bug in one engine.
 
 #![cfg(feature = "unicorn-oracle")]
 
@@ -24,7 +17,7 @@ fn agree(code: &[u8], init: &CpuState) {
     assert!(diff.is_empty(), "microlift vs unicorn diverged: {diff:?}");
 }
 
-/// `mov rax, imm ; add rax, rcx ; ret` - the canonical smoke test.
+/// `mov rax, imm ; add rax, rcx ; ret` - smoke test.
 #[test]
 fn add_reg_reg_agrees() {
     let code = [
@@ -37,8 +30,7 @@ fn add_reg_reg_agrees() {
     agree(&code, &init);
 }
 
-/// A pile of flag-defining ALU ops over seeded operands: the two engines must
-/// agree bit-for-bit on CF/PF/AF/ZF/SF/OF, not just the result.
+/// Flag-defining ALU ops: CF/PF/AF/ZF/SF/OF must match, not just the result.
 #[test]
 fn alu_flags_agree_over_operands() {
     // op rax, rcx ; ret  for each of add/sub/and/or/xor/cmp.
@@ -73,9 +65,7 @@ fn alu_flags_agree_over_operands() {
     }
 }
 
-/// Shifts, `imul`, `neg`, `not`, `bswap`, `lea`, `movzx/movsx`, `setcc`, `cmov`
-/// through a single straight-line block. Exercises a broad instruction slice in
-/// one comparison.
+/// Shifts, `imul`, `neg`, `not`, `bswap`, `lea`, `movzx/movsx`, `setcc`, `cmov` in one straight-line block.
 #[test]
 fn mixed_straightline_block_agrees() {
     let code = [
@@ -95,9 +85,7 @@ fn mixed_straightline_block_agrees() {
     agree(&code, &init);
 }
 
-/// A non-diffable instruction Microlift turns into a VM exit (`cpuid`) must make
-/// the differential decline (returns `None`) - Unicorn executes it, Microlift
-/// exits, so there is nothing sound to compare.
+/// A VM-exit instruction (`cpuid`) makes the differential decline (`None`): nothing sound to compare.
 #[test]
 fn non_diffable_declines() {
     let code = [0x0F, 0xA2, 0xC3]; // cpuid ; ret
@@ -106,9 +94,7 @@ fn non_diffable_declines() {
     assert!(diff.is_none(), "cpuid must not be compared");
 }
 
-/// Identity-mapped memory: a store then load through a shared arena VA must read
-/// back the same value under both engines, and the surrounding registers must
-/// agree. Skipped if the fixed mapping is unavailable on this host.
+/// Store then load through a shared arena VA must agree. Skipped if the fixed mapping is unavailable.
 #[cfg(unix)]
 #[test]
 fn identity_memory_roundtrip_agrees() {
@@ -152,8 +138,7 @@ fn identity_memory_roundtrip_agrees() {
     assert_eq!(stored, seed.wrapping_add(1));
 }
 
-/// The testkit's `LiftTest::assert_matches_unicorn` hook: a program that both
-/// asserts a concrete Microlift result *and* cross-checks Unicorn in one line.
+/// `LiftTest::assert_matches_unicorn`: a concrete Microlift result plus a Unicorn cross-check.
 #[test]
 fn liftttest_hook_cross_checks() {
     // mov rax, 42 ; add rax, rax ; ret  -> 84
@@ -169,14 +154,7 @@ fn liftttest_hook_cross_checks() {
     assert_eq!(out.ctx.rax, 84);
 }
 
-/// Packed integer add/sub (`PADDB..PADDQ`, `PSUBB..PSUBQ` and the saturating
-/// forms) over adversarial lane patterns.
-///
-/// The oracle runs the default (scalar lo/hi) XMM representation, which
-/// implements these with SWAR / per-lane expansion - so this is the check that
-/// that lane math matches hardware exactly, including carry/borrow isolation at
-/// lane boundaries and the saturation clamps. The vector representation is
-/// cross-checked against the same expectations in `tests/sse_tests.rs`.
+/// Packed integer add/sub incl. saturating forms over adversarial lane patterns: checks the scalar SWAR/per-lane math (carry isolation, clamps) against hardware. The vector representation is covered in `tests/sse_tests.rs`.
 #[test]
 fn packed_int_add_sub_agrees() {
     // <op> xmm0, xmm1 ; ret
@@ -239,11 +217,7 @@ fn packed_int_add_sub_agrees() {
     }
 }
 
-/// PCMPEQ/PCMPGT, PMIN/PMAX, PAVG and the PMUL forms against hardware.
-///
-/// The compares in particular are worth pinning down: they produce all-ones
-/// lane masks, so any lane-boundary slip in the scalar expansion shows up as a
-/// glaringly wrong result rather than an off-by-one.
+/// PCMPEQ/PCMPGT, PMIN/PMAX, PAVG and PMUL forms; compare masks make any lane-boundary slip glaring.
 #[test]
 fn packed_lane_ops_agree() {
     // <op> xmm0, xmm1 ; ret   (all `66 0F <op> C1`)
@@ -281,7 +255,7 @@ fn packed_lane_ops_agree() {
     }
 }
 
-/// PCMPEQQ / PCMPGTQ - the SSE4 quadword compares (three-byte opcodes).
+/// PCMPEQQ / PCMPGTQ - SSE4 quadword compares.
 #[test]
 fn packed_qword_compares_agree() {
     for (name, opcode) in [("pcmpeqq", 0x29u8), ("pcmpgtq", 0x37)] {
@@ -301,8 +275,7 @@ fn packed_qword_compares_agree() {
     }
 }
 
-/// The full PUNPCK{L,H}{BW,WD,DQ,QDQ} family - pure lane permutation, so any
-/// mis-ordered interleave is caught exactly.
+/// PUNPCK{L,H}{BW,WD,DQ,QDQ}: pure lane permutation, so any mis-ordering shows exactly.
 #[test]
 fn packed_unpack_agrees() {
     let ops: &[(&str, u8)] = &[
@@ -345,7 +318,7 @@ fn sign_mask_extraction_agrees() {
         for &(dst, _) in PACKED_OPERANDS {
             let mut init = CpuState::zeroed();
             init.xmm[0] = dst;
-            // Seed a dirty destination so a failure to zero the upper bits shows.
+            // Dirty destination exposes failure to zero the upper bits.
             init.gpr[gpr::RAX] = 0xDEAD_BEEF_DEAD_BEEF;
             let diff =
                 differential_unicorn(code, CODE_VA, &init, &[], BUDGET, DiffOptions::default())
@@ -355,8 +328,7 @@ fn sign_mask_extraction_agrees() {
     }
 }
 
-/// PSLLDQ / PSRLDQ across every interesting byte count: within a half, exactly
-/// at the half boundary, across it, and past the end of the register.
+/// PSLLDQ / PSRLDQ across counts: within a half, at the boundary, across it, past the end.
 #[test]
 fn byte_shift_dq_agrees() {
     for count in [0u8, 1, 3, 7, 8, 9, 15, 16, 31, 255] {
@@ -384,8 +356,7 @@ fn byte_shift_dq_agrees() {
     }
 }
 
-/// The newly added floating-point arithmetic, including the MIN/MAX forms whose
-/// NaN and signed-zero behaviour is deliberately *not* IEEE.
+/// Float arithmetic incl. MIN/MAX, whose NaN and signed-zero behaviour is not IEEE.
 #[test]
 fn sse_float_arith_agrees() {
     let ops: &[(&str, &[u8])] = &[
@@ -435,27 +406,15 @@ fn sse_float_arith_agrees() {
     }
 }
 
-/// Operands for the ADDSUB differential, chosen so the two lane kinds are
-/// forced apart.
-///
-/// The point of every entry is that an even lane and an odd lane must disagree
-/// on it: `inf - inf` invalidates where `inf + inf` does not, and the two swap
-/// over when the source sign flips. A handler running one operation across all
-/// four lanes passes every finite test and fails these. The signed zeros do the
-/// same job with no NaN involved at all - `-0.0 - +0.0` is `-0.0` while
-/// `-0.0 + +0.0` is `+0.0`.
-///
-/// NaNs appear on one side only, never both: with a NaN in each operand the
-/// oracle itself is unreliable, since Unicorn does not reproduce x86's
-/// "destination NaN wins" rule (`MULPS` shows the same divergence with no
-/// ADDSUB involved). See the caveat on [`FLOAT_OPERANDS`].
+/// ADDSUB operands force the even and odd lane kinds apart (`inf - inf` invalidates where `inf + inf` does not; signed zeros do the same without NaN).
+/// NaNs on one side only: with a NaN in both, Unicorn does not reproduce x86's destination-wins rule (see [`FLOAT_OPERANDS`]).
 const ADDSUB_OPERANDS: &[([u64; 2], [u64; 2])] = &[
     // f64 +inf against +inf then -inf: lane 0 subtracts, lane 1 adds.
     (
         [0x7FF0_0000_0000_0000, 0x7FF0_0000_0000_0000],
         [0x7FF0_0000_0000_0000, 0xFFF0_0000_0000_0000],
     ),
-    // the mirror: the invalid operation lands in the other lane.
+    // Mirror: the invalid operation lands in the other lane.
     (
         [0xFFF0_0000_0000_0000, 0x7FF0_0000_0000_0000],
         [0xFFF0_0000_0000_0000, 0x7FF0_0000_0000_0000],
@@ -479,8 +438,7 @@ const ADDSUB_OPERANDS: &[([u64; 2], [u64; 2])] = &[
         [0x7FF8_0000_DEAD_BEEF, 0xFFF8_0000_CAFE_BABE],
         [0x4000_0000_4000_0000, 0x3F80_0000_3F80_0000],
     ),
-    // QNaN source against a finite destination, the direction that would break
-    // under a "negate the source and add" implementation.
+    // QNaN source against finite destination: breaks a "negate and add" implementation.
     (
         [0x3FF0_0000_0000_0000, 0x3F80_0000_3F80_0000],
         [0xFFF8_0000_1234_5678, 0x7FF8_0000_9ABC_DEF0],
@@ -528,15 +486,8 @@ fn sse3_addsub_agrees() {
     }
 }
 
-/// The sequence a compiler emits around ADDSUBPS: a complex multiply built
-/// from MOVSLDUP / MOVSHDUP / SHUFPS / MULPS / ADDSUBPS, checked against
-/// hardware as a whole rather than one instruction at a time.
-///
-/// Operands are finite: the MULPS pair ahead of the ADDSUBPS can put a NaN
-/// into *both* of its operands, which is the one case the oracle cannot
-/// adjudicate (see the caveat on [`ADDSUB_OPERANDS`]). The NaN and infinity
-/// behaviour of ADDSUBPS itself is pinned down by
-/// [`sse3_addsub_agrees`] instead.
+/// The compiler sequence around ADDSUBPS (complex multiply via MOVSLDUP / MOVSHDUP / SHUFPS / MULPS), checked as a whole.
+/// Finite operands: the MULPS pair can put a NaN in both operands, which the oracle cannot adjudicate (see [`ADDSUB_OPERANDS`]; [`sse3_addsub_agrees`] covers NaNs).
 #[test]
 fn complex_multiply_sequence_agrees() {
     let code = [
@@ -548,8 +499,7 @@ fn complex_multiply_sequence_agrees() {
         0xF2, 0x0F, 0xD0, 0xD3, // addsubps xmm2, xmm3
         0xC3, // ret
     ];
-    // (a + bi) * (c + di), four complex pairs per run: signed zeros, a
-    // denormal, and magnitudes whose product both underflows and overflows.
+    // (a + bi) * (c + di), four pairs per run: signed zeros, a denormal, products that underflow and overflow.
     let pairs: &[[f32; 4]] = &[
         [1.0, 2.0, 3.0, 4.0],
         [-1.5, 0.25, 2.0, -8.0],
@@ -572,7 +522,7 @@ fn complex_multiply_sequence_agrees() {
     }
 }
 
-/// UCOMISS / COMISS - the flag-setting single-precision compares.
+/// UCOMISS / COMISS - single-precision flag-setting compares.
 #[test]
 fn ucomiss_agrees() {
     for (name, code) in [
@@ -594,8 +544,7 @@ fn ucomiss_agrees() {
     }
 }
 
-/// CVTSI2SD / CVTTSD2SI in both the 32- and 64-bit operand forms, including the
-/// NaN and out-of-range inputs that must yield the integer indefinite value.
+/// CVTSI2SD / CVTTSD2SI in 32- and 64-bit forms, incl. NaN and out-of-range inputs (integer indefinite).
 #[test]
 fn sse2_int_float_conversions_agree() {
     let doubles: &[f64] = &[
@@ -657,7 +606,7 @@ fn sse2_int_float_conversions_agree() {
     }
 }
 
-/// Bit patterns that stress lane boundaries, sign bits and saturation edges.
+/// Bit patterns stressing lane boundaries, sign bits and saturation edges.
 const PACKED_OPERANDS: &[([u64; 2], [u64; 2])] = &[
     ([0, 0], [0, 0]),
     (
@@ -684,38 +633,15 @@ const PACKED_OPERANDS: &[([u64; 2], [u64; 2])] = &[
         [0x0706_0504_0302_0100, 0x0F0E_0D0C_0B0A_0908],
         [0x1716_1514_1312_1110, 0x1F1E_1D1C_1B1A_1918],
     ),
-    // Byte patterns aimed at PSHUFB's control rules: indices with bit 7 set
-    // (which zero the output byte) and indices whose bits 4..6 are set (which
-    // hardware masks away rather than treating as out of range).
+    // PSHUFB control rules: bit 7 zeroes the byte; bits 4..6 are masked away, not out of range.
     (
         [0x0F0E_0D0C_0B0A_0908, 0x0706_0504_0302_0100],
         [0x8898_A8B8_C8D8_E8F8, 0x3021_1203_7F40_5160],
     ),
 ];
 
-/// XMM seeds interpreted as floats, for the arithmetic differential.
-///
-/// Every *dword* of the **source** operand is a positive finite normal `f32`
-/// and the whole quadword is a positive finite normal `f64`, while the
-/// destination ranges freely over signed
-/// zeros, NaNs, infinities, negatives and denormals. That asymmetry is
-/// deliberate: it keeps every case free of an operation that *generates* a
-/// fresh default NaN (`0/0`, `inf-inf`, `0*inf`).
-///
-/// Generated default NaNs are excluded because x86 and AArch64 disagree on
-/// their sign - x86's integer/floating indefinite is `0xFFF8_0000_0000_0000`,
-/// the AArch64 default NaN is `0x7FF8_0000_0000_0000` - and Microlift lowers
-/// these ops to Cranelift `fdiv`/`fsub`, so the *host* FPU picks the sign.
-/// That divergence is general, not a property of any one instruction:
-/// `DIVSD`, `SUBPS` and the rest show it identically.
-///
-/// `sqrt(-x)` used to be on that list and no longer is: the SQRT handlers
-/// materialise x86's indefinite themselves rather than deferring to the host,
-/// so [`sse_sqrt_negative_agrees`] covers negative operands directly. The same
-/// treatment would lift the restriction for the others.
-///
-/// *Propagated* input NaNs keep their exact bits and are covered here - the NaN
-/// destinations below flow through every op.
+/// XMM seeds as floats. Source dwords/quadwords are positive finite normals while destinations range freely, so no op generates a fresh default NaN (x86 `0xFFF8_..` vs AArch64 `0x7FF8_..`; the host FPU picks the sign).
+/// `sqrt` is covered separately by [`sse_sqrt_negative_agrees`] since its handlers materialise x86's indefinite. Propagated input NaNs keep their bits and are covered here.
 const FLOAT_OPERANDS: &[([u64; 2], [u64; 2])] = &[
     // 1.0 / 2.0 (f64) destinations against 2.0 / 1.0 sources
     (
@@ -749,12 +675,7 @@ const FLOAT_OPERANDS: &[([u64; 2], [u64; 2])] = &[
     ),
 ];
 
-/// MIN/MAX and the compares against NaN- and zero-heavy operands.
-///
-/// These never generate a NaN - they only *select* an operand - so unlike
-/// [`FLOAT_OPERANDS`] they can put NaNs and zeros on both sides, which is
-/// exactly where x86's asymmetric "return the source unless the strict
-/// comparison holds" rule differs from an IEEE `minNum`/`maxNum`.
+/// MIN/MAX and compares over NaN- and zero-heavy operands; they only select, so NaNs and zeros may be on both sides (where x86's "source unless strict" rule differs from IEEE `minNum`).
 const SELECT_OPERANDS: &[([u64; 2], [u64; 2])] = &[
     // -0.0 vs +0.0, both orders
     (
@@ -782,10 +703,7 @@ const SELECT_OPERANDS: &[([u64; 2], [u64; 2])] = &[
     ),
 ];
 
-/// MINSS/MAXSS/MINPS/MAXPS/MINSD/MAXSD/MINPD/MAXPD over NaNs and signed zeros.
-///
-/// Split out from [`sse_float_arith_agrees`] so it can use the NaN-on-both-sides
-/// operands that a NaN-generating op could not.
+/// MIN/MAX variants over NaNs and signed zeros; split out from [`sse_float_arith_agrees`] for its NaN-on-both-sides operands.
 #[test]
 fn sse_minmax_selection_agrees() {
     let ops: &[(&str, &[u8])] = &[
@@ -816,15 +734,7 @@ fn sse_minmax_selection_agrees() {
     }
 }
 
-/// Sources for the SQRT differential, centred on the negative inputs whose
-/// result is a *generated* NaN.
-///
-/// `sqrt(-x)` is the one case where the general default-NaN caveat on
-/// [`FLOAT_OPERANDS`] would otherwise bite: on an AArch64 host the FPU's
-/// default NaN is `0x7FF8_..`, while x86 produces the indefinite `0xFFF8_..`.
-/// The SQRT handlers therefore materialise x86's indefinite themselves instead
-/// of letting the host FPU pick, and these operands are the proof - every lane
-/// is exercised as both an `f32` quadruple and an `f64` pair.
+/// SQRT sources centred on negative inputs, whose result is a generated NaN. The handlers materialise x86's indefinite themselves (not the host's), proven for every lane as f32 quadruple and f64 pair.
 const SQRT_OPERANDS: &[[u64; 2]] = &[
     // negative normals: -1.0 / -2.0 as f64, and -1.0 / -2.0 / -0.5 / -4.0 f32
     [0xBFF0_0000_0000_0000, 0xC000_0000_0000_0000],
@@ -843,11 +753,7 @@ const SQRT_OPERANDS: &[[u64; 2]] = &[
     [0x3F80_0000_BF80_0000, 0xBF00_0000_4000_0000],
 ];
 
-/// SQRTPS/SQRTPD/SQRTSS/SQRTSD against negative inputs.
-///
-/// Split out from [`sse_float_arith_agrees`] for the same reason
-/// [`sse_minmax_selection_agrees`] is: it needs operands that suite
-/// deliberately excludes. See [`SQRT_OPERANDS`].
+/// SQRTPS/SQRTPD/SQRTSS/SQRTSD against negative inputs; operands the arith suite excludes. See [`SQRT_OPERANDS`].
 #[test]
 fn sse_sqrt_negative_agrees() {
     let ops: &[(&str, &[u8])] = &[
@@ -858,9 +764,7 @@ fn sse_sqrt_negative_agrees() {
     ];
     for (name, code) in ops {
         for &src in SQRT_OPERANDS {
-            // The destination is a distinct pattern so a handler that wrote the
-            // wrong lane, or failed to preserve the scalar forms' upper bits,
-            // shows up as a divergence rather than a coincidental match.
+            // Distinct destination pattern exposes a wrong lane or lost upper bits.
             let mut init = CpuState::zeroed();
             init.xmm[0] = [0x1234_5678_9ABC_DEF0, 0x0FED_CBA9_8765_4321];
             init.xmm[1] = src;
@@ -872,13 +776,7 @@ fn sse_sqrt_negative_agrees() {
     }
 }
 
-/// The packed conversions - `CVTPD2PS`, `CVTPS2PD`, `CVTDQ2PS`,
-/// `CVT[T]PS2DQ`, `CVTDQ2PD`, `CVT[T]PD2DQ` - over the shared float operand
-/// pool plus integer bit patterns that exercise the dword-lane forms.
-///
-/// This is the check that the rounding mode (nearest-even), the
-/// integer-indefinite result for unrepresentable inputs, and the zeroing of
-/// bits[127:64] by the narrowing forms all match hardware.
+/// Packed conversions over the float pool plus dword patterns: checks nearest-even rounding, integer indefinite, and zeroing of bits[127:64] by narrowing forms.
 #[test]
 fn packed_conversions_agree() {
     let ops: &[(&str, &[u8])] = &[
@@ -892,8 +790,7 @@ fn packed_conversions_agree() {
         ("cvttpd2dq", &[0x66, 0x0F, 0xE6, 0xC1, 0xC3]),
     ];
 
-    // Dword patterns: zero, +-1, the signed extremes, and values whose f32
-    // conversion must round, plus halfway cases for the float -> int direction.
+    // Dword patterns: zero, +-1, signed extremes, f32-rounding values, float -> int halfway cases.
     let int_operands: &[([u64; 2], [u64; 2])] = &[
         (
             [0x0000_0001_0000_0000, 0xFFFF_FFFF_7FFF_FFFF],
@@ -921,8 +818,7 @@ fn packed_conversions_agree() {
     }
 }
 
-/// CVTSS2SI / CVTSD2SI - the rounding (not truncating) scalar-to-integer forms,
-/// in both operand widths.
+/// CVTSS2SI / CVTSD2SI - rounding (not truncating) forms, both widths.
 #[test]
 fn rounding_scalar_to_int_conversions_agree() {
     // Halfway cases in both directions, plus the unrepresentable inputs.
@@ -977,9 +873,7 @@ fn rounding_scalar_to_int_conversions_agree() {
     }
 }
 
-/// CMPPS / CMPPD / CMPSS / CMPSD across all eight legacy predicates, and the
-/// lane shuffles (SHUFPS / SHUFPD / PSHUFLW / PSHUFHW) and dword duplications
-/// (MOVSLDUP / MOVSHDUP) compilers emit alongside them.
+/// CMPPS/CMPPD/CMPSS/CMPSD over all eight predicates, plus SHUFPS/SHUFPD/PSHUFLW/PSHUFHW and MOVSLDUP/MOVSHDUP.
 #[test]
 fn packed_compare_and_shuffle_agree() {
     for imm in 0..8u8 {
@@ -1040,8 +934,7 @@ fn packed_compare_and_shuffle_agree() {
     }
 }
 
-/// PINSRW against hardware: every word selector (including the imm8 bits above
-/// `[2:0]` that hardware ignores), for both the GPR and the m16 source form.
+/// PINSRW: every word selector (imm8 bits above `[2:0]` ignored), GPR and m16 source.
 #[test]
 fn pinsrw_agrees() {
     for imm in 0..16u8 {
@@ -1056,8 +949,7 @@ fn pinsrw_agrees() {
     }
 }
 
-/// The `PINSRW xmm, m16, imm8` form, which needs an identity-mapped source
-/// word both engines can read. Skipped if the fixed mapping is unavailable.
+/// `PINSRW xmm, m16, imm8` needs an identity-mapped source word. Skipped if unavailable.
 #[cfg(unix)]
 #[test]
 fn pinsrw_mem_agrees() {
@@ -1086,8 +978,7 @@ fn pinsrw_mem_agrees() {
     }
 }
 
-/// Run `code` against Unicorn for every [`PACKED_OPERANDS`] pair, seeded into
-/// `xmm0` (destination) and `xmm1` (source).
+/// Run `code` against Unicorn for every [`PACKED_OPERANDS`] pair (`xmm0` dst, `xmm1` src).
 fn agree_packed(name: &str, code: &[u8]) {
     for &(dst, src) in PACKED_OPERANDS {
         let mut init = CpuState::zeroed();
@@ -1102,13 +993,7 @@ fn agree_packed(name: &str, code: &[u8]) {
     }
 }
 
-/// The SSSE3 block: `PSHUFB`, the horizontal add/sub forms, the sign ops, the
-/// mixed-signedness multiply-accumulates and `PABS*`.
-///
-/// `PSHUFB` gets the shuffle-heavy operand set for free - every pair above is
-/// used as a control vector as well as data, so the byte selectors cover
-/// in-range indices, the high-bit zeroing rule and indices whose bits 4..6 are
-/// set (which hardware masks away and Cranelift's `swizzle` would not).
+/// SSSE3: `PSHUFB`, horizontal add/sub, sign ops, mixed-signedness multiply-accumulates, `PABS*`. Every pair is also a PSHUFB control (high-bit zeroing, bits 4..6 masked away where Cranelift `swizzle` would not).
 #[test]
 fn ssse3_lane_ops_agree() {
     // <op> xmm0, xmm1 ; ret   (all `66 0F 38 <op> C1`)
@@ -1134,8 +1019,7 @@ fn ssse3_lane_ops_agree() {
     }
 }
 
-/// PALIGNR over every byte count, including the 16..31 range that shifts the
-/// destination down into the result and the >= 32 range that clears it.
+/// PALIGNR over every count, incl. 16..31 (shifts dst into the result) and >= 32 (clears).
 #[test]
 fn palignr_agrees() {
     for imm in 0..=34u8 {
@@ -1143,8 +1027,7 @@ fn palignr_agrees() {
     }
 }
 
-/// The widening multiplies, the dot product, sum-of-absolute-differences and
-/// the saturating narrowing packs.
+/// Widening multiplies, dot product, SAD and saturating narrowing packs.
 #[test]
 fn packed_multiply_and_pack_agree() {
     // `66 0F <op> C1`
@@ -1164,8 +1047,7 @@ fn packed_multiply_and_pack_agree() {
     }
 }
 
-/// The SSE4.1 min/max set and `PTEST` (whose whole observable effect is
-/// flags - the `rflags` comparison in the diff is the test).
+/// SSE4.1 min/max and `PTEST` (observable only via flags).
 #[test]
 fn sse41_minmax_and_ptest_agree() {
     let ops: &[(&str, u8)] = &[
@@ -1198,7 +1080,7 @@ fn sse41_minmax_and_ptest_agree() {
     }
 }
 
-/// The sign- and zero-extending widening loads (register source form).
+/// Sign- and zero-extending widening loads, register source.
 #[test]
 fn pmovsx_pmovzx_agree() {
     let ops: &[(&str, u8)] = &[
@@ -1220,9 +1102,7 @@ fn pmovsx_pmovzx_agree() {
     }
 }
 
-/// Blends: the `imm8`-selected forms and the variable forms that take their
-/// mask from the implicit `XMM0` - which is also the destination here, so the
-/// mask is read before it is overwritten.
+/// Blends: imm8 forms and variable forms whose mask is the implicit `XMM0`, also the destination (read before overwritten).
 #[test]
 fn blends_agree() {
     for imm in [0x00u8, 0x01, 0x55, 0xAA, 0xF0, 0xFF] {
@@ -1250,8 +1130,7 @@ fn blends_agree() {
     }
 }
 
-/// Lane insert and extract at every lane width and index, in both directions
-/// (`PINSR*` from a GPR, `PEXTR*` into a GPR).
+/// Lane insert/extract at every width and index (`PINSR*` from GPR, `PEXTR*` to GPR).
 #[test]
 fn lane_insert_extract_agree() {
     for lane in 0..16u8 {
@@ -1285,9 +1164,7 @@ fn lane_insert_extract_agree() {
     }
 }
 
-/// The memory-source forms: a 128-bit operand for PSHUFB/PMULUDQ and the
-/// *narrower* loads PMOVZX/PMOVSX and PINSRB use, which must read only the
-/// bytes they consume. Skipped if the fixed mapping is unavailable.
+/// Memory sources: 128-bit for PSHUFB/PMULUDQ, and narrower PMOVZX/PMOVSX/PINSRB loads that must read only their bytes. Skipped if unavailable.
 #[cfg(unix)]
 #[test]
 fn packed_memory_sources_agree() {
@@ -1331,9 +1208,7 @@ fn packed_memory_sources_agree() {
     }
 }
 
-/// EXTRACTPS against hardware: every lane selector (including the imm8 bits
-/// above `[1:0]` that hardware ignores), for both the 32-bit and the `REX.W`
-/// destination spelling.
+/// EXTRACTPS: every lane selector (imm8 bits above `[1:0]` ignored), 32-bit and `REX.W` destinations.
 #[test]
 fn extractps_agrees() {
     for imm in 0..8u8 {
@@ -1349,7 +1224,7 @@ fn extractps_agrees() {
         for (name, code) in progs {
             let mut init = CpuState::zeroed();
             init.xmm[1] = [0x2222_2222_1111_1111, 0x4444_4444_3333_3333];
-            // A dirty destination catches a merge where hardware zero-extends.
+            // Dirty destination catches a merge where hardware zero-extends.
             init.gpr[gpr::RAX] = 0xDEAD_BEEF_DEAD_BEEF;
             let diff =
                 differential_unicorn(code, CODE_VA, &init, &[], BUDGET, DiffOptions::default())
@@ -1359,23 +1234,8 @@ fn extractps_agrees() {
     }
 }
 
-/// Dot-product destinations at *single* precision: signed zeros, infinities,
-/// denormals and near-overflow magnitudes, and no NaN in any dword.
-///
-/// [`FLOAT_OPERANDS`] cannot be reused here. It keeps the source NaN-free but
-/// lets the destination hold NaNs, which is safe for a lane-wise op - only one
-/// operand of each addition can then be a NaN. `DPPS` reduces *across* lanes,
-/// so two NaN destination lanes meet each other in the summation tree, and the
-/// two-QNaN case is a standing disagreement between the engines: x86 returns
-/// the first (destination) operand, which is what Microlift gets by deferring
-/// to the host, while Unicorn's older softfloat applies the x87 larger-
-/// significand rule. Plain `ADDPS` with a QNaN in both operands shows the same
-/// divergence, so it is not a property of these instructions.
-///
-/// Propagation of a *single* NaN is covered by
-/// [`dot_product_nan_propagation_agrees`]; the infinities and zeros below still
-/// exercise the *generated* NaNs (`inf - inf`, `0 * inf`), where Microlift
-/// substitutes x86's floating indefinite rather than the host's default NaN.
+/// Single-precision dot-product destinations: signed zeros, infinities, denormals, no NaN lanes.
+/// `DPPS` reduces across lanes, so two NaN lanes meet in the tree and the two-QNaN case diverges (x86 keeps the destination, Unicorn applies the x87 larger-significand rule). Single-NaN propagation is [`dot_product_nan_propagation_agrees`]; infinities still exercise generated NaNs.
 const DPPS_OPERANDS: &[([u64; 2], [u64; 2])] = &[
     // f32 lanes 1.5, 2.5, -3.0, 4.0 against 2.0, 2.0, 4.0, 8.0
     (
@@ -1387,26 +1247,24 @@ const DPPS_OPERANDS: &[([u64; 2], [u64; 2])] = &[
         [0x8000_0000_0000_0000, 0x0000_0000_0000_0000],
         [0x3F80_0000_3F80_0000, 0x4049_0FDB_4049_0FDB],
     ),
-    // +/-inf lanes: with two enabled multiplies of opposite sign the tree hits
-    // `inf + -inf`, an invalid operation that *generates* a NaN.
+    // +/-inf lanes: opposite-sign multiplies hit `inf + -inf`, a generated NaN.
     (
         [0x7F80_0000_FF80_0000, 0xFF80_0000_7F80_0000],
         [0x3F80_0000_3F80_0000, 0x4000_0000_4000_0000],
     ),
-    // an infinity against a +0.0 source lane: `0 * inf`, the other invalid
-    // operation reachable here.
+    // Infinity against a +0.0 source: `0 * inf`.
     (
         [0x0000_0000_7F80_0000, 0x7F80_0000_0000_0000],
         [0x3F80_0000_0000_0000, 0x0000_0000_3F80_0000],
     ),
-    // denormals and near-overflow magnitudes, so the sum can round to infinity
+    // Denormals and near-overflow magnitudes: the sum can round to infinity.
     (
         [0x0000_0001_8000_0001, 0x7F7F_FFFF_FF7F_FFFF],
         [0x0080_0000_4000_0000, 0x4000_0000_3F80_0000],
     ),
 ];
 
-/// The double-precision companion of [`DPPS_OPERANDS`], NaN-free per quadword.
+/// Double-precision companion of [`DPPS_OPERANDS`], NaN-free per quadword.
 const DPPD_OPERANDS: &[([u64; 2], [u64; 2])] = &[
     (
         [0x3FF0_0000_0000_0000, 0x4000_0000_0000_0000],
@@ -1434,24 +1292,8 @@ const DPPD_OPERANDS: &[([u64; 2], [u64; 2])] = &[
     ),
 ];
 
-/// DPPS / DPPD over every `imm8`, on operands whose summation is **exact**.
-///
-/// The exactness is a hard requirement, not a convenience. Unicorn 2.x carries
-/// a pre-fix QEMU `helper_dpps`/`helper_dppd` that folds the products into a
-/// running accumulator, where the SDM (and current QEMU) specify the pairwise
-/// tree `(t0 + t1) + (t2 + t3)`. The two agree only when no intermediate
-/// rounds, so every value in the tables above is a small power-of-two multiple,
-/// an infinity, or a magnitude that overflows or underflows identically either
-/// way. Adding an operand that rounds turns this test into an assertion about
-/// the oracle's bug; `test_dpps_sums_as_a_pairwise_tree_not_left_to_right` in
-/// `tests/sse_tests.rs` pins the order against the SDM instead.
-///
-/// What the oracle *does* prove here is everything else, and the full 256-value
-/// sweep is why: the two mask nibbles interact, a masked-off multiply
-/// substituting `+0.0` is the only thing keeping an infinity in a disabled lane
-/// out of the sum, and which `imm8` values reach an `inf + -inf` - so a
-/// *generated* NaN, whose sign is x86's floating indefinite and not the host
-/// FPU's default - depends on the mask too.
+/// DPPS / DPPD over every `imm8` on operands whose summation is exact: Unicorn 2.x folds products linearly where the SDM specifies the tree `(t0 + t1) + (t2 + t3)`, so rounding operands would test the oracle's bug (`tests/sse_tests.rs` pins the order).
+/// The 256-value sweep covers mask interaction, masked-off `+0.0` substitution, and which `imm8` values reach a generated `inf + -inf`.
 #[test]
 fn dot_product_agrees() {
     for (name, opcode, operands) in [
@@ -1483,13 +1325,7 @@ fn dot_product_agrees() {
     }
 }
 
-/// Dot-product NaN *propagation*, with exactly one NaN in play.
-///
-/// One multiply is enabled and its destination lane holds a QNaN, so every
-/// addition in the tree sees at most one NaN operand and the result must be
-/// that NaN, bits intact. This is the coverage
-/// [`DPPS_OPERANDS`] / [`DPPD_OPERANDS`] deliberately give up to stay clear of
-/// the two-QNaN disagreement.
+/// Dot-product NaN propagation with exactly one NaN: one enabled multiply with a QNaN lane, which the operand tables give up to avoid the two-QNaN disagreement.
 #[test]
 fn dot_product_nan_propagation_agrees() {
     // Sign, payload and signalling-ness all have to survive.
@@ -1538,18 +1374,14 @@ fn dot_product_nan_propagation_agrees() {
     }
 }
 
-/// PHMINPOSUW against hardware. The unsigned comparison and the lowest-index
-/// tie rule are both invisible in the common case, so this leans on
-/// [`PACKED_OPERANDS`], which contains all-equal vectors and words whose high
-/// bit is set.
+/// PHMINPOSUW; the unsigned compare and lowest-index tie rule need [`PACKED_OPERANDS`]' all-equal and high-bit vectors.
 #[test]
 fn phminposuw_agrees() {
     // phminposuw xmm0, xmm1 ; ret
     agree_packed("phminposuw", &[0x66, 0x0F, 0x38, 0x41, 0xC1, 0xC3]);
 }
 
-/// MPSADBW over every block/window selector `imm8` encodes, plus the bits above
-/// `[2:0]` that hardware ignores.
+/// MPSADBW over every block/window selector, plus ignored bits above `[2:0]`.
 #[test]
 fn mpsadbw_agrees() {
     for imm in 0..16u8 {
@@ -1570,34 +1402,15 @@ fn mpsadbw_agrees() {
     }
 }
 
-/// `Spec::IntegerOverflowFlags` against real hardware.
-///
-/// The half `specialize_tests` cannot prove. That file shows the specialized
-/// CF and OF match microlift's own portable formulas; this shows the formulas
-/// match the CPU - which is what would catch both microlift paths being wrong
-/// the same way, and CF/OF are exactly the pair where that is plausible, since
-/// the unsigned and signed overflow conditions are easy to conflate and
-/// `usub_overflow`'s operand order is easy to get backwards.
-///
-/// The operands straddle both boundaries at every width. The `seto`/`setb`
-/// after each instruction is not decoration: without a reader the liveness pass
-/// reports both flags dead and the specialization correctly declines, leaving
-/// this measuring the portable path twice.
+/// `Spec::IntegerOverflowFlags` against hardware: `specialize_tests` only shows specialized == microlift's portable formulas; this catches both being wrong alike (unsigned vs signed conditions, `usub_overflow` operand order).
+/// The `seto`/`setb` readers are needed: without them the specialization declines and the portable path is measured twice.
 #[test]
 fn integer_overflow_flags_agree_with_unicorn() {
     use microlift::testkit::oracle::unicorn::differential_unicorn_spec;
 
-    // seto dl ; setb bl - readers that keep CF and OF live.
+    // seto dl ; setb bl - readers keeping CF and OF live.
     const READ: &[u8] = &[0x0F, 0x90, 0xC2, 0x0F, 0x92, 0xC3];
-    // xor esi, esi - a fully-defined flag write, appended after `READ` for the
-    // instructions whose ZF/SF/AF/PF the architecture leaves *undefined*.
-    //
-    // `IMUL`'s truncating forms are the only ones here. Microlift leaves those
-    // four as they were (which is what `flag_effects` classifies, and what
-    // `dead_flag_tests` pins down); real silicon sets them from the product.
-    // Neither is wrong, and neither is comparable - so this overwrites all five
-    // defined flags on both engines and leaves the two this test is about in DL
-    // and BL, where the GPR comparison sees them.
+    // xor esi, esi - overwrites all five defined flags after instructions with undefined ZF/SF/AF/PF (`IMUL`: microlift keeps them, silicon sets them), leaving the two tested flags in DL and BL.
     const NORMALIZE: &[u8] = &[0x31, 0xF6];
     let cases: &[(&str, &[u8])] = &[
         ("add r64", &[0x48, 0x01, 0xC8]),
@@ -1674,17 +1487,8 @@ fn integer_overflow_flags_agree_with_unicorn() {
     }
 }
 
-/// Every target-specialized SSE lowering, against real hardware semantics.
-///
-/// `tests/specialize_tests.rs` proves specialized == microlift's portable path;
-/// this proves the specialized path == Unicorn. The two together are what make
-/// a specialization trustworthy - the first alone would happily certify a
-/// specialization that faithfully reproduced a bug in the portable expansion.
-///
-/// Both [`SpecTarget`]s are exercised on whatever host this runs on. That is
-/// deliberate: the JIT compiles for the host either way, so this checks the IR
-/// each target's path *emits*, not the machine it was tuned for. Divergence
-/// here is a semantic error in the sequence, which is host-independent.
+/// Every target-specialized SSE lowering against Unicorn: `specialize_tests` proves specialized == portable, this proves == hardware (portable alone could certify a replicated bug).
+/// Both [`SpecTarget`]s run on the host: this checks the IR each emits, so divergence is a host-independent semantic error.
 #[test]
 fn specialized_lowerings_agree_with_unicorn() {
     use microlift::testkit::oracle::unicorn::differential_unicorn_spec;
@@ -1719,8 +1523,7 @@ fn specialized_lowerings_agree_with_unicorn() {
         })
         .collect();
 
-    // ROUNDPS / ROUNDPD sweep every rounding mode, since the imm8 selects the
-    // Cranelift opcode at lift time.
+    // ROUNDPS/ROUNDPD sweep every rounding mode (imm8 selects the opcode at lift time).
     for imm in 0..8u8 {
         all.push((
             format!("roundps-{imm}"),
@@ -1753,11 +1556,7 @@ fn specialized_lowerings_agree_with_unicorn() {
 
 // SSE4.2
 
-/// `CRC32` in every encoding, against hardware.
-///
-/// The lift is a bit-serial expansion of the CRC-32C remainder, so a wrong
-/// polynomial, a wrong bit order, or a wrong chunking of the 64-bit form all
-/// look like a plausible checksum right up until this compares one.
+/// `CRC32` in every encoding: a wrong polynomial, bit order or chunking looks like a plausible checksum until compared.
 #[test]
 fn crc32_agrees_with_unicorn() {
     let forms: &[(&str, &[u8])] = &[
@@ -1795,9 +1594,7 @@ fn crc32_agrees_with_unicorn() {
     }
 }
 
-/// `POPCNT`, including the five flags it clears - the part a hand-written
-/// expectation is most likely to get wrong, since the manual's "undefined" for
-/// the neighbouring bit scans does not apply here.
+/// `POPCNT` incl. the five flags it clears (unlike the undefined flags of BSF/BSR).
 #[test]
 fn popcnt_agrees_with_unicorn() {
     let forms: &[(&str, &[u8])] = &[
@@ -1821,7 +1618,7 @@ fn popcnt_agrees_with_unicorn() {
             let mut init = CpuState::zeroed();
             init.gpr[gpr::RAX] = 0xAAAA_AAAA_AAAA_AAAA;
             init.gpr[gpr::RCX] = rcx;
-            // Every modelled flag set, so a missing clear is a divergence.
+            // All modelled flags set so a missing clear diverges.
             init.rflags = 0x8D5;
             let diff =
                 differential_unicorn(&code, CODE_VA, &init, &[], BUDGET, DiffOptions::default())
@@ -1841,9 +1638,7 @@ fn xmm_bytes(bytes: &[u8]) -> [u64; 2] {
     ]
 }
 
-/// The operand pairs the packed string compares are swept over: empty, short,
-/// exactly full, embedded nulls, repeats, substrings, and word-granularity
-/// patterns.
+/// Packed string-compare operand pairs: empty, short, full, embedded nulls, repeats, substrings, word patterns.
 fn pcmpstr_operands() -> Vec<([u64; 2], [u64; 2])> {
     let strings: &[&[u8]] = &[
         b"",
@@ -1935,13 +1730,7 @@ fn pcmpestr_agrees_with_unicorn() {
 }
 */
 
-/// `XADD` when its two operands alias.
-///
-/// `XADD` writes both operands, so their order matters, and the destination is
-/// resolved to a `Place` (its effective address frozen) before either write.
-/// The register cases pin the write order against hardware; the memory case is
-/// the one where a naive lowering re-derives the address *after* the source
-/// register has been overwritten with the old memory value.
+/// `XADD` with aliasing operands: the destination `Place` is frozen before either write. Registers pin write order; the memory case catches re-deriving the address after the source was overwritten.
 #[test]
 fn xadd_operand_aliasing_agrees() {
     // xadd rax, rax - one register named twice.
@@ -1955,21 +1744,14 @@ fn xadd_operand_aliasing_agrees() {
     init.gpr[gpr::RBX] = 7;
     agree(&[0x48, 0x0F, 0xC1, 0xC3, 0xC3], &init);
 
-    // xadd r8, r8 - same, through the REX.B encoding. (`gpr` names only the
-    // low eight; r8..r15 continue the array at index 8.)
+    // xadd r8, r8 - same via REX.B (`gpr` names the low eight; r8..r15 continue at index 8).
     let mut init = CpuState::zeroed();
     init.gpr[8] = 0xFFFF_FFFF_FFFF_FFFF;
     agree(&[0x4D, 0x0F, 0xC1, 0xC0, 0xC3], &init);
 }
 
-/// The memory-destination half of [`xadd_operand_aliasing_agrees`], including
-/// the case where the source register is also the address base.
-///
-/// This cannot go through `differential_unicorn`: that runs the two engines
-/// back to back over the *same* identity-mapped arena, so a program that
-/// writes memory leaves the second engine reading the first one's output. An
-/// `XADD` with a memory destination does exactly that, so the arena is
-/// re-seeded between the runs here.
+/// Memory-destination half of [`xadd_operand_aliasing_agrees`], incl. source as address base.
+/// Not via `differential_unicorn`: both engines share the arena, so a memory-writing program would leave the second reading the first's output; the arena is re-seeded between runs.
 #[cfg(unix)]
 #[test]
 fn xadd_memory_aliasing_agrees() {

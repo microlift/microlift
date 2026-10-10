@@ -1,5 +1,4 @@
-//! Comprehensive Value Set Analysis tests covering lattice operations,
-//! dataflow propagation, and edge cases in the transfer function.
+//! VSA tests: lattice operations, dataflow propagation and transfer-function edges.
 
 use iced_x86::{Decoder, DecoderOptions, Register};
 use microlift::context::MemorySegment;
@@ -439,9 +438,7 @@ fn test_register_value_set_join_preserves_unmodified_register() {
     let b = RegisterValueSet::new();
     let joined = a.join(&b);
     // RCX in a is Constant(99); b contributes Top -> join = Top.
-    // (a registers not in b are already in result; b's Top for unknown regs
-    //  means the join computes existing ⊔ Top = Top for every reg in b -
-    //  but b has no explicit entries, so only a's entries survive unchanged.)
+    // a has no entry from b, so only a's entries survive unchanged.
     assert_eq!(joined.get(Register::RCX), ValueSet::Constant(99));
 }
 
@@ -604,7 +601,7 @@ fn test_lea_known_base_propagates() {
 #[test]
 fn test_lea_with_index_register_is_top() {
     // lea rax, [rbx+rcx*2]  ->  rax = Top (index register present)
-    // REX.W=0x48, 8D, ModRM(00 000 100)=0x04, SIB(01 001 011)=0x4B
+    // REX.W=0x48, 8D, ModRM 0x04, SIB 0x4B
     let bytes = [0x48u8, 0x8D, 0x04, 0x4B];
     let insts = decode_at(&bytes, 0x1000);
     let mut vsa = ValueSetAnalyzer::new();
@@ -617,8 +614,7 @@ fn test_lea_with_index_register_is_top() {
 #[test]
 fn test_lea_with_no_base_register_is_top() {
     // lea rax, [rcx*4 + 0]  ->  Top (no base, only scaled index)
-    // REX.W, 8D, ModRM(00 000 100)=0x04, SIB(10 001 101)=0x8D + disp32 zero
-    // scale=2(4x), index=001(rcx), base=101(disp32) -> SIB=0b10_001_101=0x8D
+    // REX.W, 8D, ModRM 0x04, SIB 0x8D (scale 4x, index rcx, base disp32 = 0)
     let bytes = [0x48u8, 0x8D, 0x04, 0x8D, 0x00, 0x00, 0x00, 0x00];
     let insts = decode_at(&bytes, 0x1000);
     let mut vsa = ValueSetAnalyzer::new();
@@ -940,12 +936,7 @@ fn test_xor_zero_then_and_with_zero_mask() {
 
 #[test]
 fn test_two_paths_with_different_constants_join_to_multiple() {
-    // Two separate paths load different constants into rax, then both reach the same jmp rax.
-    // We simulate this by injecting a Multiple state directly and checking resolution.
-    //
-    //   path A: rax = 0x1000
-    //   path B: rax = 0x2000
-    //   -> at jmp rax, rax = Multiple({0x1000, 0x2000})
+    // Inject a Multiple state at `jmp rax` ({0x1000, 0x2000} from two paths) and check resolution.
     let bytes = [0xFFu8, 0xE0]; // jmp rax
     let insts = decode_at(&bytes, 0x5000);
     let mut state = RegisterValueSet::new();
@@ -1036,18 +1027,12 @@ fn test_resolved_indirect_targets_empty_when_unresolvable() {
     assert!(resolved.is_empty());
 }
 
-// Regression: transfer-function soundness (wrong-constant resolution)
-//
-// These exercise cases where VSA must NOT hand back a stale/over-narrow concrete
-// target for an indirect transfer. A wrong `Constant`/`Multiple` here is not
-// conservative imprecision - a consumer that devirtualizes on it miscompiles the
-// guest (a data-dependent branch collapsed to a constant/incorrect condition).
+// Soundness regressions: a wrong `Constant`/`Multiple` for an indirect transfer is not mere imprecision; a devirtualizing consumer would miscompile.
 
 #[test]
 fn test_subregister_write_updates_full_register() {
     // mov rax, 0x1111 ; mov eax, 0x2222 ; jmp rax
-    // Writing EAX zero-extends into RAX, so the real target is 0x2222 - never the
-    // stale 0x1111 left in the full register.
+    // Writing EAX zero-extends into RAX: target is 0x2222, never the stale 0x1111.
     let bytes = [
         0x48u8, 0xC7, 0xC0, 0x11, 0x11, 0x00, 0x00, // mov rax, 0x1111 (ip 0x1000)
         0xB8, 0x22, 0x22, 0x00, 0x00, // mov eax, 0x2222 (ip 0x1007)
@@ -1068,8 +1053,7 @@ fn test_subregister_write_updates_full_register() {
 #[test]
 fn test_subregister_read_is_masked_to_operand_width() {
     // mov rax, 0x1_0000_2222 ; mov ecx, eax ; jmp rcx
-    // `mov ecx, eax` copies only the low 32 bits (0x2222) and zero-extends, so
-    // rcx = 0x2222 - not the full 64-bit 0x1_0000_2222.
+    // `mov ecx, eax` copies the low 32 bits and zero-extends: rcx = 0x2222.
     let bytes = [
         0x48u8, 0xB8, 0x22, 0x22, 0x00, 0x00, 0x01, 0x00, 0x00,
         0x00, // movabs rax, 0x100002222 (0x1000)
@@ -1118,10 +1102,7 @@ fn test_rdtsc_kills_stale_rax() {
 
 #[test]
 fn test_merge_widens_value_across_join_point() {
-    // Diamond: two predecessors reach `mov rcx, rax ; jmp rcx` with rax = 0x1111
-    // (branch taken) or 0x2222 (fallthrough). The analysis must widen rcx to both
-    // targets, not fix it at whichever predecessor was visited first.
-    //
+    // Diamond: rax = 0x1111 (taken) or 0x2222 (fallthrough) at `mov rcx, rax ; jmp rcx`; rcx must widen to both.
     // 0x1000: mov rax, 0x1111
     // 0x1007: je   0x1010
     // 0x1009: mov rax, 0x2222

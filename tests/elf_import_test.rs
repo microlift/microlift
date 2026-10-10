@@ -1,19 +1,6 @@
-//! Real-compiler ELF functions driven through the testkit's import-trampoline
-//! system.
-//!
-//! Each case compiles a small C function to an x86-64 shared object with a real
-//! toolchain, lifts the function's bytes straight out of the `.text`, and traps
-//! its PLT entries back to host implementations of `strlen`/`strcmp`/`memcpy`
-//! through a [`ImportTable`]. That table is engine-neutral: the *same* handler
-//! services Microlift's `ImportedFunctionCall` VM exits and Unicorn's stub
-//! hooks, so under `--features unicorn-oracle` every case additionally asserts
-//! the two engines end in the same architectural state.
-//!
-//! Run: `cargo test --features testkit --test elf_import_test`
-//!      `cargo test --features unicorn-oracle --test elf_import_test`
-//!
-//! Skipped (with a note) when no x86-64 ELF compiler is on `PATH`; set
-//! `MICROLIFT_X86_64_ELF_CC` to point at one.
+//! Real-compiler ELF functions with PLT entries trapped to host `strlen`/`strcmp`/`memcpy` via `ImportTable`.
+//! Under `unicorn-oracle` each case also asserts both engines end in the same state.
+//! Skipped when no x86-64 ELF compiler is on `PATH`; set `MICROLIFT_X86_64_ELF_CC`.
 
 #![cfg(feature = "testkit")]
 
@@ -62,10 +49,9 @@ unsigned long memcpy_and_checksum(unsigned char *dst, const unsigned char *src,
 }
 "#;
 
-/// Instruction budget for the emulated (Unicorn) side; the JIT ignores it.
 const BUDGET: u64 = 1 << 20;
 
-/// Both engines run on one shared [`HostStack`], so `rsp` itself is comparable.
+/// Both engines share one [`HostStack`] so `rsp` is comparable.
 #[cfg(feature = "unicorn-oracle")]
 const DIFF: DiffOptions = DiffOptions {
     compare_rsp: true,
@@ -142,28 +128,14 @@ fn compile_x86_64_elf(source: &str, basename: &str) -> Option<Vec<u8>> {
     compile_x86_64_elf_with(source, basename, &["-O0"])
 }
 
-/// As [`compile_x86_64_elf`], with extra compiler/linker flags appended (opt
-/// level, load address, ...).
 fn compile_x86_64_elf_with(source: &str, basename: &str, extra: &[&str]) -> Option<Vec<u8>> {
     compile_x86_64_elf_multi(&[("main", source)], basename, extra)
 }
 
-/// Serializes the compile-and-read below.
-///
-/// `basename` names a file in a directory shared by the whole binary, and two
-/// tests here pass the same one (`process_string`). Run in parallel, one test's
-/// `gcc` truncates the `.so` while the other is reading it, and the reader gets
-/// a valid-but-wrong or half-written image - which surfaced as an intermittent
-/// `expect("function symbol")`, the symbol genuinely absent from the bytes that
-/// were read. Unique per-call paths would work too, at the cost of leaving a
-/// fresh artifact behind on every run; the compile is not on any hot path, so
-/// serializing is the cheaper answer.
+/// Serializes compile-and-read: parallel tests sharing a basename would truncate each other's `.so`.
 static COMPILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Compile several translation units into one shared object. Link order is the
-/// given order, which is what decides `.text` layout - the only way to pin a
-/// specific function at the front of the image, since GCC emits callees before
-/// their callers within a single unit.
+/// Link order fixes `.text` layout, which is the only way to put a given function first.
 fn compile_x86_64_elf_multi(
     sources: &[(&str, &str)],
     basename: &str,
@@ -258,8 +230,6 @@ fn find_plt_entry_va(elf_bytes: &[u8], import_name: &str) -> Option<u64> {
     None
 }
 
-/// A lifted function: its bytes, the VA they were loaded at, and the PLT entries
-/// it calls.
 struct ElfFunction {
     bytes: Vec<u8>,
     va: u64,
@@ -273,8 +243,6 @@ fn load_function(source: &str, basename: &str, symbol: &str) -> Option<(ElfFunct
     Some((ElfFunction { bytes, va }, elf))
 }
 
-/// Run `f` on the Microlift JIT with `imports` trapped to `handler`, asserting a
-/// clean halt.
 fn run_microlift(
     f: &ElfFunction,
     init: &CpuState,
@@ -291,7 +259,6 @@ fn run_microlift(
     *out.state()
 }
 
-/// Same program under Unicorn, through the stub-page trampolines.
 #[cfg(feature = "unicorn-oracle")]
 fn run_unicorn(
     f: &ElfFunction,
@@ -323,8 +290,6 @@ fn test_elf_process_string() {
     let strcmp_plt = find_plt_entry_va(&elf, "strcmp").expect("strcmp PLT entry");
     let imports = [strlen_plt, strcmp_plt];
 
-    // The handler is a pure function of the guest state, so both engines can be
-    // handed a freshly built copy of it.
     let make_handler = || {
         move |va: u64, st: &mut CpuState| {
             if va == strlen_plt {
@@ -339,7 +304,6 @@ fn test_elf_process_string() {
         }
     };
 
-    // "hello" -> len 5 -> copy "iello" -> strcmp("hello","iello") < 0.
     let test_string = b"hello\0";
     let stack = HostStack::new(1024);
     let mut init = CpuState::zeroed();
@@ -360,7 +324,6 @@ fn test_elf_process_string() {
         assert!(diff.is_empty(), "process_string diverged: {diff:?}");
     }
 
-    // "x" -> len 1 -> early return 0; only strlen is called, on both engines.
     let short = b"x\0";
     let stack2 = HostStack::new(1024);
     let mut init2 = CpuState::zeroed();
@@ -411,8 +374,6 @@ fn test_elf_memcpy_semantics() {
 
     let expected_args = (dst.as_ptr() as u64, data.as_ptr() as u64, data.len() as u64);
 
-    // Per-engine bookkeeping: each run records its own calls, so "memcpy is
-    // called exactly once" is asserted for each engine independently.
     let mut ml_calls: Vec<(u64, u64, u64)> = Vec::new();
     let handler = |va: u64, st: &mut CpuState| {
         assert_eq!(va, memcpy_plt, "only memcpy should be imported");
@@ -447,8 +408,7 @@ fn test_elf_memcpy_semantics() {
 
     #[cfg(feature = "unicorn-oracle")]
     {
-        // Clear the destination so the emulated run has to re-establish it
-        // through its own trampoline rather than reading Microlift's leftovers.
+        // Force the emulated run to rebuild the destination itself.
         dst = [0u8; 11];
 
         let mut uc_calls: Vec<(u64, u64, u64)> = Vec::new();
@@ -468,8 +428,6 @@ fn test_elf_memcpy_semantics() {
     }
 }
 
-/// The one-line form: [`differential_with_imports`] runs both engines from one
-/// seed with one handler factory and reports their state difference directly.
 #[cfg(feature = "unicorn-oracle")]
 #[test]
 fn test_elf_process_string_differential_helper() {
@@ -513,22 +471,10 @@ fn test_elf_process_string_differential_helper() {
     assert!(diff.is_empty(), "microlift vs unicorn diverged: {diff:?}");
 }
 
-// The guest is a whole loaded ELF image rather than a single function. It is
-// linked at a high, mappable base and identity-mapped into the host address
-// space, so guest VA == host VA holds for its code, its `.rodata` strings and
-// its data - which is what lets `puts` be serviced by simply reading the host
-// pointer the guest passed.
-//
-// The program checks its own `rsp` across every call shape Microlift has to get
-// right (uninlined guest leaf calls, nested and recursive guest->guest calls,
-// imported calls, and imported calls made from inside a guest callee holding a
-// large frame), reports each violation through `puts`, and folds the failures
-// into its return value. A passing run is `rax == 0` with no `puts` output.
+// Whole ELF image identity-mapped, so guest VA == host VA and `puts` can read guest pointers directly.
+// The guest checks its own `rsp` across every call shape and folds failures into `rax`; a pass is `rax == 0`.
 
-/// The self-test compiles to a fixed path and maps its image at a fixed VA, so
-/// only one of these tests may be in flight at a time - `cargo test` runs the
-/// cases in a file concurrently. Poisoning is ignored: a panicking test has
-/// already dropped its mapping, and cascading failures only hide the real one.
+/// The self-test uses a fixed path and VA, so only one may run at a time; poisoning is ignored.
 static SELFTEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn selftest_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -584,8 +530,7 @@ int ml_import_preserves_regs(const char *s);
 
 "#;
 
-/// The entry translation unit. Linked first so it owns the lowest `.text`
-/// addresses: the lifted region starts at this function.
+/// Linked first so the lifted region starts at this function.
 const SELFTEST_ENTRY: &str = r#"/* ENTRY POINT. Lives in its own translation unit, linked first, so it owns the
  * lowest `.text` address of the program: the lifted region starts here and runs
  * to the end of `.text`, which is what puts every guest callee in region.
@@ -686,7 +631,6 @@ int stack_discipline_main(const char *s, const unsigned char *blob, unsigned lon
 
 "#;
 
-/// The callees, linked after the entry.
 const SELFTEST_HELPERS: &str = r#"__attribute__((noinline)) long ml_leaf_add(long a, long b) {
     return a + b;
 }
@@ -818,10 +762,8 @@ __attribute__((noinline)) int ml_import_preserves_regs(const char *s) {
 }
 "#;
 
-/// A whole ELF image mapped so that guest VA == host VA, plus the pieces of it
-/// the test drives: the entry function's byte range and its PLT entries.
 struct LoadedImage {
-    /// Keeps the identity mapping alive; dropping it unmaps the guest.
+    /// Dropping it unmaps the guest.
     _arena: IdentityArena,
     entry: ElfFunction,
     puts_plt: u64,
@@ -837,9 +779,7 @@ fn page_align_up(v: u64) -> u64 {
     (v + 0xFFF) & !0xFFF
 }
 
-/// Compile the self-test, map every `PT_LOAD` at its link-time address, and
-/// return the lifted region: the entry function through the end of `.text`, so
-/// every guest->guest callee is inside the lifted bytes.
+/// Lifts from the entry function to the end of `.text`, so every guest callee is in-region.
 fn load_stack_discipline_image() -> Option<LoadedImage> {
     let entry_unit = format!("{SELFTEST_PRELUDE}{SELFTEST_ENTRY}");
     let helpers_unit = format!("{SELFTEST_PRELUDE}{SELFTEST_HELPERS}");
@@ -851,18 +791,13 @@ fn load_stack_discipline_image() -> Option<LoadedImage> {
         "stack_discipline",
         &[
             "-O2",
-            // Keep every call a real call: no tail-call jumps to the PLT (those
-            // would leave the region as a jump rather than an import call).
+            // Keep calls real; sibling-call jumps to the PLT would leave the region.
             "-fno-optimize-sibling-calls",
-            // Guest->guest calls must be *direct*. Default visibility in a
-            // shared object makes them interposable, so GCC routes even
-            // intra-image calls through the PLT - which would leave the lifted
-            // region on every call.
+            // Direct guest->guest calls; default visibility would route them through the PLT.
             "-fvisibility=hidden",
             "-fno-semantic-interposition",
             &format!("-Wl,-Ttext-segment={SELFTEST_LOAD_BASE:#x}"),
-            // Compact the image so the identity mapping is a few pages, not the
-            // default 2 MiB-aligned segments.
+            // Few pages instead of 2 MiB-aligned segments.
             "-Wl,-z,max-page-size=0x1000",
         ],
     )?;
@@ -898,9 +833,7 @@ fn load_stack_discipline_image() -> Option<LoadedImage> {
     let (entry_va, _) =
         elf_symbol_va_size(&elf, "stack_discipline_main").expect("stack_discipline_main symbol");
 
-    // The lifted region has to contain every guest callee, and the entry must
-    // be its first byte - so the entry function must be the lowest-addressed
-    // one. GCC emits in definition order, which the C source relies on.
+    // Entry must be the lowest-addressed function; GCC emits in definition order.
     for name in [
         "ml_leaf_add",
         "ml_nested1",
@@ -939,8 +872,7 @@ fn load_stack_discipline_image() -> Option<LoadedImage> {
     })
 }
 
-/// Read a NUL-terminated guest string. Sound because the image is identity
-/// mapped: the guest pointer *is* a host pointer.
+/// Sound because the image is identity-mapped.
 fn read_guest_cstr(p: u64) -> String {
     assert_ne!(p, 0, "guest passed a NULL string to puts");
     let mut out = Vec::new();
@@ -956,8 +888,7 @@ fn read_guest_cstr(p: u64) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Callee-saved sentinels seeded into the guest: the ABI says the guest must
-/// give every one of them back untouched.
+/// The guest must return each of these untouched.
 const CALLEE_SAVED: [(usize, u64); 6] = [
     (gpr::RBX, 0xBBBB_0000_0000_BBBB),
     (gpr::RBP, 0xB9B9_0000_0000_B9B9),
@@ -967,16 +898,13 @@ const CALLEE_SAVED: [(usize, u64); 6] = [
     (15, 0x1515_0000_0000_1515),
 ];
 
-/// One execution of the self-test: returns the guest's grade (`rax`), whatever
-/// it printed, and the final state.
 struct SelfTestRun {
     grade: i32,
     messages: Vec<String>,
     state: CpuState,
 }
 
-/// `strlen_bias` is added to every `strlen` result: 0 services the imports
-/// faithfully, anything else lies to the guest so its own checks must fire.
+/// A non-zero `strlen_bias` lies to the guest so its own checks must fire.
 fn run_stack_discipline(
     img: &LoadedImage,
     init: &CpuState,
@@ -1027,8 +955,6 @@ enum Engine {
     Unicorn,
 }
 
-/// Seed the guest entry: `rdi` = a 9-byte string, `rsi`/`rdx` = a blob, plus the
-/// callee-saved sentinels and the shared stack.
 fn selftest_init(stack: &HostStack, s: &[u8], blob: &[u8], img: &LoadedImage) -> CpuState {
     let mut init = CpuState::zeroed();
     init.gpr[gpr::RSP] = stack.rsp();
@@ -1051,11 +977,8 @@ fn assert_callee_saved_intact(state: &CpuState, who: &str) {
     }
 }
 
-/// The guest grades its own stack discipline across every call shape, and must
-/// come back clean.
 #[test]
 fn test_guest_stack_discipline_selftest() {
-    // Held until the image below is dropped (guards the fixed mapping).
     let _serialize = selftest_guard();
 
     let Some(img) = load_stack_discipline_image() else {
@@ -1079,8 +1002,7 @@ fn test_guest_stack_discipline_selftest() {
         ml.messages.join("\n  ")
     );
     assert_callee_saved_intact(&ml.state, "microlift");
-    // The `ret` into the exit trampoline pops the return address and nothing
-    // else: the guest balanced its own stack exactly.
+    // The RET pops only the return address: stack is balanced.
     assert_eq!(
         ml.state.gpr[gpr::RSP],
         stack.rsp() + 8,
@@ -1105,12 +1027,9 @@ fn test_guest_stack_discipline_selftest() {
     }
 }
 
-/// Proves the self-test can actually fail, and that its reporting path works:
-/// lie about `strlen` and the guest must notice, print, and grade itself down -
-/// identically on both engines.
+/// The self-test must be able to fail: a lying `strlen` is noticed identically on both engines.
 #[test]
 fn test_guest_stack_discipline_detects_bad_import() {
-    // Held until the image below is dropped (guards the fixed mapping).
     let _serialize = selftest_guard();
 
     let Some(img) = load_stack_discipline_image() else {
@@ -1126,9 +1045,7 @@ fn test_guest_stack_discipline_detects_bad_import() {
     let stack = HostStack::new(4096);
     let init = selftest_init(&stack, s, &blob, &img);
 
-    // `strlen` now returns one too many: the direct import check (bit 0x20) and
-    // the mixed guest/import check (bit 0x80) must both trip - and only those,
-    // since every stack-pointer check is unaffected by a wrong return value.
+    // Only the import-value checks (0x20, 0x80) trip; stack-pointer checks are unaffected.
     const F_IMPORT_VALUE: i32 = 0x0020;
     const F_MIXED_VALUE: i32 = 0x0080;
 

@@ -1,7 +1,4 @@
-//! Soundness regression tests for the VSA control-flow modelling: conditional
-//! transfers other than `Jcc`/`Loop` (namely `LOOPE`/`LOOPNE`/`JRCXZ`) must
-//! propagate their taken edge, and `SYSCALL` must fall through with its
-//! ABI-clobbered registers invalidated.
+//! VSA soundness: `LOOPE`/`LOOPNE`/`JRCXZ` must propagate their taken edge, and `SYSCALL` falls through with ABI-clobbered registers invalidated.
 
 use iced_x86::{Decoder, DecoderOptions, Register};
 use microlift::vsa::{ValueSet, ValueSetAnalyzer};
@@ -26,10 +23,7 @@ fn loope_back_edge_is_propagated() {
     // 0x1005: mov ecx, 5     (B9 05 00 00 00)
     // 0x100A: mov eax, 2     (B8 02 00 00 00)   <- loop_top
     // 0x100F: loope 0x100A   (E1 F9)            back-edge to 0x100A
-    //
-    // The pre-state of loop_top must be the join of the entry (eax=1) and the
-    // loope back-edge (eax=2). If the back-edge is dropped, eax stays a single
-    // Constant(1) - an unsound under-approximation.
+    // loop_top's pre-state must join entry (eax=1) and the back-edge (eax=2); dropping the edge would leave Constant(1), an unsound under-approximation.
     let bytes = [
         0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax,1
         0xB9, 0x05, 0x00, 0x00, 0x00, // mov ecx,5
@@ -56,10 +50,7 @@ fn syscall_falls_through_and_clobbers_rax() {
     // 0x1000: mov eax, 0x40   (B8 40 00 00 00)
     // 0x1005: syscall         (0F 05)
     // 0x1007: jmp rax         (FF E0)
-    //
-    // SYSCALL returns to 0x1007 (must be analyzed) and clobbers RAX, so the
-    // indirect `jmp rax` must be unresolvable - NOT resolved to the stale
-    // pre-syscall value 0x40.
+    // SYSCALL returns to 0x1007 and clobbers RAX, so `jmp rax` must not resolve to the stale 0x40.
     let bytes = [
         0xB8, 0x40, 0x00, 0x00, 0x00, // mov eax,0x40
         0x0F, 0x05, // syscall
@@ -82,9 +73,7 @@ fn syscall_falls_through_and_clobbers_rax() {
     assert_eq!(vsa.value_sets[&0x1007].get(Register::RAX), ValueSet::Top);
 }
 
-// RBX is callee-saved under the standard x86-64 C ABI, so a value in it would
-// survive a CALL *if* the analysis trusted that ABI. The default is conservative
-// (trust nothing), so it must NOT survive; ABI-aware precision is opt-in.
+// RBX is callee-saved, but the default trusts no ABI so it must not survive a CALL; ABI-aware precision is opt-in.
 const CALLEE_SAVED_ACROSS_CALL: [u8; 11] = [
     0x48, 0xC7, 0xC3, 0x00, 0x30, 0x00, 0x00, // mov rbx, 0x3000   @0x1000
     0xFF, 0xD0, // call rax          @0x1007 (rax unknown)
@@ -99,16 +88,14 @@ fn default_is_conservative_no_value_survives_a_call() {
     vsa.analyze(&insts);
 
     let jmp = insts.iter().find(|i| i.ip() == 0x1009).unwrap();
-    // Conservative mode clobbers every GPR across the call, so RBX is unknown
-    // afterwards and the jmp must not resolve.
+    // Conservative mode clobbers every GPR across the call.
     assert_eq!(vsa.indirect_targets(jmp), None);
 }
 
 #[test]
 fn standard_abi_opt_in_preserves_callee_saved_across_call() {
     let insts = decode_at(&CALLEE_SAVED_ACROSS_CALL, 0x1000);
-    // Opt into ABI-aware precision: RBX is callee-saved under SysV/Win64, so the
-    // standard clobber set keeps it across the call and the jmp resolves.
+    // ABI-aware: RBX is callee-saved, so the jmp resolves.
     let mut vsa = ValueSetAnalyzer::new().with_standard_abi();
     vsa.analyze(&insts);
 
@@ -119,8 +106,7 @@ fn standard_abi_opt_in_preserves_callee_saved_across_call() {
 #[test]
 fn custom_call_clobbers_switch_off_conservative_mode() {
     let insts = decode_at(&CALLEE_SAVED_ACROSS_CALL, 0x1000);
-    // Supplying an explicit clobber set implies ABI-aware mode. Here RBX is NOT
-    // in the set, so it is (deliberately) preserved across the call.
+    // An explicit clobber set implies ABI-aware mode; RBX is not in it, so it is preserved.
     let mut vsa = ValueSetAnalyzer::new().with_call_clobbers(vec![Register::RAX]);
     assert!(!vsa.conservative, "explicit clobbers imply ABI-aware mode");
     vsa.analyze(&insts);
@@ -132,8 +118,7 @@ fn custom_call_clobbers_switch_off_conservative_mode() {
 #[test]
 fn cpuid_clobbers_output_registers() {
     // mov rax, 0x3000 ; cpuid ; jmp rax
-    // CPUID (a VM exit in the lifter) architecturally writes RAX/RBX/RCX/RDX,
-    // which iced reports, so the catch-all invalidates RAX -> jmp unresolvable.
+    // CPUID writes RAX/RBX/RCX/RDX, so the jmp is unresolvable.
     let bytes = [
         0x48, 0xC7, 0xC0, 0x00, 0x30, 0x00, 0x00, // mov rax,0x3000  @0x1000
         0x0F, 0xA2, // cpuid           @0x1007
@@ -149,9 +134,7 @@ fn cpuid_clobbers_output_registers() {
 #[test]
 fn software_interrupt_clobbers_registers_in_conservative_mode() {
     // mov rax, 0x3000 ; int 0x80 ; jmp rax
-    // `int 0x80` transfers to a handler (a VM exit) that may return a value in
-    // RAX. iced reports no GP writes for INT, so only conservative mode catches
-    // this - the default. The jmp must not resolve to the stale 0x3000.
+    // `int 0x80` may return in RAX but iced reports no GP writes, so only conservative mode catches it.
     let bytes = [
         0x48, 0xC7, 0xC0, 0x00, 0x30, 0x00, 0x00, // mov rax,0x3000  @0x1000
         0xCD, 0x80, // int 0x80        @0x1007
@@ -169,8 +152,7 @@ fn software_interrupt_clobbers_registers_in_conservative_mode() {
         "conservative mode must not carry rax across int 0x80"
     );
 
-    // ABI-aware mode trusts iced's (empty) GP write set for INT, so it would
-    // carry the stale value - demonstrating exactly why conservative is default.
+    // ABI-aware trusts iced's empty write set and keeps the stale value, which is why conservative is default.
     let mut precise = ValueSetAnalyzer::new().with_standard_abi();
     precise.analyze(&insts);
     assert_eq!(precise.indirect_targets(jmp), Some(vec![0x3000]));
@@ -179,12 +161,7 @@ fn software_interrupt_clobbers_registers_in_conservative_mode() {
 #[test]
 fn jrcxz_taken_edge_is_propagated() {
     // 0x1000: mov eax, 7      (B8 07 00 00 00)
-    // 0x1005: jrcxz 0x100C    (67 E3 04)  addr-size CX? use rcx form: E3 rel8
-    //   Use `E3 05` at 0x1005 (2 bytes) -> next 0x1007, target 0x1007+5=0x100C.
-    // 0x1007: mov eax, 9      (B8 09 00 00 00)   fallthrough sets eax=9
-    // 0x100C: <target>        (nop landing)      reached by BOTH the jrcxz taken
-    //   edge (eax=7) and the fallthrough of `mov eax,9` (eax=9) => {7,9}.
-    //   Without the taken edge it would be a single Constant(9).
+    // `E3 05` at 0x1005 -> target 0x100C. The target is reached by the taken edge (eax=7) and the fallthrough (eax=9): {7,9}; without the taken edge it would be Constant(9).
     let bytes = [
         0xB8, 0x07, 0x00, 0x00, 0x00, // mov eax,7      @0x1000
         0xE3, 0x05, // jrcxz 0x100C  @0x1005

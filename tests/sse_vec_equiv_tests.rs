@@ -1,13 +1,5 @@
-//! Scalar-vs-vector XMM equivalence for the SSE handlers.
-//!
-//! The scalar `(lo, hi)` expansion is the authority on semantics; the
-//! `use_vector_xmm` fast paths in `semantics/sse_vec.rs` are a performance
-//! choice that must not change a single result bit. Every instruction with a
-//! vector fast path is run here under both backing representations over seeded
-//! pseudo-random XMM state, and the full architectural state is compared.
-//!
-//! This is the regression net for the fast paths: adding one without listing
-//! its encoding here leaves it unproven.
+//! Scalar-vs-vector XMM equivalence: `use_vector_xmm` fast paths in `semantics/sse_vec.rs` may not change a result bit.
+//! Run under both representations over seeded state; list every new fast-path encoding here.
 
 use cranelift::codegen::isa::CallConv;
 use microlift::arch::x86_64::X86_64;
@@ -16,8 +8,7 @@ use microlift::core::{LifterConfig, lift_to_function};
 use microlift::testkit::prelude::*;
 use microlift::testkit::rng::Rng;
 
-/// Run `bytes` under both XMM backing representations from identical state and
-/// return the two resulting contexts.
+/// Run `bytes` under both XMM representations from identical state; return both contexts.
 fn both_modes(bytes: &[u8], seed: u64) -> (RegisterContext, RegisterContext) {
     let mut rng = Rng::new(seed);
     let mut init = RegisterContext::default();
@@ -25,7 +16,7 @@ fn both_modes(bytes: &[u8], seed: u64) -> (RegisterContext, RegisterContext) {
         xmm[0] = rng.next_u64();
         xmm[1] = rng.next_u64();
     }
-    // GPRs matter for the handlers that write one (PMOVMSKB, PEXTR*, CVT*2SI).
+    // GPRs matter for handlers that write one (PMOVMSKB, PEXTR*, CVT*2SI).
     init.rax = rng.next_u64();
     init.rcx = rng.next_u64();
     init.rdx = rng.next_u64();
@@ -35,11 +26,7 @@ fn both_modes(bytes: &[u8], seed: u64) -> (RegisterContext, RegisterContext) {
     (scalar, vector)
 }
 
-/// Assert that both representations agree on XMM state, GPRs and flags.
-///
-/// Each seed costs two JIT compiles, so the immediate sweeps below pass a small
-/// `seeds` - an immediate selects a distinct lift-time code path, and a handful
-/// of random 128-bit inputs per path already pins it down.
+/// Assert both representations agree on XMM state, GPRs and flags. Each seed costs two compiles, so immediate sweeps use few seeds.
 #[track_caller]
 fn assert_modes_agree_n(name: &str, bytes: &[u8], seeds: u64) {
     for seed in 0..seeds {
@@ -53,15 +40,13 @@ fn assert_modes_agree_n(name: &str, bytes: &[u8], seeds: u64) {
     }
 }
 
-/// [`assert_modes_agree_n`] at the default seed count, for the forms whose
-/// behaviour is fixed at lift time (no immediate to sweep).
+/// [`assert_modes_agree_n`] at the default seed count, for lift-time-fixed forms.
 #[track_caller]
 fn assert_modes_agree(name: &str, bytes: &[u8]) {
     assert_modes_agree_n(name, bytes, 16);
 }
 
-/// Build `prefix + opcode + modrm(xmm0, xmm1)` followed by `ret`, with an
-/// optional trailing `imm8`.
+/// `prefix + opcode + modrm(xmm0, xmm1)` then `ret`, with optional trailing `imm8`.
 fn snippet(bytes: &[u8], imm: Option<u8>) -> Vec<u8> {
     let mut out = bytes.to_vec();
     if let Some(i) = imm {
@@ -73,8 +58,7 @@ fn snippet(bytes: &[u8], imm: Option<u8>) -> Vec<u8> {
 
 #[test]
 fn shuffles_agree_across_xmm_representations() {
-    // Every imm8 is exercised for the immediate-controlled shuffles: the mask
-    // is built at lift time, so each immediate is a distinct code path.
+    // Every imm8: the mask is built at lift time, so each is a distinct path.
     for imm in 0..=255u8 {
         // pshufd xmm0, xmm1, imm
         assert_modes_agree_n("pshufd", &snippet(&[0x66, 0x0F, 0x70, 0xC1], Some(imm)), 2);
@@ -88,8 +72,7 @@ fn shuffles_agree_across_xmm_representations() {
         assert_modes_agree_n("pshufhw", &snippet(&[0xF3, 0x0F, 0x70, 0xC1], Some(imm)), 2);
     }
 
-    // Byte shifts and align: counts past the register width are the
-    // interesting edges (all-zero result, and PALIGNR's 16..31 window).
+    // Byte shifts/align: counts past the register width are the edges (zero result, PALIGNR 16..31).
     for imm in 0..=40u8 {
         // pslldq xmm0, imm
         assert_modes_agree_n("pslldq", &snippet(&[0x66, 0x0F, 0x73, 0xF8], Some(imm)), 3);
@@ -160,13 +143,7 @@ fn packed_fp_ops_agree_across_xmm_representations() {
     }
 }
 
-/// The scalar single/double arithmetic forms, whose vector fast path keeps
-/// lane 0 in the vector register file instead of routing it through a GPR.
-///
-/// The merge is the whole risk here: these instructions write bits[31:0] (or
-/// [63:0]) and *preserve* everything above, so the fast path's `insertlane`
-/// has to leave lanes 1.. exactly as the portable mask-and-OR expansion does.
-/// Seeded random XMM state is what catches a lane getting clobbered.
+/// Scalar single/double arithmetic keeps lane 0 in the vector file; the `insertlane` merge must preserve lanes 1.. like the portable expansion.
 #[test]
 fn scalar_fp_ops_agree_across_xmm_representations() {
     let cases: &[(&str, &[u8])] = &[
@@ -183,10 +160,7 @@ fn scalar_fp_ops_agree_across_xmm_representations() {
         assert_modes_agree(name, &snippet(bytes, None));
     }
 
-    // The memory-source forms take a separate path in the fast lane read (a
-    // float-typed load rather than an `extractlane`), so they need their own
-    // cases. `[rsp]` is the harness's stack, which holds the exit trampoline
-    // address - an arbitrary but identical bit pattern under both modes.
+    // Memory-source forms take a separate lane read (float load); `[rsp]` holds the same bit pattern under both modes.
     let mem_cases: &[(&str, &[u8])] = &[
         ("mulss-m32", &[0xF3, 0x0F, 0x59, 0x04, 0x24]),
         ("addss-m32", &[0xF3, 0x0F, 0x58, 0x04, 0x24]),
@@ -220,8 +194,7 @@ fn movmsk_and_conversions_agree_across_xmm_representations() {
 fn packed_integer_ops_agree_across_xmm_representations() {
     let cases: &[(&str, &[u8])] = &[
         ("pshufb", &[0x66, 0x0F, 0x38, 0x00, 0xC1]),
-        // The blendv forms take their mask from the implicit XMM0, which is
-        // also the destination here - the mask is read before the write.
+        // Blendv takes its mask from XMM0, also the destination: mask is read before the write.
         ("pblendvb", &[0x66, 0x0F, 0x38, 0x10, 0xC1]),
         ("blendvps", &[0x66, 0x0F, 0x38, 0x14, 0xC1]),
         ("blendvpd", &[0x66, 0x0F, 0x38, 0x15, 0xC1]),
@@ -260,7 +233,7 @@ fn packed_integer_ops_agree_across_xmm_representations() {
         assert_modes_agree(name, &snippet(bytes, None));
     }
 
-    // The imm8-controlled blends: every lane-selection pattern.
+    // imm8-controlled blends: every lane-selection pattern.
     for imm in 0..=255u8 {
         // pblendw xmm0, xmm1, imm
         assert_modes_agree_n(
@@ -283,14 +256,7 @@ fn packed_integer_ops_agree_across_xmm_representations() {
     }
 }
 
-/// Every vector fast path must lower on every backend microlift can be pointed
-/// at, not just the host.
-///
-/// This is not hypothetical: `smulhi`/`umulhi` are documented as
-/// vector-polymorphic and `x86_pmulhrsw` / `x86_pmaddubsw` model their x86
-/// instructions exactly, but none of the three has an aarch64 rule; the
-/// `UnorderedOrGreaterThan{,OrEqual}` vector compares have no aarch64 rule
-/// either. Each looked correct until compiled for the other target.
+/// Every vector fast path must lower on every backend, not just the host (`smulhi`/`umulhi`, `x86_pmulhrsw`, `x86_pmaddubsw` and the unordered vector compares have no aarch64 rule).
 #[test]
 fn vector_fast_paths_lower_on_every_target() {
     // One encoding per distinct vector fast path.
@@ -342,10 +308,7 @@ fn vector_fast_paths_lower_on_every_target() {
         ("cvtpd2ps", &[0x66, 0x0F, 0x5A, 0xC1]),
         ("cvtps2pd", &[0x0F, 0x5A, 0xC1]),
         ("cvtdq2pd", &[0xF3, 0x0F, 0xE6, 0xC1]),
-        // These five have no vector fast path - their cross-lane reductions
-        // have no Cranelift primitive behind them - but under `use_vector_xmm`
-        // they still reach the XMM file through `extractlane`/`insertlane`, so
-        // they emit vector IR and have to lower like everything else here.
+        // No vector fast path (no Cranelift primitive for the reduction), but they emit vector IR via `extractlane`/`insertlane` and must lower.
         ("extractps", &[0x66, 0x0F, 0x3A, 0x17, 0xC8, 0x02]),
         ("dpps", &[0x66, 0x0F, 0x3A, 0x40, 0xC1, 0xFF]),
         ("dppd", &[0x66, 0x0F, 0x3A, 0x41, 0xC1, 0x33]),
@@ -353,8 +316,7 @@ fn vector_fast_paths_lower_on_every_target() {
         ("mpsadbw", &[0x66, 0x0F, 0x3A, 0x42, 0xC1, 0x05]),
     ];
 
-    // The `NLT` / `NLE` compare predicates are the ones without an aarch64
-    // vector-float rule, so sweep all eight rather than picking one.
+    // `NLT`/`NLE` lack an aarch64 vector-float rule; sweep all eight.
     let mut cases: Vec<(String, Vec<u8>)> = snippets
         .iter()
         .map(|(n, b)| ((*n).to_string(), snippet(b, None)))
@@ -377,9 +339,7 @@ fn vector_fast_paths_lower_on_every_target() {
                 ..Default::default()
             };
             let mut func = lift_to_function::<X86_64>(bytes, 0x1000, config).expect("lift");
-            // The lifter bakes in the *host* calling convention; override it so
-            // this exercises instruction lowering rather than tripping the
-            // target's ABI code on a convention it does not accept.
+            // Override the host calling convention to exercise lowering, not ABI.
             func.signature.call_conv = CallConv::SystemV;
             ArtifactBackend::compile_to_raw(func, Some(triple), None)
                 .unwrap_or_else(|e| panic!("{name} failed to lower for {triple}: {e:?}"));

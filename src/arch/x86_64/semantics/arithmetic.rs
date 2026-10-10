@@ -22,8 +22,7 @@ impl<'a> Lifter<'a> {
 
     pub(super) fn handle_adc(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let size = self.operand_size(instruction, 0)?;
-        // CF is read before the operands, so a memory operand's load cannot be
-        // reordered ahead of a flag this same instruction goes on to redefine.
+        // CF is read before the operands so a memory load is not reordered ahead of a flag this instruction redefines.
         let cf = self.carry_in(size);
         let (place, dst, src) = self.read_binary_rmw(instruction, size)?;
         let result = self.adc_sbb_with_flags(dst, src, cf, true, size)?;
@@ -43,13 +42,9 @@ impl<'a> Lifter<'a> {
         let src_reg = instruction.op1_register();
         let src_val = self.get_reg_val(src_reg)?;
 
-        // Flags first since they are a function of the two values just read, and the
-        // operand writes below are ordered against each other, not against them.
+        // Flags first: they depend only on the two values just read.
         let result = self.add_with_flags(dst_val, src_val, size)?;
-        // Hardware order: TEMP <- SRC + DEST; SRC <- DEST; DEST <- TEMP. The
-        // destination write must come last so `xadd r, r` ends up holding the sum,
-        // not the old value. `place` froze the address, so one order serves both
-        // operand kinds.
+        // Hardware order: TEMP <- SRC + DEST; SRC <- DEST; DEST <- TEMP; the destination write is last so `xadd r, r` holds the sum.
         self.set_reg_val(src_reg, dst_val)?;
         self.write_place(place, result)
     }
@@ -82,8 +77,7 @@ impl<'a> Lifter<'a> {
         let (size, place, val) = self.read_unary_rmw(instruction)?;
         let ty = size_to_type(size);
         let zero = self.builder.ins().iconst(ty, 0);
-        // NEG is `0 - val`, flags included: CF is the borrow (set unless the
-        // operand was zero) and OF the signed overflow (only at INT_MIN).
+        // NEG is `0 - val`: CF is the borrow, OF the signed overflow.
         let result = self.sub_with_flags(zero, val, size)?;
         self.write_place(place, result)
     }
@@ -96,25 +90,21 @@ impl<'a> Lifter<'a> {
     pub(super) fn handle_imul(&mut self, instruction: &Instruction) -> crate::Result<()> {
         match instruction.op_count() {
             1 => {
-                // 1-operand form: RDX:RAX = RAX * r/m
                 let size = self.operand_size(instruction, 0)?;
                 let ty = size_to_type(size);
                 let rax = self.get_reg_val(Register::RAX)?;
                 let src = self.read_operand(instruction, 0, size)?;
 
-                // `rax` is the whole 64-bit register and needs narrowing; `src` was read at
-                // the operand's own width and usually does not.
+                // `rax` is the whole register and needs narrowing; `src` is already operand width.
                 let rax_narrow = self.narrow_to(ty, rax);
                 let src_narrow = self.narrow_to(ty, src);
 
                 let lo = self.builder.ins().imul(rax_narrow, src_narrow);
                 let hi = self.builder.ins().smulhi(rax_narrow, src_narrow);
 
-                // Write results based on size:
-                // 8-bit -> AX=AH:AL, 16-bit -> DX:AX, 32-bit -> EDX:EAX, 64-bit -> RDX:RAX
+                // 8-bit -> AX, 16-bit -> DX:AX, 32-bit -> EDX:EAX, 64-bit -> RDX:RAX
                 let (lo_reg, hi_reg) = match size {
                     1 => {
-                        // Result in AX; AH=hi8, AL=lo8
                         let lo_64 = self.builder.ins().uextend(types::I64, lo);
                         let hi_64 = self.builder.ins().uextend(types::I64, hi);
                         let hi_shifted = self.builder.ins().ishl_imm_u(hi_64, 8);
@@ -144,7 +134,6 @@ impl<'a> Lifter<'a> {
                 self.set_flag(crate::lifter::X86Flag::Overflow, of_cf)?;
             }
             2 => {
-                // 2-operand: dst = dst * src
                 let size = self.operand_size(instruction, 0)?;
                 let dst = self.read_operand(instruction, 0, size)?;
                 let src = self.read_operand(instruction, 1, size)?;
@@ -152,7 +141,6 @@ impl<'a> Lifter<'a> {
                 self.write_operand(instruction, 0, result)?;
             }
             3 => {
-                // 3-operand: dst = src1 * imm
                 let size = self.operand_size(instruction, 0)?;
                 let src = self.read_operand(instruction, 1, size)?;
                 let imm = self.read_operand(instruction, 2, size)?;
@@ -203,8 +191,6 @@ impl<'a> Lifter<'a> {
                     _ => unreachable!(),
                 };
                 let acc = self.get_reg_val(acc_reg)?;
-                // Already the operand's width, since `acc_reg` is AX/EAX/RAX - say so rather
-                // than assume it.
                 let acc_narrow = self.narrow_to(ty, acc);
                 let lo = self.builder.ins().imul(acc_narrow, src);
                 let hi = self.builder.ins().umulhi(acc_narrow, src);
@@ -225,10 +211,7 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Assemble the full double-width dividend `high:low` for DIV/IDIV in
-    /// `work_ty` (twice the operand width). The concatenation is purely
-    /// bitwise, so the same routine serves both the signed and unsigned forms -
-    /// `sdiv`/`srem` reinterpret the assembled bits as a signed 2N-bit value.
+    /// Assemble the double-width dividend `high:low` in `work_ty` for DIV/IDIV (bitwise, so signed and unsigned share it).
     fn assemble_dividend(
         &mut self,
         low: Register,
@@ -244,9 +227,7 @@ impl<'a> Lifter<'a> {
         Ok(self.builder.ins().bor(hi_shifted, lo_w))
     }
 
-    /// The `(low_acc, high_acc, working_type)` triple for a DIV/IDIV of the
-    /// given operand `size`: the dividend is `high:low` (e.g. `DX:AX`) and the
-    /// division is carried out in `working_type`, twice the operand width.
+    /// The `(low_acc, high_acc, working_type)` for DIV/IDIV of `size`: dividend `high:low` (e.g. `DX:AX`), divided in twice the operand width.
     fn div_regs(size: usize) -> Option<(Register, Register, Type)> {
         match size {
             1 => Some((Register::AL, Register::AH, types::I16)),
@@ -257,8 +238,7 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// A zero constant of width `ty` (`iconst` only builds up to `I64`, so `I128`
-    /// is materialised by zero-extending an `I64` zero).
+    /// A zero of width `ty`; `I128` is a zero-extended `I64`.
     fn wide_zero(&mut self, ty: Type) -> Value {
         if ty == types::I128 {
             let z = self.builder.ins().iconst(types::I64, 0);
@@ -268,10 +248,7 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// Unsigned `dividend / divisor` in `work_ty`, returning `(quot, rem)`.
-    /// Uses native `udiv`/`urem` where the backend supports it, falling back to
-    /// the portable long-division loop for the unsupported `I128` case. The
-    /// caller must have already excluded a zero divisor.
+    /// Unsigned `dividend / divisor` in `work_ty` as `(quot, rem)`: native `udiv`/`urem`, or the portable loop for `I128`. The divisor must be nonzero.
     fn emit_udivmod(&mut self, dividend: Value, divisor: Value, work_ty: Type) -> (Value, Value) {
         if work_ty == types::I128 {
             self.emit_udivmod128(dividend, divisor)
@@ -295,18 +272,11 @@ impl<'a> Lifter<'a> {
         self.emit_division(instruction, false)
     }
 
-    /// Shared DIV/IDIV lowering with architectural divide-error (#DE) checks.
+    /// Shared DIV/IDIV lowering with #DE checks.
     ///
-    /// x86 raises #DE when the divisor is zero or the quotient does not fit in
-    /// the destination width. Both are checked *before* any result is committed
-    /// (a fault leaves all registers unchanged), and either one branches to a
-    /// [`ExitReason::DivideError`] VM exit whose PC points at the faulting
-    /// instruction. Because the guards run first, the division itself never sees
-    /// a zero divisor, so the emitted `udiv`/`urem` (or the I128 loop) can't trap.
-    ///
-    /// [`Optimization::UnsafeImpreciseDivisionExceptions`] drops both guards, the
-    /// fault block and its `sync_to_context` - see [`Lifter::divide_error_checks`]
-    /// for what a guest gives up by asking for that.
+    /// A zero divisor or a quotient that does not fit branches to a [`ExitReason::DivideError`] VM exit at the faulting
+    /// instruction, before any result is committed. [`Optimization::UnsafeImpreciseDivisionExceptions`] drops the guards;
+    /// see [`Lifter::divide_error_checks`].
     ///
     /// [`Optimization::UnsafeImpreciseDivisionExceptions`]:
     ///     crate::core::optimize::Optimization::UnsafeImpreciseDivisionExceptions
@@ -331,7 +301,6 @@ impl<'a> Lifter<'a> {
             None
         };
 
-        // Guard 1: divide by zero.
         if let Some(de_block) = de_block {
             let div0 = self.builder.ins().icmp_imm_s(IntCC::Equal, divisor_n, 0);
             let after_div0 = self.builder.create_block();
@@ -342,8 +311,6 @@ impl<'a> Lifter<'a> {
             self.builder.seal_block(after_div0);
         }
 
-        // Divisor is non-zero (either guarded above, or promised by the caller
-        // through the optimization); compute the full-width quotient/remainder.
         let (quot, rem) = if signed {
             let divisor_w = self.builder.ins().sextend(work_ty, divisor_n);
             let zero = self.wide_zero(work_ty);
@@ -355,9 +322,7 @@ impl<'a> Lifter<'a> {
                 .builder
                 .ins()
                 .icmp(IntCC::SignedLessThan, divisor_w, zero);
-            // Divide magnitudes, then reapply signs (x86 truncates toward zero;
-            // the remainder takes the dividend's sign). Working on magnitudes
-            // also keeps the division away from the `INT_MIN / -1` trap case.
+            // Divide magnitudes and reapply signs (truncate toward zero, remainder takes the dividend's sign); avoids `INT_MIN / -1`.
             let neg_n = self.builder.ins().isub(zero, dividend);
             let abs_n = self.builder.ins().select(n_neg, neg_n, dividend);
             let neg_d = self.builder.ins().isub(zero, divisor_w);
@@ -393,14 +358,12 @@ impl<'a> Lifter<'a> {
                 .ins()
                 .brif(overflow, de_block, &[], after_ovf, &[]);
 
-            // Fault path first, so `de_block` is terminated before we switch away (the
-            // frontend forbids leaving an unfilled block).
+            // Terminate `de_block` before switching away.
             self.builder.switch_to_block(de_block);
             self.builder.seal_block(de_block);
             self.emit_divide_error(instruction)?;
 
-            // Non-faulting path: commit quotient and remainder, and leave the builder
-            // here so the engine keeps lifting from the continuation.
+            // Non-faulting path: commit, and leave the builder here for the engine.
             self.builder.switch_to_block(after_ovf);
             self.builder.seal_block(after_ovf);
         }
@@ -413,20 +376,11 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Whether `DIV`/`IDIV` still emit their architectural #DE guards.
+    /// Whether `DIV`/`IDIV` still emit their #DE guards.
     ///
-    /// [`Optimization::UnsafeImpreciseDivisionExceptions`] turns them off. What a
-    /// guest gives up is the whole fault protocol, not its precision: a division
-    /// that *would* have raised #DE no longer exits with
-    /// [`ExitReason::DivideError`], and instead writes a result. For a divisor
-    /// whose quotient merely overflows the destination, that result is the
-    /// truncated quotient. For a **zero** divisor there is no result at all, and
-    /// what happens depends on the width: the native `udiv`/`urem` Cranelift emits
-    /// traps (the host takes an integer-divide-by-zero trap, not a guest #DE),
-    /// while the 128-bit software loop in [`Lifter::emit_udivmod128`] terminates -
-    /// it is bounded by the dividend's significant bits, not by the divisor - and
-    /// yields a garbage quotient and remainder. So this is only ever safe for a
-    /// guest that provably never divides by zero and never overflows a quotient.
+    /// [`Optimization::UnsafeImpreciseDivisionExceptions`] turns them off, giving up the fault protocol: an overflowing quotient
+    /// is truncated, and a zero divisor traps on the host (native `udiv`) or yields garbage ([`Lifter::emit_udivmod128`]).
+    /// Only safe for a guest that never divides by zero or overflows a quotient.
     ///
     /// [`Optimization::UnsafeImpreciseDivisionExceptions`]:
     ///     crate::core::optimize::Optimization::UnsafeImpreciseDivisionExceptions
@@ -437,8 +391,7 @@ impl<'a> Lifter<'a> {
             .allows(crate::core::optimize::Optimization::UnsafeImpreciseDivisionExceptions)
     }
 
-    /// Emit a divide-error (#DE) VM exit: sync guest state with the PC pointing
-    /// *at* the faulting `DIV`/`IDIV` (faults re-execute) and return to the host.
+    /// Emit a divide-error VM exit with the PC at the faulting `DIV`/`IDIV` (faults re-execute).
     fn emit_divide_error(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let rip_at = self.runtime_addr(instruction.ip());
         self.sync_to_context(Some(rip_at), ExitReason::DivideError)?;
@@ -447,19 +400,9 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Unsigned 128-bit / 128-bit division via restoring shift/subtract long
-    /// division, returning `(quotient, remainder)` as `I128`.
-    ///
-    /// The backend lacks native `udiv.i128`/`urem.i128`, but it does support
-    /// i128 shifts, adds, subtracts and comparisons, which is all this needs.
-    /// The dividend is normalized once with its leading-zero count, so a value
-    /// whose significant part is only 64 bits takes 64 iterations rather than
-    /// 128. Within the loop all shifts are by the constant one: this matters
-    /// on x64 because variable shifts of an `I128` lower to comparatively
-    /// expensive multi-instruction sequences.
-    ///
-    /// Blocks use explicit parameters (not `Variable`s) to carry the loop state,
-    /// so they need no manual sealing beyond the engine's final `seal_all_blocks`.
+    /// Unsigned 128-bit division by restoring shift/subtract, returning `(quotient, remainder)` as `I128`.
+    /// The backend lacks `udiv.i128`/`urem.i128`; the dividend is normalized by its leading-zero count and all shifts are
+    /// by one (variable `I128` shifts lower expensively on x64). Loop state is carried in block params.
     fn emit_udivmod128(&mut self, n: Value, d: Value) -> (Value, Value) {
         let i128 = types::I128;
         let i64 = types::I64;
@@ -472,9 +415,7 @@ impl<'a> Lifter<'a> {
             self.builder.ins().uextend(i128, o)
         };
 
-        // Two native 64-bit CLZ ops. A zero dividend has clz=128, handled by the
-        // n < d fast path below; the select also keeps the normalization shift in
-        // range for IR validation and targets with strict shifts.
+        // A zero dividend has clz=128, handled by the `n < d` fast path; the select keeps the shift in range.
         let hi = self.builder.ins().ushr_imm_u(n, 64);
         let hi = self.builder.ins().ireduce(types::I64, hi);
         let lo = self.builder.ins().ireduce(types::I64, n);
@@ -508,8 +449,7 @@ impl<'a> Lifter<'a> {
         self.builder.append_block_param(fast_exit, i128); // q = 0
         self.builder.append_block_param(fast_exit, i128); // r = n
 
-        // d is known non-zero at the call site, so n < d is already a complete
-        // result - and avoids entering the loop at all for small dividends.
+        // `d` is nonzero, so `n < d` is a complete result and skips the loop.
         self.builder.ins().brif(
             n_lt_d,
             fast_exit,
@@ -533,8 +473,7 @@ impl<'a> Lifter<'a> {
             &[remaining.into(), n_work.into(), q.into(), r.into()],
         );
 
-        // body: consume the current MSB, then shift the normalized dividend
-        // and quotient left for the next iteration.
+        // body: consume the MSB, shift dividend and quotient left.
         self.builder.switch_to_block(body);
         let remaining = self.builder.block_params(body)[0];
         let n_work = self.builder.block_params(body)[1];
@@ -564,7 +503,6 @@ impl<'a> Lifter<'a> {
             ],
         );
 
-        // exit(q, r): division complete.
         self.builder.switch_to_block(exit);
         let quot = self.builder.block_params(exit)[0];
         let rem = self.builder.block_params(exit)[1];
@@ -574,8 +512,6 @@ impl<'a> Lifter<'a> {
         let fast_quot = self.builder.block_params(fast_exit)[0];
         let fast_rem = self.builder.block_params(fast_exit)[1];
 
-        // Merge the normal loop exit and the n < d fast exit before returning
-        // to the caller's current block.
         let merge = self.builder.create_block();
         self.builder.append_block_param(merge, i128);
         self.builder.append_block_param(merge, i128);
@@ -590,7 +526,6 @@ impl<'a> Lifter<'a> {
         (merged_q, merged_r)
     }
 
-    // Sign-extension conversions (implicit operand form)
 
     /// CBW - AX = sign_extend(AL)
     pub(super) fn handle_cbw(&mut self, _instruction: &Instruction) -> crate::Result<()> {

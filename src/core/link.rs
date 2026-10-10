@@ -1,186 +1,100 @@
-//! Block linking: letting a translated region resolve its own successor.
+//! Block linking: a translated region resolves its own successor from a host table.
 //!
-//! The lifted code performs no validation beyond the address compare, so for
-//! every [`BlockLinkEntry`] it publishes the host must guarantee:
+//! Lifted code checks only that a row's `guest_pc` matches. The host must guarantee:
 //!
-//! - `code` is a compiled translation that can be entered at `guest_pc`
-//!   ([`LiftedCode::resume_points`] is the exact set), with the `image_base` that
-//!   translation wants (`pc = image_base + (ip - lift_base)`).
-//! - `code` stays mapped while the entry is reachable. Overwriting it is the only
-//!   way to retract it, and nothing here is atomic - one table per guest thread
-//!   is the intended behavior.
-//! - The table is `entries` rows long and at least 8-byte aligned; the probe's
-//!   loads are `notrap`/`aligned`, so a misaligned table is undefined.
+//! - `code` is a translation enterable at `guest_pc` with the row's `image_base`.
+//! - `code` stays mapped while the row is reachable; overwriting the row retracts it.
+//! - The table has `entries` rows and is at least 8-byte aligned (loads are `notrap`).
 //!
-//! An entry may be stale in the one way that does not matter: naming an older
-//! translation of the same, unchanged guest bytes. Two such translations are
-//! interchangeable, and that is what makes a collision a miss rather than an
-//! error - the direct-mapped table evicts silently and correctly, because losing
-//! a row costs a lookup and nothing else.
+//! A row naming an older translation of unchanged bytes is harmless, so a
+//! direct-mapped collision is a miss, not an error. A row outliving its bytes
+//! (self-modifying code, unmapping, eviction) is not: the host retracts it via
+//! [`LiftedCode::covered`] and [`LiftedCode::data_dependencies`].
+//! [`crate::runtime::CodeCache`] implements this protocol.
 //!
-//! It may not be stale in the way that matters. A row outlives the validity
-//! of the translation it names as soon as the guest bytes under `guest_pc`
-//! change, the range is unmapped, or the host frees the translation - and lifted
-//! code performs no check that would notice. The address compare proves the row
-//! is about this PC; it never proves the row is still *true*. Three cases a
-//! real host produces:
-//!
-//! - Self-modifying or generated guest code. The row names a translation of
-//!   bytes that no longer exist. ([`LifterConfig::region_tail_exit`] exists for
-//!   exactly this guest.)
-//! - Unmapping - `munmap`, `dlclose`, an image unload.
-//! - Eviction, which is not the guest's fault at all and is unavoidable in
-//!   any bounded cache.
-//!
-//! Retraction is the host's. What a translation depends on is [`LiftedCode::covered`] plus
-//! [`LiftedCode::data_dependencies`]; [`crate::runtime::CodeCache`] is an
-//! implementation of the protocol, and [`crate::runtime`] is where the rest of
-//! the host's obligations are written down.
-//!
-//! [`LinkDispatch`] decides what a region does with a match; everything above
-//! holds for both shapes.
-//!
-//! [`LifterConfig::region_tail_exit`]: crate::core::LifterConfig::region_tail_exit
 //! [`LiftedCode::covered`]: crate::core::LiftedCode::covered
 //! [`LiftedCode::data_dependencies`]: crate::core::LiftedCode::data_dependencies
-//!
-//! [`RegisterContext`]: crate::arch::x86_64::context::RegisterContext
-//! [`LifterConfig::block_link`]: crate::core::LifterConfig::block_link
-//! [`LiftedCode::resume_points`]: crate::core::LiftedCode::resume_points
 
 use crate::core::pin::PinnedAbi;
 
-/// One row of a host's block-link table: "guest `guest_pc` is compiled, it is
-/// at `code`, and it wants `image_base`".
+/// One row of the host's link table: `guest_pc` is compiled at `code` and wants `image_base`.
 ///
-/// `#[repr(C)]` and exactly 32 bytes because lifted code indexes it with a
-/// shift - the layout is ABI, not an implementation detail. The trailing word
-/// is padding and is never read.
+/// `#[repr(C)]`, exactly 32 bytes: lifted code indexes it with a shift.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BlockLinkEntry {
-    /// The guest address this row is about, as a **run-time** virtual address -
-    /// the same space `ctx.rip` is in. Zero for an empty row, which is safe
-    /// because a guest PC of zero is not code anyone links to.
+    /// Run-time guest address (same space as `ctx.rip`). Zero marks an empty row.
     pub guest_pc: u64,
-    /// Host address of the compiled entry point for `guest_pc`.
+    /// Host address of the compiled entry point.
     pub code: u64,
-    /// What the host must put in `ctx.image_base` before entering `code`.
+    /// Value the host must put in `ctx.image_base` before entering `code`.
     pub image_base: u64,
-    /// Padding to 32 bytes. Never read by lifted code.
+    /// Padding; never read.
     pub reserved: u64,
 }
 
 /// The size of one [`BlockLinkEntry`], as lifted code computes it.
 pub const ENTRY_SIZE: u64 = 32;
 
-/// Byte offset of [`BlockLinkEntry::code`] within a row, as lifted code loads
-/// it. Read only under [`LinkDispatch::Pinned`], where the region branches to
-/// the code itself instead of naming the row for the host.
+/// Byte offset of [`BlockLinkEntry::code`]; read only under [`LinkDispatch::Pinned`].
 pub const CODE_OFFSET: i32 = 8;
 
-/// Byte offset of [`BlockLinkEntry::image_base`] within a row. Read only under
-/// [`LinkDispatch::Pinned`], for the same reason: there is no host on that path
-/// to set it from the row.
+/// Byte offset of [`BlockLinkEntry::image_base`]; read only under [`LinkDispatch::Pinned`].
 pub const IMAGE_BASE_OFFSET: i32 = 16;
 
-/// What an exit whose destination is known at **lift time** links through.
+/// A dedicated cell for an exit whose destination is known at lift time.
 ///
-/// A [`BlockLinkEntry`] like any other, but one the host installs at an index
-/// the lifter chose rather than at [`BlockLinkConfig::slot`] of a PC. That is
-/// the whole difference, and everything follows from it:
-///
-/// - No hashing and no collisions. The probe's shift/mask/scale/add/compare
-///   becomes a load and a null test. Two hot targets sixteen bytes apart alias
-///   into one table row and turn a link into a permanent miss; two cells cannot.
-/// - `guest_pc` is never read by lifted code. It is the host's own record of
-///   what the cell is for, which is exactly what retraction needs.
-/// - `code == 0` means "not installed". Zero is not a code address for the
-///   same reason zero is not a guest PC, so a freshly zeroed array is a valid
-///   uninstalled state and clearing a cell is how a link is retracted.
+/// A [`BlockLinkEntry`] the host installs at a lifter-chosen index instead of
+/// [`BlockLinkConfig::slot`]. No hashing, no collisions; `code == 0` means not
+/// installed, so a zeroed array is valid and clearing a cell retracts the link.
+/// `guest_pc` is never read by lifted code.
 ///
 /// Reported as [`LiftedCode::link_sites`], in cell order.
 ///
 /// [`LiftedCode::link_sites`]: crate::core::LiftedCode::link_sites
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LinkSite {
-    /// The guest address this cell is about, as a **lift-time** VA.
-    ///
-    /// Lift-time, not run-time: it never enters the compiled code, so it stays
-    /// meaningful for an artifact that will be relocated. A host relocates it
-    /// the way the lifter's `runtime_addr` would before matching it against a
-    /// translation.
+    /// Lift-time VA; relocate it as `runtime_addr` would before matching.
     pub target: u64,
-    /// Why the lifter wanted a cell here.
+    /// Why the cell exists. Lifted code treats every kind identically.
     pub kind: LinkSiteKind,
 }
 
 /// What kind of transfer a [`LinkSite`] serves.
-///
-/// Only affects what a host may usefully do with it - lifted code treats every
-/// cell identically.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkSiteKind {
-    /// A branch, call or fallthrough leaving the region for a constant address.
-    /// FEX's `BranchOps.cpp` inline-constant case.
+    /// Branch, call or fallthrough leaving the region for a constant address.
     StaticEdge,
-    /// The address a call *returns* to - a resume point inside this very region.
-    /// Reserved for the call-return stack; not yet emitted.
+    /// A call's return address. Reserved for the call-return stack; not yet emitted.
     CallReturn,
 }
 
-/// The symbol name of a region's link-cell array.
-///
-/// One data object per compiled region, `link_sites.len()` rows long and
-/// zero-initialised, so an artifact loaded from disk starts uninstalled.
+/// Symbol name of a region's zero-initialised link-cell array.
 pub const CELL_SYMBOL: &str = "lifted_cells";
 
-/// The shape of the host's link table, as the lifter must know it.
+/// Geometry of the host's link table, baked into the emitted probe.
 ///
-/// Both fields are baked into the emitted probe, so changing either means
-/// discarding the translations lifted under the old value. Keeping the
-/// geometry here makes [`BlockLinkConfig::slot`] the single definition of
-/// where a PC lives, so the host fills the row lifted code reads by
-/// construction rather than by agreement.
+/// Changing either field invalidates translations lifted under the old value.
+/// [`slot`](Self::slot) is the single definition of where a PC lives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockLinkConfig {
-    /// How many rows the table has. Must be a power of two, so the index is a
-    /// mask rather than a division.
+    /// Row count; a power of two so the index is a mask.
     pub entries: u32,
-    /// How far to shift a guest PC right before masking.
-    ///
-    /// The low bits of a code address are its least distinguishing (functions are
-    /// aligned), so dropping them spreads a working set over the table. Four is
-    /// the usual answer.
+    /// Right shift applied to a PC before masking (low bits of code addresses carry little entropy).
     pub shift: u32,
-    /// What the probe does once it has found a row. See [`LinkDispatch`].
+    /// What the probe does once it finds a row.
     pub dispatch: LinkDispatch,
 }
 
-/// What a region does with the successor it resolved: hand it to the host, or
-/// branch to it.
-///
-/// The boundary between the two shapes of block linking. Both use the same
-/// table, layout and probe up to the address compare, and differ only in the
-/// three instructions after it.
+/// What a region does with a resolved successor. The probe is identical up to the address compare.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkDispatch {
-    /// Publish the matching row in [`BlockLinkOffsets::hit`] and return.
-    ///
-    /// The host reads the row and calls the code it names, so the register file
-    /// still goes out to the context and back on every region entry - what is
-    /// deleted is the host's decision. A region under this mode is an ordinary
-    /// `extern "C" fn(*mut RegisterContext)`.
+    /// Publish the row in [`BlockLinkOffsets::hit`] and return; the host calls its `code`.
     HostResume,
-    /// Tail-call the code the row names, carrying the pinned registers with it.
+    /// Tail-call the row's `code` with [`PinnedAbi`] registers held in machine registers.
     ///
-    /// The host does not see the link: the successor is entered by a
-    /// `return_call_indirect` with the guest state in [`PinnedAbi`] still in
-    /// machine registers, so the fill and spill are paid once per chain instead
-    /// of once per region. See [`crate::core::pin`].
-    ///
-    /// Inert, falling back to [`HostResume`](Self::HostResume), when the ABI is
-    /// empty or the guest frontend cannot type its slots.
+    /// Falls back to [`HostResume`](Self::HostResume) if the ABI is empty or the
+    /// guest cannot type its slots. See [`crate::core::pin`].
     Pinned(PinnedAbi),
 }
 
@@ -189,8 +103,7 @@ impl BlockLinkConfig {
     ///
     /// # Panics
     ///
-    /// If `entries` is not a power of two: the lifter emits a mask, which for a
-    /// non-power-of-two size would silently read outside the table.
+    /// If `entries` is not a power of two.
     pub fn new(entries: u32) -> Self {
         assert!(
             entries.is_power_of_two(),
@@ -203,21 +116,16 @@ impl BlockLinkConfig {
         }
     }
 
-    /// The same table, resolved by **branching** to the successor with `abi`
-    /// held in registers rather than by returning the row to the host.
+    /// The same table, resolved by branching to the successor with `abi` held in registers.
     ///
-    /// Every region reachable through the table must be lifted under this exact
-    /// config - the geometry and the ABI. See [`crate::core::pin`].
+    /// Every region reachable through the table must be lifted under this exact config.
     #[must_use]
     pub fn pinned(mut self, abi: PinnedAbi) -> Self {
         self.dispatch = LinkDispatch::Pinned(abi);
         self
     }
 
-    /// The pinned ABI this config asks for, if any.
-    ///
-    /// Says nothing about whether the *guest* can supply it - that is
-    /// [`crate::core::pinned_abi_for`], the question the engine actually asks.
+    /// The pinned ABI requested, if any. The guest may still be unable to supply it.
     pub fn pinned_abi(&self) -> Option<PinnedAbi> {
         match self.dispatch {
             LinkDispatch::HostResume => None,
@@ -225,13 +133,11 @@ impl BlockLinkConfig {
         }
     }
 
-    /// The row `pc` belongs to. **The** definition, shared by the lifter's
-    /// emitted arithmetic and by the host filling the table.
+    /// The row `pc` belongs to; shared by emitted code and the host.
     pub fn slot(&self, pc: u64) -> usize {
         ((pc >> self.shift) as usize) & (self.entries as usize - 1)
     }
 
-    /// The mask lifted code applies after the shift.
     pub(crate) fn mask(&self) -> i64 {
         self.entries as i64 - 1
     }
@@ -239,24 +145,16 @@ impl BlockLinkConfig {
 
 /// Where a guest's `RegisterContext` keeps the two fields block linking needs.
 ///
-/// Returned by [`GuestArch::block_link_offsets`](crate::core::GuestArch::block_link_offsets);
-/// a guest that has not made room for them returns `None` and never links.
+/// A guest without room for them returns `None` from
+/// [`GuestArch::block_link_offsets`](crate::core::GuestArch::block_link_offsets) and never links.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockLinkOffsets {
-    /// Byte offset of the pointer to the host's [`BlockLinkEntry`] table. Read
-    /// on every linkable exit; a null pointer disables linking for that entry,
-    /// so a host that has not set it up is not a special case.
+    /// Byte offset of the pointer to the host's [`BlockLinkEntry`] table; null disables linking.
     pub table: i32,
-    /// Byte offset of the word the probe writes the matching entry's **address**
-    /// into. Zero means "no link; service this exit yourself".
+    /// Byte offset of the word the probe writes the matching entry's address into.
     ///
-    /// The address of a [`BlockLinkEntry`], which today is always a row of
-    /// [`table`](Self::table). A host should dereference it rather than assume
-    /// it lies inside its own table.
-    ///
-    /// The host clears it before entering rather than the probe clearing it on a
-    /// miss: that puts the store on the once-per-entry path, and lets an exit with
-    /// no probe at all report "no link" without knowing linking exists.
+    /// Zero means no link. The host clears it before entering; dereference it
+    /// rather than assuming it lies inside [`table`](Self::table).
     pub hit: i32,
 }
 
@@ -282,7 +180,6 @@ mod tests {
     fn slots_are_the_masked_shift_the_lifter_emits() {
         let config = BlockLinkConfig::new(8192);
         assert_eq!(config.mask(), 8191);
-        // The arithmetic the probe performs, written out independently.
         for pc in [0u64, 0x1000, 0x1004, 0x1_0000_0000, 0xdead_beef] {
             assert_eq!(config.slot(pc), ((pc >> 4) & 8191) as usize);
             assert!(config.slot(pc) < 8192);
@@ -292,8 +189,6 @@ mod tests {
     #[test]
     fn the_shift_is_what_spreads_aligned_functions_out() {
         let config = BlockLinkConfig::new(16);
-        // Sixteen bytes apart is one slot apart; within sixteen bytes is a
-        // collision, which is a miss and not an error.
         assert_ne!(config.slot(0x400), config.slot(0x410));
         assert_eq!(config.slot(0x400), config.slot(0x40f));
     }

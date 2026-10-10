@@ -1,16 +1,11 @@
-//! The interpreter fallback: an instruction the lifter does not implement is
-//! handed to the host's callback *inline*, and the region carries on with the
-//! next instruction rather than exiting and being re-entered.
+//! An instruction the lifter does not implement goes to the host's callback inline and the region carries on.
 
 use microlift::arch::x86_64::context::X86_64Callbacks;
 use microlift::testkit::DEFAULT_LIFT_BASE;
 use microlift::testkit::prelude::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// `WBINVD` (`0F 09`) stands in for "an instruction the lifter will never
-/// implement": it is ring-0 only, so it cannot appear in the usermode guest code
-/// microlift targets, and it will keep falling through to the
-/// interpreter-fallback path.
+/// `WBINVD` (`0F 09`) is ring-0 only, so it stands in for a never-implemented instruction.
 const WBINVD: [u8; 2] = [0x0F, 0x09];
 
 /// Offset of the `WBINVD`: 7 bytes of `mov rax, 42`.
@@ -20,8 +15,7 @@ static CALLS: AtomicU64 = AtomicU64::new(0);
 static SEEN_RIP: AtomicU64 = AtomicU64::new(0);
 static SEEN_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// Interprets the `WBINVD` - a cache flush is a no-op here - and advances the
-/// PC past it, which is all the region needs to resume inline.
+/// Treats the `WBINVD` as a no-op and advances the PC past it.
 unsafe extern "C" fn interpret(ctx: *mut RegisterContext, num_instructions: u64) {
     let ctx = unsafe { &mut *ctx };
     CALLS.fetch_add(1, Ordering::SeqCst);

@@ -1,28 +1,6 @@
-//! Specialized-vs-portable equivalence for the target-directed fast paths.
-//!
-//! The portable expansion is the authority on semantics; the sequences in
-//! `semantics/sse_spec.rs` are a lowering choice that must not change a single
-//! result bit. Every instruction with a specialization is run here under each
-//! [`SpecTarget`] and under none, from identical seeded pseudo-random state,
-//! and the full architectural context is compared.
-//!
-//! This is the regression net for the whole feature. Unlike the jump-table
-//! recovery - which is safe by construction, because a wrong guess only ever
-//! lifts unreachable code - a wrong specialization silently computes the wrong
-//! answer. Adding one without listing its encoding here leaves it unproven.
-//!
-//! Three properties are checked, and they are not the same property:
-//!
-//! 1. **Results agree** with the unspecialized vector path, and with the scalar
-//!    `(lo, hi)` path underneath it (`agrees_with_portable`), including on the
-//!    saturation and NaN edges hardware and x86 disagree about.
-//! 2. **The compiled code shrinks**, per instruction and per target, exactly
-//!    where the support table says it should and nowhere else
-//!    (`specializations_shrink_the_compiled_code`). Without this a
-//!    silently-inert `try_*` would pass (1) perfectly.
-//! 3. **Each target's IR lowers** for the machine it names, cross-compiled
-//!    (`each_target_lowers_its_own_ir`). This is where an opcode with no rule on
-//!    one backend would be caught.
+//! Specialized-vs-portable equivalence: a specialization may not change a single result bit.
+//! Checks (1) results agree with the vector and scalar paths, (2) code shrinks exactly where the support table says (`specializations_shrink_the_compiled_code`), (3) each target's IR lowers (`each_target_lowers_its_own_ir`).
+//! Adding a specialization without listing its encoding here leaves it unproven.
 
 use cranelift::codegen::isa::CallConv;
 use microlift::arch::x86_64::X86_64;
@@ -31,42 +9,25 @@ use microlift::core::{LifterConfig, lift_to_code};
 use microlift::testkit::prelude::*;
 use microlift::testkit::rng::Rng;
 
-/// A guest instruction with a specialization: its encoding, the [`Spec`] that
-/// covers it, and the targets on which that specialization is expected to
-/// shrink the compiled code.
+/// A guest instruction, its [`Spec`], and the targets where it must shrink.
 struct Case {
     name: String,
     bytes: Vec<u8>,
     spec: Spec,
-    /// Targets where this instruction must get *smaller*. On any other target
-    /// it must be byte-identical to the portable lowering - a specialization
-    /// that fires and does not pay is a bug, not a wash.
+    /// Targets where this must get smaller; elsewhere it must be byte-identical to portable.
     improves: &'static [SpecTarget],
-    /// Whether this case must be lifted with
-    /// [`LifterConfig::eliminate_dead_flags`] on.
-    ///
-    /// Only [`Spec::IntegerOverflowFlags`] needs it, and needs it absolutely:
-    /// that specialization declines outright without flag liveness to consult,
-    /// so every check here would be measuring an inert feature. See its
-    /// module note for why it is wired that way.
+    /// Lift with [`LifterConfig::eliminate_dead_flags`] on; [`Spec::IntegerOverflowFlags`] declines without flag liveness.
     lean: bool,
 }
 
 /// Both families.
 const BOTH: &[SpecTarget] = &[SpecTarget::X86_64, SpecTarget::Aarch64];
-/// aarch64 only - the portable path is already good on x86-64, or the
-/// replacement is a measured regression there. See [`Spec::supported_on`] and
-/// `Lifter::try_horizontal_int_spec` for which is which.
+/// aarch64 only: portable is already good on x86-64 or the replacement regresses. See [`Spec::supported_on`].
 const ARM: &[SpecTarget] = &[SpecTarget::Aarch64];
-/// x86-64 only - so far, exactly the sub-word scalar widths, which aarch64 has
-/// no flag-setting arithmetic for. See `Lifter::native_overflow_width_ok`.
+/// x86-64 only: sub-word scalar widths. See `Lifter::native_overflow_width_ok`.
 const X64: &[SpecTarget] = &[SpecTarget::X86_64];
 
-/// Every specialization, paired with a guest encoding that reaches it.
-///
-/// The `imm`-carrying entries are swept over their immediates where the
-/// immediate selects a distinct lift-time path (`ROUNDPS`/`ROUNDPD`, whose imm8
-/// picks the rounding mode).
+/// Every specialization with an encoding that reaches it; `imm`-carrying entries are swept over their lift-time-distinct immediates.
 fn cases() -> Vec<Case> {
     let mut out: Vec<Case> = Vec::new();
 
@@ -82,8 +43,7 @@ fn cases() -> Vec<Case> {
         });
     };
 
-    // ROUNDPS / ROUNDPD - imm8[2:0] selects the mode; bit 2 means "use MXCSR",
-    // which resolves to nearest. Sweep all eight so every mode is covered.
+    // ROUNDPS/ROUNDPD imm8[2:0] selects the mode (bit 2 = MXCSR -> nearest); sweep all eight.
     for imm in 0..8u8 {
         let m = Spec::PackedFpRound;
         push(
@@ -100,18 +60,14 @@ fn cases() -> Vec<Case> {
         );
     }
 
-    // Horizontal floating-point. The even/odd gather is `shufps`-shaped at
-    // dword and qword width, which baseline x86-64 has, so all four pay off on
-    // both families.
+    // Horizontal float: dword/qword gathers are `shufps`-shaped, so all four pay on both families.
     let h = Spec::PackedFpHorizontal;
     push("haddps", &[0xF2, 0x0F, 0x7C, 0xC1], h, BOTH);
     push("hsubps", &[0xF2, 0x0F, 0x7D, 0xC1], h, BOTH);
     push("haddpd", &[0x66, 0x0F, 0x7C, 0xC1], h, BOTH);
     push("hsubpd", &[0x66, 0x0F, 0x7D, 0xC1], h, BOTH);
 
-    // Horizontal integer. The plain adds are `iadd_pairwise` and pay off
-    // everywhere; the rest gather, so the word-width ones are aarch64-only -
-    // a 16-bit permute needs SSSE3's `pshufb`, which baseline x86-64 lacks.
+    // Horizontal int: plain adds are `iadd_pairwise` (pay everywhere); word gathers need `pshufb`, so aarch64-only.
     let p = Spec::PackedIntHorizontal;
     push("phaddw", &[0x66, 0x0F, 0x38, 0x01, 0xC1], p, BOTH);
     push("phaddd", &[0x66, 0x0F, 0x38, 0x02, 0xC1], p, BOTH);
@@ -139,8 +95,7 @@ fn cases() -> Vec<Case> {
         Spec::SumOfAbsoluteDifferences,
         BOTH,
     );
-    // The portable `I64X2` imul is fine on a machine that has `pmuludq`, so
-    // these two are aarch64-only in the support table.
+    // Portable `I64X2` imul is fine with `pmuludq`: aarch64-only.
     push(
         "pmuludq",
         &[0x66, 0x0F, 0xF4, 0xC1],
@@ -160,11 +115,7 @@ fn cases() -> Vec<Case> {
         ARM,
     );
 
-    // `<insn> ; seto dl ; setb bl`, REPEATS times. The two `setcc`s are what
-    // make the measurement mean anything: they give CF and OF a reader, so the
-    // liveness pass reports them live and the specialization is reached at all.
-    // Without them every copy but the last has both flags dead and the honest
-    // answer is a plain `iadd`.
+    // `<insn> ; seto dl ; setb bl` x REPEATS: the setccs give CF/OF a reader so the specialization is reached.
     let mut push_n = |name: &str, bytes: &[u8], spec: Spec, improves: &'static [SpecTarget]| {
         let mut unit = bytes.to_vec();
         unit.extend_from_slice(&[0x0F, 0x90, 0xC2]); // seto dl
@@ -180,19 +131,8 @@ fn cases() -> Vec<Case> {
         });
     };
 
-    // Scalar integer CF/OF. Register forms only - the locked ones need a live
-    // pointer and live in `overflow_flags_tests.rs` - and every destination is
-    // RAX so `assert_same` sees the result as well as the flags.
-    //
-    // Each is repeated [`REPEATS`] times, for the reason documented there: this
-    // is the one specialization whose per-instruction effect is smaller than
-    // the size of one region's fixed overhead.
-    //
-    // Widths are swept on ADD alone: the width reaches the specialization only
-    // as the operand type, and every other form here is 64-bit. The two narrow
-    // ones are x86-64-only - aarch64's `ADDS`/`SUBS` start at 32 bits, so
-    // Cranelift synthesizes the sub-word overflow ops there and the result is a
-    // measured regression. See `Lifter::native_overflow_width_ok`.
+    // Scalar integer CF/OF, register forms only (locked forms live in `overflow_flags_tests.rs`), destination RAX so `assert_same` sees result and flags.
+    // Repeated [`REPEATS`] times. Widths swept on ADD alone; narrow ones are x86-64-only (see `Lifter::native_overflow_width_ok`).
     let o = Spec::IntegerOverflowFlags;
     push_n("add-r64", &[0x48, 0x01, 0xC8], o, BOTH);
     push_n("add-r32", &[0x01, 0xC8], o, BOTH);
@@ -206,27 +146,17 @@ fn cases() -> Vec<Case> {
     push_n("dec-r64", &[0x48, 0xFF, 0xC8], o, BOTH);
     push_n("neg-r64", &[0x48, 0xF7, 0xD8], o, BOTH);
     push_n("xadd-r64", &[0x48, 0x0F, 0xC1, 0xC8], o, BOTH);
-    // `smul_overflow` is x64's *one-operand* `imul`, which pins RAX and RDX;
-    // the moves that costs are worse than the second multiply it saves, so the
-    // multiply forms are aarch64-only. See `try_native_imul_flags`.
+    // `smul_overflow` is x64's one-operand `imul` (pins RAX/RDX), a net loss: aarch64-only. See `try_native_imul_flags`.
     push_n("imul-r64", &[0x48, 0x0F, 0xAF, 0xC1], o, ARM);
     push_n("imul-imm32", &[0x69, 0xC1, 0x34, 0x12, 0x00, 0x00], o, ARM);
 
     out
 }
 
-/// Copies of the guest instruction in the scalar-integer snippets.
-///
-/// Every other specialization here replaces a dozen-instruction expansion with
-/// one or two, so a single copy stands well clear of the measurement noise
-/// [`code_len`] describes. [`Spec::IntegerOverflowFlags`] replaces about six
-/// host instructions with about three - single digits of `.text` against a
-/// region whose fixed prologue and context sync are some 1500 bytes - and at
-/// that scale the noise floor is not a floor but the whole signal. Repeating
-/// the instruction scales the effect and leaves the overhead where it was.
+/// Copies of the instruction per snippet: this spec saves only ~3 host instructions against ~1500 bytes of fixed overhead, so repeating scales the effect.
 const REPEATS: usize = 32;
 
-/// Seeded XMM/GPR state, identical across every configuration under test.
+/// Seeded XMM/GPR state, identical across configurations.
 fn seeded_state(seed: u64) -> RegisterContext {
     let mut rng = Rng::new(seed);
     let mut init = RegisterContext::default();
@@ -240,7 +170,7 @@ fn seeded_state(seed: u64) -> RegisterContext {
     init
 }
 
-/// Run `bytes` from `init` under a given specialization, vector-backed XMM.
+/// Run `bytes` from `init` under a specialization, vector-backed XMM.
 fn run_spec(
     bytes: &[u8],
     init: RegisterContext,
@@ -272,12 +202,7 @@ fn assert_same(name: &str, seed: u64, what: &str, a: &RegisterContext, b: &Regis
     );
 }
 
-/// Every specialization computes exactly what the portable paths compute.
-///
-/// Both portable paths are compared against, not just one: the unspecialized
-/// vector path (the direct sibling) *and* the scalar `(lo, hi)` expansion,
-/// which is the ultimate authority and the only one some of these instructions
-/// had before this feature existed.
+/// Every specialization equals both the unspecialized vector path and the scalar `(lo, hi)` expansion (the authority).
 #[test]
 fn agrees_with_portable() {
     let targets = [SpecTarget::X86_64, SpecTarget::Aarch64];
@@ -308,64 +233,54 @@ fn agrees_with_portable() {
     }
 }
 
-/// The edge cases the specializations were specifically reasoned about, where
-/// hardware and x86 nearly-but-not-quite agree.
-///
-/// Random state finds these only by luck - `-32768 * -32768` is one pair out of
-/// 2^32 - so they are seeded by hand. Each is a case where a plausible-looking
-/// specialization is wrong.
+/// Hand-seeded edges where plausible specializations are wrong (`-32768 * -32768` is one pair in 2^32).
 #[test]
 fn agrees_on_the_saturation_edges() {
     // (name, encoding, xmm0, xmm1)
     let edges: &[(&str, &[u8], [u64; 2], [u64; 2])] = &[
-        // PMULHRSW: aarch64's SQRDMULH saturates to 0x7FFF where x86 wraps to
-        // 0x8000. Every word is the minimum, so every lane hits it.
+        // PMULHRSW: aarch64 SQRDMULH saturates to 0x7FFF where x86 wraps to 0x8000.
         (
             "pmulhrsw-min",
             &[0x66, 0x0F, 0x38, 0x0B, 0xC1, 0xC3],
             [0x8000_8000_8000_8000, 0x8000_8000_8000_8000],
             [0x8000_8000_8000_8000, 0x8000_8000_8000_8000],
         ),
-        // PMADDWD: -32768*-32768 twice overflows a dword and must *wrap*, not
-        // saturate.
+        // PMADDWD: -32768*-32768 twice overflows a dword and must wrap.
         (
             "pmaddwd-overflow",
             &[0x66, 0x0F, 0xF5, 0xC1, 0xC3],
             [0x8000_8000_8000_8000, 0x8000_8000_8000_8000],
             [0x8000_8000_8000_8000, 0x8000_8000_8000_8000],
         ),
-        // PMADDUBSW: 255*-128 + 255*-128 = -65280, below i16::MIN, so the
-        // saturating narrow has to clamp.
+        // PMADDUBSW: 255*-128 twice = -65280, below i16::MIN: must clamp.
         (
             "pmaddubsw-saturate-low",
             &[0x66, 0x0F, 0x38, 0x04, 0xC1, 0xC3],
             [0xFFFF_FFFF_FFFF_FFFF, 0xFFFF_FFFF_FFFF_FFFF],
             [0x8080_8080_8080_8080, 0x8080_8080_8080_8080],
         ),
-        // PMADDUBSW: 255*127 + 255*127 = 64770, above i16::MAX.
+        // PMADDUBSW: 255*127 twice = 64770, above i16::MAX.
         (
             "pmaddubsw-saturate-high",
             &[0x66, 0x0F, 0x38, 0x04, 0xC1, 0xC3],
             [0xFFFF_FFFF_FFFF_FFFF, 0xFFFF_FFFF_FFFF_FFFF],
             [0x7F7F_7F7F_7F7F_7F7F, 0x7F7F_7F7F_7F7F_7F7F],
         ),
-        // PSADBW: the maximum possible sum, 8 * 255 per half.
+        // PSADBW: maximum sum, 8 * 255 per half.
         (
             "psadbw-max",
             &[0x66, 0x0F, 0xF6, 0xC1, 0xC3],
             [0xFFFF_FFFF_FFFF_FFFF, 0xFFFF_FFFF_FFFF_FFFF],
             [0, 0],
         ),
-        // PSADBW the other way round: the absolute difference must be
-        // symmetric, which is the whole point of the two saturating subtracts.
+        // PSADBW reversed: absolute difference must be symmetric.
         (
             "psadbw-max-reversed",
             &[0x66, 0x0F, 0xF6, 0xC1, 0xC3],
             [0, 0],
             [0xFFFF_FFFF_FFFF_FFFF, 0xFFFF_FFFF_FFFF_FFFF],
         ),
-        // PHADDSW / PHSUBSW: adjacent extremes, so the pairwise result leaves
-        // the i16 range in both directions.
+        // PHADDSW/PHSUBSW: adjacent extremes leave the i16 range both ways.
         (
             "phaddsw-saturate",
             &[0x66, 0x0F, 0x38, 0x03, 0xC1, 0xC3],
@@ -378,16 +293,14 @@ fn agrees_on_the_saturation_edges() {
             [0x8000_7FFF_7FFF_8000, 0x7FFF_8000_8000_7FFF],
             [0x8000_7FFF_0000_FFFF, 0x7FFF_8000_0001_0000],
         ),
-        // PMULDQ: the most negative dword squared, which needs the full 64 bits
-        // and the sign extension to be right.
+        // PMULDQ: most negative dword squared needs full 64 bits.
         (
             "pmuldq-min",
             &[0x66, 0x0F, 0x38, 0x28, 0xC1, 0xC3],
             [0x0000_0000_8000_0000, 0x0000_0000_8000_0000],
             [0x0000_0000_8000_0000, 0x0000_0000_8000_0000],
         ),
-        // PMULUDQ: the maximum unsigned dword squared. The *odd* dwords are all
-        // ones too, and must be ignored.
+        // PMULUDQ: max dword squared; the odd dwords are ones and must be ignored.
         (
             "pmuludq-max",
             &[0x66, 0x0F, 0xF4, 0xC1, 0xC3],
@@ -409,40 +322,26 @@ fn agrees_on_the_saturation_edges() {
     }
 }
 
-/// NaN and infinity handling in the horizontal float forms.
-///
-/// `HADDPS`/`HSUBPS` feed the ordinary packed arithmetic, which owes x86's
-/// sign-set floating indefinite for an invalid operation rather than the host's
-/// default NaN. `inf + -inf` and `inf - inf` are the cases that produce one.
+/// `HADDPS`/`HSUBPS` owe x86's sign-set indefinite for `inf + -inf`, not the host's default NaN.
 #[test]
 fn agrees_on_float_horizontal_nans() {
     const INF: u32 = 0x7F80_0000;
     const NINF: u32 = 0xFF80_0000;
     const QNAN: u32 = 0x7FC0_0000;
-    // Distinct payloads, so a lane that propagates the wrong operand's NaN is
-    // visible rather than coincidentally right.
+    // Distinct payloads expose a wrong-operand NaN.
     const QNAN_A: u32 = 0x7FC0_0003;
     const QNAN_B: u32 = 0xFFC0_0005;
 
-    // No signaling NaNs here. Quieting one is a property of the shared packed
-    // arithmetic, not of the horizontal gather this test is about - and under
-    // `--features unicorn-oracle` every `LiftTest::run` is cross-checked against
-    // Unicorn, which disagrees with x86 (and with microlift) about SNaN payload
-    // propagation: `HADDPS` of `0x7F800001` and a quiet NaN gives the quieted
-    // source, `0x7FC00001`, on hardware and in microlift, and `0x7FC00000` in
-    // Unicorn. That is a real divergence and worth chasing, but it belongs to
-    // neither the portable nor the specialized path here, both of which agree.
+    // No SNaNs: quieting belongs to shared packed arithmetic, and Unicorn disagrees with hardware on SNaN payloads here (`0x7FC00000` vs `0x7FC00001`).
     let pack = |a: u32, b: u32| u64::from(a) | (u64::from(b) << 32);
 
     let states: &[([u64; 2], [u64; 2])] = &[
-        // inf + -inf in the low pair, inf - inf in the next: the invalid
-        // operations, which owe x86's sign-set indefinite rather than the
-        // host's default NaN.
+        // inf + -inf, inf - inf: invalid, owe the sign-set indefinite.
         (
             [pack(INF, NINF), pack(INF, INF)],
             [pack(NINF, INF), pack(QNAN_A, QNAN)],
         ),
-        // NaN operands, which must propagate rather than become indefinite.
+        // NaN operands propagate rather than become indefinite.
         (
             [pack(QNAN_A, 0x3F80_0000), pack(QNAN, INF)],
             [pack(QNAN_B, QNAN_A), pack(NINF, QNAN_B)],
@@ -469,8 +368,7 @@ fn agrees_on_float_horizontal_nans() {
     }
 }
 
-/// Count the IR instructions a lift emits, which is the closest lift-time proxy
-/// for what the specialization buys.
+/// IR instruction count: a lift-time proxy for what the specialization buys.
 fn ir_len(bytes: &[u8], spec: Specialization, lean: bool) -> usize {
     let config = LifterConfig {
         use_vector_xmm: true,
@@ -486,7 +384,7 @@ fn ir_len(bytes: &[u8], spec: Specialization, lean: bool) -> usize {
         .sum()
 }
 
-/// One compile of `bytes` under `spec` for `triple`, returning `.text` size.
+/// One compile of `bytes` under `spec` for `triple`; returns `.text` size.
 fn compile_once(bytes: &[u8], spec: Specialization, triple: &str, lean: bool) -> usize {
     let config = LifterConfig {
         use_vector_xmm: true,
@@ -495,38 +393,16 @@ fn compile_once(bytes: &[u8], spec: Specialization, triple: &str, lean: bool) ->
         ..Default::default()
     };
     let mut code = lift_to_code::<X86_64>(bytes, 0x1000, config).expect("lift");
-    // The lifter bakes in the *host* calling convention; override it so this
-    // measures instruction lowering rather than tripping the target's ABI code
-    // on a convention it does not accept.
+    // Override the host calling convention to measure lowering, not ABI.
     code.func.signature.call_conv = CallConv::SystemV;
     ArtifactBackend::compile_lifted_to_raw(code, Some(triple), None)
         .expect("compile")
         .len()
 }
 
-/// Compiled `.text` size for `bytes` under `spec`, cross-compiled for `triple`.
-///
-/// Machine code size, not IR instruction count, is the metric these
-/// specializations are actually about - and the difference is not academic.
-/// `PMULUDQ`'s portable path is a single `imul` on `I64X2`, which is *one* IR
-/// instruction and a seven-instruction `rev64`/`mul`/`xtn`/`addp`/`shll`/`umlal`
-/// sequence on aarch64; the specialization replaces it with five IR
-/// instructions that lower to three. Counting IR would score that a regression.
-///
-/// ## Why the minimum of several compiles
-///
-/// Two lifts of the same bytes with the same config do not produce identical
-/// code. The lifter's context sync walks a `HashMap` of registers, and each
-/// `HashMap` instance gets its own hash seed, so the closing run of stores is
-/// emitted in a different order each time - same instructions, different
-/// x86 displacement encodings, and up to **26 bytes** of difference in `.text`.
-/// (aarch64 is exactly stable: fixed-width encodings make store order free.)
-///
-/// That noise is the same size as the smallest genuine effect measured here, so
-/// a single sample cannot tell them apart. Taking the minimum of several
-/// compiles pulls each measurement most of the way to the floor for its IR
-/// shape; the residue is absorbed by [`noise_floor`], which is what the
-/// comparisons are made modulo.
+/// Compiled `.text` size under `spec`, cross-compiled for `triple`.
+/// Machine code, not IR count, is the metric (PMULUDQ: 1 IR op vs 7 aarch64 instructions portable; 5 IR ops -> 3 specialized).
+/// Lifts are not byte-identical: HashMap-ordered context stores vary x86 `.text` by up to 26 bytes, so take the minimum of several compiles modulo [`noise_floor`].
 fn code_len(bytes: &[u8], spec: Specialization, triple: &str, lean: bool) -> usize {
     (0..SAMPLES)
         .map(|_| compile_once(bytes, spec, triple, lean))
@@ -537,15 +413,7 @@ fn code_len(bytes: &[u8], spec: Specialization, triple: &str, lean: bool) -> usi
 /// Compiles per measurement.
 const SAMPLES: usize = 8;
 
-/// How many bytes of difference to treat as measurement noise on `target`.
-///
-/// Measured, not guessed: twelve compiles of one unchanged configuration span
-/// up to 26 bytes on x86-64 and **exactly zero** on aarch64. Fixed-width
-/// aarch64 encodings make the store reordering described on [`code_len`] free,
-/// while x86 displacement encodings shrink and grow with it. Taking the minimum
-/// of [`SAMPLES`] compiles removes most of that; 16 covers the rest with room
-/// to spare, and is still well under the smallest real effect in the table
-/// (35 bytes on x86-64).
+/// Bytes of difference treated as noise on `target`: 0 on aarch64 (fixed-width), up to 26 on x86-64 before taking the minimum; 16 covers the rest and is below the smallest real effect (35).
 fn noise_floor(target: SpecTarget) -> i64 {
     match target {
         SpecTarget::Aarch64 => 0,
@@ -553,26 +421,9 @@ fn noise_floor(target: SpecTarget) -> i64 {
     }
 }
 
-/// Each specialization actually fires on every target that claims it and
-/// shrinks the compiled code - and does nothing at all on a target that does
-/// not claim it.
-///
-/// Without the first half, a `try_*` that returned `false` unconditionally - a
-/// mistyped gate, a `Spec` left off a target - would pass every equivalence
-/// check above while doing nothing at all. Without the second, a
-/// [`Spec::supported_on`] entry could quietly claim a target it has no
-/// implementation for.
-///
-/// This is what decided the support table: the claim "specialization X helps
-/// target Y" is measured here, per pair, rather than assumed. `PMULUDQ` on
-/// x86-64 is the pair that failed - the portable `I64X2` `imul` is perfectly
-/// reasonable on a machine that has `pmuludq`, and the shuffle-based
-/// replacement is a net loss - which is why it is aarch64-only.
-///
-/// The compile is against each target's **baseline** feature set, no
-/// `isa_settings`. That is the weakest configuration an AOT caller can hand the
-/// backend, so a specialization that only pays off with optional ISA features
-/// enabled does not count.
+/// Each specialization fires and shrinks code on every target claiming it, and does nothing elsewhere.
+/// This decides the support table per pair (PMULUDQ on x86-64 failed: portable `imul` is fine there).
+/// Compiles against each target's baseline feature set, no `isa_settings`.
 #[test]
 fn specializations_shrink_the_compiled_code() {
     let targets = [
@@ -589,8 +440,7 @@ fn specializations_shrink_the_compiled_code() {
             lean,
         } = case;
         for (target, triple) in targets {
-            // Only the one specialization under test, so a measurement cannot
-            // be explained by a different one firing.
+            // Only the spec under test.
             let only = Specialization::for_target(target).only(&[spec]);
 
             if improves.contains(&target) {
@@ -605,18 +455,7 @@ fn specializations_shrink_the_compiled_code() {
                     spec.name()
                 );
             } else {
-                // The other direction is checked in IR rather than in `.text`.
-                // "Did not fire" is a statement about what the lifter emitted,
-                // and the lifter is deterministic there, so this is exact -
-                // where a `.text` comparison has to be made modulo
-                // [`noise_floor`], and that floor was calibrated on
-                // single-instruction regions. It does not cover the repeated
-                // snippets [`REPEATS`] produces, whose noise is proportionally
-                // larger and did in fact exceed it.
-                //
-                // The improving direction cannot be checked this way: IR count
-                // is not a proxy for lowering quality - see [`code_len`] on
-                // `PMULUDQ`, five IR instructions replacing one.
+                // "Did not fire" is checked in IR (exact, the lifter is deterministic); `.text` noise exceeds the floor on repeated snippets. IR count cannot check the improving direction (see [`code_len`]).
                 assert_eq!(
                     ir_len(&bytes, only, lean),
                     ir_len(&bytes, Specialization::generic(), lean),
@@ -630,10 +469,7 @@ fn specializations_shrink_the_compiled_code() {
     }
 }
 
-/// Disabling a specialization restores the portable IR exactly.
-///
-/// This is what makes `without()` a usable bisection tool: it has to be a true
-/// off switch, not a different third path.
+/// Disabling a specialization restores the portable IR exactly: `without()` is a true off switch.
 #[test]
 fn disabling_restores_the_portable_ir() {
     for case in cases() {
@@ -641,8 +477,7 @@ fn disabling_restores_the_portable_ir() {
         let base = ir_len(&bytes, Specialization::generic(), lean);
         for target in [SpecTarget::X86_64, SpecTarget::Aarch64] {
             let off = Specialization::for_target(target).without(spec);
-            // Other specializations do not apply - each snippet is one guest
-            // instruction - so the whole set minus this one must be inert.
+            // Each snippet is one guest instruction, so the rest of the set is inert.
             assert_eq!(
                 ir_len(&bytes, off, lean),
                 base,
@@ -654,12 +489,7 @@ fn disabling_restores_the_portable_ir() {
     }
 }
 
-/// Each target's specialized IR lowers for that target.
-///
-/// The one that matters: `x86_pmulhrsw` and `x86_pmaddubsw` have no aarch64
-/// rule, and `sqmul_round_sat` is only reachable through the aarch64 path. A
-/// specialization wired to the wrong family compiles fine and then fails to
-/// lower, which nothing above would notice.
+/// Each target's specialized IR lowers for it: `x86_pmulhrsw`/`x86_pmaddubsw` have no aarch64 rule and `sqmul_round_sat` is aarch64-only.
 #[test]
 fn each_target_lowers_its_own_ir() {
     let pairs = [
@@ -677,9 +507,7 @@ fn each_target_lowers_its_own_ir() {
                 ..Default::default()
             };
             let mut code = lift_to_code::<X86_64>(&bytes, 0x1000, config).expect("lift");
-            // The lifter bakes in the *host* calling convention; override it so
-            // this exercises instruction lowering rather than tripping the
-            // target's ABI code on a convention it does not accept.
+            // Override the host calling convention to exercise lowering, not ABI.
             code.func.signature.call_conv = CallConv::SystemV;
             ArtifactBackend::compile_lifted_to_raw(code, Some(triple), None)
                 .unwrap_or_else(|e| panic!("{name} failed to lower for {triple}: {e:?}"));
@@ -687,22 +515,13 @@ fn each_target_lowers_its_own_ir() {
     }
 }
 
-/// A vector specialization is inert without vector-backed XMM registers.
-///
-/// Those sequences are whole-register vector ones, so there is nothing to build
-/// them out of in scalar mode; asking anyway must be a no-op rather than an
-/// error or a partial application. [`Spec::IntegerOverflowFlags`] declares
-/// itself exempt - it rewrites scalar integer arithmetic and has no opinion
-/// about how XMM registers are stored - so it is checked for the opposite.
+/// Vector specs are inert without vector-backed XMM; [`Spec::IntegerOverflowFlags`] is exempt (scalar integer) and checked for the opposite.
 #[test]
 fn inert_without_vector_xmm() {
     for case in cases() {
         let (name, bytes, needs_vec) = (case.name, case.bytes, case.spec.requires_vector_xmm());
         let lean = case.lean;
-        // A target the case is actually claimed on, not a fixed one: a spec can
-        // decline for a target-specific reason that has nothing to do with
-        // vector XMM (`IntegerOverflowFlags` at sub-word widths on aarch64),
-        // and that would read here as the exemption being wrong.
+        // The target the case is claimed on: a spec can decline for target-specific reasons (sub-word widths on aarch64).
         let target = case.improves[0];
         let config = |spec| LifterConfig {
             use_vector_xmm: false,
@@ -740,8 +559,7 @@ fn inert_without_vector_xmm() {
     }
 }
 
-/// Not a test: prints the measurement table `specializations_shrink_the_compiled_code`
-/// asserts on. Run with `--ignored --nocapture` when adding a specialization.
+/// Not a test: prints the measurement table. Run with `--ignored --nocapture` when adding a specialization.
 #[test]
 #[ignore]
 fn dump_code_sizes() {
@@ -754,7 +572,7 @@ fn dump_code_sizes() {
             let (name, bytes, spec, lean) = (case.name, case.bytes, case.spec, case.lean);
             let base = code_len(&bytes, Specialization::generic(), triple, lean);
             let only = Specialization::for_target(target).none().with(spec);
-            // Bypass supported_on so unsupported pairs are measured too.
+            // Bypass supported_on so unsupported pairs are measured.
             let n = code_len(&bytes, only, triple, lean);
             println!(
                 "{name:24} {spec:?} base={base} spec={n} delta={}",

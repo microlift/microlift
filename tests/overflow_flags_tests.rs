@@ -22,7 +22,7 @@ fn config(spec: Specialization, lean: bool) -> LifterConfig {
     }
 }
 
-/// How many overflow-producing instructions a lift of `bytes` emits.
+/// Count of overflow-producing instructions in a lift of `bytes`.
 fn overflow_ops(bytes: &[u8], spec: Specialization, lean: bool) -> usize {
     let code = lift_to_code::<X86_64>(bytes, DEFAULT_LIFT_BASE, config(spec, lean)).expect("lift");
     code.func
@@ -33,11 +33,8 @@ fn overflow_ops(bytes: &[u8], spec: Specialization, lean: bool) -> usize {
         .count()
 }
 
-/// Every add-, subtract- and multiply-shaped mnemonic, in a shape whose CF and
-/// OF are read - `seto`/`setb` right after, so the liveness pass reports both
-/// live and the specialization is actually reached.
-///
-/// `LOCK` forms address `[rsp]`, which the harness guarantees is mapped.
+/// Add/sub/mul shapes with CF and OF read (`seto`/`setb`) so the specialization is reached.
+/// `LOCK` forms address `[rsp]`, which the harness maps.
 fn snippets() -> Vec<(&'static str, Vec<u8>)> {
     // seto dl ; setb bl - the readers that make CF and OF live.
     const READ: &[u8] = &[0x0F, 0x90, 0xC2, 0x0F, 0x92, 0xC3];
@@ -59,16 +56,14 @@ fn snippets() -> Vec<(&'static str, Vec<u8>)> {
         ("xadd r64", &[0x48, 0x0F, 0xC1, 0xC8]),
         ("imul r64,r64", &[0x48, 0x0F, 0xAF, 0xC1]),
         ("imul r32,r32,imm", &[0x69, 0xC1, 0x34, 0x12, 0x00, 0x00]),
-        // Memory destinations: `add [rsp], rcx` and friends. The stack is the
-        // one address the harness always has mapped.
+        // Memory destinations on the always-mapped stack.
         ("add [rsp], rcx", &[0x48, 0x01, 0x0C, 0x24]),
         ("sub [rsp], rcx", &[0x48, 0x29, 0x0C, 0x24]),
         ("adc [rsp], rcx", &[0x48, 0x11, 0x0C, 0x24]),
         ("sbb [rsp], rcx", &[0x48, 0x19, 0x0C, 0x24]),
         ("inc qword [rsp]", &[0x48, 0xFF, 0x04, 0x24]),
         ("neg qword [rsp]", &[0x48, 0xF7, 0x1C, 0x24]),
-        // The locked forms, which route through `atomic_rmw` / `atomic_cas`.
-        // LOCK ADC and LOCK SBB are the retry loop.
+        // Locked forms route through `atomic_rmw`/`atomic_cas`; LOCK ADC/SBB are the retry loop.
         ("lock add [rsp], rcx", &[0xF0, 0x48, 0x01, 0x0C, 0x24]),
         ("lock sub [rsp], rcx", &[0xF0, 0x48, 0x29, 0x0C, 0x24]),
         ("lock adc [rsp], rcx", &[0xF0, 0x48, 0x11, 0x0C, 0x24]),
@@ -96,12 +91,7 @@ fn snippets() -> Vec<(&'static str, Vec<u8>)> {
         .collect()
 }
 
-/// Operand pairs straddling the boundaries CF and OF disagree about.
-///
-/// `(rax, rcx, cf_in)`. The unsigned wrap and the signed one are different
-/// events - `0x7FFF..F + 1` overflows signed and not unsigned, `-1 + 1` the
-/// other way round - so a `uadd_overflow` where a `sadd_overflow` belonged, or
-/// either with its operands swapped, shows up here and nowhere in random state.
+/// `(rax, rcx, cf_in)` pairs where unsigned and signed overflow disagree (`0x7FFF..F + 1`, `-1 + 1`).
 const OPERANDS: &[(u64, u64, u8)] = &[
     (0, 0, 0),
     (0, 1, 0),
@@ -151,12 +141,7 @@ fn run(bytes: &[u8], spec: Specialization, lean: bool, ops: (u64, u64, u8)) -> S
     state(&t.run().ctx)
 }
 
-/// The specialized lowering computes exactly what the portable one computes,
-/// for every mnemonic, every width and every boundary operand pair.
-///
-/// The portable run is with the specialization off and the liveness pass *on*,
-/// which is the configuration this feature is an optimisation of - so a
-/// divergence here is this feature's, not the dead-flag pass's.
+/// Specialized lowering equals the portable one (liveness pass on, specialization off) for every mnemonic, width and boundary pair.
 #[test]
 fn agrees_with_the_portable_paths() {
     for (name, bytes) in snippets() {
@@ -175,8 +160,7 @@ fn agrees_with_the_portable_paths() {
     }
 }
 
-/// The dead-flag pass itself is not perturbed: with the specialization on, the
-/// answer still matches a lift that has neither.
+/// The dead-flag pass is not perturbed by the specialization.
 #[test]
 fn agrees_with_the_unoptimised_lifter() {
     for (name, bytes) in snippets() {
@@ -212,23 +196,13 @@ fn no_overflow_ops_without_liveness() {
     }
 }
 
-/// A snippet whose operands are narrower than 32 bits.
-///
-/// aarch64's `ADDS`/`SUBS` start at 32 bits, so Cranelift has to synthesize the
-/// overflow ops below that and the result is a measured regression; the lifter
-/// declines there. See `Lifter::native_overflow_width_ok` and
-/// `specialize_tests::specializations_shrink_the_compiled_code`.
+/// Operands narrower than 32 bits: aarch64 would synthesize the overflow ops (measured regression), so the lifter declines. See `Lifter::native_overflow_width_ok`.
 fn is_sub_word(name: &str) -> bool {
     name.ends_with(" r16") || name.ends_with(" r8")
 }
 
-/// The width gate, in both directions: a sub-word site declines on aarch64 and
-/// still fires on x86-64, with CF and OF live either way.
-///
-/// The two halves are both required. Without the first, a lifter that ignored
-/// the width would pass every equivalence test while emitting the sequence that
-/// was measured as a regression; without the second, a gate that was accidentally
-/// unconditional would look exactly the same from here.
+/// Width gate both ways: sub-word declines on aarch64 and still fires on x86-64.
+/// Both halves are needed to catch an unconditional or width-ignoring gate.
 #[test]
 fn sub_word_overflow_ops_are_aarch64_only() {
     for (name, bytes) in snippets().into_iter().filter(|(n, _)| is_sub_word(n)) {
@@ -268,21 +242,11 @@ fn liveness_lets_the_overflow_ops_through() {
     }
 }
 
-/// A site whose CF and OF nothing reads gets a plain `iadd`, not an
-/// overflow-producing add whose condition byte is thrown away.
-///
-/// This is the request the whole gate exists to satisfy, and the snippets are
-/// chosen so the answer is unambiguous: the flags of the *first* instruction
-/// are overwritten by the second before anything looks at them, and the second
-/// instruction is one this specialization has no opinion about.
+/// A site whose CF/OF nothing reads gets a plain `iadd`, not an overflow add.
 #[test]
 fn dead_flags_leave_a_plain_add() {
     // <insn> ; test rax, rax ; sete dl ; ret
-    //
-    // `TEST` writes CF, OF, ZF, SF and PF, so the first instruction's CF and OF
-    // are both dead. AF is *not* written by TEST (it is left unchanged), which
-    // is why the first instruction still emits its AF - and why this checks the
-    // overflow opcodes specifically rather than the total IR length.
+    // TEST kills CF/OF but not AF, hence checking overflow opcodes rather than IR length.
     const KILL: &[u8] = &[0x48, 0x85, 0xC0, 0x0F, 0x94, 0xC2, 0xC3];
     let cases: &[(&str, &[u8])] = &[
         ("add r64", &[0x48, 0x01, 0xC8]),
@@ -308,9 +272,7 @@ fn dead_flags_leave_a_plain_add() {
     }
 }
 
-/// `ADC`/`SBB` need their carry *in* whatever happens, so a dead carry *out*
-/// still leaves the two-step arithmetic - but no overflow ops, and no carry
-/// chain.
+/// ADC/SBB still need carry-in, but a dead carry-out needs no overflow ops or carry chain.
 #[test]
 fn a_dead_carry_out_still_leaves_the_carry_in() {
     // adc rax, rcx ; test rax, rax ; sete dl ; ret
@@ -328,7 +290,7 @@ fn a_dead_carry_out_still_leaves_the_carry_in() {
             target.name()
         );
     }
-    // And it still adds the carry in: 1 + 1 + CF(1) == 3.
+    // Carry-in still applies: 1 + 1 + CF(1) == 3.
     let out = LiftTest::new(bytes)
         .specialize(Specialization::host())
         .eliminate_dead_flags()
@@ -341,11 +303,8 @@ fn a_dead_carry_out_still_leaves_the_carry_in() {
     assert_eq!(out.ctx.rax, 3, "ADC dropped its carry in");
 }
 
-/// The specialized IR lowers for the target it names, cross-compiled.
-///
-/// riscv64 is the reason [`SpecTarget::Generic`] gets none of this: it lowers
-/// `uadd_overflow` alone, at `I32`/`I64` only. Compiling the *generic* lift for
-/// it is the check that nothing leaks out of the gate.
+/// Specialized IR cross-compiles for its target.
+/// riscv64 lowers only `uadd_overflow` at I32/I64, so compiling the generic lift for it checks nothing leaks past the gate.
 #[test]
 fn each_target_lowers_its_own_ir() {
     let pairs = [
@@ -357,9 +316,7 @@ fn each_target_lowers_its_own_ir() {
         for (target, triple) in pairs {
             let cfg = config(Specialization::for_target(target), true);
             let mut code = lift_to_code::<X86_64>(&bytes, DEFAULT_LIFT_BASE, cfg).expect("lift");
-            // The lifter bakes in the host calling convention; override it so
-            // this measures instruction lowering rather than the target's ABI
-            // code rejecting a convention.
+            // Override the host calling convention to measure lowering, not ABI.
             code.func.signature.call_conv = CallConv::SystemV;
             ArtifactBackend::compile_lifted_to_raw(code, Some(triple), None)
                 .unwrap_or_else(|e| panic!("{name} failed to lower for {triple}: {e:?}"));

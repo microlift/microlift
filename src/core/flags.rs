@@ -1,11 +1,8 @@
 //! Which condition-flag writes a region actually needs.
 //!
-//! Every write is lifted eagerly. Only after SSA is sealed do we walk backward
-//! from observable uses and discard unused, side-effect-free flag computations.
-//! The candidate graph starts at values actually assigned to flags, rather than
-//! an instruction table. Context stores and callbacks are ordinary live uses;
-//! synthetic exits, overlapping decodes and internal handler control flow need
-//! no separate model. Loads, traps, calls, stores and unknown effects stay.
+//! Flags are lifted eagerly; after SSA is sealed, unused side-effect-free flag
+//! computations are removed by backward liveness from observable uses.
+//! Loads, traps, calls, stores and unknown effects always stay.
 
 use std::collections::HashMap;
 
@@ -14,17 +11,15 @@ use cranelift_codegen::ir::{Function, Inst, InstructionData, Opcode, Value, Valu
 
 use crate::core::dce;
 
-/// Remove unused pure computations feeding the recorded flag values.
+/// Removes unused pure computations feeding recorded flag values.
 ///
-/// Must run after all blocks are sealed and context synchronization is complete.
-/// Shared data computations survive whenever any actual consumer needs them.
+/// Must run after all blocks are sealed and context sync is complete.
 pub(crate) fn eliminate(func: &mut Function, flags: &[Value]) {
     if flags.is_empty() {
         return;
     }
 
-    // A block parameter depends on every incoming argument. Build these edges
-    // once, including duplicate destinations and jump-table arms.
+    // A block parameter depends on every incoming argument.
     let mut incoming: SecondaryMap<Value, Vec<Value>> = SecondaryMap::new();
     for block in func.layout.blocks() {
         for inst in func.layout.block_insts(block) {
@@ -61,9 +56,7 @@ pub(crate) fn eliminate(func: &mut Function, flags: &[Value]) {
         }
     }
 
-    // Everything outside the candidate graph stays, even if otherwise dead.
-    // Branch arguments are conditional uses: they matter only when their
-    // destination parameter does. This permits removing dead loop-carried flags.
+    // Branch arguments are uses only when their destination parameter is live.
     let mut live = EntitySet::<Value>::new();
     let mut live_insts = EntitySet::<Inst>::new();
     for block in func.layout.blocks() {
@@ -100,8 +93,7 @@ pub(crate) fn eliminate(func: &mut Function, flags: &[Value]) {
                 dead.push(inst);
                 continue;
             }
-            // A native overflow op also computes an ordinary arithmetic result.
-            // When only that result survives, shed the unused condition output.
+            // Only the arithmetic result survives: shed the condition output.
             let opcode = match func.dfg.insts[inst].opcode() {
                 Opcode::UaddOverflow | Opcode::SaddOverflow => Opcode::Iadd,
                 Opcode::UsubOverflow | Opcode::SsubOverflow => Opcode::Isub,
@@ -131,9 +123,7 @@ pub(crate) fn eliminate(func: &mut Function, flags: &[Value]) {
     dce::remove_dead_block_params(func);
 }
 
-/// Fail closed for memory, control flow, traps and other side effects. In
-/// particular, guest loads stay even when their result only fed dead flags:
-/// changing which guest instruction faults would be an observable change.
+/// Fails closed; guest loads stay even if only dead flags used them (fault behavior is observable).
 fn removable(func: &Function, inst: Inst) -> bool {
     let op = func.dfg.insts[inst].opcode();
     !func.dfg.inst_results(inst).is_empty()
@@ -147,70 +137,54 @@ fn removable(func: &Function, inst: Inst) -> bool {
         && !op.other_side_effects()
 }
 
-/// A legacy set of guest condition flags, in the frontend's own numbering.
-/// Retained for instruction metadata; SSA elimination does not use these bits.
+/// Legacy flag set in the frontend's numbering; SSA elimination does not use it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FlagSet(u8);
 
 impl FlagSet {
-    /// No flags.
     pub const NONE: FlagSet = FlagSet(0);
-    /// Every flag, including bits no guest has assigned a meaning to.
-    ///
-    /// The unassigned bits are harmless, and "all bits" rather than "all bits this
-    /// guest uses" is what lets the engine stay ignorant of the numbering.
     pub const ALL: FlagSet = FlagSet(u8::MAX);
 
-    /// The set containing just `bit`.
     pub const fn bit(bit: u8) -> FlagSet {
         FlagSet(1 << bit)
     }
 
-    /// Whether `bit` is in the set.
     pub const fn contains(self, bit: u8) -> bool {
         self.0 & (1 << bit) != 0
     }
 
-    /// Set union.
     pub const fn union(self, other: FlagSet) -> FlagSet {
         FlagSet(self.0 | other.0)
     }
 
-    /// Everything in `self` that is not in `other`.
     pub const fn without(self, other: FlagSet) -> FlagSet {
         FlagSet(self.0 & !other.0)
     }
 
-    /// Whether the set is empty.
     pub const fn is_empty(self) -> bool {
         self.0 == 0
     }
 }
 
-/// Legacy instruction flag metadata, retained for frontend compatibility.
-/// Dead flag elimination uses actual SSA dependencies instead of these sets.
+/// Legacy per-instruction flag metadata; unused by elimination.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FlagEffects {
-    /// Flags the lift of this instruction consumes.
     pub reads: FlagSet,
-    /// Flags the lift of this instruction definitely assigns.
     pub writes: FlagSet,
 }
 
 impl FlagEffects {
-    /// Reads everything, writes nothing: the answer that is never wrong.
+    /// Reads everything, writes nothing: never wrong.
     pub const CONSERVATIVE: FlagEffects = FlagEffects {
         reads: FlagSet::ALL,
         writes: FlagSet::NONE,
     };
 
-    /// Touches no flags at all - a `MOV`, a `LEA`, a `PUSH`.
     pub const TRANSPARENT: FlagEffects = FlagEffects {
         reads: FlagSet::NONE,
         writes: FlagSet::NONE,
     };
 
-    /// Writes `writes` and reads nothing.
     pub const fn writing(writes: FlagSet) -> FlagEffects {
         FlagEffects {
             reads: FlagSet::NONE,
@@ -218,7 +192,6 @@ impl FlagEffects {
         }
     }
 
-    /// Reads `reads` and writes nothing - a `Jcc`, a `SETcc`, a `CMOVcc`.
     pub const fn reading(reads: FlagSet) -> FlagEffects {
         FlagEffects {
             reads,
@@ -233,22 +206,18 @@ impl Default for FlagEffects {
     }
 }
 
-/// Legacy address-based liveness container. The engine no longer uses it;
-/// flag computations are removed only after their actual SSA uses are known.
+/// Legacy address-based liveness container; unused by the engine.
 #[derive(Debug, Clone, Default)]
 pub struct FlagLiveness {
     live_out: HashMap<u64, FlagSet>,
 }
 
 impl FlagLiveness {
-    /// The flags live *after* the instruction at `va` - the ones its lift has to
-    /// compute. [`FlagSet::ALL`] for an address with no entry, which is the answer
-    /// that makes a gap cost nothing but speed.
+    /// Flags live *after* `va`; [`FlagSet::ALL`] when absent.
     pub fn live_out(&self, va: u64) -> FlagSet {
         self.live_out.get(&va).copied().unwrap_or(FlagSet::ALL)
     }
 
-    /// How many addresses have an entry. Diagnostics and tests.
     pub fn len(&self) -> usize {
         self.live_out.len()
     }
@@ -362,7 +331,6 @@ mod tests {
             let param = b.append_block_param(merge, types::I64);
             let first = b.ins().bxor_imm_u(x, 16);
             let second = b.ins().bxor_imm_u(x, 32);
-            // Both destinations are the same block with different arguments.
             b.ins()
                 .brif(x, merge, &[first.into()], merge, &[second.into()]);
             b.switch_to_block(merge);
@@ -452,7 +420,6 @@ mod tests {
         }
     }
 
-    /// The two defaults are the two halves of "wrong costs speed, not answers".
     #[test]
     fn the_defaults_are_the_conservative_ones() {
         assert_eq!(FlagEffects::default(), FlagEffects::CONSERVATIVE);

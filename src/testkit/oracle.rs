@@ -1,17 +1,13 @@
-//! A pluggable CPU-oracle abstraction for differential testing.
-//! Only deterministic, self-contained instructions: reg/reg and reg/imm
-//! arithmetic, logic, shifts, `setcc`, `cmov`, `lea`, `mov`, and loads/stores
-//! confined to the shared arena. Anything that produces a Microlift *VM exit*
-//! (port I/O, cpuid, xgetbv, rdtsc, imported/indirect call, ud2, int3)
-//! or is host-specific (rdtsc/rdrand) is **not** diffable and surfaces as
-//! [`OracleOutcome::Exit`] rather than a comparable [`CpuOracle`] halt.
+//! Pluggable CPU oracles for differential testing.
+//!
+//! Only deterministic, self-contained instructions are diffable; VM exits and host-specific
+//! instructions (cpuid, rdtsc, port I/O, ...) surface as [`OracleOutcome::Exit`].
 
 use crate::context::{ExitReason, RegisterContext};
 use crate::core::specialize::Specialization;
 use crate::testkit::{LiftTest, RetAddr};
 
-/// x86 general-purpose register indices, in hardware encoding order, for
-/// [`CpuState::gpr`].
+/// x86 GPR indices in hardware encoding order, for [`CpuState::gpr`].
 pub mod gpr {
     pub const RAX: usize = 0;
     pub const RCX: usize = 1;
@@ -23,29 +19,21 @@ pub mod gpr {
     pub const RDI: usize = 7;
 }
 
-/// An architectural machine state at an oracle boundary. Flat and decoupled
-/// from [`RegisterContext`] so a non-Microlift oracle need not depend on our
-/// struct layout.
+/// Architectural state at an oracle boundary; flat so non-Microlift oracles need not know our context layout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CpuState {
-    /// GPRs in hardware encoding order: rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi,
-    /// r8..r15 (see [`gpr`]).
+    /// GPRs in encoding order (see [`gpr`]).
     pub gpr: [u64; 16],
     pub rip: u64,
-    /// Packed RFLAGS (only the arithmetic flags Microlift models: CF, PF, AF,
-    /// ZF, SF, OF, DF).
+    /// Packed RFLAGS: CF, PF, AF, ZF, SF, OF, DF.
     pub rflags: u64,
-    /// XMM0..15, each `[lo64, hi64]`.
     pub xmm: [[u64; 2]; 16],
-    /// FS segment base (for `fs:`-prefixed / `rd/wrfsbase` accesses). An
-    /// *input* to a run, not part of the diff - see [`diff_states`].
+    /// FS base; an input to a run, not diffed ([`diff_states`]).
     pub fs_base: u64,
-    /// GS segment base (for `gs:`-prefixed / `rd/wrgsbase` accesses). An input,
-    /// not diffed.
+    /// GS base; an input, not diffed.
     pub gs_base: u64,
 }
 
-// RFLAGS bit positions.
 const CF: u64 = 1 << 0;
 const PF: u64 = 1 << 2;
 const AF: u64 = 1 << 4;
@@ -55,7 +43,6 @@ const DF: u64 = 1 << 10;
 const OF: u64 = 1 << 11;
 
 impl CpuState {
-    /// All zero (a clean reset state).
     pub fn zeroed() -> Self {
         CpuState {
             gpr: [0; 16],
@@ -67,7 +54,6 @@ impl CpuState {
         }
     }
 
-    /// Snapshot the diffable subset of a [`RegisterContext`].
     pub fn from_ctx(c: &RegisterContext) -> Self {
         let mut rflags = 0u64;
         if c.cf != 0 {
@@ -104,7 +90,6 @@ impl CpuState {
         }
     }
 
-    /// Write this state into a [`RegisterContext`] (registers, rip, flags, xmm).
     pub fn apply_to_ctx(&self, c: &mut RegisterContext) {
         let g = &self.gpr;
         c.rax = g[0];
@@ -137,42 +122,30 @@ impl CpuState {
     }
 }
 
-/// A block of guest memory to be present (identity-mapped) before a run: `bytes`
-/// placed at guest virtual address `base`.
+/// Guest memory to be present (identity-mapped) at `base` before a run.
 #[derive(Clone, Debug)]
 pub struct MemImage {
     pub base: u64,
     pub bytes: Vec<u8>,
 }
 
-/// Why a run stopped, from an oracle's perspective.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OracleExit {
-    /// A Microlift VM exit (or an emulator event) that is not part of the
-    /// diffable instruction set - the two engines cannot be meaningfully
-    /// compared past this point.
+    /// A VM exit or emulator event outside the diffable set; nothing past it is comparable.
     NonDiffable(ExitReason),
-    /// The external emulator (Unicorn) stopped with an error/exception rather
-    /// than reaching the exit trampoline: an invalid opcode, an unmapped
-    /// fetch/access it could not satisfy, an `int` with no handler,
-    /// etc. The payload is the raw `uc_error` discriminant, kept only for
-    /// diagnostics. Like [`OracleExit::NonDiffable`], nothing past this point
-    /// is comparable, so [`differential`] declines the comparison.
+    /// The emulator stopped with an error (payload: raw `uc_error`) before the exit trampoline;
+    /// [`differential`] declines the comparison.
     Emulator(i32),
 }
 
-/// The result of running an oracle.
 #[derive(Clone, Debug)]
 pub enum OracleOutcome {
-    /// The code ran to a clean natural stop; `CpuState` is comparable.
     Halted(CpuState),
-    /// The code hit a non-diffable event; state is reported but should be
-    /// excluded from a value comparison.
+    /// Non-diffable event; state is reported but excluded from comparison.
     Exit { state: CpuState, reason: OracleExit },
 }
 
 impl OracleOutcome {
-    /// The final state, whether the run halted cleanly or exited.
     pub fn state(&self) -> &CpuState {
         match self {
             OracleOutcome::Halted(s) => s,
@@ -180,19 +153,14 @@ impl OracleOutcome {
         }
     }
 
-    /// Whether the run reached a clean, comparable halt.
     pub fn is_halted(&self) -> bool {
         matches!(self, OracleOutcome::Halted(_))
     }
 }
 
-/// A machine-state execution engine that can be differentially tested.
 pub trait CpuOracle {
-    /// Load `code` such that its first byte is at guest VA `code_va`, seed
-    /// registers from `init`, ensure each [`MemImage`] is present, run until a
-    /// natural stop / non-diffable event / the `max_insns` budget, and report
-    /// the outcome. (`max_insns` is advisory; the in-process JIT has no
-    /// instruction budget and ignores it.)
+    /// Loads `code` at `code_va`, seeds registers from `init`, ensures each [`MemImage`] is present,
+    /// and runs to a natural stop, non-diffable event or `max_insns` (advisory; the JIT ignores it).
     fn run(
         &mut self,
         code: &[u8],
@@ -202,37 +170,22 @@ pub trait CpuOracle {
         max_insns: u64,
     ) -> OracleOutcome;
 
-    /// A short human-readable name (used in diff messages).
     fn name(&self) -> &'static str;
 }
 
-/// The Microlift JIT as an oracle: lift `code`, JIT it, and run it against a
-/// [`RegisterContext`] seeded from `init`.
-///
-/// Because Microlift executes with *guest VA == host VA*, any [`MemImage`] the
-/// guest dereferences must already be host-backed at its `base` (place it in an
-/// [`IdentityArena`]); this oracle asserts that rather than copying.
+/// The Microlift JIT as an oracle. Guest VA == host VA, so any [`MemImage`] the guest touches must be
+/// host-backed at its `base` (an [`IdentityArena`]); asserted, not copied.
 #[derive(Default)]
 pub struct MicroliftOracle {
-    /// Backend optimization level to compile with.
     pub opt: crate::testkit::Opt,
-    /// Whether to use native `I64X2` XMM variables and the vector fast paths.
-    ///
-    /// Defaults off, matching [`LifterConfig`](crate::core::LifterConfig).
+    /// Native `I64X2` XMM variables and vector fast paths. Default off.
     pub vector_xmm: bool,
-    /// Target-directed instruction specializations to apply.
-    ///
-    /// Defaults to [`Specialization::generic`]. Setting it points the oracle at the
-    /// specialized lowerings, which is how those get differential coverage against
-    /// real hardware rather than only against microlift's own portable path. The
-    /// vector ones additionally need [`vector_xmm`](Self::vector_xmm), and
-    /// [`Spec::IntegerOverflowFlags`](crate::core::specialize::Spec::IntegerOverflowFlags)
-    /// needs [`eliminate_dead_flags`](Self::eliminate_dead_flags);
-    /// [`specialized`](Self::specialized) sets both.
+    /// Target specializations; default [`Specialization::generic`]. Gives specialized lowerings
+    /// coverage against hardware. Vector ones need [`vector_xmm`](Self::vector_xmm),
+    /// [`Spec::IntegerOverflowFlags`](crate::core::specialize::Spec::IntegerOverflowFlags) needs
+    /// [`eliminate_dead_flags`](Self::eliminate_dead_flags); [`specialized`](Self::specialized) sets both.
     pub specialization: Specialization,
-    /// Whether to run the dead-flag liveness pass (`config.eliminate_dead_flags`).
-    ///
-    /// Defaults off, matching [`LifterConfig`](crate::core::LifterConfig).
+    /// Dead-flag liveness pass (`config.eliminate_dead_flags`). Default off.
     pub eliminate_dead_flags: bool,
 }
 
@@ -244,12 +197,7 @@ impl MicroliftOracle {
         }
     }
 
-    /// Lift with `spec` applied, and with everything the specializations need to be
-    /// reachable: vector-backed XMM registers and the dead-flag liveness pass.
-    ///
-    /// Both are turned on together rather than per-`Spec` so a caller enabling a
-    /// whole target's set gets a lift where every member can fire. Neither changes
-    /// an architectural result, and both are separately proven not to.
+    /// Lifts with `spec` plus the vector XMM and dead-flag passes it needs to fire; neither changes results.
     pub fn specialized(mut self, spec: Specialization) -> Self {
         self.vector_xmm = true;
         self.eliminate_dead_flags = true;
@@ -270,10 +218,7 @@ impl CpuOracle for MicroliftOracle {
         let mut ctx = RegisterContext::default();
         init.apply_to_ctx(&mut ctx);
 
-        // If the caller placed a stack VA in the state (e.g. inside an
-        // `IdentityArena`), the harness honors it; otherwise it allocates one.
-        // Either way the exit trampoline is pushed at `[rsp]` so a guest `ret`
-        // stops cleanly.
+        // A caller-placed stack VA is honored, else one is allocated; the exit trampoline is pushed at `[rsp]`.
         let out = LiftTest::new(code)
             .at(code_va)
             .image_base(code_va)
@@ -304,11 +249,9 @@ impl CpuOracle for MicroliftOracle {
     }
 }
 
-/// A field-by-field difference between two [`CpuState`]s. Empty means equal.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StateDiff {
-    /// GPR index -> (a, b) for each differing register (rsp is skipped by
-    /// [`differential`] unless a shared stack VA is used - see its docs).
+    /// GPR index -> (a, b) per differing register; `rsp` is skipped by [`differential`] without a shared stack.
     pub gpr: Vec<(usize, u64, u64)>,
     pub rflags: Option<(u64, u64)>,
     pub rip: Option<(u64, u64)>,
@@ -321,21 +264,14 @@ impl StateDiff {
     }
 }
 
-/// Options controlling which fields a differential comparison considers.
-///
-/// Both fields default to `false`: `rsp` is only meaningful when both oracles
-/// share a stack VA (an [`IdentityArena`]) - the in-process JIT otherwise
-/// allocates its own stack, so `rsp` legitimately differs - and `rip`
-/// trampoline/return bookkeeping can differ across engines.
+/// Which fields a differential comparison considers. Both default `false`: `rsp` is only
+/// meaningful with a shared stack VA ([`IdentityArena`]), and `rip` bookkeeping can differ.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DiffOptions {
-    /// Compare `rsp` (requires a shared stack VA).
     pub compare_rsp: bool,
-    /// Compare `rip`.
     pub compare_rip: bool,
 }
 
-/// Compute the difference between two states under `opts`.
 pub fn diff_states(a: &CpuState, b: &CpuState, opts: DiffOptions) -> StateDiff {
     let mut d = StateDiff::default();
     for i in 0..16 {
@@ -360,12 +296,8 @@ pub fn diff_states(a: &CpuState, b: &CpuState, opts: DiffOptions) -> StateDiff {
     d
 }
 
-/// Run the same program on two oracles and return their state difference.
-///
-/// Each oracle is given the identical `init`/`mem`; the caller is responsible
-/// for providing fresh (uncorrupted) memory images if an oracle mutates shared
-/// backing. When either run reports a non-diffable exit the comparison is
-/// skipped and `None` is returned (there is nothing sound to compare).
+/// Runs the same program on two oracles and diffs the states; `None` on a non-diffable exit.
+/// Each oracle gets identical `init`/`mem`; the caller supplies fresh images if one mutates them.
 pub fn differential<A: CpuOracle, B: CpuOracle>(
     a: &mut A,
     b: &mut B,
@@ -384,12 +316,8 @@ pub fn differential<A: CpuOracle, B: CpuOracle>(
     Some(diff_states(oa.state(), ob.state(), opts))
 }
 
-/// A host memory buffer mapped at a fixed virtual address so that *guest VA ==
-/// host VA* - the reconciliation primitive that lets microlift's
-/// pointer-is-the-host-address JIT be diffed against an external emulator.
-///
-/// Unix only, and it never displaces an existing mapping - see
-/// [`IdentityArena::map`].
+/// Host buffer mapped at a fixed VA so guest VA == host VA; Unix only, never displaces a mapping
+/// ([`IdentityArena::map`]).
 #[cfg(unix)]
 pub struct IdentityArena {
     ptr: *mut u8,
@@ -398,22 +326,11 @@ pub struct IdentityArena {
 
 #[cfg(unix)]
 impl IdentityArena {
-    /// Map `len` bytes read/write at exactly `va`. `va` and `len` should be page
-    /// aligned and in a normally-free range. `None` if the mapping could not be
-    /// established there, which callers treat as "skip this test".
+    /// Maps `len` bytes read/write at exactly `va`; `None` if it cannot be placed there (callers skip).
     ///
-    /// **Never `MAP_FIXED`.** It does not fail on a collision, it *replaces* the
-    /// mapping that was there - which in a test binary is another thread's JIT code
-    /// or heap, placed there precisely because the range was free a moment ago. That
-    /// corrupts the other thread and survives being noticed: the owner's `munmap`
-    /// then tears down what is now *this* arena, and the fault lands here, at
-    /// exactly `va`, in a test that did nothing wrong. It reproduced as an
-    /// intermittent SIGSEGV in `unicorn_oracle_tests` under `--release`.
-    ///
-    /// Linux has `MAP_FIXED_NOREPLACE`: same exact placement, `EEXIST` instead of a
-    /// silent replacement. Everywhere else `va` is a plain **hint** with no fixed
-    /// flag, and the exact-address check below turns "somewhere else" into `None`.
-    /// Both spellings are atomic with respect to other threads.
+    /// **Never `MAP_FIXED`**: it silently replaces another thread's mapping and corrupts it
+    /// (an intermittent SIGSEGV under `--release`). Linux uses `MAP_FIXED_NOREPLACE`; elsewhere
+    /// `va` is a hint and the exact-address check turns "elsewhere" into `None`.
     pub fn map(va: u64, len: usize) -> Option<Self> {
         #[cfg(target_os = "linux")]
         let fixed = libc_flags::MAP_FIXED_NOREPLACE;
@@ -422,7 +339,7 @@ impl IdentityArena {
 
         let prot = libc_flags::PROT_READ | libc_flags::PROT_WRITE;
         let flags = libc_flags::MAP_PRIVATE | libc_flags::MAP_ANON | fixed;
-        // SAFETY: standard anonymous mapping; we own the returned range.
+        // SAFETY: anonymous mapping we own.
         let p = unsafe { mmap_raw(va as *mut core::ffi::c_void, len, prot, flags) };
         if p.is_null() || p as isize == -1 || p as u64 != va {
             if !p.is_null() && p as isize != -1 {
@@ -436,18 +353,15 @@ impl IdentityArena {
         })
     }
 
-    /// Base virtual address of the arena (equal to the requested `va`).
     pub fn base(&self) -> u64 {
         self.ptr as u64
     }
 
-    /// The whole arena as a mutable byte slice.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        // SAFETY: we own `len` bytes at `ptr` for the arena's lifetime.
+        // SAFETY: we own `len` bytes at `ptr`.
         unsafe { core::slice::from_raw_parts_mut(self.ptr, self.len) }
     }
 
-    /// Write `bytes` at offset `off` within the arena.
     pub fn write_at(&mut self, off: usize, bytes: &[u8]) {
         self.as_mut_slice()[off..off + bytes.len()].copy_from_slice(bytes);
     }
@@ -456,13 +370,12 @@ impl IdentityArena {
 #[cfg(unix)]
 impl Drop for IdentityArena {
     fn drop(&mut self) {
-        // SAFETY: unmapping the exact range we mapped.
+        // SAFETY: unmapping the range we mapped.
         unsafe { munmap_raw(self.ptr as *mut core::ffi::c_void, self.len) };
     }
 }
 
-// Minimal libc bindings for the arena so `testkit` need not pull in the `libc`
-// crate. These match the System V / BSD `mmap` ABI on the supported hosts.
+// Minimal libc bindings so `testkit` need not depend on the `libc` crate (System V / BSD `mmap` ABI).
 #[cfg(unix)]
 mod libc_flags {
     pub const PROT_READ: i32 = 0x1;
@@ -489,7 +402,7 @@ unsafe extern "C" {
     fn munmap(addr: *mut core::ffi::c_void, len: usize) -> i32;
 }
 
-// Wrapper supplying the fixed `fd = -1, offset = 0` for anonymous maps.
+// Fixes `fd = -1, offset = 0` for anonymous maps.
 #[cfg(unix)]
 unsafe fn mmap_raw(
     addr: *mut core::ffi::c_void,
@@ -497,13 +410,13 @@ unsafe fn mmap_raw(
     prot: i32,
     flags: i32,
 ) -> *mut core::ffi::c_void {
-    // SAFETY: forwarding to the libc `mmap` with the fixed anonymous fd/offset.
+    // SAFETY: forwards to libc `mmap` with fixed anonymous args.
     unsafe { mmap(addr, len, prot, flags, -1, 0) }
 }
 
 #[cfg(unix)]
 unsafe fn munmap_raw(addr: *mut core::ffi::c_void, len: usize) -> i32 {
-    // SAFETY: forwarding to libc `munmap` for a range we mapped.
+    // SAFETY: unmaps a range we mapped.
     unsafe { munmap(addr, len) }
 }
 
@@ -519,7 +432,6 @@ pub mod unicorn {
 
     const PAGE: u64 = 0x1000;
 
-    /// GPR-index (see [`gpr`]) -> Unicorn register id, in [`CpuState::gpr`] order.
     const GPR_REG: [RegisterX86; 16] = [
         RegisterX86::RAX,
         RegisterX86::RCX,
@@ -568,8 +480,7 @@ pub mod unicorn {
         const OF: u64 = 1 << 11;
         CF | PF | AF | ZF | SF | DF | OF
     };
-    // Bit 1 of EFLAGS is reserved and reads as 1 on real hardware; set it so the
-    // seeded value is architecturally well-formed.
+    // Bit 1 of EFLAGS is reserved and reads 1.
     const RFLAGS_RESERVED: u64 = 1 << 1;
 
     fn page_base(addr: u64) -> u64 {
@@ -593,7 +504,6 @@ pub mod unicorn {
             Self::default()
         }
 
-        /// Seed the engine's architectural registers from `st`.
         fn write_state(
             uc: &mut Unicorn<'_, ()>,
             st: &CpuState,
@@ -606,21 +516,12 @@ pub mod unicorn {
                 RegisterX86::EFLAGS,
                 (st.rflags & RFLAGS_MASK) | RFLAGS_RESERVED,
             )?;
-            // Segment bases, so `fs:`/`gs:`-prefixed accesses hit the same
-            // host-backed TLS buffer Microlift addresses.
+            // Segment bases, so `fs:`/`gs:` accesses hit the same TLS buffer as Microlift.
             uc.reg_write(RegisterX86::FS_BASE, st.fs_base)?;
             uc.reg_write(RegisterX86::GS_BASE, st.gs_base)?;
-            // `MXCSR` is not part of `CpuState`, so both engines have to be put
-            // in the same *implicit* starting state. Microlift's is the
-            // architectural reset value (`RegisterContext::default`); Unicorn
-            // starts it at zero, which unmasks every SSE exception and is not a
-            // state hardware powers up in. Seed it so an `STMXCSR` reads the
-            // same value on both sides.
+            // MXCSR is not in `CpuState`: seed the reset value (Unicorn starts at zero, all exceptions unmasked).
             uc.reg_write(RegisterX86::MXCSR, crate::context::MXCSR_RESET as u64)?;
-            // Same story for the x87 environment, which `CpuState` also does
-            // not carry: Microlift starts with the `FNINIT` control word and
-            // every register tagged empty, Unicorn with a zero control word and
-            // every register tagged valid.
+            // Same for the x87 environment: Microlift starts at the `FNINIT` word with all registers empty.
             uc.reg_write(RegisterX86::FPCW, crate::context::X87_CW_RESET as u64)?;
             uc.reg_write(RegisterX86::FPTAG, 0xFFFF)?;
             for (i, &reg) in XMM_REG.iter().enumerate() {
@@ -632,7 +533,6 @@ pub mod unicorn {
             Ok(())
         }
 
-        /// Read the diffable architectural state back out of the engine.
         fn snapshot(uc: &Unicorn<'_, ()>) -> CpuState {
             let mut st = CpuState::zeroed();
             for (i, &reg) in GPR_REG.iter().enumerate() {
@@ -654,28 +554,20 @@ pub mod unicorn {
     }
 
     impl UnicornOracle {
-        /// The engine-side half of the [`ImportTable`] trampoline: for each trapped VA,
-        /// make the address fetchable and break out of emulation the moment control
-        /// reaches it.
-        ///
-        /// The returned cell carries the VA the run stopped at. Breaking out - rather
-        /// than redirecting `RIP` from inside the hook - keeps the trampoline
-        /// independent of how Unicorn sequences a code hook against the instruction it
-        /// guards: the service loop simply restarts emulation at the address it chose.
+        /// Engine half of the [`ImportTable`] trampoline: makes each trapped VA fetchable and stops
+        /// emulation when control reaches it. The returned cell carries the stop VA; breaking out
+        /// (not redirecting `RIP` in the hook) keeps this independent of Unicorn's hook sequencing.
         fn install_import_stubs(
             uc: &mut Unicorn<'_, ()>,
             vas: &[u64],
         ) -> Result<Rc<Cell<Option<u64>>>, unicorn_engine::uc_error> {
             let pending: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
             for &va in vas {
-                // A PLT entry usually shares a page with the lifted code, which
-                // is already mapped; only map (and fill) a page we don't have.
+                // A PLT entry usually shares an already-mapped page; map only missing pages.
                 let mut probe = [0u8; 1];
                 if uc.mem_read(va, &mut probe).is_err() {
                     uc.mem_map(page_base(va), PAGE, Prot::ALL)?;
-                    // `hlt`. The hook stops emulation before this ever runs; if
-                    // that assumption were to break we want a loud emulator
-                    // fault rather than a silent state divergence.
+                    // `hlt`; never executed, loud fault if the hook assumption breaks.
                     uc.mem_write(va, &[0xF4])?;
                 }
                 let pending = Rc::clone(&pending);
@@ -696,8 +588,7 @@ pub mod unicorn {
             max_insns: u64,
             mut imports: Option<&mut ImportTable<'_>>,
         ) -> OracleOutcome {
-            // A construction/mapping failure is reported as an emulator exit
-            // (the state is meaningless) rather than panicking the fuzzer.
+            // Mapping failure is reported as an emulator exit, not a panic.
             let mut uc = match Unicorn::new(Arch::X86, Mode::MODE_64) {
                 Ok(uc) => uc,
                 Err(e) => {
@@ -727,17 +618,12 @@ pub mod unicorn {
                 bail!(e);
             }
 
-            // on first touch of any other page, map it backed by its own address so
-            // guest VA == host VA
+            // Map any other page on first touch, backed by its own address (guest VA == host VA).
             if let Err(e) =
                 uc.add_mem_hook(HookType::MEM_UNMAPPED, 1, 0, |uc, _ty, addr, _sz, _v| {
                     let base = page_base(addr);
-                    // SAFETY: The host owns this page for every address
-                    // the diffable program legitimately touches (stack / arena).
-                    // A bad access faults here exactly as it would under
-                    // Microlift's JIT. Ignore the result: an `Err` (e.g. a race
-                    // that mapped it first) simply means the retry will succeed or
-                    // fault on its own.
+                    // SAFETY: the host owns these pages; a bad access faults as under the JIT, and an
+                    // `Err` (page mapped by a race) just means the retry succeeds or faults.
                     let _ = unsafe { uc.mem_map_ptr(base, PAGE, Prot::ALL, base as *mut c_void) };
                     true
                 })
@@ -762,10 +648,8 @@ pub mod unicorn {
                 rsp = top - 8;
                 scratch_stack = Some(stack);
             }
-            // Push the exit trampoline at [rsp] directly into host memory (the
-            // identity hook backs the same bytes for Unicorn's own reads).
-            // SAFETY: `rsp` is a live host stack address (scratch `Vec` above,
-            // or a caller-provided host-backed VA per the oracle contract).
+            // Push the exit trampoline at [rsp] in host memory (the identity hook backs Unicorn's reads).
+            // SAFETY: `rsp` is a live host stack address.
             unsafe {
                 *(rsp as *mut u64) = EXIT_TRAMPOLINE;
             }
@@ -786,8 +670,7 @@ pub mod unicorn {
                 if result.is_err() {
                     break result;
                 }
-                // No pending trampoline: the run reached the exit trampoline (or
-                // exhausted its instruction budget) on its own.
+                // Reached the exit trampoline or exhausted the budget.
                 let Some(va) = pending.get() else {
                     break Ok(());
                 };
@@ -795,10 +678,8 @@ pub mod unicorn {
                     break Ok(());
                 };
 
-                // Present the handler with the same view Microlift's
-                // `ImportedFunctionCall` exit gives it: arguments in place and
-                // `rsp` already past the return address the `CALL` pushed
-                // (Microlift never pushes one).
+                // Match Microlift's view: arguments in place, `rsp` past the pushed return address
+                // (Microlift pushes none).
                 let mut state = Self::snapshot(&uc);
                 let sp = state.gpr[gpr::RSP];
                 let mut ret_bytes = [0u8; 8];
@@ -820,8 +701,7 @@ pub mod unicorn {
                 if let Err(e) = Self::write_state(&mut uc, &state) {
                     bail!(e);
                 }
-                // An import invoked as the outermost frame returns straight to
-                // the trampoline; there is nothing left to emulate.
+                // Outermost import returns straight to the trampoline; nothing left to emulate.
                 if ret == EXIT_TRAMPOLINE {
                     break Ok(());
                 }
@@ -885,13 +765,8 @@ pub mod unicorn {
         super::differential(&mut a, &mut b, code, code_va, init, mem, max_insns, opts)
     }
 
-    /// [`differential_unicorn`] with microlift lifting under `spec`.
-    ///
-    /// The check that the target-specialized lowerings agree with the *hardware*,
-    /// not merely with microlift's own portable expansion. `tests/specialize_tests.rs`
-    /// proves specialized == portable; this proves portable == hardware, and it is
-    /// the second that would catch both of microlift's paths being wrong the same
-    /// way.
+    /// [`differential_unicorn`] with microlift lifting under `spec`: checks specialized lowerings
+    /// against hardware (`tests/specialize_tests.rs` proves specialized == portable).
     pub fn differential_unicorn_spec(
         code: &[u8],
         code_va: u64,

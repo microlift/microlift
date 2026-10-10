@@ -11,18 +11,10 @@ pub const LINK_TABLE_ID: u32 = 0x8000_0003;
 
 pub const HOST_SLOT_ID: u32 = 0x8000_0002;
 
-/// A region's own link-cell array ([`crate::core::link::LinkSite`]).
-///
-/// Distinct from [`LINK_TABLE_ID`]: the table is the host's, shared by every
-/// region on the thread, while this array belongs to one compiled artifact. They
-/// hold the same row type but are never the same memory, and telling Cranelift
-/// so is what lets a store to one leave the other's loads alone.
+/// A region's own link-cell array ([`crate::core::link::LinkSite`]); never the same memory as [`LINK_TABLE_ID`].
 pub const LINK_CELL_ID: u32 = 0x8000_0004;
 
 /// The host's call-return ring ([`crate::core::callret::CallRetEntry`]).
-///
-/// Its own region: a push writes here and nothing else, so tagging it is what
-/// keeps a call from looking like a fence to everything downstream.
 pub const CALLRET_ID: u32 = 0x8000_0005;
 
 pub fn region_flags(func: &mut Function, user_id: u32, description: &'static str) -> MemFlagsData {
@@ -35,8 +27,7 @@ pub fn region_flags(func: &mut Function, user_id: u32, description: &'static str
         .with_alias_region(Some(region))
 }
 
-/// Memflags for a guest memory access: trapping and unaligned, like any guest
-/// address, but tagged as disjoint from the context.
+/// Trapping, unaligned memflags tagged as disjoint from the context.
 pub fn guest_memory_flags(func: &mut Function) -> MemFlagsData {
     let region = func.dfg.alias_regions.insert(AliasRegionData {
         user_id: GUEST_MEMORY_ID,
@@ -45,9 +36,5 @@ pub fn guest_memory_flags(func: &mut Function) -> MemFlagsData {
     MemFlagsData::new().with_alias_region(Some(region))
 }
 
-/// Read-only data emitted alongside the region ([`crate::core::DataObject`]),
-/// e.g. the CRC-32C table.
-///
-/// Nothing in a lifted region writes here, so its own region lets a load out of
-/// a table float past any store.
+/// Read-only data ([`crate::core::DataObject`]); loads may float past any store.
 pub const CONST_DATA_ID: u32 = 0x8000_0006;

@@ -1,6 +1,6 @@
 use microlift::testkit::prelude::*;
 
-/// Pack up to 16 bytes into an XMM `[lo, hi]` pair, zero-filling the rest.
+/// Pack up to 16 bytes into an XMM `[lo, hi]` pair, zero-filled.
 fn xmm(bytes: &[u8]) -> [u64; 2] {
     assert!(bytes.len() <= 16);
     let mut buf = [0u8; 16];
@@ -13,9 +13,7 @@ fn xmm(bytes: &[u8]) -> [u64; 2] {
 
 // CRC32
 
-/// `crc32 eax, cl` over the digits "123456789", the standard CRC-32C check
-/// value. The instruction is the raw remainder step, so the caller supplies the
-/// `0xFFFF_FFFF` pre-conditioning and the final inversion.
+/// `crc32 eax, cl` over "123456789", the CRC-32C check value; the instruction is the raw remainder step (caller does pre/post inversion).
 #[test]
 fn crc32_byte_matches_the_published_check_value() {
     let mut code = vec![0x48, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF]; // mov rax, -1 (eax = 0xFFFFFFFF)
@@ -30,7 +28,7 @@ fn crc32_byte_matches_the_published_check_value() {
     assert_eq!(out.ctx.rax as u32 ^ 0xFFFF_FFFF, 0xE306_9283);
 }
 
-/// The three narrower forms against values derived from the same reference.
+/// Narrower forms against the same reference.
 #[test]
 fn crc32_widths() {
     // crc32 eax, cl ; ret   with eax = 0, cl = 'a'
@@ -70,10 +68,7 @@ fn crc32_widths() {
     assert_eq!(out.ctx.rax, 0xE998_6AA9);
 }
 
-/// A quadword fold must equal eight byte folds of the same data - the chunking
-/// identity the 64-bit expansion is built on. If the two 32-bit halves were
-/// folded in the wrong order, or the high half XORed in at the wrong point,
-/// this is what catches it.
+/// A quadword fold equals eight byte folds (catches wrong half order).
 #[test]
 fn crc32_qword_equals_eight_byte_folds() {
     const DATA: u64 = 0x0123_4567_89AB_CDEF;
@@ -99,8 +94,7 @@ fn crc32_qword_equals_eight_byte_folds() {
     assert_eq!(wide.ctx.rax, 0xE998_6AA9);
 }
 
-/// The `r64` forms produce a 32-bit value: the upper half of the destination is
-/// zeroed, not preserved.
+/// `r64` forms zero the upper half.
 #[test]
 fn crc32_r64_zeroes_the_upper_half() {
     // crc32 rax, cl ; ret
@@ -110,12 +104,11 @@ fn crc32_r64_zeroes_the_upper_half() {
             c.rcx = 0;
         })
         .run();
-    // The remainder starts from the destination's *low* 32 bits, which are zero.
+    // The remainder starts from the destination's low 32 bits, which are zero.
     assert_eq!(out.ctx.rax, 0);
 }
 
-/// A memory source, and the inlined (non-outlined) expansion, must agree with
-/// the register source and the outlined helper.
+/// Memory source and inlined expansion must agree with register source and outlined helper.
 #[test]
 fn crc32_memory_source_and_inline_expansion_agree() {
     // crc32 eax, byte [rsi] ; ret
@@ -135,9 +128,7 @@ fn crc32_memory_source_and_inline_expansion_agree() {
     }
 }
 
-/// The table is a build-time constant emitted into the artifact once, however
-/// many `CRC32`s reference it - and it is the CRC-32C table, not merely 1 KiB of
-/// something.
+/// The CRC-32C table is emitted once however many `CRC32`s use it.
 #[test]
 fn the_crc32_table_is_emitted_once_as_data() {
     use microlift::arch::x86_64::X86_64;
@@ -161,8 +152,7 @@ fn the_crc32_table_is_emitted_once_as_data() {
     let table = &lifted.data_objects[0];
     assert_eq!(table.bytes.len(), 256 * 4);
 
-    // Recomputed here bit-serially, so the table and its consumer do not share
-    // an implementation to be wrong together.
+    // Recomputed bit-serially so table and consumer do not share a bug.
     for (index, entry) in table.bytes.chunks_exact(4).enumerate() {
         let mut expected = index as u32;
         for _ in 0..8 {
@@ -172,15 +162,14 @@ fn the_crc32_table_is_emitted_once_as_data() {
     }
 }
 
-/// A region that has both a link-cell array and the table: the two share one
-/// `DataId` space, and the cells take index 0.
+/// Link-cell array and table share one `DataId` space; cells take index 0.
 #[test]
 fn the_crc32_table_sits_after_the_link_cell_array() {
     use microlift::arch::x86_64::X86_64;
     use microlift::core::link::BlockLinkConfig;
     use microlift::core::{LifterConfig, lift_to_code};
 
-    // crc32 eax, cl ; jmp +0x1000 - the jump leaves the region, so it takes a cell.
+    // crc32 eax, cl ; jmp +0x1000 - leaves the region, so it takes a cell.
     let code = [
         0xF2, 0x0F, 0x38, 0xF0, 0xC1,
         0xE9, 0x00, 0x10, 0x00, 0x00,
@@ -206,9 +195,7 @@ fn the_crc32_table_sits_after_the_link_cell_array() {
         .expect("compiles");
 }
 
-/// `CRC32` touches no flag - including under the dead-flag pass, where it is
-/// classified as transparent and so must not be allowed to shadow an earlier
-/// write.
+/// `CRC32` touches no flag, and as dead-flag-transparent must not shadow an earlier write.
 #[test]
 fn crc32_preserves_flags() {
     // cmp rax, rax (sets ZF) ; crc32 eax, cl ; ret
@@ -242,7 +229,7 @@ fn popcnt_counts_and_sets_flags() {
         let out = LiftTest::new(&program)
             .reg(|c| {
                 c.rcx = src;
-                // Seed every flag set so the clears are observable.
+                // All flags set so the clears are observable.
                 c.cf = 1;
                 c.set_pf(1 != 0);
                 c.set_af(1 != 0);
@@ -252,7 +239,7 @@ fn popcnt_counts_and_sets_flags() {
             .run();
         assert_eq!(out.ctx.rax, expect, "popcnt of {src:#x}");
         assert_eq!(out.ctx.zf, u8::from(src == 0));
-        // POPCNT *clears* the other five rather than leaving them undefined.
+        // POPCNT clears the other five.
         assert_eq!(
             (out.ctx.cf, u8::from(out.ctx.pf()), u8::from(out.ctx.af()), out.ctx.sf, out.ctx.of),
             (0, 0, 0, 0, 0)
@@ -284,8 +271,7 @@ fn istrm(imm: u8) -> Vec<u8> {
     vec![0x66, 0x0F, 0x3A, 0x62, 0xC1, imm, 0xC3]
 }
 
-/// `pcmpestri xmm0, xmm1, imm8 ; ret` (`wide` adds `REX.W`, taking the lengths
-/// from RAX/RDX rather than EAX/EDX).
+/// `pcmpestri xmm0, xmm1, imm8 ; ret` (`wide` adds `REX.W`: lengths from RAX/RDX).
 fn estri(imm: u8, wide: bool) -> Vec<u8> {
     let mut v = vec![0x66];
     if wide {
@@ -300,8 +286,7 @@ fn estrm(imm: u8) -> Vec<u8> {
     vec![0x66, 0x0F, 0x3A, 0x60, 0xC1, imm, 0xC3]
 }
 
-/// Run a string compare over `(xmm0, xmm1)`, under every configuration that is
-/// supposed to make no difference to the answer.
+/// Run a string compare under every configuration that must not change the answer.
 fn strcmp_run(
     code: &[u8],
     a: &[u8],
@@ -311,9 +296,7 @@ fn strcmp_run(
     strcmp_run_inner(code, a, b, seed, true)
 }
 
-/// [`strcmp_run`] with the automatic Unicorn cross-check suppressed, for the
-/// one case where the oracle is the engine that is wrong. See
-/// [`pcmpestri_length_absolute_value_and_saturation`].
+/// [`strcmp_run`] without the Unicorn cross-check, where the oracle is wrong. See [`pcmpestri_length_absolute_value_and_saturation`].
 fn strcmp_run_no_unicorn(
     code: &[u8],
     a: &[u8],
@@ -365,10 +348,7 @@ fn strcmp_run_inner(
     last.unwrap()
 }
 
-/// The `strlen` idiom: equal-each against an all-zero operand. Every position
-/// of the (empty) first operand is invalid, so a position matches only where
-/// the *second* operand has also run out - making the first set bit the index
-/// of the terminator.
+/// `strlen`: equal-each against all-zero; the first set bit is the terminator.
 #[test]
 fn pcmpistri_is_strlen() {
     for (s, len) in [
@@ -384,8 +364,7 @@ fn pcmpistri_is_strlen() {
         assert_eq!(out.ctx.sf, 1, "the empty operand is shorter than 16");
     }
 
-    // A full 16 bytes with no terminator: no match, index 16, and neither
-    // exhaustion flag.
+    // 16 bytes, no terminator: no match, index 16, no exhaustion flags.
     let out = strcmp_run(&istri(0x08), &[], b"0123456789abcdef", |_| {});
     assert_eq!(out.ctx.rcx, 16);
     assert_eq!(out.ctx.cf, 0);
@@ -393,7 +372,7 @@ fn pcmpistri_is_strlen() {
     assert_eq!(out.ctx.sf, 1);
 }
 
-/// The `strchr` idiom: equal-any against a one-character set.
+/// `strchr`: equal-any against a one-character set.
 #[test]
 fn pcmpistri_is_strchr() {
     let out = strcmp_run(&istri(0x00), b"a", b"zza", |_| {});
@@ -406,20 +385,17 @@ fn pcmpistri_is_strchr() {
     assert_eq!(out.ctx.rcx, 16);
     assert_eq!(out.ctx.cf, 0);
 
-    // Present at position 0, which is the one case that also sets OF.
+    // At position 0, the case that also sets OF.
     let out = strcmp_run(&istri(0x00), b"a", b"abc", |_| {});
     assert_eq!(out.ctx.rcx, 0);
     assert_eq!(out.ctx.of, 1);
 
-    // A multi-character set: the *first* member found wins, not the first
-    // member listed.
+    // Multi-character set: the first member found wins, not the first listed.
     let out = strcmp_run(&istri(0x00), b"xyz", b"aazaa", |_| {});
     assert_eq!(out.ctx.rcx, 2);
 }
 
-/// The `strcmp` idiom: equal-each with the result inverted, so the first set
-/// bit is the first *difference*. Two equal strings must produce no set bit at
-/// all - which is only true because two exhausted positions force a match.
+/// `strcmp`: equal-each inverted; equal strings give no set bit because exhausted positions force a match.
 #[test]
 fn pcmpistri_is_strcmp() {
     let out = strcmp_run(&istri(0x18), b"abc", b"abc", |_| {});
@@ -430,14 +406,12 @@ fn pcmpistri_is_strcmp() {
     assert_eq!(out.ctx.rcx, 2);
     assert_eq!(out.ctx.cf, 1);
 
-    // Differing lengths: the terminator itself is the difference.
+    // Differing lengths: the terminator is the difference.
     let out = strcmp_run(&istri(0x18), b"ab", b"abc", |_| {});
     assert_eq!(out.ctx.rcx, 2);
 }
 
-/// The `strstr` idiom: equal-ordered reports where the first operand occurs as
-/// a substring of the second. A needle shorter than the register only matches
-/// because running off its end forces a match.
+/// `strstr`: equal-ordered; a short needle matches because running off its end forces a match.
 #[test]
 fn pcmpistri_is_strstr() {
     let out = strcmp_run(&istri(0x0C), b"bc", b"abcd", |_| {});
@@ -448,14 +422,12 @@ fn pcmpistri_is_strstr() {
     assert_eq!(out.ctx.rcx, 16);
     assert_eq!(out.ctx.cf, 0);
 
-    // A match that would run past the end of the haystack is not a match: "cd"
-    // starts at index 3 of "abc", but index 4 is past the terminator.
+    // A match running past the haystack's end is no match: "cd" at index 3 of "abc".
     let out = strcmp_run(&istri(0x0C), b"cd", b"abc", |_| {});
     assert_eq!(out.ctx.rcx, 16);
 }
 
-/// The character-class idiom: ranges, with pairs of the first operand read as
-/// inclusive bounds.
+/// Character class: ranges as inclusive bound pairs.
 #[test]
 fn pcmpistri_scans_ranges() {
     // ['a'..'z']
@@ -471,24 +443,24 @@ fn pcmpistri_scans_ranges() {
     assert_eq!(out.ctx.rcx, 16);
 }
 
-/// `imm8[6]` on an index form selects the *most* significant set bit.
+/// `imm8[6]` on an index form selects the most significant set bit.
 #[test]
 fn pcmpistri_most_significant_index() {
-    // equal any, 'a' anywhere in "aXa".
+    // equal any, 'a' in "aXa".
     let out = strcmp_run(&istri(0x40), b"a", b"aXa", |_| {});
     assert_eq!(out.ctx.rcx, 2);
     let out = strcmp_run(&istri(0x00), b"a", b"aXa", |_| {});
     assert_eq!(out.ctx.rcx, 0);
 
-    // No match still reports the element count, not 31.
+    // No match reports the element count, not 31.
     let out = strcmp_run(&istri(0x40), b"a", b"XXX", |_| {});
     assert_eq!(out.ctx.rcx, 16);
 }
 
-/// Word-granularity elements: 8 per register, and the "no match" index is 8.
+/// Words: 8 elements per register; no-match index is 8.
 #[test]
 fn pcmpistri_word_elements() {
-    // equal any over words: find 0x2211 in [0x0001, 0x2211, ...].
+    // equal any over words: 0x2211 in [0x0001, 0x2211, ...].
     let needle = xmm(&[0x11, 0x22]);
     let hay = xmm(&[0x01, 0x00, 0x11, 0x22]);
     let out = LiftTest::new(&istri(0x01))
@@ -499,7 +471,7 @@ fn pcmpistri_word_elements() {
         .run();
     assert_eq!(out.ctx.rcx, 1);
 
-    // Nothing matches: the element count is 8 here, not 16.
+    // No match: element count is 8, not 16.
     let out = LiftTest::new(&istri(0x01))
         .reg(|c| {
             c.xmm[0] = xmm(&[0xFF, 0xFE]);
@@ -509,8 +481,7 @@ fn pcmpistri_word_elements() {
     assert_eq!(out.ctx.rcx, 8);
 }
 
-/// Signed elements (`imm8[1]`) change the range comparison: `0x80` is below
-/// `'a'` as a signed byte and above `'z'` as an unsigned one.
+/// Signed elements: `0x80` is below `'a'` signed and above `'z'` unsigned.
 #[test]
 fn pcmpistri_signed_ranges() {
     // Unsigned ['a'..'z'] does not contain 0x80.
@@ -527,12 +498,7 @@ fn pcmpistri_signed_ranges() {
     assert_eq!(out.ctx.rcx, 0);
 }
 
-/// `PCMPISTRM` with `imm8[6] == 0`: `XMM0` receives the raw bitmask, and
-/// everything above it is zeroed.
-///
-/// The destination is `XMM0` whatever the operands are, so this uses
-/// `pcmpistrm xmm2, xmm1` - with `XMM0` pre-filled with ones - to show the
-/// whole register is written rather than merged into.
+/// `PCMPISTRM` with `imm8[6] == 0`: `XMM0` gets the raw bitmask and the whole register is written, not merged (pre-filled with ones).
 #[test]
 fn pcmpistrm_bit_mask() {
     // pcmpistrm xmm2, xmm1, 0x00 ; ret
@@ -562,19 +528,17 @@ fn pcmpistrm_expanded_mask() {
     assert_eq!(out.ctx.xmm[0], [0x0000_0000_FFFF_0000, 0]);
 }
 
-/// The explicit-length forms take their lengths from `EAX`/`EDX` instead of
-/// scanning, so a null byte is just another byte.
+/// Explicit-length forms take lengths from `EAX`/`EDX`; a null is just a byte.
 #[test]
 fn pcmpestri_uses_explicit_lengths() {
-    // equal any: 'a' in "z\0a", with an explicit length of 3 that reaches past
-    // the embedded null the implicit form would stop at.
+    // equal any: 'a' in "z\0a", length 3 reaching past the null.
     let out = strcmp_run(&estri(0x00, false), b"a", &[b'z', 0, b'a'], |c| {
         c.rax = 1;
         c.rdx = 3;
     });
     assert_eq!(out.ctx.rcx, 2);
 
-    // The same data with the implicit form stops at the null and finds nothing.
+    // The implicit form stops at the null and finds nothing.
     let out = strcmp_run(&istri(0x00), b"a", &[b'z', 0, b'a'], |_| {});
     assert_eq!(out.ctx.rcx, 16);
 
@@ -586,8 +550,7 @@ fn pcmpestri_uses_explicit_lengths() {
     assert_eq!(out.ctx.rcx, 16);
 }
 
-/// Explicit lengths are absolute values saturated to the element count, and
-/// only the low 32 bits count without `REX.W`.
+/// Explicit lengths are absolute values saturated to the element count; only the low 32 bits count without `REX.W`.
 #[test]
 fn pcmpestri_length_absolute_value_and_saturation() {
     let data = &[b'z', b'z', b'a'][..];
@@ -599,7 +562,7 @@ fn pcmpestri_length_absolute_value_and_saturation() {
     });
     assert_eq!(out.ctx.rcx, 2);
 
-    // A length past 16 saturates rather than wrapping, and clears ZF/SF.
+    // A length past 16 saturates and clears ZF/SF.
     let out = strcmp_run(&estri(0x00, false), b"a", data, |c| {
         c.rax = 99;
         c.rdx = 99;
@@ -615,14 +578,8 @@ fn pcmpestri_length_absolute_value_and_saturation() {
     });
     assert_eq!(out.ctx.rcx, 2);
 
-    // With REX.W it is not - and this value's absolute value saturates to 16.
-    //
-    // No Unicorn differential on this one case: QEMU's `pcmp_elen` computes the
-    // 64-bit absolute value and then stores it in an `int`, so `RDX` here comes
-    // out as -3 rather than 4294967293 and it reports `ZF = |RDX| < 16 = 1`.
-    // The SDM takes the whole of RDX under REX.W, which saturates - so the
-    // divergence is Unicorn's, and this is the encoding that proves the
-    // 64-bit half of `explicit_len` is not silently truncating the same way.
+    // With REX.W the whole of RDX counts and saturates to 16.
+    // No Unicorn differential: QEMU's `pcmp_elen` stores the 64-bit absolute value in an `int`, so it reads -3 and diverges from the SDM.
     let out = strcmp_run_no_unicorn(&estri(0x00, true), b"a", data, |c| {
         c.rax = 1;
         c.rdx = 0xFFFF_FFFF_0000_0003;
@@ -630,7 +587,7 @@ fn pcmpestri_length_absolute_value_and_saturation() {
     assert_eq!(out.ctx.rcx, 2);
     assert_eq!(out.ctx.zf, 0, "the saturated length is a full register");
 
-    // A zero length makes every position of that operand invalid.
+    // A zero length makes every position invalid.
     let out = strcmp_run(&estri(0x00, false), b"a", data, |c| {
         c.rax = 1;
         c.rdx = 0;
@@ -639,7 +596,7 @@ fn pcmpestri_length_absolute_value_and_saturation() {
     assert_eq!(out.ctx.cf, 0);
 }
 
-/// `PCMPESTRM` writes `XMM0` under explicit lengths like its implicit twin.
+/// `PCMPESTRM` writes `XMM0` under explicit lengths.
 #[test]
 fn pcmpestrm_writes_xmm0() {
     let out = strcmp_run(&estrm(0x40), b"a", &[b'z', 0, b'a'], |c| {
@@ -649,8 +606,7 @@ fn pcmpestrm_writes_xmm0() {
     assert_eq!(out.ctx.xmm[0], [0x0000_0000_00FF_0000, 0]);
 }
 
-/// A memory second operand is a plain 128-bit load, including the bytes past
-/// the string's terminator.
+/// A memory second operand is a plain 128-bit load, including bytes past the terminator.
 #[test]
 fn pcmpistri_memory_operand() {
     // pcmpistri xmm0, [rsi], 0x00 ; ret
@@ -665,36 +621,23 @@ fn pcmpistri_memory_operand() {
     assert_eq!(out.ctx.rcx, 2);
 }
 
-/// The two negating polarities differ in what they do to the positions *past*
-/// the second operand's end, and the difference is exactly why `strcmp` uses
-/// one of them and not the other.
-///
-/// Plain negation (`imm8[5:4] == 01`) inverts all 16 positions, so the
-/// forced-true positions past both strings' ends become false and drop out.
-/// Masked negation (`11`) inverts only the positions valid in the second
-/// operand, so those forced trues survive and the first set bit is the
-/// terminator rather than a difference.
+/// Plain negation (`01`) inverts all 16 positions, dropping the forced-true ones past both ends; masked (`11`) inverts only valid positions, so the first set bit is the terminator. Hence `strcmp` uses plain.
 #[test]
 fn pcmpistri_negation_polarities_differ_past_the_end() {
-    // Equal strings, equal-each. Plain negation reports no difference at all;
-    // masked negation reports the first position past the second operand.
+    // Equal strings: plain reports no difference; masked reports the first position past the second operand.
     let out = strcmp_run(&istri(0x18), b"abc", b"abc", |_| {});
     assert_eq!(out.ctx.rcx, 16);
     let out = strcmp_run(&istri(0x38), b"abc", b"abc", |_| {});
     assert_eq!(out.ctx.rcx, 3);
 
-    // A longer first operand: position 3 is (valid, invalid), which forces
-    // false and so is *not* a match under either polarity - plain negation
-    // turns it into the reported difference, masked negation leaves the
-    // terminator at 3 clear and reports 4.
+    // Longer first operand: position 3 (valid, invalid) is no match under either; plain reports it, masked reports 4.
     let out = strcmp_run(&istri(0x18), b"abcd", b"abc", |_| {});
     assert_eq!(out.ctx.rcx, 3);
     let out = strcmp_run(&istri(0x38), b"abcd", b"abc", |_| {});
     assert_eq!(out.ctx.rcx, 4);
 }
 
-/// Every string compare defines the same six flags, and two of them are always
-/// cleared.
+/// Every string compare defines the same six flags; two are always cleared.
 #[test]
 fn pcmpistri_clears_af_and_pf() {
     let out = strcmp_run(&istri(0x00), b"a", b"zza", |c| {
@@ -704,8 +647,7 @@ fn pcmpistri_clears_af_and_pf() {
     assert_eq!((u8::from(out.ctx.af()), u8::from(out.ctx.pf())), (0, 0));
 }
 
-/// The dead-flag pass must not elide any of them: the string compares are
-/// hand-classified as writing all six.
+/// Dead-flag pass must not elide any: they are classified as writing all six.
 #[test]
 fn pcmpistri_flags_survive_dead_flag_elimination() {
     let code = istri(0x00);

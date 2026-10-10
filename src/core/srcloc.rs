@@ -1,41 +1,21 @@
-//! Guest source locations: which guest instruction a piece of lifted IR - and,
-//! after compilation, a piece of host machine code - came from.
+//! Guest source locations: [`SourceLocMap`] maps guest VA <-> Cranelift [`SourceLoc`];
+//! [`GuestCodeMap`] maps compiled host code ranges back to guest VAs.
 //!
-//! [`SourceLocMap`] converts between a guest VA and Cranelift's [`SourceLoc`];
-//! [`GuestCodeMap`] is the post-compilation product, sorted host code ranges
-//! tagged with the guest VA they implement.
-//!
-//! A `SourceLoc` is 31 bits - Cranelift reserves the high bit to tag a location
-//! as relative - and `0x7fff_ffff` is reserved as "no location", so a VA is
-//! stored as a signed displacement from the lift base, biased into that range:
-//! within ~1 GiB it round-trips exactly, further away it encodes as no location
-//! rather than a wrong one. Signed because out-of-region branch targets go
-//! backwards as often as forwards.
-//!
-//! The VA is a lift-time address, so under
-//! [`AddressMode::ImageBaseRelative`](crate::core::AddressMode::ImageBaseRelative)
-//! a consumer comparing against a live PC must map it as
-//! [`LiftEngine::to_lift_va`](crate::core::LiftEngine::to_lift_va) does.
+//! A VA is a signed displacement from the lift base, biased into 31 bits: exact within ~1 GiB,
+//! "no location" beyond (never a wrong one). It is a lift-time address, so compare live PCs via
+//! [`LiftEngine::to_lift_va`](crate::core::LiftEngine::to_lift_va).
 
 use cranelift_codegen::CompiledCode;
 use cranelift_codegen::ir::SourceLoc;
 
-/// The bias applied to the signed displacement so it fills the 31-bit source
-/// location range with its ordering intact. `delta == -2^30` maps to `0`,
-/// `delta == 0` maps to `0x4000_0000`, and `delta == 2^30 - 1` maps to
-/// `0x7fff_ffff` - which collides with Cranelift's reserved "no location" value
-/// and is therefore rejected.
+/// Bias placing the signed displacement in 31 bits; `2^30 - 1` would hit the reserved "no location" and is rejected.
 const SIGN_BIAS: i64 = 0x4000_0000;
 
-/// Converts between guest virtual addresses and Cranelift [`SourceLoc`]s for
-/// one lifted region. Cheap to copy: the whole mapping is the lift base plus
-/// the fixed encoding described in the [module docs](self).
+/// Guest VA <-> [`SourceLoc`] for one lifted region.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SourceLocMap {
-    /// The VA the region's first byte was lifted at
-    /// ([`LiftEngine::lift_base`](crate::core::LiftEngine::lift_base)).
-    /// Displacements are measured from here.
+    /// [`LiftEngine::lift_base`](crate::core::LiftEngine::lift_base); displacements are measured from here.
     pub lift_base: u64,
 }
 
@@ -44,28 +24,21 @@ impl SourceLocMap {
         Self { lift_base }
     }
 
-    /// Encode guest VA `va` as a `SourceLoc`.
-    ///
-    /// [`SourceLoc::default`] ("no location") when `va` is more than ~1 GiB from
-    /// [`lift_base`](Self::lift_base). Never returns a *wrong* location.
+    /// [`SourceLoc::default`] ("no location") when `va` is more than ~1 GiB from the base.
     pub fn encode(&self, va: u64) -> SourceLoc {
         self.try_encode(va).unwrap_or_default()
     }
 
-    /// [`encode`](Self::encode), distinguishing "out of range" from a real
-    /// location.
+    /// [`encode`](Self::encode) returning `None` when out of range.
     pub fn try_encode(&self, va: u64) -> Option<SourceLoc> {
         let delta = va.wrapping_sub(self.lift_base) as i64;
         let bits = u32::try_from(delta + SIGN_BIAS).ok()?;
-        // The top of the range is the reserved "no location" encoding.
         if bits >= SourceLoc::default().bits() {
             return None;
         }
         Some(SourceLoc::new(bits))
     }
 
-    /// Recover the guest VA a `SourceLoc` stands for, or `None` if it carries no
-    /// location.
     pub fn decode(&self, loc: SourceLoc) -> Option<u64> {
         if loc.is_default() {
             return None;
@@ -75,16 +48,12 @@ impl SourceLocMap {
     }
 }
 
-/// One contiguous run of host machine code, and the guest instruction it was
-/// lifted from. Offsets are relative to the start of the compiled function.
+/// A host code run and the guest instruction it came from; offsets are function-relative.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct GuestCodeRange {
-    /// First byte of the run, relative to the function's entry.
     pub start: u32,
-    /// One past the last byte of the run, relative to the function's entry.
     pub end: u32,
-    /// Guest VA of the instruction this code implements.
     pub guest_va: u64,
 }
 
@@ -102,11 +71,9 @@ impl GuestCodeRange {
     }
 }
 
-/// Host code offset -> guest instruction map for one compiled function.
+/// Host code offset -> guest instruction for one compiled function.
 ///
-/// Built from the [`SourceLoc`]s that survived lowering, so it covers only code
-/// Cranelift attributed to a guest instruction - the prologue and the entry
-/// dispatch deliberately carry none. Sorted by `start`, non-overlapping.
+/// Covers only code with a surviving [`SourceLoc`] (not the prologue or entry dispatch); sorted, non-overlapping.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct GuestCodeMap {
@@ -114,10 +81,7 @@ pub struct GuestCodeMap {
 }
 
 impl GuestCodeMap {
-    /// Extract the map from a compiled function.
-    ///
-    /// `map` must be the [`SourceLocMap`] of the lift that produced the IR -
-    /// [`LiftedCode::source_map`](crate::core::LiftedCode::source_map).
+    /// `map` must be the lift's [`LiftedCode::source_map`](crate::core::LiftedCode::source_map).
     pub fn from_compiled(compiled: &CompiledCode, map: SourceLocMap) -> Self {
         let ranges = compiled
             .buffer
@@ -134,14 +98,12 @@ impl GuestCodeMap {
         Self { ranges }
     }
 
-    /// Build a map directly from sorted, non-overlapping ranges. Mostly useful
-    /// for tests and for callers that persist a map and read it back.
+    /// From sorted, non-overlapping ranges.
     pub fn from_ranges(mut ranges: Vec<GuestCodeRange>) -> Self {
         ranges.sort_by_key(|r| r.start);
         Self { ranges }
     }
 
-    /// Every range, ordered by host code offset.
     pub fn ranges(&self) -> &[GuestCodeRange] {
         &self.ranges
     }
@@ -150,44 +112,30 @@ impl GuestCodeMap {
         self.ranges.is_empty()
     }
 
-    /// The guest instruction whose code covers host `offset` (relative to the
-    /// function entry), or `None` if that offset belongs to code with no guest
-    /// origin - a prologue, the dispatch switch, or codegen filler.
+    /// Guest instruction covering function-relative `offset`; `None` for prologue, dispatch or filler.
     pub fn lookup(&self, offset: u32) -> Option<u64> {
-        // Ranges are sorted and disjoint, so the candidate is the last one
-        // starting at or before `offset`.
         let idx = self.ranges.partition_point(|r| r.start <= offset);
         let range = self.ranges.get(idx.checked_sub(1)?)?;
         range.contains(offset).then_some(range.guest_va)
     }
 
-    /// [`lookup`](Self::lookup) for an absolute host address, given the address
-    /// the function was compiled to (what
-    /// [`CraneliftBackend::compile_lifted`](crate::backend::CraneliftBackend::compile_lifted)
-    /// returns). Answers "which guest instruction is this `RIP` in?".
+    /// [`lookup`](Self::lookup) for an absolute host address, given the function's compiled address.
     pub fn lookup_host_addr(&self, func_ptr: *const u8, addr: u64) -> Option<u64> {
         let base = func_ptr as u64;
         let offset = addr.checked_sub(base)?;
         self.lookup(u32::try_from(offset).ok()?)
     }
 
-    /// Every host code range lifted from guest instruction `va`, in code order.
-    /// There can be several: a guest instruction's IR may be split, duplicated
-    /// across blocks, or interleaved with its neighbours by scheduling.
+    /// Every host range lifted from `va`, in code order (IR may be split or duplicated).
     pub fn ranges_for(&self, va: u64) -> impl Iterator<Item = &GuestCodeRange> {
         self.ranges.iter().filter(move |r| r.guest_va == va)
     }
 
-    /// Total host bytes attributed to guest instruction `va`.
     pub fn code_size_for(&self, va: u64) -> u32 {
         self.ranges_for(va).map(|r| r.len()).sum()
     }
 
-    /// The distinct guest instruction addresses that survived into machine code,
-    /// ascending.
-    ///
-    /// An absent instruction was eliminated outright - its result was dead - which
-    /// makes this a direct read on what eager flag computation costs.
+    /// Distinct guest addresses that survived into machine code, ascending.
     pub fn guest_addresses(&self) -> Vec<u64> {
         let mut vas: Vec<u64> = self.ranges.iter().map(|r| r.guest_va).collect();
         vas.sort_unstable();
@@ -213,7 +161,6 @@ mod tests {
         let map = SourceLocMap::new(0x1000);
         assert!(map.try_encode(0x1000 + (1 << 30)).is_none());
         assert!(map.try_encode(0x1000u64.wrapping_sub(1 << 30) - 1).is_none());
-        // The most positive displacement collides with the reserved encoding.
         assert!(map.try_encode(0x1000 + (1 << 30) - 1).is_none());
         assert!(map.try_encode(0x1000 + (1 << 30) - 2).is_some());
         assert!(map.try_encode(0x1000u64.wrapping_sub(1 << 30)).is_some());

@@ -1,20 +1,7 @@
-//! SSE4.2 `CRC32` - the CRC-32C (Castagnoli) accumulator.
+//! SSE4.2 `CRC32`: the CRC-32C accumulator; no flags are touched.
 //!
-//! `CRC32 r32/r64, r/m8/16/32/64` folds its source into the 32-bit running
-//! remainder in the destination's low half, using the reflected CRC-32C
-//! polynomial. No flags are touched.
-//!
-//! Cranelift exposes no host instruction for it, so this is the ordinary
-//! byte-at-a-time table algorithm: `crc = (crc >> 8) ^ T[(crc ^ byte) & 0xFF]`,
-//! four steps for a `m32` and eight for a `m64`. [`CRC32C_TABLE`] is computed by
-//! `const fn` at our build time and emitted into the artifact as a read-only
-//! [`DataObject`](crate::core::DataObject) - guest memory this crate does not
-//! own is not involved, and neither is any run-time initialisation.
-//!
-//! At six IR instructions a byte the 64-bit form is ~50, so [`Crc32Kernel`]
-//! still outlines each width into a shared helper, as the x87 softfloat kernels
-//! do. The table's base is a parameter of that helper rather than a symbol it
-//! names itself, so the relocation stays in the region the backend renumbers.
+//! Byte-at-a-time table algorithm over [`CRC32C_TABLE`], emitted as a read-only [`DataObject`](crate::core::DataObject).
+//! Each width is outlined into a shared helper ([`Crc32Kernel`]); the table base is a parameter, not a symbol.
 
 use crate::MicroliftError;
 use crate::lifter::Lifter;
@@ -53,11 +40,7 @@ pub fn table_bytes() -> Vec<u8> {
         .collect()
 }
 
-/// Fold `bits` bits of `data` into the 32-bit remainder `crc`, reading the
-/// table at `table`.
-///
-/// `crc` is an `I32`; `data` is an `I64` whose low `bits` bits are the operand.
-/// The result is an `I32`. `bits` must be 8, 16, 32 or 64.
+/// Fold `bits` (8/16/32/64) bits of `data` into the `I32` remainder `crc`, reading the table at `table`.
 pub fn emit_crc32c(
     b: &mut FunctionBuilder,
     crc: Value,
@@ -80,7 +63,7 @@ pub fn emit_crc32c(
     acc
 }
 
-/// One table step. Only the low byte of `data` is read.
+/// One table step; reads only the low byte of `data`.
 fn fold_byte(
     b: &mut FunctionBuilder,
     crc: Value,
@@ -98,11 +81,7 @@ fn fold_byte(
     b.ins().bxor(shifted, entry)
 }
 
-/// One outlinable `CRC32` expansion, named by its *source* operand width.
-///
-/// The destination width does not appear here: `CRC32 r64, r/m8` and
-/// `CRC32 r32, r/m8` fold the same 8 bits into the same 32-bit remainder and
-/// differ only in how the caller writes the result back.
+/// One outlinable `CRC32` expansion, named by *source* width (destination width only changes the write-back).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Crc32Kernel {
     Byte,
@@ -111,7 +90,6 @@ pub enum Crc32Kernel {
     Qword,
 }
 
-/// Every kernel, for callers that want to pre-emit or enumerate them.
 pub const CRC32_KERNELS: [Crc32Kernel; 4] = [
     Crc32Kernel::Byte,
     Crc32Kernel::Word,
@@ -120,7 +98,6 @@ pub const CRC32_KERNELS: [Crc32Kernel; 4] = [
 ];
 
 impl Crc32Kernel {
-    /// The kernel for a source operand of `size` bytes.
     pub fn for_size(size: usize) -> Option<Crc32Kernel> {
         Some(match size {
             1 => Crc32Kernel::Byte,
@@ -131,7 +108,6 @@ impl Crc32Kernel {
         })
     }
 
-    /// Source width in bits.
     pub fn bits(self) -> u32 {
         match self {
             Crc32Kernel::Byte => 8,
@@ -141,9 +117,7 @@ impl Crc32Kernel {
         }
     }
 
-    /// The symbol the helper function is declared under. Namespaced and stable
-    /// for the same reason the x87 kernels' are: two AOT-lifted regions linked
-    /// together must share one copy.
+    /// Helper symbol; stable so AOT regions linked together share one copy.
     pub fn symbol(self) -> &'static str {
         match self {
             Crc32Kernel::Byte => "__microlift_crc32c_u8",
@@ -153,8 +127,7 @@ impl Crc32Kernel {
         }
     }
 
-    /// `(crc: I32, data: I64, table: I64) -> I32`. `call_conv` should match the
-    /// calling function's, so a call needs no convention bridging.
+    /// `(crc: I32, data: I64, table: I64) -> I32`.
     pub fn signature(self, call_conv: CallConv) -> Signature {
         let mut sig = Signature::new(call_conv);
         sig.params.push(AbiParam::new(types::I32));
@@ -164,8 +137,6 @@ impl Crc32Kernel {
         sig
     }
 
-    /// Emit the kernel's body into `b`, whose function must already have been
-    /// given [`signature`](Self::signature).
     pub fn build_body(self, b: &mut FunctionBuilder) {
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
@@ -184,11 +155,7 @@ impl Crc32Kernel {
 }
 
 impl<'a> Lifter<'a> {
-    /// `CRC32 r32/r64, r/m8/16/32/64`.
-    ///
-    /// The remainder lives in the destination's low 32 bits whatever the
-    /// destination width, so the `r64` forms zero the upper half explicitly rather
-    /// than through a 32-bit write. No flag is touched.
+    /// `CRC32 r32/r64, r/m8/16/32/64`; the `r64` forms zero the upper half explicitly.
     pub(super) fn handle_crc32(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let src_size = self.operand_size(instruction, 1)?;
         let kernel = Crc32Kernel::for_size(src_size).ok_or_else(|| {
@@ -218,9 +185,7 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// Emit one `CRC32` fold, as a call to the shared helper or - when
-    /// outlining is off - inline at this site. Both paths run the identical
-    /// [`emit_crc32c`] builder over the same emitted table.
+    /// Emit one fold as a call to the shared helper, or inline when outlining is off.
     fn crc32_kernel(&mut self, kernel: Crc32Kernel, crc: Value, data: Value) -> Value {
         let table = self.data_constant(CRC32C_TABLE_SYMBOL, 4, table_bytes);
 

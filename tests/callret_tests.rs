@@ -9,15 +9,11 @@ use microlift::runtime::{CodeCache, Step, ThreadRuntime, Translation};
 use microlift::testkit::prelude::*;
 use microlift::testkit::{DEFAULT_LIFT_BASE, EXIT_TRAMPOLINE};
 
-/// Where the callee lives.
 const CALLEE: u64 = 0x2000;
-/// The address the call comes back to - `DEFAULT_LIFT_BASE` plus the `call`'s
-/// five bytes.
 const RETURN_TO: u64 = DEFAULT_LIFT_BASE + 5;
 const ROWS: u32 = 256;
 const FRAMES: u32 = 4;
 
-/// `call 0x2000 ; mov rax, 1 ; ret`
 #[rustfmt::skip]
 const CALLER: &[u8] = &[
     0xE8, 0xFB, 0x0F, 0x00, 0x00,              // call 0x2000
@@ -25,7 +21,6 @@ const CALLER: &[u8] = &[
     0xC3,                                      // ret
 ];
 
-/// `mov rbx, 7 ; ret` - returns to [`RETURN_TO`].
 const CALLEE_CODE: &[u8] = &[0x48, 0xC7, 0xC3, 0x07, 0x00, 0x00, 0x00, 0xC3];
 
 fn link_config() -> BlockLinkConfig {
@@ -36,7 +31,7 @@ fn ring() -> CallRetConfig {
     CallRetConfig::new(FRAMES)
 }
 
-/// `ring` on, or only cells - the control for every behavioural case here.
+/// `ring` on, or cells only (the control case).
 fn config(with_ring: bool) -> impl Fn(&mut LifterConfig) {
     move |c: &mut LifterConfig| {
         c.block_link = Some(link_config());
@@ -74,7 +69,7 @@ impl Guest {
         if with_ring {
             runtime = runtime.with_call_return(ring());
         }
-        // The guest `call` pushes below this, so leave it a word of headroom.
+        // Leave headroom for the guest `call`'s push.
         runtime.ctx.rsp = top - 8;
         // SAFETY: inside `stack`, which this struct owns.
         unsafe { *(runtime.ctx.rsp as *mut u64) = EXIT_TRAMPOLINE };
@@ -86,7 +81,6 @@ impl Guest {
     }
 }
 
-/// Both regions in the cache, the caller published, everything installed.
 fn seeded(with_ring: bool) -> (Arc<RwLock<CodeCache>>, Guest) {
     let cache = Arc::new(RwLock::new(CodeCache::new()));
     let mut guest = Guest::new(&cache, with_ring);
@@ -114,9 +108,7 @@ fn a_call_gets_a_cell_for_the_address_it_returns_to() {
     assert_eq!(returns.len(), 1);
     assert_eq!(returns[0].target, RETURN_TO);
 
-    // The whole design rests on this: a return address is always a *call resume
-    // point*, so the region's entry dispatch can already be entered there and
-    // the cell needs no finer granularity than a whole region.
+    // A return address is always a call resume point, so cell granularity is a whole region.
     assert!(
         code.resume_points.contains(&RETURN_TO),
         "the return address must be enterable: {:x?}",
@@ -143,8 +135,7 @@ fn the_ring_being_off_emits_no_return_cell() {
 
 #[test]
 fn the_ring_needs_cells_to_have_anything_to_name() {
-    // A hit hands back a cell, so the ring is inert without them rather than
-    // half-working - the same silent-fallback shape as `pinned_abi_for`.
+    // A hit yields a cell, so the ring is inert without cells.
     let config = LifterConfig {
         block_link: Some(link_config()),
         link_cells: false,
@@ -156,8 +147,7 @@ fn the_ring_needs_cells_to_have_anything_to_name() {
     assert!(code.link_sites.is_empty());
 }
 
-/// With `link_table` null, a `RET` - whose target is a runtime value and so has no static cell - can only be
-/// resolved by the ring.
+/// With `link_table` null only the ring can resolve a `RET`.
 #[test]
 fn a_return_is_predicted_with_no_table_at_all() {
     let (_cache, mut guest) = seeded(true);
@@ -181,8 +171,7 @@ fn a_return_is_predicted_with_no_table_at_all() {
 
 #[test]
 fn without_the_ring_the_same_return_needs_the_host() {
-    // The other half of the control: identical program, ring off. The callee's
-    // `RET` has no cell and no table, so it must exit.
+    // Ring off: the callee's RET has no cell and no table, so it exits.
     let (_cache, mut guest) = seeded(false);
     guest.runtime.detach_table();
 
@@ -200,11 +189,7 @@ fn without_the_ring_the_same_return_needs_the_host() {
 
 #[test]
 fn a_return_to_an_address_nobody_pushed_is_a_miss() {
-    // **The inverse control.** A ring that took the top frame without checking
-    // its `guest_pc` would re-enter the caller here, which is a wrong jump - the
-    // exact failure the compare exists to prevent. The callee rewrites its own
-    // return address, so the address it returns to and the frame the caller
-    // pushed disagree.
+    // The callee rewrites its return address; the ring must compare `guest_pc` or it jumps wrong.
     const ELSEWHERE: u64 = 0x3000;
     #[rustfmt::skip]
     let rogue: &[u8] = &[
@@ -237,8 +222,7 @@ fn a_return_to_an_address_nobody_pushed_is_a_miss() {
     assert_eq!(step, Step::Exit(ExitReason::UnknownJump));
     assert_eq!(guest.runtime.ctx.rip, ELSEWHERE);
 
-    // A declining pop must leave the ring alone - the frame it refused still
-    // belongs to an outer call that has not returned yet.
+    // A declined pop leaves the frame for the outer call.
     assert_eq!(
         guest.runtime.ctx.callret_off,
         (ring().bytes() - microlift::core::callret::FRAME_SIZE),
@@ -246,14 +230,9 @@ fn a_return_to_an_address_nobody_pushed_is_a_miss() {
     );
 }
 
-/// **The property the no-guard-page argument rests on.** A guest that pushes
-/// more frames than the ring holds must get correct answers, losing only hit
-/// rate. Four frames, five nested calls.
+/// Overflowing the ring costs hit rate, never correctness.
 #[test]
 fn an_unbalanced_guest_gets_correct_answers_with_a_worse_hit_rate() {
-    // Five regions, each calling the next: 0x1000 -> 0x2000 -> ... -> 0x6000.
-    // The innermost returns, and the returns unwind back out through a ring that
-    // is one frame too small to have remembered them all.
     const DEPTH: u64 = 5;
     let cache = Arc::new(RwLock::new(CodeCache::new()));
     let stack = vec![0u64; 1024];
@@ -271,10 +250,8 @@ fn an_unbalanced_guest_gets_correct_answers_with_a_worse_hit_rate() {
             (i + 1) * 0x1000
         };
         let bytes: Vec<u8> = if i + 1 == DEPTH {
-            // Innermost: `add rax, 1 ; ret`
             vec![0x48, 0x83, 0xC0, 0x01, 0xC3]
         } else {
-            // `call next ; add rax, 1 ; ret`
             let next = (i + 2) * 0x1000;
             let disp = (next as i64 - (at as i64 + 5)) as i32;
             let mut v = vec![0xE8];
@@ -305,9 +282,7 @@ fn an_unbalanced_guest_gets_correct_answers_with_a_worse_hit_rate() {
         }
     }
 
-    // Every level ran exactly once. This is the assertion that matters: a ring
-    // too small to remember the outermost frames still produced the right
-    // answer, because a stale frame *misses* rather than lying.
+    // A stale frame misses rather than lying.
     assert_eq!(
         runtime.ctx.rax, DEPTH,
         "each of the {DEPTH} levels must have run once"
@@ -317,9 +292,7 @@ fn an_unbalanced_guest_gets_correct_answers_with_a_worse_hit_rate() {
 
 #[test]
 fn a_thread_with_no_ring_is_not_a_special_case() {
-    // Code lifted *with* the ring, run on a thread that never allocated one: a
-    // null pointer must mean "no prediction", not a crash - the same shape as a
-    // null `link_table`.
+    // A null ring pointer means no prediction, not a crash.
     let cache = Arc::new(RwLock::new(CodeCache::new()));
     let mut guest = Guest::new(&cache, false); // no ring on the thread
     let caller = cache.write().unwrap().insert(caller(true)); // ring in the code
@@ -330,7 +303,6 @@ fn a_thread_with_no_ring_is_not_a_special_case() {
     // SAFETY: as above.
     let step = unsafe { guest.runtime.step() };
 
-    // It falls back to the table, which is published, so the program completes.
     assert_eq!(step, Step::Exit(ExitReason::Return));
     assert_eq!(guest.runtime.ctx.rbx, 7);
     assert_eq!(guest.runtime.ctx.rax, 1);
@@ -345,8 +317,7 @@ fn a_matching_pop_advances_the_ring_and_a_missing_one_does_not() {
     // SAFETY: as above.
     unsafe { guest.runtime.step() };
 
-    // One push (offset wraps down by a frame) and one matching pop (back up), so
-    // a balanced program leaves the pointer exactly where it found it.
+    // Balanced push/pop restores the pointer.
     assert_eq!(
         guest.runtime.ctx.callret_off, 0,
         "a balanced call/return is a no-op on the ring"

@@ -24,9 +24,7 @@ fn the_default_has_nothing_enabled() {
 
 #[test]
 fn unsafe_imprecise_nan_still_produces_a_nan() {
-    // The one guarantee this optimization keeps even though it gives up the
-    // bit pattern: the value is still a NaN, so downstream arithmetic and
-    // comparisons behave the same.
+    // Still a NaN, so downstream arithmetic behaves the same.
     for vector in REPRS {
         let r = LiftTest::new(MULSS)
             .generated_nan(GeneratedNan::X86Exact)
@@ -61,8 +59,7 @@ fn code_len(bytes: &[u8], optimizations: Optimizations, triple: &str) -> usize {
         .len()
 }
 
-/// The half a behavioural test cannot reach: an implementation that ignored
-/// the optimization entirely would pass everything above.
+/// Size check: an implementation ignoring the optimization would pass the tests above.
 #[test]
 fn unsafe_imprecise_nan_sheds_the_fixup() {
     for triple in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
@@ -93,8 +90,7 @@ fn no_de() -> Optimizations {
 
 #[test]
 fn a_valid_division_is_unaffected_by_dropping_the_de_guards() {
-    // The guards only ever *reject*, so removing them must leave every division
-    // that would not have faulted computing exactly what it computed before.
+    // Guards only reject, so removing them leaves non-faulting divisions unchanged.
     for opts in [Optimizations::none(), no_de()] {
         let out = LiftTest::new(DIV_RCX)
             .optimizations(opts)
@@ -112,9 +108,7 @@ fn a_valid_division_is_unaffected_by_dropping_the_de_guards() {
 
 #[test]
 fn a_quotient_overflow_faults_by_default_and_wraps_with_the_optimization() {
-    // AX/BL = 0x2000, which does not fit in AL. This is the guard-2 case, and
-    // the only #DE that is safe to actually execute with the guards gone (a
-    // zero divisor has no result at all - see `Optimization`'s doc comment).
+    // AX/BL = 0x2000 overflows AL: the guard-2 case, the only #DE safe to execute without guards.
     let seed = |c: &mut RegisterContext| {
         c.rax = 0x2000;
         c.rbx = 1;
@@ -142,13 +136,11 @@ fn a_quotient_overflow_faults_by_default_and_wraps_with_the_optimization() {
         ExitReason::Return as u32,
         "with the guards gone the same division must not fault"
     );
-    // AL = the truncated quotient, AH = the remainder; the rest of RAX is
-    // untouched, exactly as an 8-bit destination write behaves.
+    // AL = quotient, AH = remainder; rest of RAX untouched.
     assert_eq!(wrapped.ctx.rax & 0xFFFF, 0x0000);
 }
 
-/// The half a behavioural test cannot reach: an implementation that ignored the
-/// optimization would still pass both cases above.
+/// Size check, as above.
 #[test]
 fn unsafe_imprecise_division_exceptions_sheds_the_guards() {
     for triple in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {

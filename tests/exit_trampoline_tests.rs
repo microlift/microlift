@@ -5,10 +5,8 @@ use microlift::core::{LifterConfig, lift_to_code};
 use microlift::testkit::EXIT_TRAMPOLINE;
 use microlift::testkit::prelude::*;
 
-/// `mov rax, 42 ; ret`
 const MOV_RET: [u8; 8] = [0x48, 0xC7, 0xC0, 0x2A, 0x00, 0x00, 0x00, 0xC3];
 
-/// A return address that is neither in-region nor the sentinel.
 const ELSEWHERE: u64 = 0x4321_0000;
 
 #[test]
@@ -23,9 +21,7 @@ fn a_declared_sentinel_still_returns() {
     assert_eq!(out.ctx.rax, 42);
 }
 
-/// With a sentinel declared, a `RET` to some other out-of-region address is
-/// still the `UnknownJump` exit - i.e. the compare is what picks between them,
-/// and this is the case that survives when it is gone.
+/// With a sentinel declared, any other out-of-region `RET` is still `UnknownJump`.
 #[test]
 fn a_declared_sentinel_does_not_swallow_other_returns() {
     let out = LiftTest::new(&MOV_RET)
@@ -38,9 +34,7 @@ fn a_declared_sentinel_does_not_swallow_other_returns() {
     assert_eq!(out.ctx.rip, ELSEWHERE);
 }
 
-/// The default: no sentinel, so *every* out-of-region `RET` is the
-/// `UnknownJump` exit, with the popped address published for the host to
-/// resolve. This is the exit block linking can resolve in-region.
+/// Default: no sentinel, every out-of-region `RET` is `UnknownJump` (the exit block linking resolves).
 #[test]
 fn without_a_sentinel_a_ret_is_an_unknown_jump() {
     for ret_to in [ELSEWHERE, EXIT_TRAMPOLINE] {
@@ -60,12 +54,9 @@ fn without_a_sentinel_a_ret_is_an_unknown_jump() {
     }
 }
 
-/// Only the out-of-region path changes: a `RET` landing on a block of this
-/// region is dispatched to it as before, with no exit at all.
+/// An in-region `RET` target dispatches as before.
 #[test]
 fn an_in_region_ret_still_dispatches_in_region() {
-    // call sub ; mov rbx, 7 ; ret        <- the inner ret lands on `mov rbx`
-    // sub: mov rax, 42 ; ret
     let bytes = [
         0xE8, 0x08, 0x00, 0x00, 0x00, // 0x1000: call 0x100D
         0x48, 0xC7, 0xC3, 0x07, 0x00, 0x00, 0x00, // 0x1005: mov rbx, 7
@@ -112,9 +103,7 @@ fn code_len(bytes: &[u8], trampoline: Option<u64>, triple: &str) -> usize {
                 ..Default::default()
             };
             let mut code = lift_to_code::<X86_64>(bytes, 0x1000, config).expect("lift");
-            // The lifter bakes in the host calling convention; override it so
-            // this measures lowering rather than tripping the target's ABI code
-            // on a convention it does not accept.
+            // Override the baked host convention so this measures lowering, not the target ABI.
             code.func.signature.call_conv = cranelift_codegen::isa::CallConv::SystemV;
             ArtifactBackend::compile_lifted_to_raw(code, Some(triple), None)
                 .expect("compile")

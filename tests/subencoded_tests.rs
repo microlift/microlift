@@ -13,10 +13,7 @@ fn test_overlapping_jmp_into_self() {
     assert_eq!(ctx.rax, 1, "overlapping `FF C0` should decode as inc eax");
 }
 
-/// Sub-encoded instruction hidden inside a `mov` immediate.
-///
-/// A linear disassembler decodes a 5-byte `mov eax, imm32` at 0x1004, but control
-/// flow jumps one byte into it, so the immediate bytes decode as `add eax, imm32`.
+/// Sub-encoded instruction hidden in a `mov` immediate: a jump one byte into `mov eax, imm32` at 0x1004 decodes the immediate as `add eax, imm32`.
 #[test]
 fn test_subencoded_in_mov_immediate() {
     #[rustfmt::skip]

@@ -1,8 +1,4 @@
-//! Bit-exact verification of the software x87 80-bit kernels against LLVM's
-//! APFloat (`rustc_apfloat::ieee::X87DoubleExtended`).
-//!
-//! Each test JIT-compiles a tiny wrapper that calls the kernel emitter and
-//! compares its raw 80-bit output to APFloat operating on the same operands.
+//! Bit-exact checks of the x87 80-bit kernels against `rustc_apfloat::ieee::X87DoubleExtended`.
 
 use cranelift::prelude::*;
 use cranelift_codegen::ir::{Function, UserFuncName};
@@ -21,7 +17,7 @@ enum Op {
     Div,
 }
 
-/// An 80-bit value as `(mantissa, sign_exp)`.
+/// 80-bit value as `(mantissa, sign_exp)`.
 fn parts(bits: u128) -> (u64, u16) {
     (bits as u64, (bits >> 64) as u16)
 }
@@ -29,8 +25,7 @@ fn bits(mant: u64, se: u16) -> u128 {
     (mant as u128) | ((se as u128) << 64)
 }
 
-/// Host frontend config, required by `FunctionBuilder::finalize`. These wrappers
-/// are JIT-compiled for the host, matching what `CraneliftBackend` builds below.
+/// Host frontend config required by `FunctionBuilder::finalize`.
 fn host_frontend_config() -> isa::TargetFrontendConfig {
     cranelift_native::builder()
         .expect("host isa builder")
@@ -39,7 +34,7 @@ fn host_frontend_config() -> isa::TargetFrontendConfig {
         .frontend_config()
 }
 
-/// JIT-compile `op` over the two operands and return the raw 80-bit result.
+/// JIT-compile `op` over two operands; return the raw 80-bit result.
 fn jit_binop(op: Op, a: u128, b: u128) -> u128 {
     let mut func = Function::with_name_signature(
         UserFuncName::user(0, 0),
@@ -129,7 +124,7 @@ fn af(bits: u128) -> X87DoubleExtended {
     X87DoubleExtended::from_bits(bits)
 }
 
-/// JIT-compile `sqrt` over one operand and return the raw 80-bit result.
+/// JIT-compile `sqrt` over one operand; return the raw 80-bit result.
 fn jit_sqrt(a: u128) -> u128 {
     let mut func = Function::with_name_signature(
         UserFuncName::user(0, 0),
@@ -162,7 +157,7 @@ fn jit_sqrt(a: u128) -> u128 {
     bits(outbuf[0], outbuf[1] as u16)
 }
 
-/// Simple deterministic xorshift PRNG so tests are reproducible.
+/// Deterministic xorshift PRNG.
 struct Rng(u64);
 impl Rng {
     fn next(&mut self) -> u64 {
@@ -175,24 +170,16 @@ impl Rng {
     }
 }
 
-/// A random *normal* 80-bit value with a full 64-bit significand (integer bit
-/// set) and a mid-range exponent, so results stay normal (no under/overflow,
-/// which the kernels currently flush). The low significand bits exercise
-/// precision beyond f64.
+/// Random normal 80-bit value with full significand and mid-range exponent, so results avoid the flushed under/overflow range.
 fn rand_normal(rng: &mut Rng) -> u128 {
     let mant = rng.next() | (1u64 << 63);
     let sign = (rng.next() & 1) as u16;
-    // Exponent in [16200, 16560): comfortably normal, and products/quotients of
-    // two such values stay within the normal range.
+    // Exponent in [16200, 16560): products and quotients stay normal.
     let exp = 16200 + (rng.next() % 360) as u16;
     bits(mant, (sign << 15) | exp)
 }
 
-/// Regression: every kernel must lower under the optimizing mid-end. The
-/// egraph pass (enabled at `opt_level=speed`, as the object/AOT backend uses)
-/// once folded a 128-bit `select(uge(a,b), a, b)` into `umax.i128`, which the
-/// x86 backend cannot lower. `opt_level=none` (the plain JIT tests) skips the
-/// egraph and so did not catch it.
+/// Regression: every kernel must lower under the egraph (`opt_level=speed`), which once folded a select into an `umax.i128` x86 cannot lower.
 #[test]
 fn test_kernels_lower_under_optimization() {
     use cranelift_codegen::settings::{self, Configurable};
@@ -215,7 +202,7 @@ fn test_kernels_lower_under_optimization() {
     let ase = builder.ins().ireduce(types::I32, a_se64);
     let bse = builder.ins().ireduce(types::I32, b_se64);
 
-    // Exercise every kernel and combine outputs so none are dead-code eliminated.
+    // Combine outputs so no kernel is dead-code eliminated.
     let mut acc_m = builder.ins().iconst(types::I64, 0);
     let mut acc_s = builder.ins().iconst(types::I32, 0);
     for (m, s) in [
@@ -258,8 +245,7 @@ fn test_add_matches_apfloat() {
         let got = jit_binop(Op::Add, a, b);
         let want = af(a).add_r(af(b), Round::NearestTiesToEven).value.to_bits()
             & 0xFFFF_FFFF_FFFF_FFFF_FFFF;
-        // Skip cases whose exact result underflows/overflows the normal range
-        // (the kernel flushes; apfloat may produce subnormal/inf).
+        // Skip results outside the normal range (kernel flushes, apfloat may not).
         if is_nan_bits(want) {
             continue;
         }
@@ -321,9 +307,7 @@ fn test_div_matches_apfloat() {
     }
 }
 
-/// Reference 80-bit square root via the host x87 FPU (default control word:
-/// round-to-nearest, 64-bit precision). APFloat does not implement sqrt, so the
-/// hardware is the oracle. Only meaningful on x86-64 test hosts.
+/// Reference sqrt via the host x87 FPU (APFloat lacks sqrt); x86-64 hosts only.
 #[cfg(target_arch = "x86_64")]
 fn host_sqrt(a: u128) -> u128 {
     let (mant, se) = parts(a);

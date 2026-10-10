@@ -12,8 +12,7 @@ unsafe extern "C" fn test_syscall_handler(ctx: *mut RegisterContext) {
     }
 }
 
-/// A syscall callback that moves the guest somewhere else entirely, the way a
-/// `sigreturn` or a thread exit would.
+/// A syscall callback that redirects control, like `sigreturn` or a thread exit.
 unsafe extern "C" fn diverting_syscall_handler(ctx: *mut RegisterContext) {
     unsafe {
         let ctx = &mut *ctx;
@@ -76,9 +75,7 @@ fn test_syscall_calls_back_and_runs_on() {
     assert_eq!(ctx.exit_reason, ExitReason::Return as u32);
 }
 
-/// The PC the callback leaves behind is what the guest resumes at, so a
-/// callback that redirects control leaves the region instead of falling
-/// through to the instruction after the `syscall`.
+/// The PC the callback leaves is where the guest resumes: redirecting leaves the region.
 #[test]
 fn test_syscall_callback_can_redirect_the_guest() {
     // mov rax, 0x60; syscall; add rax, 1; ret
@@ -107,7 +104,7 @@ fn test_syscall_callback_can_redirect_the_guest() {
 
 #[test]
 fn test_stack_data_integrity() {
-    // Test that we can actually write more data to the stack and read it back
+    // Write more data to the stack and read it back.
     // push 1; push 2; push 3; pop rax; pop rbx; pop rcx; ret
     let bytes = [
         0x6A, 0x01, // push 1

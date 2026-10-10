@@ -1,17 +1,4 @@
-//! Regression tests for the second x86-64 lifter review round.
-//!
-//! Each test encodes real-hardware behaviour and would fail against the
-//! pre-fix lifter:
-//!
-//! 1. SHLD/SHRD with a masked count of 0 must leave the destination unchanged.
-//! 2. XADD with the same register both ways must double it (DEST written last).
-//! 3. BT-family memory forms with a register index address a bit *string*.
-//! 4. FST m32/m64 of inf/NaN and rounding-sensitive values.
-//! 5. Shift flags: OF defined for count==1, PF updated for nonzero counts.
-//! 6. 0x67 (32-bit address size) operands must produce verifiable IR.
-//! 7. UD2/INT3 report a relocation-correct RIP (image_base + offset).
-//! 8. Fast imports needing stack args are demoted to slow exits, not miscompiled.
-//! 9. BSF/BSR leave the destination unchanged when the source is 0.
+//! Regression tests for the second x86-64 lifter review round (SHLD/SHRD count 0, XADD, BT memory forms, FST specials, shift flags, 0x67, UD2/INT3 RIP, stack-arg imports, BSF/BSR zero source).
 
 use cranelift::prelude::*;
 use cranelift_codegen::ir::{Function, UserFuncName};
@@ -27,13 +14,10 @@ use microlift::os::get_host_calling_conv;
 
 const LIFT_BASE: u64 = 0x1000;
 
-/// The sentinel return address this file's harness pushes; a `RET` to it exits
-/// with `ExitReason::Return` because the config below declares it.
+/// Sentinel return address; a `RET` to it exits with `Return`.
 const EXIT_TRAMPOLINE: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 
-/// Lift + JIT `bytes` at LIFT_BASE, run against `ctx`, and return the mutated
-/// context. `image_base` defaults to LIFT_BASE (override before calling to test
-/// relocation). A fresh stack is installed with the exit trampoline pre-pushed.
+/// Lift + JIT `bytes` at LIFT_BASE and return the mutated context. Override `image_base` to test relocation.
 fn run(bytes: &[u8], mut ctx: RegisterContext) -> RegisterContext {
     let mut flag_builder = settings::builder();
     flag_builder.set("use_colocated_libcalls", "false").unwrap();
@@ -161,10 +145,10 @@ fn bts_mem_bit_index_sets_correct_word() {
 
 #[test]
 fn bt_mem_negative_index_addresses_below_base() {
-    // bit string: word[-1] has bit 31 set; index -1 targets it.
+    // Word[-1] has bit 31 set; index -1 targets it.
     let mut buf: [u32; 2] = [0x8000_0000, 0];
     let mut ctx = RegisterContext::default();
-    // point rax at buf[1] so a -1 index reaches buf[0] bit 31.
+    // rax = buf[1] so a -1 index reaches buf[0] bit 31.
     ctx.rax = unsafe { buf.as_mut_ptr().add(1) } as u64;
     ctx.rbx = 0xFFFF_FFFF_FFFF_FFFF; // -1
     // bt [rax], rbx ; setc cl ; ret  (64-bit index)
@@ -319,9 +303,7 @@ fn int3_reports_relocated_rip() {
 
 #[test]
 fn fast_import_with_seven_int_args_compiles() {
-    // A symbol whose signature has 7 integer args (return + 7 params). The 7th
-    // spills past SysV's six argument registers, so the fast call must read it
-    // from the guest stack; the emitted call still has to match its signature.
+    // Seven integer args: the 7th spills past SysV's six registers and must be read from the guest stack.
     let sym = DynamicSymbol {
         name: "seven_args",
         value: 0x1 as *mut core::ffi::c_void,
@@ -349,8 +331,7 @@ fn fast_import_with_seven_int_args_compiles() {
     bytes.extend_from_slice(&rel.to_le_bytes());
     bytes.push(0xC3);
 
-    // Must lift and compile without a verifier error: every declared parameter
-    // is supplied, the seventh from `[rsp]`.
+    // Must lift and compile without a verifier error.
     let func = lift_to_function::<X86_64>(&bytes, LIFT_BASE, config).unwrap();
     let mut backend = CraneliftBackend::new().unwrap();
     backend

@@ -1,8 +1,4 @@
-//! x86-64 calling-convention descriptors for fast-import calls.
-//!
-//! Provides the concrete [`CallAbi`] presets a caller registers imports with,
-//! plus the translation between the arch-neutral [`GuestReg`] identifiers used
-//! by [`CallAbi`] and `iced_x86::Register`.
+//! x86-64 calling-convention presets for fast imports, plus [`GuestReg`] <-> `iced_x86::Register` translation.
 
 use crate::MicroliftError;
 use crate::arch::x86_64::regs::gpr_index;
@@ -17,25 +13,19 @@ impl From<Register> for GuestReg {
     }
 }
 
-/// Resolve a [`GuestReg`] back to the x86-64 register it names.
 pub fn x86_reg(reg: GuestReg) -> crate::Result<Register> {
     Register::try_from(reg.0 as usize).map_err(|_| {
         MicroliftError::UnsupportedRegister(format!("invalid guest register id {}", reg.0))
     })
 }
 
-/// Build a [`RegMask`] over the named x86-64 general-purpose registers.
-///
-/// Sub-registers select their containing 64-bit register (`EDI` and `DIL` both
-/// mean `RDI`), since that is the granularity the register file - and therefore
-/// the context sync - works at. Non-GPR operands are ignored; use
-/// [`xmm_mask`] for vector registers.
-///
+/// [`RegMask`] over x86-64 GPRs; sub-registers select their containing 64-bit register
+/// (`EDI` and `DIL` mean `RDI`). Non-GPRs are ignored; see [`xmm_mask`].
 /// ```
 /// use iced_x86::Register;
 /// use microlift::arch::x86_64::abi::gpr_mask;
 ///
-/// // `int foo(int, char *)` under SysV: arguments in EDI and RSI.
+/// // `int foo(int, char *)` under SysV reads EDI and RSI.
 /// let reads = gpr_mask(&[Register::EDI, Register::RSI]);
 /// assert!(reads.has_gpr(7) && reads.has_gpr(6));
 /// ```
@@ -49,7 +39,7 @@ pub fn gpr_mask(regs: &[Register]) -> RegMask {
     mask
 }
 
-/// Build a [`RegMask`] over the named XMM register indices (`0` = `XMM0`).
+/// [`RegMask`] over XMM indices (`0` = `XMM0`).
 pub fn xmm_mask(indices: &[u8]) -> RegMask {
     let mut mask = RegMask::NONE;
     for &idx in indices {
@@ -58,15 +48,11 @@ pub fn xmm_mask(indices: &[u8]) -> RegMask {
     mask
 }
 
-/// The [`BridgeEffects`] for a bridge following a described guest calling
-/// convention: it reads the argument registers `abi` would place `arg_types`
-/// in, and clobbers the return register plus the flags.
+/// [`BridgeEffects`] for a bridge following `abi`: reads the registers `abi` would place `arg_types` in,
+/// clobbers the return register and flags. `None` when `abi` cannot place every argument.
 ///
-/// A convenience, **not** a safety net - it cannot know about a callee that
-/// reads guest memory, walks a varargs list, or clobbers caller-saved
-/// registers the guest still cares about. Start from [`BridgeEffects::full`]
-/// and narrow deliberately if unsure. `None` when `abi` cannot place every
-/// argument, which is exactly when a hand-written mask is required.
+/// Not a safety net: it cannot know about guest-memory reads, varargs or other clobbers; narrow
+/// [`BridgeEffects::full`] by hand if unsure.
 pub fn abi_bridge_effects(
     abi: &CallAbi,
     arg_types: &[FunctionArgumentType],
@@ -80,8 +66,7 @@ pub fn abi_bridge_effects(
                 }
             }
             ArgLocation::FpReg(i) => reads = reads.with_vec(i),
-            // Stack arguments are read through the guest stack pointer, which
-            // `sync_regs_masked` always stores anyway.
+            // Stack arguments go through SP, which sync always stores.
             ArgLocation::Stack(_) => {}
         }
     }
@@ -104,16 +89,12 @@ pub fn abi_bridge_effects(
     Some(BridgeEffects::new(reads, writes))
 }
 
-/// Both x86-64 ABIs pass spilled arguments in 8-byte stack slots.
+/// Spilled arguments use 8-byte stack slots in both ABIs.
 const X86_64_SLOT_BYTES: u32 = 8;
 
 impl CallAbi {
-    /// System V AMD64 (Linux, macOS, the BSDs).
-    ///
-    /// Integer/pointer arguments in RDI, RSI, RDX, RCX, R8, R9; floating-point
-    /// arguments in XMM0–XMM7, counted independently of the integer arguments;
-    /// anything further on the stack. Integer returns in RAX, FP returns in
-    /// XMM0.
+    /// System V AMD64: integer args in RDI, RSI, RDX, RCX, R8, R9; FP in XMM0-7 (counted
+    /// independently); rest on the stack. Returns in RAX / XMM0.
     pub fn sysv_amd64() -> Self {
         Self {
             name: "sysv_amd64",
@@ -137,12 +118,8 @@ impl CallAbi {
         }
     }
 
-    /// Microsoft x64 - the single convention 64-bit Windows uses.
-    ///
-    /// Four positional argument slots: RCX/RDX/R8/R9 for integers, XMM0-XMM3 for
-    /// floats, with an FP argument consuming the integer slot at its position and
-    /// vice versa. Arguments five and up go on the stack above the caller's
-    /// 32-byte shadow space. Integer returns in RAX, FP returns in XMM0.
+    /// Microsoft x64: four positional slots (RCX/RDX/R8/R9 or XMM0-3, an FP arg consumes the
+    /// integer slot at its position); rest on the stack above 32 bytes of shadow space. Returns in RAX / XMM0.
     pub fn win64() -> Self {
         Self {
             name: "win64",
@@ -164,12 +141,7 @@ impl CallAbi {
         }
     }
 
-    /// The convention x86-64 guest code built for *this* host would use:
-    /// [`win64`](CallAbi::win64) on Windows, [`sysv_amd64`](CallAbi::sysv_amd64)
-    /// everywhere else.
-    ///
-    /// Convenient when lifting code that came from the same platform Microlift
-    /// runs on; anything else should name its ABI explicitly.
+    /// The convention for this host: [`win64`](CallAbi::win64) on Windows, else [`sysv_amd64`](CallAbi::sysv_amd64).
     pub fn x86_64_host() -> Self {
         #[cfg(target_os = "windows")]
         {
@@ -213,8 +185,7 @@ mod tests {
             .place_args(&[F::None, F::Pointer, F::DoublePrecisionFp, F::Pointer])
             .unwrap();
         assert_eq!(placed[0].1, ArgLocation::IntReg(Register::RCX.into()));
-        // Second argument -> XMM1, not XMM0: the FP register index follows the
-        // argument position, not the count of FP arguments seen so far.
+        // FP register index follows argument position, not FP-argument count.
         assert_eq!(placed[1].1, ArgLocation::FpReg(1));
         assert_eq!(placed[2].1, ArgLocation::IntReg(Register::R8.into()));
     }
@@ -229,7 +200,7 @@ mod tests {
         let placed = sysv.place_args(&seven).unwrap();
         assert_eq!(placed[6].1, ArgLocation::Stack(0));
 
-        // Microsoft x64 reserves 32 bytes of shadow space first.
+        // 32 bytes of shadow space come first.
         let five = vec![F::None; 1]
             .into_iter()
             .chain(std::iter::repeat(F::Pointer).take(5))

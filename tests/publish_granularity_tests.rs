@@ -1,13 +1,5 @@
-//! Publishing a translation at one address rather than at every address.
-//!
-//! [`ThreadLinks::publish`] makes a region linkable at every resume point it
-//! has; [`ThreadLinks::publish_at`] makes it linkable at one. The difference is
-//! invisible until the table is under pressure, and then it is the whole
-//! difference: a region with many resume points rewrites a large share of a
-//! direct-mapped table, evicting rows the thread was still using.
-//!
-//! These pin the narrow form's contract - which row it writes, which it does
-//! not, and what it refuses.
+//! `ThreadLinks::publish` vs `publish_at`: the narrow form writes only one row, sparing a direct-mapped table.
+//! Pins which row it writes, which it does not, and what it refuses.
 
 use std::sync::{Arc, RwLock};
 
@@ -22,14 +14,10 @@ fn link_config() -> BlockLinkConfig {
     BlockLinkConfig::new(ROWS)
 }
 
-/// The second entry point, far enough from the first to land in a different
-/// row. Adjacent addresses share a slot - the index drops the low bits - so a
-/// fixture built out of two `ret`s side by side would have the broad publish
-/// evicting its own first row and prove nothing.
+/// Second entry point far enough away to land in a different row (adjacent addresses share a slot).
 const SECOND_ENTRY: u64 = DEFAULT_LIFT_BASE + 16;
 
-/// Sixteen `nop`s and a `ret`, entered either at the top or at the `ret` - so
-/// the translation has two resume points a publish can choose between.
+/// Sixteen `nop`s and a `ret`, entered at the top or the `ret`: two resume points.
 fn two_entry_points() -> Translation {
     let mut bytes = vec![0x90; 16];
     bytes.push(0xC3);
@@ -42,7 +30,7 @@ fn two_entry_points() -> Translation {
         .expect("compiles")
 }
 
-/// Whether this thread's table currently offers `pc`.
+/// Whether this thread's table offers `pc`.
 fn linkable(runtime: &ThreadRuntime, pc: u64) -> bool {
     runtime.links().table().get(pc).is_some()
 }
@@ -51,7 +39,7 @@ fn runtime(cache: &Arc<RwLock<CodeCache>>) -> ThreadRuntime {
     ThreadRuntime::new(link_config(), Arc::clone(cache))
 }
 
-/// The broad form is the baseline: every resume point becomes linkable.
+/// Baseline: every resume point becomes linkable.
 #[test]
 fn publishing_broadly_offers_every_resume_point() {
     let cache = Arc::new(RwLock::new(CodeCache::new()));
@@ -64,8 +52,7 @@ fn publishing_broadly_offers_every_resume_point() {
     assert!(linkable(&runtime, SECOND_ENTRY));
 }
 
-/// And the narrow form offers exactly the one asked for. The second resume
-/// point staying absent is the entire point: it is a row not spent.
+/// Narrow form offers only the one asked for; the other row stays unspent.
 #[test]
 fn publishing_narrowly_offers_only_the_address_asked_for() {
     let cache = Arc::new(RwLock::new(CodeCache::new()));
@@ -81,11 +68,7 @@ fn publishing_narrowly_offers_only_the_address_asked_for() {
     );
 }
 
-/// An address the region cannot be entered at is refused rather than published.
-///
-/// Publishing it would be worse than useless: entering there either runs the
-/// region from the top or exits having made no progress, and the broad form
-/// only avoids the question by walking the set.
+/// An address the region cannot be entered at is refused, not published.
 #[test]
 fn an_address_that_is_not_a_resume_point_is_refused() {
     let cache = Arc::new(RwLock::new(CodeCache::new()));
@@ -96,7 +79,7 @@ fn an_address_that_is_not_a_resume_point_is_refused() {
     assert!(!runtime.publish_at(&translation, inside_but_not_an_entry));
     assert!(!linkable(&runtime, inside_but_not_an_entry));
 
-    // And an address the region has nothing to do with.
+    // An address unrelated to the region.
     assert!(!runtime.publish_at(&translation, 0x9999_0000));
     assert!(!linkable(&runtime, 0x9999_0000));
 }

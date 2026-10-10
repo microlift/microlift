@@ -1,6 +1,5 @@
-//! aarch64 guest frontend: register file, context struct, yaxpeax-arm
-//! decoder/leader classification, state sync, and instruction semantics. Wired
-//! together through the [`GuestArch`] impl for [`Aarch64`].
+//! aarch64 guest frontend: registers, context, yaxpeax-arm decode, sync and semantics,
+//! wired together through the [`GuestArch`] impl for [`Aarch64`].
 
 pub mod context;
 pub mod decode;
@@ -17,17 +16,12 @@ use context::Aarch64RegisterContext;
 use decode::A64Instr;
 use regs::{Aarch64RegState, FLAG_NAMES, FLAG_ORDER, GPR_NAMES, GPR_ORDER};
 
-/// aarch64 guest architecture marker.
 pub struct Aarch64;
 
-/// The aarch64 monomorphization of the generic engine. Instruction semantics
-/// are inherent methods on this type.
 pub type Lifter64<'a> = LiftEngine<'a, Aarch64>;
 
 impl GuestArch for Aarch64 {
-    /// Fixed-width: every A64 instruction is one aligned word. A region cut on
-    /// any four-byte boundary therefore never splits one, which is why
-    /// [`LifterConfig::region_tail_exit`] can never fire for this guest.
+    /// Fixed-width, so [`LifterConfig::region_tail_exit`] never fires.
     const MAX_INSTRUCTION_LEN: u64 = 4;
 
     type Instr = A64Instr;
@@ -89,9 +83,7 @@ impl GuestArch for Aarch64 {
         decode::control_flow(i)
     }
 
-    /// Every constant-offset `Aarch64RegisterContext` field, one alias region
-    /// each - see [`crate::core::alias`]. The V registers are absent because
-    /// they are not SSA variables here yet.
+    /// One alias region per constant-offset field ([`crate::core::alias`]); V registers are not SSA variables yet.
     fn context_fields(_config: &LifterConfig) -> Vec<(i32, &'static str)> {
         let mut fields: Vec<(i32, &'static str)> = Vec::with_capacity(40);
         for (&reg, &name) in GPR_ORDER.iter().zip(GPR_NAMES.iter()) {

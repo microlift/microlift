@@ -1,11 +1,7 @@
-//! **Experimental** recovery of Clang-style jump tables.
+//! **Experimental** recovery of Clang-style jump tables for indirect `JMP`s
+//! ([`ControlFlowKind::IndirectBranch`] otherwise contributes no leaders).
 //!
-//! An indirect `JMP` normally ends a region: [`ControlFlowKind::IndirectBranch`]
-//! contributes no block leaders, so the lifted code dispatches to an
-//! `UnknownJump` VM exit. A Clang-compiled `switch` is the common case where the
-//! successors *are* statically knowable - they sit in a table in read-only
-//! memory, which the caller has described via [`LifterConfig::segments`]. This
-//! pass matches the two shapes Clang emits on x86-64:
+//! Tables must lie in read-only memory described via [`LifterConfig::segments`]. Matches two shapes:
 //!
 //! ```text
 //! ; PIC: table holds i32 displacements from the table itself
@@ -18,10 +14,8 @@
 //!     jmp    qword ptr [.LJTI + rax*8]
 //! ```
 //!
-//! **Being wrong here is cheap, and that is the design.** A recovered target is
-//! only ever *added* as a leader, and dispatch still happens on the address the
-//! guest computes - so a bogus entry lifts a block nothing reaches and a missed
-//! entry leaves the pre-existing exit. Writable segments are never trusted.
+//! Safe by construction: targets are only added as leaders and dispatch stays on the runtime
+//! address, so a bogus entry lifts an unreached block. Writable segments are never trusted.
 //!
 //! [`ControlFlowKind::IndirectBranch`]: crate::arch::ControlFlowKind::IndirectBranch
 //! [`LifterConfig::segments`]: crate::core::LifterConfig::segments
@@ -33,71 +27,44 @@ use iced_x86::{
 };
 use std::collections::HashMap;
 
-/// How far back from an indirect `JMP` to look for the instructions that
-/// computed its target. The dispatch sequences above are 3-6 instructions; the
-/// slack covers scheduling that has moved unrelated work in between.
+/// How far back from an indirect `JMP` to look for its target computation.
 const MAX_LOOKBACK: usize = 32;
-/// Hard cap on the number of entries read from one table.
 const MAX_ENTRIES: u64 = 4096;
-/// Cap used when no range check was proven and entries are walked until one
-/// stops looking like an in-region target.
+/// Cap on entries walked when no range check was proven.
 const MAX_UNBOUNDED_ENTRIES: u64 = 512;
-/// Depth limit when chasing register copies back to a constant.
 const MAX_CONST_DEPTH: u32 = 4;
 
-/// How the bytes in a recovered table encode a target address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JumpTableKind {
-    /// Each entry is the target address itself, zero-extended from
-    /// [`JumpTable::entry_size`].
+    /// The entry is the target address, zero-extended.
     Absolute,
-    /// Each entry is a *signed* displacement from `anchor` - the address Clang
-    /// materialized with a RIP-relative `lea` and then added to the loaded
-    /// entry. Almost always the table's own address.
+    /// Signed displacement from `anchor` (the RIP-relative `lea` address, usually the table itself).
     Relative { anchor: u64 },
 }
 
-/// One recovered jump table.
 #[derive(Debug, Clone)]
 pub struct JumpTable {
-    /// Virtual address of the indirect `JMP` this table dispatches.
     pub jump_ip: u64,
-    /// Virtual address of the first table entry.
     pub table: u64,
-    /// Width of one entry in bytes (4 or 8).
     pub entry_size: u8,
-    /// How to turn an entry into an address.
     pub kind: JumpTableKind,
-    /// The register holding the switch index at the table load.
     pub index: Register,
-    /// `true` when a `cmp idx, N` / `ja` range check fixed the entry count, so
-    /// the table was read exactly. `false` when the count is a heuristic walk.
+    /// `true` when a `cmp idx, N` / `ja` range check fixed the count; `false` for a heuristic walk.
     pub bounded: bool,
-    /// The recovered targets, in table order, de-duplicated.
     pub targets: Vec<u64>,
-    /// How many entries were actually read out of the table.
     pub entries: u64,
 }
 
 impl JumpTable {
-    /// The guest bytes the table itself occupies.
-    ///
-    /// A translation built on this table depends on these bytes as surely as it
-    /// depends on the code, which is what
-    /// [`LiftedCode::data_dependencies`](crate::core::LiftedCode::data_dependencies)
-    /// reports. Note the dependency is benign in one direction the code's is
-    /// not - see that field.
+    /// Guest bytes the table occupies; a translation depends on them as on code
+    /// ([`LiftedCode::data_dependencies`](crate::core::LiftedCode::data_dependencies)).
     pub fn extent(&self) -> std::ops::Range<u64> {
         self.table..self.table + self.entries * self.entry_size as u64
     }
 }
 
-/// Run the pass over a region of x86-64 code mapped at `base`.
-///
-/// One entry per indirect `JMP` whose table could be recovered, keyed by that
-/// `JMP`'s address. `segments` supplies the read-only memory the table is read
-/// from; the region itself is added as one, so a table emitted inside the lifted
-/// code resolves without the caller describing it.
+/// Runs the pass over code mapped at `base`; one entry per indirect `JMP` with a recoverable table,
+/// keyed by its address. The region itself counts as a readable segment.
 pub fn analyze_jump_tables(
     bytes: &[u8],
     base: u64,
@@ -131,7 +98,6 @@ pub fn analyze_jump_tables(
     out
 }
 
-/// Shape of the table access, before the entries have been read.
 struct TableAccess {
     table: u64,
     entry_size: u8,
@@ -147,10 +113,9 @@ fn match_jump_table(
     let jmp = &instrs[jmp_idx];
 
     let (access, kind) = match jmp.op0_kind() {
-        // `jmp qword ptr [table + idx*8]` - the load *is* the dispatch, and what
-        // it loads is the target.
+        // `jmp qword ptr [table + idx*8]`: the load is the dispatch.
         OpKind::Memory => (table_access(instrs, jmp_idx, jmp)?, JumpTableKind::Absolute),
-        // `jmp reg` - walk back to whatever defined `reg`.
+        // `jmp reg`: walk back to the definition of `reg`.
         OpKind::Register => {
             let reg = jmp.op0_register();
             let def_idx = find_def(instrs, jmp_idx, reg)?;
@@ -178,9 +143,7 @@ fn match_jump_table(
     })
 }
 
-/// Interpret the instruction at `def_idx`, which defines the `JMP`'s target
-/// register `reg`, as either the `add entry, anchor` of the PIC form or a plain
-/// load of an absolute entry.
+/// Interprets the definition of `reg` as the PIC `add entry, anchor` or a plain absolute load.
 fn match_target_expr(
     instrs: &[Instruction],
     def_idx: usize,
@@ -192,8 +155,7 @@ fn match_target_expr(
         && def.op0_kind() == OpKind::Register
         && def.op1_kind() == OpKind::Register
     {
-        // One operand is the loaded entry, the other the RIP-relative anchor.
-        // Clang emits both orderings depending on register allocation.
+        // One operand is the entry, the other the RIP-relative anchor; either order.
         let (dst, src) = (def.op0_register(), def.op1_register());
 
         if let Some(anchor) = resolve_const(instrs, def_idx, src, 0) {
@@ -209,13 +171,11 @@ fn match_target_expr(
         return None;
     }
 
-    // No relocation step: the loaded entry is the address.
     let _ = reg;
     let access = table_load(instrs, def_idx)?;
     Some((access, JumpTableKind::Absolute))
 }
 
-/// Match `mov`/`movsxd`/`movzx reg, [table + idx*scale]`.
 fn table_load(instrs: &[Instruction], idx: usize) -> Option<TableAccess> {
     let inst = &instrs[idx];
     match inst.mnemonic() {
@@ -228,12 +188,10 @@ fn table_load(instrs: &[Instruction], idx: usize) -> Option<TableAccess> {
     table_access(instrs, idx, inst)
 }
 
-/// Extract the table base / entry width / index register from the memory
-/// operand of `inst` (which lives at `idx`).
+/// Extracts base, entry width and index register from `inst`'s memory operand.
 fn table_access(instrs: &[Instruction], idx: usize, inst: &Instruction) -> Option<TableAccess> {
     let index = inst.memory_index();
-    // No index register means a single indirection (a GOT slot, say), not a
-    // table. `crate::vsa` already resolves those to a constant.
+    // No index register: a single indirection (GOT slot), already resolved by `crate::vsa`.
     if index == Register::None {
         return None;
     }
@@ -244,10 +202,8 @@ fn table_access(instrs: &[Instruction], idx: usize, inst: &Instruction) -> Optio
 
     let disp = inst.memory_displacement64();
     let table = match inst.memory_base() {
-        // Absolute displacement: `[table + idx*8]`.
         Register::None => disp,
-        // RIP-relative operands cannot carry an index register, so reaching
-        // here would mean the decode disagrees with the ISA.
+        // RIP-relative operands cannot carry an index.
         Register::RIP | Register::EIP => return None,
         base => resolve_const(instrs, idx, base, 0)?.wrapping_add(disp),
     };
@@ -260,9 +216,7 @@ fn table_access(instrs: &[Instruction], idx: usize, inst: &Instruction) -> Optio
     })
 }
 
-/// Resolve `reg` to a constant by walking back to its definition: a
-/// RIP-relative `lea` (the usual way Clang materializes a table address), a
-/// `mov reg, imm`, or a copy from another register that itself resolves.
+/// Resolves `reg` to a constant via a RIP-relative `lea`, `mov reg, imm`, or a copy that resolves.
 fn resolve_const(instrs: &[Instruction], before: usize, reg: Register, depth: u32) -> Option<u64> {
     if depth > MAX_CONST_DEPTH {
         return None;
@@ -270,7 +224,6 @@ fn resolve_const(instrs: &[Instruction], before: usize, reg: Register, depth: u3
     let def_idx = find_def(instrs, before, reg)?;
     let def = &instrs[def_idx];
     match def.mnemonic() {
-        // iced resolves a RIP-relative displacement to its absolute target.
         Mnemonic::Lea if def.memory_base() == Register::RIP => Some(def.memory_displacement64()),
         Mnemonic::Lea if def.memory_base() == Register::None => Some(def.memory_displacement64()),
         Mnemonic::Mov if is_immediate(def.op1_kind()) => Some(def.immediate(1)),
@@ -281,10 +234,7 @@ fn resolve_const(instrs: &[Instruction], before: usize, reg: Register, depth: u3
     }
 }
 
-/// Find the entry count from the `cmp idx, N` / `ja default` range check Clang
-/// emits ahead of the dispatch. Follows register copies backwards, since the
-/// index is usually zero-extended (`mov eax, edi`) between the check and the
-/// table load.
+/// Finds the entry count from the `cmp idx, N` / `ja default` check, following register copies.
 fn find_bound(instrs: &[Instruction], jmp_idx: usize, index: Register) -> Option<u64> {
     let mut tracked = index.full_register();
     let stop = jmp_idx.saturating_sub(MAX_LOOKBACK);
@@ -300,21 +250,17 @@ fn find_bound(instrs: &[Instruction], jmp_idx: usize, index: Register) -> Option
             && inst.op0_register().full_register() == tracked
             && is_immediate(inst.op1_kind())
         {
-            // The branch guarding the dispatch must immediately follow the
-            // compare; anything else and we are looking at an unrelated check.
+            // The guarding branch must immediately follow the compare.
             let imm = inst.immediate(1);
             return match instrs.get(i + 1)?.mnemonic() {
-                // Above / greater: index N is in range, so N+1 entries.
                 Mnemonic::Ja | Mnemonic::Jg => imm.checked_add(1),
-                // Above-or-equal / greater-or-equal: N entries.
                 Mnemonic::Jae | Mnemonic::Jge => Some(imm),
                 _ => None,
             };
         }
 
         if writes_reg(&mut info, inst, tracked) {
-            // A copy just renames the index; anything else redefines it and the
-            // check (if any) was about a different value.
+            // A copy renames the index; anything else redefines it.
             if is_reg_copy(inst) {
                 tracked = inst.op1_register().full_register();
                 continue;
@@ -325,9 +271,8 @@ fn find_bound(instrs: &[Instruction], jmp_idx: usize, index: Register) -> Option
     None
 }
 
-/// Read `count` (or, unbounded, up to the first implausible) entries and turn
-/// them into target addresses. Returns `None` when the table cannot be read at
-/// all, or when a proven bound points at memory we do not have.
+/// Reads `count` entries (unbounded: until one looks implausible) as targets; `None` if unreadable
+/// or a proven bound runs off the segments.
 fn read_targets(
     access: &TableAccess,
     kind: JumpTableKind,
@@ -343,9 +288,7 @@ fn read_targets(
     };
 
     let mut targets: Vec<u64> = Vec::new();
-    // Counted separately from `targets`, which de-duplicates. The loop can also
-    // stop early on the unbounded path, so neither `count` nor `targets.len()`
-    // is the number of entries actually read.
+    // Separate from `targets`, which de-duplicates, and early exit makes `count` unreliable.
     let mut entries = 0u64;
     for i in 0..count {
         let addr = access
@@ -353,8 +296,7 @@ fn read_targets(
             .checked_add(i.checked_mul(access.entry_size as u64)?)?;
         let raw = match read_ro(segments, addr, access.entry_size) {
             Some(raw) => raw,
-            // A proven bound that runs off the end of the segments means the
-            // match was wrong somewhere; do not guess at a partial table.
+            // Bound runs off the segments: the match was wrong; do not guess.
             None if bound.is_some() => return None,
             None => break,
         };
@@ -364,8 +306,7 @@ fn read_targets(
                 anchor.wrapping_add(sign_extend(raw, access.entry_size) as u64)
             }
         };
-        // Unbounded: the walk has no idea where the table ends, so an entry that
-        // does not point back into the region being lifted is where it stops.
+        // Unbounded: stop at the first entry that does not point back into the region.
         if bound.is_none() && !region.contains(&target) {
             break;
         }
@@ -378,9 +319,7 @@ fn read_targets(
     (!targets.is_empty()).then_some((targets, entries))
 }
 
-/// Read `size` bytes at `addr` from the *non-writable* segments only. Writable
-/// memory can change between lift and run, so a value read from it proves
-/// nothing - the same rule [`crate::vsa`] applies.
+/// Reads `size` bytes from non-writable segments only (same rule as [`crate::vsa`]).
 fn read_ro(segments: &[MemorySegment], addr: u64, size: u8) -> Option<u64> {
     segments
         .iter()
@@ -397,9 +336,7 @@ fn sign_extend(raw: u64, size: u8) -> i64 {
     }
 }
 
-/// Walk back from `from` for the instruction that last wrote `reg`, stopping at
-/// anything that ends straight-line flow. A conditional branch is walked past on
-/// purpose: the `ja default` of the range check sits inside the window.
+/// Walks back for the last writer of `reg`, past conditional branches (the range check's `ja`).
 fn find_def(instrs: &[Instruction], from: usize, reg: Register) -> Option<usize> {
     let full = reg.full_register();
     let stop = from.saturating_sub(MAX_LOOKBACK);

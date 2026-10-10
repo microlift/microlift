@@ -1,34 +1,13 @@
-//! `LifterConfig::eliminate_dead_flags`: it must change nothing, and it must
-//! change something.
-//!
-//! Two obligations, and they pull in opposite directions, which is why both are
-//! here. The optimisation is *metamorphic* - turning it on may not alter a
-//! single bit of architectural state, including the flags themselves, because
-//! the whole claim is that the writes it drops were never going to be read. And
-//! it is an *optimisation* - if it drops nothing, the analysis is broken in a
-//! way no equivalence test would ever notice.
-//!
-//! So: [`the_state_is_identical_either_way`] is the correctness half, over a
-//! battery of snippets chosen for conditional flag writes, callbacks and exits;
-//! [`a_dead_flag_costs_no_ir`] and its neighbours are the effectiveness half,
-//! counted in IR instructions rather than compiled bytes
-//! because IR is the thing this exists to produce less of (and because compiled
-//! size carries hash-seed noise - see `specialize_tests::code_len`).
-//!
-//! The strongest check is not in this file. `fuzz_cross_config` runs the same
-//! equivalence over proptest-generated ALU snippets and random operands; this
-//! file is the hand-picked cases that suite would be unlikely to find.
+//! `eliminate_dead_flags` must change no observable state, yet must drop IR.
+//! Equivalence is [`the_state_is_identical_either_way`]; effectiveness is counted in IR instructions.
+//! Proptest coverage lives in `fuzz_cross_config`.
 
 use microlift::arch::x86_64::X86_64;
 use microlift::core::{LifterConfig, lift_to_code};
 use microlift::testkit::DEFAULT_LIFT_BASE;
 use microlift::testkit::prelude::*;
 
-/// Everything a lift can leave behind that the guest could observe.
-///
-/// `rsp` and `rip` are excluded: the harness allocates a fresh stack per run so
-/// `rsp` is a different host address each time, and `rip` follows from it on the
-/// exit path. Every flag is in, since flags are exactly what is at stake.
+/// Everything the guest can observe except `rsp`/`rip` (host-stack dependent).
 type State = ([u64; 15], [u8; 7], u32);
 
 fn state(ctx: &RegisterContext) -> State {
@@ -50,8 +29,6 @@ fn state(ctx: &RegisterContext) -> State {
     )
 }
 
-/// Seed the same registers both ways, so a divergence is the optimisation and
-/// not the inputs.
 fn seed(ctx: &mut RegisterContext) {
     ctx.rax = 0x0123_4567_89AB_CDEF;
     ctx.rbx = 0x8000_0000_0000_0000;
@@ -67,36 +44,28 @@ fn seed(ctx: &mut RegisterContext) {
     ctx.of = 1;
 }
 
-/// The snippets, each ending in `ret` so the harness gets its state back.
-///
-/// Includes partially preserved flags, conditional writes, context publication
-/// and ordinary `cmp`/`jcc` control flow.
+/// Each snippet ends in `ret` so the harness gets its state back.
 const SNIPPETS: &[(&str, &[u8])] = &[
-    // The motivating case: five of the CMP's six flags have no reader, and the
-    // sixth (ZF) does.
+    // Five of CMP's six flags have no reader.
     ("cmp/je", &[0x48, 0x39, 0xD8, 0x74, 0x01, 0x90, 0xC3]),
-    // Nothing reads any of them before the return - and the return publishes
-    // all seven, so nothing may be dropped.
+    // The return publishes all seven, so nothing may be dropped.
     ("add then return", &[0x48, 0x01, 0xD8, 0xC3]),
-    // AF survives an AND, because `update_flags_logical` leaves it alone and
-    // the classification says so. `lahf` is the reader that would notice.
+    // AND leaves AF alone; `lahf` is the reader that would notice.
     (
         "add; and; lahf",
         &[0x48, 0x01, 0xD8, 0x48, 0x21, 0xC8, 0x9F, 0xC3],
     ),
-    // The undefined flags of IMUL are likewise left as they were.
+    // IMUL's undefined flags are left as they were.
     (
         "add; imul; lahf",
         &[0x48, 0x01, 0xD8, 0x48, 0x0F, 0xAF, 0xC1, 0x9F, 0xC3],
     ),
-    // A shift reads the flags it may have to keep - `shl rax, cl` with cl = 3,
-    // then again with the count masked to zero further down.
+    // Shift flags are kept when the count may be zero.
     (
         "add; shl rax, cl",
         &[0x48, 0x01, 0xD8, 0x48, 0xD3, 0xE0, 0xC3],
     ),
-    // Two arms of a branch that disagree about which flag they read: the CMP
-    // must keep whatever either side wants.
+    // Arms reading different flags: the CMP must keep both.
     (
         "cmp; jbe over an adc",
         &[
@@ -107,8 +76,7 @@ const SNIPPETS: &[(&str, &[u8])] = &[
             0xC3, // ret
         ],
     ),
-    // A backward branch, so the fixpoint has to iterate: the ADD inside the
-    // loop feeds the `jne` that jumps back over it.
+    // Backward branch: the liveness fixpoint must iterate.
     (
         "loop on dec/jne",
         &[
@@ -118,10 +86,8 @@ const SNIPPETS: &[(&str, &[u8])] = &[
             0xC3, // ret
         ],
     ),
-    // `cpuid` is unclassified, so everything before it stays live - which is
-    // what keeps the flags the host sees at the exit correct.
+    // `cpuid` is unclassified, so everything before it stays live.
     ("add; cpuid", &[0x48, 0x01, 0xD8, 0x0F, 0xA2, 0xC3]),
-    // Flags into and out of a `setcc`/`cmovcc` pair.
     (
         "sub; sete; cmovne",
         &[
@@ -131,12 +97,9 @@ const SNIPPETS: &[(&str, &[u8])] = &[
             0xC3,
         ],
     ),
-    // Direction flag: written, then read by nothing this region contains, then
-    // published by the return.
     ("std; cld", &[0xFD, 0xFC, 0xC3]),
 ];
 
-/// The optimisation may not change a single observable bit.
 #[test]
 fn the_state_is_identical_either_way() {
     for (name, bytes) in SNIPPETS {
@@ -154,11 +117,9 @@ fn the_state_is_identical_either_way() {
     }
 }
 
-/// The same, but resumed after the exit - a region that comes back has to agree
-/// too, since the second half runs against flags the first half published.
+/// A resumed region runs against the flags the first half published.
 #[test]
 fn a_resumed_region_agrees_as_well() {
-    // add rax, rbx ; cpuid ; add rax, rcx ; ret
     let bytes = &[0x48, 0x01, 0xD8, 0x0F, 0xA2, 0x48, 0x01, 0xC8, 0xC3];
 
     let run = |lean: bool| {
@@ -177,11 +138,7 @@ fn a_resumed_region_agrees_as_well() {
     assert_eq!(run(false), run(true), "resuming diverged");
 }
 
-/// How many IR instructions one lift emits.
-///
-/// The unit this optimisation is denominated in: the point is not smaller
-/// machine code - the compiler was already deleting these - but less IR for the
-/// compiler to walk, optimise and register-allocate on the way there.
+/// IR instruction count, the unit this optimisation saves (compiled size has hash-seed noise).
 fn ir_len(bytes: &[u8], eliminate: bool) -> usize {
     let config = LifterConfig {
         eliminate_dead_flags: eliminate,
@@ -195,15 +152,9 @@ fn ir_len(bytes: &[u8], eliminate: bool) -> usize {
         .sum()
 }
 
-/// A flag with no reader costs no IR. If this ever passes trivially, the
-/// equivalence tests above are checking that nothing does nothing.
 #[test]
 fn a_dead_flag_costs_no_ir() {
-    // cmp rax, rbx ; je +1 ; nop ; ret
-    //
-    // The `je` reads ZF. CF, PF, AF, SF and OF are computed by the `cmp` and
-    // read by nobody - but the `ret` publishes them, so they are live after all
-    // and this snippet must *not* shrink. That is the control.
+    // CMP/je: the `ret` publishes every flag, so this must not shrink (the control).
     let control = &[0x48, 0x39, 0xD8, 0x74, 0x01, 0x90, 0xC3];
     assert_eq!(
         ir_len(control, false),
@@ -211,11 +162,7 @@ fn a_dead_flag_costs_no_ir() {
         "a region whose exit publishes the flags has no dead ones to drop"
     );
 
-    // The same compare, with the flags overwritten before anything can leave:
-    // cmp rax, rbx ; je +3 ; xor rax, rax ; add rax, rbx ; ret
-    //
-    // Now the `cmp`'s CF/PF/AF/SF/OF are all killed by the `xor`/`add` on one
-    // path and by the `add` on the other, so only ZF has to survive it.
+    // Flags overwritten on every path: only ZF has to survive.
     let bytes = &[
         0x48, 0x39, 0xD8, // cmp rax, rbx
         0x74, 0x03, // je +3
@@ -231,12 +178,9 @@ fn a_dead_flag_costs_no_ir() {
     );
 }
 
-/// Parity is the flag this was built for: four IR instructions on every
-/// arithmetic instruction in the program, for something almost nothing reads.
+/// Parity costs four IR instructions per arithmetic instruction and almost nothing reads it.
 #[test]
 fn a_chain_of_arithmetic_sheds_most_of_its_flag_ir() {
-    // Eight adds whose flags nobody reads, then a `test`/`jne` that wants ZF,
-    // then a call that publishes everything.
     let mut bytes = Vec::new();
     for _ in 0..8 {
         bytes.extend_from_slice(&[0x48, 0x01, 0xD8]); // add rax, rbx
@@ -253,12 +197,9 @@ fn a_chain_of_arithmetic_sheds_most_of_its_flag_ir() {
     );
 }
 
-/// Nothing is dropped where the analysis cannot see, and the region that proves
-/// it is the one that ends in a call: a callee may do anything, and the sync
-/// that reaches it publishes every flag.
+/// A call publishes every flag, so nothing is dropped before it.
 #[test]
 fn a_call_keeps_every_flag() {
-    // add rax, rbx ; call +0 ; ret
     let bytes = &[0x48, 0x01, 0xD8, 0xE8, 0x00, 0x00, 0x00, 0x00, 0xC3];
     assert_eq!(
         ir_len(bytes, false),
@@ -267,13 +208,9 @@ fn a_call_keeps_every_flag() {
     );
 }
 
-/// An instruction the frontend has not classified is conservative, which is
-/// what makes an unimplemented instruction safe without the table knowing which
-/// ones those are.
+/// Unclassified instructions are conservatively all-live.
 #[test]
 fn an_unclassified_instruction_keeps_every_flag() {
-    // add rax, rbx ; cpuid ; ret - `cpuid` is deliberately absent from the
-    // classification, and it syncs the whole context to the host.
     let bytes = &[0x48, 0x01, 0xD8, 0x0F, 0xA2, 0xC3];
     assert_eq!(
         ir_len(bytes, false),
@@ -282,7 +219,6 @@ fn an_unclassified_instruction_keeps_every_flag() {
     );
 }
 
-/// Preserve the opt-in API: embedders choose when to enable the pass.
 #[test]
 fn the_default_is_off() {
     assert!(!LifterConfig::default().eliminate_dead_flags);
@@ -290,11 +226,7 @@ fn the_default_is_off() {
 
 #[test]
 fn an_overlapping_tail_exit_cannot_kill_the_incoming_carry() {
-    // stc ; je BASE+5 ; mov eax, 0xC0814800 ; clc ; ret
-    // The taken edge decodes ADD RAX, imm32 at BASE+5, inside the MOV's
-    // immediate. That ADD runs past coverage, so it exits without executing.
-    // Only the fallthrough path clears CF. The old guest-CFG pass incorrectly
-    // counted the unexecuted ADD as killing CF on the taken path as well.
+    // The taken edge decodes an ADD inside the MOV immediate; it must not count as killing CF.
     let bytes = [
         0xF9, 0x74, 0x02, 0xB8, 0x00, 0x48, 0x81, 0xC0, 0xF8, 0xC3, 0x00, 0x00, 0xC3,
     ];
@@ -326,8 +258,7 @@ fn an_overlapping_tail_exit_cannot_kill_the_incoming_carry() {
     }
 }
 
-// Record what the interpreter sees without shared globals, then change CF so
-// the ADC after the callback proves that the reload is live too.
+// Change CF in the callback so the later ADC proves the reload is live.
 unsafe extern "C" fn observe_and_change_flags(ctx: *mut RegisterContext, count: u64) {
     let c = unsafe { &mut *ctx };
     c.r12 = u64::from(c.cf)
@@ -344,7 +275,6 @@ unsafe extern "C" fn observe_and_change_flags(ctx: *mut RegisterContext, count: 
 #[test]
 fn callbacks_observe_all_flags_and_their_updates_reach_the_guest() {
     use microlift::arch::x86_64::context::X86_64Callbacks;
-    // add rax, rbx ; wbinvd (interpreted) ; adc rsi, rdi ; add rax, rcx ; ret
     let bytes = [
         0x48, 0x01, 0xD8, 0x0F, 0x09, 0x48, 0x11, 0xFE, 0x48, 0x01, 0xC8, 0xC3,
     ];
@@ -372,8 +302,7 @@ fn callbacks_observe_all_flags_and_their_updates_reach_the_guest() {
 
 #[test]
 fn a_conditional_fault_publishes_the_flags_before_the_faulting_instruction() {
-    // ADD's flags are overwritten on the successful DIV path, but must reach
-    // the divide-error exit when the divisor is zero or the quotient overflows.
+    // ADD's flags must reach the divide-error exit.
     let bytes = [
         0x48, 0x01, 0xD8, // add rax, rbx
         0x48, 0xF7, 0xF1, // div rcx
@@ -425,7 +354,6 @@ fn conditional_flag_updates_and_partial_writes_agree_for_zero_counts() {
                         })
                         .run()
                 };
-                // The counted loop in SNIPPETS cannot terminate from zero.
                 if name == "loop on dec/jne" {
                     continue;
                 }
@@ -435,9 +363,7 @@ fn conditional_flag_updates_and_partial_writes_agree_for_zero_counts() {
     }
 }
 
-/// Not an assertion - a printout, so the numbers behind the thresholds above
-/// can be read rather than trusted. `cargo test --features testkit --test
-/// dead_flag_tests -- --ignored --nocapture`.
+/// Printout only: `cargo test --features testkit --test dead_flag_tests -- --ignored --nocapture`.
 #[test]
 #[ignore]
 fn dump_ir_savings() {

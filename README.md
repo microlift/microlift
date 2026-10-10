@@ -50,7 +50,7 @@ assert_eq!(ExitReason::try_from(ctx.exit_reason), Ok(ExitReason::UnknownJump));
 assert_eq!(ctx.rax, 42);
 ```
 
-A lifted region is a function taking one `*mut RegisterContext`. It runs the guest code against that context and reports why it stopped in `ctx.exit_reason`. Here the `ret` leaves the region, so the host sees an `UnknownJump` to the return address; the backend and its code must outlive the call. `CraneliftBackend` JIT-compiles in-process, and `ArtifactBackend` produces object code for any target triple.
+A lifted region is a function that takes a `*mut RegisterContext` as its first parameter. It runs the guest code against that context and reports why it stopped in `ctx.exit_reason`. Here the `ret` leaves the region, so the host sees an `UnknownJump` to the return address; the backend and its code must outlive the call. `CraneliftBackend` JIT-compiles in-process, and `ArtifactBackend` produces object code for any target triple.
 
 ## Testing
 

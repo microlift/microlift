@@ -1,5 +1,4 @@
-//! Guest source locations: every lifted IR instruction is tagged with the guest
-//! instruction it came from, and that tag survives into the compiled code.
+//! Every lifted IR instruction is tagged with its guest instruction, and the tag survives into compiled code.
 
 use microlift::arch::x86_64::X86_64;
 use microlift::backend::ArtifactBackend;
@@ -8,8 +7,7 @@ use microlift::core::{AddressMode, LifterConfig, lift_to_code};
 use microlift::testkit::{DEFAULT_LIFT_BASE, prelude::*};
 use std::collections::BTreeSet;
 
-/// `xor eax, eax ; add eax, 7 ; imul eax, eax, 3 ; ret`, and the VA of each
-/// instruction when lifted at `base`.
+/// `xor eax, eax ; add eax, 7 ; imul eax, eax, 3 ; ret` and each instruction's VA at `base`.
 const PROGRAM: &[u8] = &[
     0x31, 0xC0, // 0: xor eax, eax
     0x83, 0xC0, 0x07, // 2: add eax, 7
@@ -22,8 +20,7 @@ fn program_vas(base: u64) -> BTreeSet<u64> {
     PROGRAM_OFFSETS.iter().map(|off| base + off).collect()
 }
 
-/// The guest VA tagged onto every IR instruction in `func`, decoded with `map`.
-/// `None` covers the untagged scaffolding (prologue, PC dispatch).
+/// Guest VA tagged on each IR instruction, decoded with `map`; `None` is untagged scaffolding.
 fn ir_source_locs(
     func: &cranelift_codegen::ir::Function,
     map: SourceLocMap,
@@ -43,12 +40,10 @@ fn ir_instructions_carry_their_guest_address() {
     let locs = ir_source_locs(&code.func, code.source_map);
     let tagged: BTreeSet<u64> = locs.iter().filter_map(|&(_, va)| va).collect();
 
-    // Every guest instruction contributed IR, and nothing was attributed to an
-    // address the decoder never saw.
+    // Every guest instruction contributed IR; nothing is attributed to an unseen address.
     assert_eq!(tagged, program_vas(base), "tagged guest addresses");
 
-    // The overwhelming majority of the IR belongs to a guest instruction; only
-    // the entry scaffolding is untagged.
+    // Only the entry scaffolding is untagged.
     let untagged = locs.iter().filter(|(_, va)| va.is_none()).count();
     assert!(
         untagged * 2 < locs.len(),
@@ -59,8 +54,7 @@ fn ir_instructions_carry_their_guest_address() {
 
 #[test]
 fn source_locations_track_the_lift_base() {
-    // The encoding is relative to the lift base, so a region lifted somewhere
-    // else must report the addresses *it* was lifted at, not offsets.
+    // Addresses follow the lift base, not offsets.
     let base = 0x7F00_1234_0000;
     let code = lift_to_code::<X86_64>(PROGRAM, base, LifterConfig::default()).unwrap();
     assert_eq!(code.source_map.lift_base, base);
@@ -88,8 +82,7 @@ fn disabling_source_locs_leaves_the_ir_untagged() {
 
 #[test]
 fn source_locations_do_not_change_behavior() {
-    // A `SourceLoc` is opaque metadata to Cranelift; turning it off must not
-    // change a single guest-visible bit.
+    // Tagging is opaque to Cranelift; turning it off changes no guest-visible bit.
     let with = LiftTest::new(PROGRAM).run();
     let without = LiftTest::new(PROGRAM)
         .with_config(|c| c.emit_source_locs = false)
@@ -116,8 +109,7 @@ fn compiled_code_maps_back_to_guest_instructions() {
 
     assert!(!map.is_empty(), "compiled region should carry a code map");
 
-    // Ranges are sorted, non-empty and disjoint - `lookup`'s binary search
-    // depends on all three.
+    // Ranges are sorted, non-empty and disjoint, as `lookup`'s binary search needs.
     let mut prev_end = 0;
     for range in map.ranges() {
         assert!(range.start >= prev_end, "ranges overlap or are unsorted");
@@ -125,10 +117,7 @@ fn compiled_code_maps_back_to_guest_instructions() {
         prev_end = range.end;
     }
 
-    // Every surviving guest address is one the decoder saw. It is a subset, not
-    // an equality: an instruction whose whole result is dead can be optimized
-    // away entirely, and `xor eax, eax` folding into the constant that follows
-    // it is exactly the kind of thing that happens here.
+    // Subset of decoded addresses, not equal: dead instructions (`xor eax, eax` folded into a constant) can vanish.
     let guests: BTreeSet<u64> = map.guest_addresses().into_iter().collect();
     assert!(!guests.is_empty());
     assert!(
@@ -136,8 +125,7 @@ fn compiled_code_maps_back_to_guest_instructions() {
         "map named an address the decoder never saw: {guests:x?}"
     );
 
-    // Every byte of every range resolves to that range's guest instruction, and
-    // the same answer comes back through an absolute host address.
+    // Every byte of a range resolves to its instruction, also via an absolute host address.
     for range in map.ranges() {
         for offset in range.start..range.end {
             assert_eq!(map.lookup(offset), Some(range.guest_va));
@@ -150,8 +138,7 @@ fn compiled_code_maps_back_to_guest_instructions() {
         assert!(map.code_size_for(range.guest_va) >= range.len());
     }
 
-    // An address before the function, and one past its end, are not in any
-    // range rather than being clamped to the nearest one.
+    // Addresses outside the function are in no range, not clamped.
     assert_eq!(
         map.lookup_host_addr(out.code_ptr(), out.code_ptr() as u64 - 1),
         None
@@ -170,9 +157,7 @@ fn code_map_is_empty_when_source_locs_are_off() {
 
 #[test]
 fn out_of_region_exit_stubs_name_their_target() {
-    // `jmp +0x40` leaves the region: the stub `finish()` emits for it is
-    // attributed to the address being jumped to, which is what a debugger
-    // stopped in that stub needs to be told.
+    // The `finish()` stub for a `jmp` out of the region is attributed to the jump target.
     let base = DEFAULT_LIFT_BASE;
     let bytes = [0xEB, 0x40]; // jmp .+0x40
     let target = base + 0x42;
@@ -192,8 +177,7 @@ fn out_of_region_exit_stubs_name_their_target() {
 
 #[test]
 fn address_mode_does_not_affect_the_mapping() {
-    // Source locations are lift-time VAs, so they are the same under both
-    // address modes even though the emitted address arithmetic differs.
+    // Source locations are lift-time VAs under both address modes.
     let for_mode = |mode: AddressMode| -> BTreeSet<u64> {
         let mut config = LifterConfig::default();
         config.address_mode = mode;
@@ -226,7 +210,7 @@ fn aot_output_carries_a_code_map() {
     assert!(guests.is_subset(&program_vas(DEFAULT_LIFT_BASE)));
 }
 
-/// Only present under the `disasm` feature, which brings in capstone.
+/// Needs the `disasm` feature (capstone).
 #[cfg(feature = "disasm")]
 #[test]
 fn annotated_disassembly_labels_each_guest_instruction() {
@@ -234,7 +218,7 @@ fn annotated_disassembly_labels_each_guest_instruction() {
     let (bytes, map) = ArtifactBackend::compile_lifted_to_raw_with_map(code, None, None).unwrap();
     let text = ArtifactBackend::disassemble_annotated(&bytes, None, &map).unwrap();
 
-    // Prologue first, then a header for each guest instruction that survived.
+    // Prologue, then a header per surviving guest instruction.
     assert!(text.contains("; [no source]"), "{text}");
     for va in map.guest_addresses() {
         assert!(text.contains(&format!("; guest {va:#x}\n")), "{text}");

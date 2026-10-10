@@ -1,18 +1,8 @@
 //! x87 FPU instruction semantics.
 //!
-//! The x87 register file is a stack of eight registers: `ST(i)` names the slot
-//! `(TOP + i) & 7`, where `TOP` decrements on a push and increments on a pop.
-//! Because `TOP` is a *runtime* value, the whole x87 state lives in the
-//! [`RegisterContext`] rather than in SSA variables, accessed through computed
-//! pointers. Nothing else touches those fields, so no entry/exit sync is needed.
-//!
-//! Registers are true 80-bit, carried in IR as a `(mant: i64, se: i32)` pair -
-//! 64-bit significand with explicit integer bit, plus sign at bit 15 and a
-//! 15-bit biased exponent. Data movement, the `m80` memory forms and the integer
-//! conversions are exact 80-bit; the arithmetic and comparisons go through the
-//! bit-exact software kernels in
-//! [`crate::arch::x86_64::semantics::softfloat`]. `f64` is used only for the
-//! `m32`/`m64` memory narrowing/widening, where it is the correct storage width.
+//! The stack lives in the [`RegisterContext`] (computed pointers off a runtime `TOP`), not SSA, so no entry/exit sync is needed.
+//! Registers are raw 80-bit `(mant: i64, se: i32)` pairs; arithmetic goes through the bit-exact
+//! [`crate::arch::x86_64::semantics::softfloat`] kernels, `f64` only for `m32`/`m64` narrowing.
 
 use crate::MicroliftError;
 use crate::arch::x86_64::context::{RegisterContext, X87_CW_RESET};
@@ -21,8 +11,7 @@ use crate::lifter::{Lifter, X86Flag};
 use cranelift::prelude::*;
 use iced_x86::{Instruction, MemorySize, OpKind};
 
-/// The binary x87 arithmetic operations, parameterised so a single handler
-/// covers `FADD`/`FSUB`/`FSUBR`/`FMUL`/`FDIV`/`FDIVR` and their popping forms.
+/// Binary x87 arithmetic ops, so one handler covers `FADD`/`FSUB`/`FSUBR`/`FMUL`/`FDIV`/`FDIVR` and their popping forms.
 #[derive(Clone, Copy)]
 pub(super) enum FpuOp {
     Add,
@@ -45,8 +34,7 @@ const SW_C2: i64 = 1 << 10;
 const SW_C3: i64 = 1 << 14;
 const SW_CC_MASK: i64 = SW_C0 | SW_C1 | SW_C2 | SW_C3;
 
-/// Significand of an 80-bit value with only the explicit integer bit set - the
-/// mantissa of every power of two, and so of `1.0` (biased exponent `0x3FFF`).
+/// Significand with only the explicit integer bit set: the mantissa of `1.0` (biased exponent `0x3FFF`).
 const F80_INT_BIT: i64 = 0x8000_0000_0000_0000u64 as i64;
 
 impl<'a> Lifter<'a> {
@@ -54,7 +42,6 @@ impl<'a> Lifter<'a> {
         self.builder.use_var(self.state.context_ptr)
     }
 
-    /// Load the top-of-stack pointer as an `I32`.
     fn fpu_load_top(&mut self) -> Value {
         let ctx = self.fpu_ctx_ptr();
         let off = std::mem::offset_of!(RegisterContext, fpu_top) as i32;
@@ -62,7 +49,7 @@ impl<'a> Lifter<'a> {
         self.builder.ins().uextend(types::I32, t)
     }
 
-    /// Store a new top-of-stack pointer (`I32`, only the low 3 bits matter).
+    /// Store a new top-of-stack pointer (only the low 3 bits matter).
     fn fpu_store_top(&mut self, top: Value) {
         let ctx = self.fpu_ctx_ptr();
         let off = std::mem::offset_of!(RegisterContext, fpu_top) as i32;
@@ -70,7 +57,6 @@ impl<'a> Lifter<'a> {
         self.ctx_store(t16, ctx, off);
     }
 
-    /// Pointer to the physical 16-byte slot backing architectural `ST(i)`.
     fn fpu_st_ptr(&mut self, i: u32) -> Value {
         let top = self.fpu_load_top();
         let raw = self.builder.ins().iadd_imm_s(top, i as i64);
@@ -78,8 +64,7 @@ impl<'a> Lifter<'a> {
         self.fpu_phys_ptr(phys)
     }
 
-    /// Pointer to physical register slot `phys` (an `I32` value, 0-7), for the
-    /// cases where the slot is computed rather than an `ST(i)` offset.
+    /// Pointer to physical slot `phys` (`I32`, 0-7), for computed slots.
     fn fpu_phys_ptr(&mut self, phys: Value) -> Value {
         let byte_off = self.builder.ins().imul_imm_s(phys, 16);
         let byte_off = self.builder.ins().uextend(types::I64, byte_off);
@@ -89,7 +74,6 @@ impl<'a> Lifter<'a> {
         self.builder.ins().iadd(base, byte_off)
     }
 
-    /// Read `ST(i)` as a raw 80-bit `(mant: i64, se: i32)` pair.
     fn fpu_read_st_raw(&mut self, i: u32) -> (Value, Value) {
         let p = self.fpu_st_ptr(i);
         let x87 = self.x87_flags();
@@ -99,13 +83,11 @@ impl<'a> Lifter<'a> {
         (mant, se)
     }
 
-    /// Write a raw 80-bit `(mant, se)` pair into `ST(i)`.
     fn fpu_write_st_raw(&mut self, i: u32, mant: Value, se: Value) {
         let p = self.fpu_st_ptr(i);
         self.fpu_write_ptr_raw(p, mant, se);
     }
 
-    /// Write a raw 80-bit `(mant, se)` pair into physical slot `phys`.
     fn fpu_write_phys_raw(&mut self, phys: Value, mant: Value, se: Value) {
         let p = self.fpu_phys_ptr(phys);
         self.fpu_write_ptr_raw(p, mant, se);
@@ -118,8 +100,7 @@ impl<'a> Lifter<'a> {
         self.builder.ins().store(x87, se16, p, 8);
     }
 
-    /// Decrement `TOP`, store a raw `(mant, se)` pair into the new `ST(0)`, and
-    /// mark that physical register valid in the tag word.
+    /// Push: decrement `TOP`, store into the new `ST(0)`, mark it valid in the tag word.
     fn fpu_push_raw(&mut self, mant: Value, se: Value) {
         let top = self.fpu_load_top();
         let dec = self.builder.ins().iadd_imm_s(top, -1);
@@ -129,8 +110,7 @@ impl<'a> Lifter<'a> {
         self.fpu_set_tag_phys(new_top, true);
     }
 
-    /// Mark the current `ST(0)` empty in the tag word and increment `TOP`
-    /// (discarding it).
+    /// Pop: mark `ST(0)` empty in the tag word and increment `TOP`.
     fn fpu_pop(&mut self) {
         let top = self.fpu_load_top();
         self.fpu_set_tag_phys(top, false);
@@ -139,8 +119,7 @@ impl<'a> Lifter<'a> {
         self.fpu_store_top(new_top);
     }
 
-    /// Load the abridged tag word as an `I32` (bit `i` = physical register `i`
-    /// is valid; matches the FXSAVE `ftw` encoding, `1` = valid, `0` = empty).
+    /// Load the abridged tag word as an `I32` (FXSAVE `ftw` encoding: bit `i` set = register `i` valid).
     fn fpu_load_tag(&mut self) -> Value {
         let ctx = self.fpu_ctx_ptr();
         let off = std::mem::offset_of!(RegisterContext, fpu_tag) as i32;
@@ -148,7 +127,6 @@ impl<'a> Lifter<'a> {
         self.builder.ins().uextend(types::I32, t)
     }
 
-    /// Store the abridged tag word (`I32`, low 8 bits significant).
     fn fpu_store_tag(&mut self, tag: Value) {
         let ctx = self.fpu_ctx_ptr();
         let off = std::mem::offset_of!(RegisterContext, fpu_tag) as i32;
@@ -156,8 +134,6 @@ impl<'a> Lifter<'a> {
         self.ctx_store(t16, ctx, off);
     }
 
-    /// Set physical register `phys` (an `I32` value, 0-7) valid or empty in the
-    /// tag word.
     fn fpu_set_tag_phys(&mut self, phys: Value, valid: bool) {
         let one = self.builder.ins().iconst(types::I32, 1);
         let bit = self.builder.ins().ishl(one, phys);
@@ -182,15 +158,8 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// Convert a raw 80-bit `(mant, se)` value to an `f64`, rounding the
-    /// significand to nearest-even (the x87 default; the control word's rounding
-    /// mode is not modelled). Handles the full exponent range:
-    ///
-    /// - `exp80 == 0x7FFF` (inf/NaN) maps to the f64 special exponent with the top
-    ///   52 payload bits preserved.
-    /// - Exponents above the f64 range overflow to infinity.
-    /// - Exponents at or below the f64 normal range produce denormals or zero, with
-    ///   correct rounding; the rounding carry handles both boundary cases.
+    /// Convert a raw 80-bit value to `f64`, rounding to nearest-even (the control word's rounding mode is not modelled).
+    /// Inf/NaN keep the top 52 payload bits; overflow gives infinity; underflow gives correctly rounded denormals or zero.
     fn f80_to_f64(&mut self, mant: Value, se: Value) -> Value {
         let sign_i32 = self.builder.ins().ushr_imm_u(se, 15);
         let sign_i32 = self.builder.ins().band_imm_u(sign_i32, 1);
@@ -216,17 +185,14 @@ impl<'a> Lifter<'a> {
             .ins()
             .icmp_imm_s(IntCC::SignedLessThanOrEqual, e, 0);
 
-        // The 80-bit significand keeps 53 bits after the shift (explicit
-        // integer bit at position 52 + 52 fraction bits). Normal values drop
-        // 11 bits; a subnormal result drops 11 + (1 - e) so the value lines up
-        // against the fixed 2^-1022 scale.
+        // 53 significand bits survive: normals drop 11, a subnormal result drops 11 + (1 - e) against the fixed 2^-1022 scale.
         let c11 = self.builder.ins().iconst(types::I64, 11);
         let shift_sub = {
             let twelve = self.builder.ins().iconst(types::I64, 12);
             self.builder.ins().isub(twelve, e)
         };
         let shift = self.builder.ins().select(subnormal, shift_sub, c11);
-        // Shifts of 64+ would be UB-ish in the IR; the value rounds to zero.
+        // Shifts of 64+ round to zero.
         let too_small = self
             .builder
             .ins()
@@ -235,7 +201,6 @@ impl<'a> Lifter<'a> {
         let sh = self.builder.ins().select(too_small, c63, shift);
 
         let keep = self.builder.ins().ushr(mant, sh);
-        // Round to nearest, ties to even, on the dropped bits.
         let one = self.builder.ins().iconst(types::I64, 1);
         let mask = {
             let m = self.builder.ins().ishl(one, sh);
@@ -260,10 +225,7 @@ impl<'a> Lifter<'a> {
         let zero64 = self.builder.ins().iconst(types::I64, 0);
         let keep_final = self.builder.ins().select(too_small, zero64, keep_r);
 
-        // combined = (base_exp << 52) + significand. For normals base_exp is e - 1,
-        // since the significand still holds the integer bit at position 52. A rounding
-        // carry out of the significand increments the exponent field - exactly the
-        // IEEE behaviour, including 0x7FE rounding up to infinity.
+        // combined = (base_exp << 52) + significand; a rounding carry bumps the exponent, as IEEE requires (0x7FE rounds to infinity).
         let e_minus_1 = self.builder.ins().iadd_imm_s(e, -1);
         let base_exp = self.builder.ins().select(subnormal, zero64, e_minus_1);
         let exp_field = self.builder.ins().ishl_imm_u(base_exp, 52);
@@ -280,7 +242,6 @@ impl<'a> Lifter<'a> {
             .builder
             .ins()
             .select(is_special, special_bits, magnitude);
-        // Zero mantissa -> signed zero (also covers the true-zero encoding).
         let magnitude = self.builder.ins().select(is_zero_mant, zero64, magnitude);
 
         let bits = self.builder.ins().bor(sign_bit, magnitude);
@@ -289,8 +250,7 @@ impl<'a> Lifter<'a> {
             .bitcast(types::F64, MemFlagsData::new(), bits)
     }
 
-    /// Convert an `f64` to a raw 80-bit `(mant, se)` value. Exact (`f64` is a
-    /// subset of the 80-bit format).
+    /// Convert an `f64` to a raw 80-bit value; exact.
     fn f64_to_f80(&mut self, val: Value) -> (Value, Value) {
         let bits = self
             .builder
@@ -303,7 +263,6 @@ impl<'a> Lifter<'a> {
         let exp64 = self.builder.ins().band_imm_u(exp64, 0x7FF);
         let frac = self.builder.ins().band_imm_u(bits, 0x000F_FFFF_FFFF_FFFF);
 
-        // Normal mantissa: explicit integer bit + fraction shifted up by 11.
         let frac_sh = self.builder.ins().ishl_imm_u(frac, 11);
         let int_bit = self.builder.ins().iconst(types::I64, (1u64 << 63) as i64);
         let mant_normal = self.builder.ins().bor(int_bit, frac_sh);
@@ -314,10 +273,7 @@ impl<'a> Lifter<'a> {
         let is_subnormal = self.builder.ins().band_not(is_exp_zero, is_frac_zero);
         let is_special = self.builder.ins().icmp_imm_s(IntCC::Equal, exp64, 0x7FF);
 
-        // Subnormal f64: no implicit integer bit. Normalise the fraction so its
-        // top set bit lands at bit 63; the 80-bit format has room to represent
-        // it as a normal value. value = frac * 2^-1074, and after shifting left
-        // by clz(frac) the integer-bit exponent is 15372 - clz (biased).
+        // Subnormal f64: normalise the fraction's top bit to bit 63; the integer-bit biased exponent is 15372 - clz.
         let clz = self.builder.ins().clz(frac);
         let mant_sub = self.builder.ins().ishl(frac, clz);
         let exp80_sub = {
@@ -346,17 +302,14 @@ impl<'a> Lifter<'a> {
         (mant, se)
     }
 
-    /// Convert a signed 64-bit integer to a raw 80-bit `(mant, se)` value.
-    /// Exact - a 64-bit integer fits in the 64-bit significand.
+    /// Convert a signed 64-bit integer to a raw 80-bit value; exact.
     fn i64_to_f80(&mut self, v: Value) -> (Value, Value) {
         let is_zero = self.builder.ins().icmp_imm_s(IntCC::Equal, v, 0);
         let neg = self.builder.ins().icmp_imm_s(IntCC::SignedLessThan, v, 0);
-        // Magnitude (|i64::MIN| wraps to 0x8000_0000_0000_0000, the correct
-        // unsigned magnitude 2^63).
+        // `i64::MIN` wraps to 2^63, the correct magnitude.
         let negated = self.builder.ins().ineg(v);
         let mag = self.builder.ins().select(neg, negated, v);
 
-        // Normalise so the most-significant set bit lands at bit 63.
         let lz = self.builder.ins().clz(mag);
         let mant_norm = self.builder.ins().ishl(mag, lz);
         // Unbiased exponent of the integer bit = 63 - lz; biased += 16383.
@@ -377,15 +330,12 @@ impl<'a> Lifter<'a> {
         (mant, se)
     }
 
-    /// Convert a raw 80-bit `(mant, se)` value to a signed 64-bit integer.
-    /// `truncate` selects round-toward-zero (`FISTTP`); otherwise
-    /// round-to-nearest-even (`FIST`/`FISTP`). Out-of-range magnitudes saturate
-    /// to the x87 integer indefinite (`0x8000_0000_0000_0000`).
+    /// Convert a raw 80-bit value to `i64`: `truncate` rounds toward zero (`FISTTP`), else nearest-even (`FIST`/`FISTP`).
+    /// Out-of-range saturates to the integer indefinite (`0x8000_0000_0000_0000`).
     fn f80_to_i64(&mut self, mant: Value, se: Value, truncate: bool) -> Value {
         let sign_sh = self.builder.ins().ushr_imm_u(se, 15);
         let sign = self.builder.ins().band_imm_u(sign_sh, 1);
         let exp80 = self.builder.ins().band_imm_u(se, 0x7FFF);
-        // Unbiased exponent of the integer bit.
         let e = self.builder.ins().iadd_imm_s(exp80, -16383);
         let e = self.builder.ins().sextend(types::I64, e);
 
@@ -393,10 +343,8 @@ impl<'a> Lifter<'a> {
         let c63 = self.builder.ins().iconst(types::I64, 63);
         let shift = self.builder.ins().isub(c63, e);
 
-        // Truncated magnitude for the in-range case (0 <= shift <= 63).
         let shift_clamped = {
-            // Cap shift at 63 so the shift is well-defined; the >=64 case is
-            // selected away below.
+            // Cap at 63 so the shift is defined; shift >= 64 is selected away below.
             let sixty3 = self.builder.ins().iconst(types::I64, 63);
             let too_small = self
                 .builder
@@ -409,8 +357,7 @@ impl<'a> Lifter<'a> {
         let mag = if truncate {
             trunc_mag
         } else {
-            // Round-to-nearest-even using the shifted-out bits.
-            // rem = mant & ((1<<shift)-1); half = 1<<(shift-1).
+            // Nearest-even from the shifted-out bits.
             let one = self.builder.ins().iconst(types::I64, 1);
             let mask = {
                 let m = self.builder.ins().ishl(one, shift_clamped);
@@ -443,7 +390,6 @@ impl<'a> Lifter<'a> {
             self.builder.ins().iadd(trunc_mag, inc)
         };
 
-        // Apply the sign.
         let neg_mag = self.builder.ins().ineg(mag);
         let is_neg = self.builder.ins().icmp_imm_s(IntCC::NotEqual, sign, 0);
         let signed = self.builder.ins().select(is_neg, neg_mag, mag);
@@ -464,9 +410,7 @@ impl<'a> Lifter<'a> {
         self.builder.ins().select(too_large, indef, r)
     }
 
-    /// Load a floating-point memory operand (`m32`/`m64`/`m80`) as a raw 80-bit
-    /// `(mant, se)` pair. All widths convert exactly (each is a subset of the
-    /// 80-bit format).
+    /// Load a floating-point memory operand (`m32`/`m64`/`m80`) as a raw 80-bit pair; exact.
     fn fpu_load_mem_f80(
         &mut self,
         instruction: &Instruction,
@@ -542,10 +486,7 @@ impl<'a> Lifter<'a> {
         Ok(self.i64_to_f80(int64))
     }
 
-    /// FLD - push a floating-point value onto the x87 stack.
-    ///
-    /// Covers `FLD m32/m64/m80` (`flds`/`fldl`/`fldt`) and `FLD ST(i)`, all
-    /// exact in 80-bit precision.
+    /// FLD - push a floating-point value: `FLD m32/m64/m80` (`flds`/`fldl`/`fldt`) and `FLD ST(i)`; exact.
     pub(super) fn handle_fld(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let (mant, se) = match self.operand_kind(instruction, 0) {
             OpKind::Memory => self.fpu_load_mem_f80(instruction, 0)?,
@@ -570,8 +511,7 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Push an implicit constant (`FLDZ`, `FLD1`, `FLDPI`, ...). The constant is
-    /// converted to its exact 80-bit encoding at lift time.
+    /// Push an implicit constant (`FLDZ`, `FLD1`, `FLDPI`, ...), converted at lift time.
     pub(super) fn handle_fld_const(&mut self, value: f64) -> crate::Result<()> {
         let (mant_bits, se_bits) = crate::arch::x86_64::context::f64_bits_to_f80(value.to_bits());
         let mant = self.builder.ins().iconst(types::I64, mant_bits as i64);
@@ -580,9 +520,7 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// FST / FSTP - store `ST(0)`; `pop` selects the popping form.
-    ///
-    /// Covers `FST(P) m32/m64`, `FSTP m80` (`fstpt`) and `FST(P) ST(i)`.
+    /// FST / FSTP - store `ST(0)`: `FST(P) m32/m64`, `FSTP m80` (`fstpt`), `FST(P) ST(i)`; `pop` selects the popping form.
     pub(super) fn handle_fst(&mut self, instruction: &Instruction, pop: bool) -> crate::Result<()> {
         let (mant, se) = self.fpu_read_st_raw(0);
         match self.operand_kind(instruction, 0) {
@@ -590,9 +528,7 @@ impl<'a> Lifter<'a> {
                 let ptr = self.get_mem_ptr(instruction, 0)?;
                 match instruction.memory_size() {
                     MemorySize::Float32 => {
-                        // Narrow via f64 (double-rounding is possible only for
-                        // values with >53 significant bits; refined with the
-                        // softfloat kernels).
+                        // Narrow via f64 (double rounding is possible for >53 significant bits).
                         let f64v = self.f80_to_f64(mant, se);
                         let f32v = self.builder.ins().fdemote(types::F32, f64v);
                         self.builder.ins().store(self.guest_flags, f32v, ptr, 0);
@@ -629,10 +565,7 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// FIST / FISTP / FISTTP - store `ST(0)` as an integer.
-    ///
-    /// `pop` selects the popping form; `truncate` selects `FISTTP` (round
-    /// toward zero) versus round-to-nearest for `FIST`/`FISTP`.
+    /// FIST / FISTP / FISTTP - store `ST(0)` as an integer; `pop` selects the popping form, `truncate` selects `FISTTP`.
     pub(super) fn handle_fist(
         &mut self,
         instruction: &Instruction,
@@ -667,10 +600,7 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// FXCH - exchange `ST(0)` with `ST(i)` (default `ST(1)`).
-    ///
-    /// iced decodes `fxch st(i)` as two operands (`op0 = ST0`, `op1 = ST(i)`),
-    /// so the exchange partner is the *last* operand.
+    /// FXCH - exchange `ST(0)` with `ST(i)` (default `ST(1)`); iced decodes two operands, so the partner is the *last* one.
     pub(super) fn handle_fxch(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let i = match instruction.op_count() {
             0 => 1,
@@ -683,10 +613,7 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Resolve the `(dst_index, dst, src)` triple for a binary x87 arithmetic
-    /// instruction across its register/register, register/memory and implicit
-    /// (no-operand `FADDP`-style) forms. Operands are raw 80-bit `(mant, se)`
-    /// pairs.
+    /// Resolve `(dst_index, dst, src)` for a binary x87 arithmetic instruction across its register, memory and implicit (`FADDP`-style) forms.
     fn fpu_binop_operands_raw(
         &mut self,
         instruction: &Instruction,
@@ -728,11 +655,7 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// Emit one softfloat kernel over raw 80-bit operands, as a call to the
-    /// shared helper function or - when outlining is off - inline at this site.
-    ///
-    /// Both paths run the identical `emit_f80_*` builder; the helper body is
-    /// just that builder wrapped in its own function (see [`F80Kernel`]).
+    /// Emit one softfloat kernel over raw 80-bit operands as a call to the shared helper, or inline when outlining is off (see [`F80Kernel`]).
     fn f80_kernel(&mut self, kernel: F80Kernel, args: &[Value]) -> Vec<Value> {
         if !self.outline_helpers() {
             let b = &mut self.builder;
@@ -752,8 +675,7 @@ impl<'a> Lifter<'a> {
             return vec![m, se];
         }
 
-        // The helper shares the lifted function's calling convention, so the
-        // call needs no ABI bridging.
+        // The helper shares the lifted function's calling convention.
         let call_conv = self.builder.func.signature.call_conv;
         let func_ref = self.outlined_helper(kernel.symbol(), kernel.signature(call_conv), |b| {
             kernel.build_body(b)
@@ -762,15 +684,13 @@ impl<'a> Lifter<'a> {
         self.builder.inst_results(call).to_vec()
     }
 
-    /// [`f80_kernel`](Self::f80_kernel) for the kernels returning one 80-bit
-    /// value.
+    /// [`f80_kernel`](Self::f80_kernel) for kernels returning one 80-bit value.
     fn f80_value_kernel(&mut self, kernel: F80Kernel, args: &[Value]) -> F80 {
         let r = self.f80_kernel(kernel, args);
         (r[0], r[1])
     }
 
-    /// FADD/FSUB/FSUBR/FMUL/FDIV/FDIVR and their `...P` popping variants, all via
-    /// the bit-exact 80-bit software kernels.
+    /// FADD/FSUB/FSUBR/FMUL/FDIV/FDIVR and their `...P` popping variants, via the 80-bit kernels.
     pub(super) fn handle_farith(
         &mut self,
         instruction: &Instruction,
@@ -778,9 +698,7 @@ impl<'a> Lifter<'a> {
         pop: bool,
     ) -> crate::Result<()> {
         let (dst_idx, (dm, dse), (sm, sse)) = self.fpu_binop_operands_raw(instruction)?;
-        // The reverse forms swap the operands rather than needing their own
-        // kernel - `a - b` and `b - a` are the same code with the arguments
-        // exchanged, so both share one helper.
+        // Reverse forms swap operands and share one helper.
         let (kernel, args) = match op {
             FpuOp::Add => (F80Kernel::Add, [dm, dse, sm, sse]),
             FpuOp::Sub => (F80Kernel::Sub, [dm, dse, sm, sse]),
@@ -820,15 +738,10 @@ impl<'a> Lifter<'a> {
         self.fpu_write_st_raw(0, rm, rse);
         Ok(())
     }
-    //
-    // `FSIN`/`FCOS`/`FSINCOS`/`FPTAN` share one out-of-range protocol and one
-    // softfloat kernel, and differ only in what they leave on the stack.
+    // `FSIN`/`FCOS`/`FSINCOS`/`FPTAN` share one out-of-range protocol and kernel.
 
-    /// The x87 trig range check: the hardware only reduces arguments with
-    /// `|ST(0)| < 2^63`. Outside that (and only for *finite* arguments - a NaN
-    /// or infinity is an invalid operation, not a range error) the instruction
-    /// does nothing at all and reports `C2`, which is the signal for the
-    /// caller's own `FPREM1` reduction loop.
+    /// The x87 trig range check: only `|ST(0)| < 2^63` is reduced. Outside that (finite arguments only; NaN/inf is invalid)
+    /// the instruction does nothing and reports `C2`.
     fn fpu_trig_out_of_range(&mut self, se: Value) -> Value {
         let exp = self.builder.ins().band_imm_u(se, 0x7FFF);
         let finite = self.builder.ins().icmp_imm_s(IntCC::NotEqual, exp, 0x7FFF);
@@ -840,17 +753,14 @@ impl<'a> Lifter<'a> {
         self.builder.ins().band(finite, too_big)
     }
 
-    /// Report the trig range check in the status word: `C2` is the result, `C1`
-    /// is cleared (nothing was rounded up and no stack fault occurred), and
-    /// `C0`/`C3` are architecturally undefined here and come out cleared.
+    /// Report the trig range check: `C2` is the result; `C1`, `C0` and `C3` are cleared.
     fn fpu_trig_store_c2(&mut self, out_of_range: Value) {
         let c2 = self.builder.ins().uextend(types::I32, out_of_range);
         let cc = self.builder.ins().ishl_imm_u(c2, 10);
         self.fpu_store_cc(cc);
     }
 
-    /// One call into the shared sin/cos kernel. `phase` is
-    /// [`softfloat::TRIG_PHASE_SIN`] or [`softfloat::TRIG_PHASE_COS`].
+    /// One call into the shared sin/cos kernel; `phase` is [`softfloat::TRIG_PHASE_SIN`] or [`softfloat::TRIG_PHASE_COS`].
     fn f80_trig(&mut self, m: Value, se: Value, phase: i64) -> F80 {
         let phase = self.builder.ins().iconst(types::I32, phase);
         self.f80_value_kernel(F80Kernel::Trig, &[m, se, phase])
@@ -899,9 +809,7 @@ impl<'a> Lifter<'a> {
         let out_of_range = self.fpu_trig_out_of_range(se);
         let (sm, sse) = self.f80_trig(m, se, softfloat::TRIG_PHASE_SIN);
         let (cm, cse) = self.f80_trig(m, se, softfloat::TRIG_PHASE_COS);
-        // tan = sin/cos through the exact divide kernel rather than a series of
-        // its own: an argument near an odd multiple of pi/2 has a tiny cosine,
-        // and the division is where that (correctly) blows up.
+        // tan = sin/cos via the exact divide kernel, so a tiny cosine near pi/2 blows up correctly.
         let (tm, tse) = self.f80_value_kernel(F80Kernel::Div, &[sm, sse, cm, cse]);
         let one_m = self.builder.ins().iconst(types::I64, F80_INT_BIT);
         let one_se = self.builder.ins().iconst(types::I32, 0x3FFF);
@@ -910,12 +818,8 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// The stack half of `FSINCOS`/`FPTAN`: replace `ST(0)` with `lower` and push
-    /// `upper` - unless the argument was out of range, in which case `ST(0)` keeps
-    /// `orig` and nothing is pushed.
-    ///
-    /// Branchless: when out of range `TOP` stays put and *both* stores land on the
-    /// original `ST(0)` slot, writing the same untouched value twice.
+    /// The stack half of `FSINCOS`/`FPTAN`: replace `ST(0)` with `lower` and push `upper`; out of range, `ST(0)` keeps `orig` and nothing is pushed.
+    /// Branchless: out of range `TOP` stays put and both stores hit the original slot with the same value.
     fn fpu_trig_push_pair(&mut self, out_of_range: Value, orig: F80, lower: F80, upper: F80) {
         let top = self.fpu_load_top();
         let dec = self.builder.ins().iadd_imm_s(top, -1);
@@ -934,9 +838,7 @@ impl<'a> Lifter<'a> {
         self.fpu_set_tag_phys(new_top, true);
     }
 
-    /// Compute the three ordered/equal/unordered predicates for `a <=> b`,
-    /// where each operand is a raw 80-bit `(mant, se)` pair. Exact (no `f64`
-    /// rounding).
+    /// The ordered/equal/unordered predicates for `a <=> b` over raw 80-bit pairs; exact.
     fn fpu_cmp_predicates(
         &mut self,
         a: (Value, Value),
@@ -946,16 +848,13 @@ impl<'a> Lifter<'a> {
         (r[0], r[1], r[2])
     }
 
-    /// Resolve the raw 80-bit source (and its stack index, if any) of a compare.
-    /// `FCOM`/`FUCOM` may take an `ST(i)` or a memory operand; the `...I`
-    /// forms always take two `ST` operands (`ST0`, `ST(i)`).
+    /// Resolve a compare's raw 80-bit source (and stack index): `FCOM`/`FUCOM` take `ST(i)` or memory; the `...I` forms two `ST` operands.
     fn fpu_cmp_src(&mut self, instruction: &Instruction) -> crate::Result<(Value, Value)> {
         if instruction.op_count() == 0 {
             // `fcom`/`fucom` with no operand compare against ST(1).
             return Ok(self.fpu_read_st_raw(1));
         }
-        // The source is the last operand (`FCOMI ST0, ST(i)` -> op1;
-        // `FCOM ST(i)`/`FCOM m32` -> op0).
+        // The source is the last operand.
         let op_index = instruction.op_count() - 1;
         match self.operand_kind(instruction, op_index) {
             OpKind::Memory => self.fpu_load_mem_f80(instruction, op_index),
@@ -969,11 +868,8 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// FCOM/FCOMP/FUCOM/FUCOMP/FTST - compare `ST(0)` and set the status-word
-    /// condition codes (C0/C2/C3). `pop` selects the popping variant.
-    ///
-    /// Ordered and unordered forms lift identically: they differ only in which
-    /// operand classes raise an invalid exception, which this lifter does not model.
+    /// FCOM/FCOMP/FUCOM/FUCOMP/FTST - compare `ST(0)` and set C0/C2/C3; `pop` selects the popping variant.
+    /// Ordered and unordered forms lift identically; their exception differences are not modelled.
     pub(super) fn handle_fcom(
         &mut self,
         instruction: &Instruction,
@@ -1003,9 +899,7 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// FCOMI/FCOMIP/FUCOMI/FUCOMIP - compare `ST(0)` with `ST(i)` and set the
-    /// integer flags (ZF/PF/CF); OF/SF/AF are cleared. `pop` selects the
-    /// popping variant.
+    /// FCOMI/FCOMIP/FUCOMI/FUCOMIP - compare `ST(0)` with `ST(i)` and set ZF/PF/CF (OF/SF/AF cleared); `pop` selects the popping variant.
     pub(super) fn handle_fcomi(
         &mut self,
         instruction: &Instruction,
@@ -1051,8 +945,7 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Merge freshly-computed condition-code bits (`cc`, an `I32` already in
-    /// status-word bit positions) into the stored status word.
+    /// Merge condition-code bits `cc` (`I32`, in status-word positions) into the stored status word.
     fn fpu_store_cc(&mut self, cc: Value) {
         let ctx = self.fpu_ctx_ptr();
         let off = std::mem::offset_of!(RegisterContext, fpu_sw) as i32;
@@ -1064,10 +957,8 @@ impl<'a> Lifter<'a> {
         self.ctx_store(merged16, ctx, off);
     }
 
-    /// FCMOVcc - conditionally copy `ST(i)` into `ST(0)` based on the integer
-    /// flags. `cond` is a non-zero `I8` when the move should occur.
+    /// FCMOVcc - copy `ST(i)` into `ST(0)` when `cond` (`I8`) is nonzero.
     fn handle_fcmov_cond(&mut self, instruction: &Instruction, cond: Value) -> crate::Result<()> {
-        // Source is `ST(i)` - op1 for the two-operand `FCMOVcc ST0, ST(i)`.
         let op_index = instruction.op_count().saturating_sub(1);
         let i = self.fpu_st_index(instruction, op_index)?;
         let (cur_mant, cur_se) = self.fpu_read_st_raw(0);
@@ -1202,8 +1093,7 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// FFREE - mark `ST(i)` empty in the tag word without changing `TOP` or the
-    /// register data.
+    /// FFREE - mark `ST(i)` empty in the tag word without changing `TOP` or the data.
     pub(super) fn handle_ffree(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let i = self.fpu_st_index(instruction, 0)?;
         let top = self.fpu_load_top();
@@ -1213,21 +1103,15 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// EMMS - mark all x87/MMX registers empty without changing TOP, the
-    /// status word, or the register contents. MMX registers alias the x87
-    /// stack, and EMMS ends MMX use by setting every tag to empty.
+    /// EMMS - mark every register empty in the tag word (MMX aliases the x87 stack); `TOP`, status and contents are unchanged.
     pub(super) fn handle_emms(&mut self, _instruction: &Instruction) -> crate::Result<()> {
         let empty = self.builder.ins().iconst(types::I32, 0);
         self.fpu_store_tag(empty);
         Ok(())
     }
 
-    /// FNOP / FWAIT - no observable effect in this FPU model.
-    ///
-    /// `FWAIT` waits for pending *unmasked* x87 exceptions. None is ever raised
-    /// here, so there is never anything to wait for - which is also what makes the
-    /// `9B`-prefixed `FSTENV`/`FCLEX`/`FINIT` spellings work, since iced decodes
-    /// those as a `WAIT` followed by the `FN` form.
+    /// FNOP / FWAIT - no effect: no unmasked exception is ever raised, which is also why the `9B`-prefixed
+    /// `FSTENV`/`FCLEX`/`FINIT` spellings work (iced decodes them as `WAIT` + the `FN` form).
     pub(super) fn handle_fpu_nop(&mut self, _instruction: &Instruction) -> crate::Result<()> {
         Ok(())
     }
@@ -1239,7 +1123,6 @@ impl<'a> Lifter<'a> {
         let sw_off = std::mem::offset_of!(RegisterContext, fpu_sw) as i32;
         let sw = self.ctx_load(types::I16, ctx, sw_off);
         let sw = self.builder.ins().uextend(types::I32, sw);
-        // Insert TOP into bits 11-13.
         let sw = self.builder.ins().band_imm_u(sw, !0x3800);
         let top = self.fpu_load_top();
         let top = self.builder.ins().band_imm_u(top, 7);
@@ -1248,16 +1131,10 @@ impl<'a> Lifter<'a> {
         self.builder.ins().ireduce(types::I16, sw)
     }
 
-    /// Expand the abridged tag word ([`RegisterContext::fpu_tag`], one bit per
-    /// physical register) into the architectural 16-bit form `FNSTENV`/`FNSAVE`
-    /// write: two bits per register, `00` valid, `01` zero, `10` special, `11`
-    /// empty.
-    ///
-    /// The three non-empty encodings are a pure function of the register's contents
-    /// and are recomputed here as the hardware derives them: exponent `0` with a
-    /// zero significand is zero; exponent `0x7FFF`, exponent `0` with a non-zero
-    /// significand, or a clear explicit integer bit is special; anything else is
-    /// valid.
+    /// Expand the abridged tag word ([`RegisterContext::fpu_tag`]) into the architectural 16-bit form `FNSTENV`/`FNSAVE` write:
+    /// two bits per register, `00` valid, `01` zero, `10` special, `11` empty.
+    /// Non-empty classes are recomputed from the contents: exponent 0 with zero significand is zero; exponent `0x7FFF`,
+    /// exponent 0 with nonzero significand, or a clear integer bit is special; anything else is valid.
     fn fpu_expand_tag_word(&mut self) -> Value {
         let abridged = self.fpu_load_tag();
         let ctx = self.fpu_ctx_ptr();
@@ -1281,8 +1158,7 @@ impl<'a> Lifter<'a> {
 
             // zero: exponent 0 and significand 0.
             let is_zero = self.builder.ins().band(exp_zero, mant_zero);
-            // valid: a finite normal - exponent in range with the explicit
-            // integer bit set.
+            // valid: a finite normal with the integer bit set.
             let exp_normal = self.builder.ins().band(exp_finite, exp_nonzero);
             let is_valid = self.builder.ins().band(exp_normal, integer_bit_set);
 
@@ -1305,11 +1181,8 @@ impl<'a> Lifter<'a> {
         word
     }
 
-    /// Collapse an architectural 16-bit tag word back into the abridged form: a
-    /// register is live iff its two-bit field is not `11`.
-    ///
-    /// Lossy in the same way the hardware's `FXSAVE` is, and harmlessly so - the
-    /// zero/special/valid distinction is recoverable from the register contents.
+    /// Collapse an architectural 16-bit tag word to the abridged form: live iff the two-bit field is not `11`.
+    /// Lossy as `FXSAVE` is; the other classes are recoverable from the contents.
     fn fpu_collapse_tag_word(&mut self, full: Value) -> Value {
         let mut abridged = self.builder.ins().iconst(types::I32, 0);
         for i in 0..8i64 {
@@ -1323,9 +1196,7 @@ impl<'a> Lifter<'a> {
         abridged
     }
 
-    /// The width of an x87 environment operand: `m14byte` (16-bit operand size)
-    /// or `m28byte` (32-bit, the default in 64-bit mode). The two layouts hold
-    /// the same fields with 16-bit vs 32-bit pointer/selector slots.
+    /// The x87 environment operand width: `m14byte` (16-bit operand size) or `m28byte` (the 64-bit-mode default).
     fn fpu_env_is_32bit(instruction: &Instruction, who: &str) -> crate::Result<bool> {
         match instruction.memory_size() {
             MemorySize::FpuEnv28 => Ok(true),
@@ -1336,17 +1207,9 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// FNSTENV m14/m28byte - store the x87 environment (control word, status word,
-    /// tag word and the instruction/data pointers), then mask every FP exception.
-    ///
-    /// The masking side effect is why `feholdexcept` uses this instruction, so it
-    /// is modelled: `FCW[5:0]` are set after the store, and the *stored* copy is the
-    /// pre-masking control word.
-    ///
-    /// `FIP`, `FCS`, the opcode, `FDP` and `FDS` are stored as zero: microlift does
-    /// not track the last x87 instruction's address, and those fields are
-    /// observable only to a debugger or an unmasked-exception handler. Everything a
-    /// `fenv.h` implementation reads back is exact.
+    /// FNSTENV m14/m28byte - store the x87 environment (control, status and tag words, pointers), then mask every FP exception.
+    /// The stored control word is the pre-masking copy (`feholdexcept` relies on this).
+    /// `FIP`, `FCS`, the opcode, `FDP` and `FDS` are stored as zero: the last instruction's address is not tracked.
     pub(super) fn handle_fnstenv(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let wide = Self::fpu_env_is_32bit(instruction, "fnstenv")?;
         let ptr = self.get_mem_ptr(instruction, 0)?;
@@ -1359,8 +1222,7 @@ impl<'a> Lifter<'a> {
         let tw = self.builder.ins().ireduce(types::I16, tw);
 
         let stride = if wide { 4 } else { 2 };
-        // Zero the whole area first, so the reserved halves of the 32-bit
-        // layout and the unmodelled pointer fields are all defined.
+        // Zero the area first so reserved halves and unmodelled pointer fields are defined.
         let zero64 = self.builder.ins().iconst(types::I64, 0);
         let zero32 = self.builder.ins().iconst(types::I32, 0);
         let zero16 = self.builder.ins().iconst(types::I16, 0);
@@ -1386,16 +1248,9 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// FLDENV m14/m28byte - reload the x87 environment saved by `FNSTENV`.
-    ///
-    /// The control word is taken verbatim, the tag word collapsed to the abridged
-    /// form, and `TOP` restored from bits 13-11 of the loaded status word -
-    /// reloading the condition codes without it would leave `ST(i)` naming the
-    /// wrong registers. The pointer/opcode fields are ignored, mirroring the zeros
-    /// [`Self::handle_fnstenv`] wrote.
-    ///
-    /// Data registers are untouched, as on hardware: `FRSTOR` is what restores the
-    /// stack as well.
+    /// FLDENV m14/m28byte - reload the environment saved by `FNSTENV`.
+    /// The control word is verbatim, the tag word collapsed, `TOP` restored from status bits 13-11; pointer/opcode fields are ignored.
+    /// Data registers are untouched (`FRSTOR` restores those).
     pub(super) fn handle_fldenv(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let wide = Self::fpu_env_is_32bit(instruction, "fldenv")?;
         let ptr = self.get_mem_ptr(instruction, 0)?;
@@ -1431,11 +1286,7 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// FNCLEX - clear the exception flags (bits 7-0) and the busy bit (15) of the
-    /// status word. The condition codes and `TOP` survive.
-    ///
-    /// Microlift never sets an exception flag, so in practice this clears bits a
-    /// host runtime may have set in the context itself.
+    /// FNCLEX - clear the exception flags (bits 7-0) and busy bit (15) of the status word; condition codes and `TOP` survive.
     pub(super) fn handle_fnclex(&mut self, _instruction: &Instruction) -> crate::Result<()> {
         let ctx = self.fpu_ctx_ptr();
         let sw_off = std::mem::offset_of!(RegisterContext, fpu_sw) as i32;
@@ -1445,11 +1296,7 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// FNINIT - reset the FPU: control word to [`X87_CW_RESET`], status word
-    /// (and `TOP`) to zero, every register tagged empty.
-    ///
-    /// The data registers themselves keep their contents, exactly as on
-    /// hardware - `FNINIT` only marks them empty in the tag word.
+    /// FNINIT - reset the FPU: control word to [`X87_CW_RESET`], status word (and `TOP`) to zero, every register tagged empty; data is kept.
     pub(super) fn handle_fninit(&mut self, _instruction: &Instruction) -> crate::Result<()> {
         let ctx = self.fpu_ctx_ptr();
         let cw = self.builder.ins().iconst(types::I16, X87_CW_RESET as i64);

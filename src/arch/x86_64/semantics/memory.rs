@@ -5,9 +5,7 @@ use crate::lifter::{Lifter, X86Flag};
 use cranelift::prelude::*;
 use iced_x86::{Instruction, OpKind, Register};
 
-/// Tracked flags and their RFLAGS bit positions, shared by PUSHFQ/POPFQ.
-/// Covers the six arithmetic status flags plus DF; other RFLAGS bits are not
-/// modelled.
+/// Tracked flags and RFLAGS bit positions for PUSHFQ/POPFQ: six status flags plus DF.
 const RFLAGS_FLAG_BITS: [(X86Flag, u8); 7] = [
     (X86Flag::Carry, 0),
     (X86Flag::Parity, 2),
@@ -18,9 +16,7 @@ const RFLAGS_FLAG_BITS: [(X86Flag, u8); 7] = [
     (X86Flag::Overflow, 11),
 ];
 
-/// The five status flags `LAHF` and `SAHF` carry, and their bit positions
-/// within the low byte of RFLAGS. Overflow and Direction are deliberately
-/// absent: they sit at bits 11 and 10, outside the byte.
+/// The five status flags `LAHF`/`SAHF` carry, by bit in the low RFLAGS byte (OF and DF sit outside it).
 const LOW_BYTE_FLAG_BITS: [(X86Flag, u8); 5] = [
     (X86Flag::Carry, 0),
     (X86Flag::Parity, 2),
@@ -29,13 +25,8 @@ const LOW_BYTE_FLAG_BITS: [(X86Flag, u8); 5] = [
     (X86Flag::Sign, 7),
 ];
 
-/// The stack slot `PUSH`/`POP` of a segment register uses, or `None` if the
-/// instruction is not one.
-///
-/// A register operand's own width is the slot width for every other push, but
-/// not here: `PUSH FS` in long mode moves `RSP` by **8** and zero-extends the
-/// 16-bit selector, while `FS`'s `Register::size()` is 2. Only the
-/// `0x66`-prefixed spelling is a 2-byte push.
+/// The stack slot `PUSH`/`POP` of a segment register uses, or `None`.
+/// `PUSH FS` moves `RSP` by 8 and zero-extends the selector though `Register::size()` is 2; only `0x66` makes it 2 bytes.
 fn segment_stack_slot_size(instruction: &Instruction) -> Option<usize> {
     use iced_x86::Code;
     if !crate::arch::x86_64::regs::is_segment_register(instruction.op0_register()) {
@@ -55,14 +46,8 @@ impl<'a> Lifter<'a> {
     pub(super) fn handle_mov(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let size = self.operand_size(instruction, 0)?;
         let src_val = self.read_operand(instruction, 1, size)?;
-        // `MOV r/m16, Sreg` is the one MOV whose operands can differ in width: the
-        // source is always a 16-bit selector, while the destination register may be
-        // 32 or 64 bits, in which case the selector is zero-extended. `read_operand`
-        // hands back a register at its own width, so widen here rather than handing
-        // `write_operand` a value narrower than the register it writes.
-        //
-        // A memory destination is *not* widened: `mov [rax], cs` writes 16 bits
-        // whatever the operand size, and iced reports `memory_size` = 2 for it.
+        // `MOV r/m16, Sreg`: zero-extend the selector for a 32/64-bit register destination.
+        // A memory destination stays 16 bits.
         let src_val = if crate::arch::x86_64::regs::is_segment_register(
             self.operand_register(instruction, 1),
         ) && size > 2
@@ -108,22 +93,13 @@ impl<'a> Lifter<'a> {
     }
 
     /// MOVSXD - sign-extend to the destination register's width.
-    ///
-    /// The familiar form is `movsxd r64, r/m32` under `REX.W`, but the encoding
-    /// permits two others: without `REX.W` the destination is a 32-bit register and
-    /// the instruction is a plain `mov`; with a `0x66` prefix it is 16-bit. Both
-    /// are discouraged by the manual and neither is unreachable - a JIT emitting
-    /// `movsxd ecx, [rdi-0x30]` is what found this. Extending to `I64`
-    /// unconditionally produced a value one type wider than the register write
-    /// expected, failing Cranelift's verifier.
+    /// Also encodable without `REX.W` (32-bit, plain `mov`) and with `0x66` (16-bit); extending to `I64` there fails the verifier.
     pub(super) fn handle_movsxd(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let dst_reg = instruction.op0_register();
         let src_size = self.operand_size(instruction, 1)?;
         let src_val = self.read_operand(instruction, 1, src_size)?;
         let dst_ty = size_to_type(dst_reg.size());
-        // `sextend`, `ireduce` and `uextend` all reject a conversion to the type
-        // a value already has, so the equal case has to be a no-op rather than
-        // an identity conversion.
+        // Cranelift extends reject an equal-width conversion.
         let val = match dst_reg.size().cmp(&src_size) {
             std::cmp::Ordering::Greater => self.builder.ins().sextend(dst_ty, src_val),
             std::cmp::Ordering::Equal => src_val,
@@ -136,9 +112,7 @@ impl<'a> Lifter<'a> {
     pub(super) fn handle_lea(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let reg = instruction.op0_register();
         let ptr = self.get_mem_ptr(instruction, 1)?;
-        // get_mem_ptr always returns I64. set_reg_val expects the value to match
-        // the register's natural width (I32 for 32-bit regs, etc.) so that its
-        // internal uextend/merge logic works. Reduce before passing.
+        // `get_mem_ptr` is `I64`; `set_reg_val` wants the register's natural width.
         let val = if reg.size() == 8 {
             ptr
         } else {
@@ -152,9 +126,7 @@ impl<'a> Lifter<'a> {
     pub(super) fn handle_push(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let op0 = instruction.op0_kind();
 
-        // In x86-64 the PUSH operand size is 8 by default, or 2 under a 0x66
-        // operand-size prefix (a 16-bit push). 32-bit pushes are not encodable
-        // in long mode. The slot decrement must match the value width.
+        // Operand size is 8, or 2 under `0x66`; 32-bit pushes are not encodable.
         let push_size: usize = match op0 {
             OpKind::Register => segment_stack_slot_size(instruction)
                 .unwrap_or_else(|| instruction.op0_register().size()),
@@ -168,8 +140,7 @@ impl<'a> Lifter<'a> {
         let val = match op0 {
             OpKind::Register => {
                 let v = self.get_reg_val(instruction.op0_register())?;
-                // `PUSH FS`/`PUSH GS` write a full 8-byte slot with the 16-bit
-                // selector zero-extended into it.
+                // `PUSH FS`/`GS` write a full 8-byte slot, selector zero-extended.
                 if self.builder.func.dfg.value_type(v) == ty {
                     v
                 } else {
@@ -177,8 +148,7 @@ impl<'a> Lifter<'a> {
                 }
             }
             OpKind::Immediate8to64 => {
-                // Must use immediate8to64() - immediate32to64() does not
-                // sign-extend from 8 bits and returns the raw unsigned value.
+                // `immediate32to64` does not sign-extend from 8 bits.
                 self.builder
                     .ins()
                     .iconst(types::I64, instruction.immediate8to64())
@@ -221,7 +191,6 @@ impl<'a> Lifter<'a> {
     pub(super) fn handle_pop(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let op0 = instruction.op0_kind();
 
-        // Match the operand size: 8 by default, 2 for a 0x66-prefixed pop.
         let pop_size: usize = match op0 {
             OpKind::Register => segment_stack_slot_size(instruction)
                 .unwrap_or_else(|| instruction.op0_register().size()),
@@ -256,9 +225,7 @@ impl<'a> Lifter<'a> {
     /// LEAVE - high-level function epilogue: `RSP = RBP; POP RBP`.
     pub(super) fn handle_leave(&mut self, _instruction: &Instruction) -> crate::Result<()> {
         let rbp = self.get_reg_val(Register::RBP)?;
-        // RSP <- RBP
         self.set_reg_val(Register::RSP, rbp)?;
-        // POP RBP: RBP <- [RSP]; RSP += 8
         let old_rbp = self
             .builder
             .ins()
@@ -270,9 +237,7 @@ impl<'a> Lifter<'a> {
     }
 
     pub(super) fn handle_xchg(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        // XCHG with a memory operand asserts LOCK implicitly on x86 (no prefix
-        // byte required), so it must be atomic. Route it through the same
-        // atomic-swap path used for `LOCK XCHG`.
+        // Memory-operand `XCHG` is implicitly locked; use the atomic-swap path.
         if instruction.op0_kind() == OpKind::Memory || instruction.op1_kind() == OpKind::Memory {
             return self.handle_lock_xchg(instruction);
         }
@@ -285,21 +250,14 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Is this string instruction carrying a `REP`/`REPE`/`REPNE` prefix?
-    ///
-    /// For `MOVS`/`STOS`/`LODS` only the plain `REP` (F3) form is
-    /// architecturally meaningful; iced reports it through any of these
-    /// accessors depending on how it classifies the F2/F3 byte, so accept all.
+    /// Whether a `REP`/`REPE`/`REPNE` prefix is present; iced reports F3 through any of the accessors.
     fn has_rep_prefix(instruction: &Instruction) -> bool {
         instruction.has_rep_prefix()
             || instruction.has_repe_prefix()
             || instruction.has_repne_prefix()
     }
 
-    /// Address size (in bytes: 8/4/2) selected for a string instruction, read
-    /// from the SI/DI operand kind iced assigns. A `0x67` address-size prefix
-    /// switches the pointer/counter registers from RSI/RDI/RCX to their 32- or
-    /// 16-bit sub-registers; the default in long mode is 64-bit.
+    /// Address size in bytes (8/4/2) of a string instruction, from the SI/DI operand kind (`0x67` narrows it).
     fn string_addr_size(instruction: &Instruction) -> usize {
         for i in 0..instruction.op_count() {
             match instruction.op_kind(i) {
@@ -312,9 +270,7 @@ impl<'a> Lifter<'a> {
         8
     }
 
-    /// The `(counter, source-index, dest-index)` register triple for a string
-    /// op of the given address size: `(RCX, RSI, RDI)` / `(ECX, ESI, EDI)` /
-    /// `(CX, SI, DI)`.
+    /// The `(counter, source-index, dest-index)` registers for an address size: `(RCX, RSI, RDI)` / `(ECX, ESI, EDI)` / `(CX, SI, DI)`.
     fn string_addr_regs(addr_size: usize) -> (Register, Register, Register) {
         match addr_size {
             2 => (Register::CX, Register::SI, Register::DI),
@@ -323,8 +279,7 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// Effective 64-bit linear address held in a string-op index register
-    /// (`RSI`/`ESI`/`SI`, etc.), zero-extended from a narrower address size.
+    /// Zero-extended 64-bit address held in a string-op index register.
     fn string_ptr(&mut self, reg: Register) -> crate::Result<Value> {
         let v = self.get_reg_val(reg)?;
         Ok(if self.builder.func.dfg.value_type(v) == types::I64 {
@@ -334,9 +289,7 @@ impl<'a> Lifter<'a> {
         })
     }
 
-    /// Advance a string-op index register by ±`element_size` (sign per `DF`),
-    /// computed in the register's own width so it wraps within the active
-    /// address size (`set_reg_val` then zero-extends a 32-bit result).
+    /// Advance a string index register by ±`element_size` (per `DF`) in its own width, so it wraps within the address size.
     fn string_advance(&mut self, reg: Register, element_size: usize) -> crate::Result<()> {
         let cur = self.get_reg_val(reg)?;
         let ty = self.builder.func.dfg.value_type(cur);
@@ -349,20 +302,16 @@ impl<'a> Lifter<'a> {
         self.set_reg_val(reg, new)
     }
 
-    /// Wrap a single string-operation body in a counter-driven `REP` loop when
-    /// the instruction has a repeat prefix; otherwise emit the body once.
+    /// Wrap one string-op body in a counter-driven `REP` loop if prefixed, else emit it once.
     ///
-    /// The emitted shape for a repeated op is:
+    /// Shape of a repeated op:
     /// ```text
     ///   header:  if count == 0 { goto done }      (count is unsigned)
     ///   body:    <one element>; count -= 1
     ///            if count != 0 { goto body } else { goto done }
     ///   done:    ...
     /// ```
-    /// which matches `REP`'s "execute count times, testing the count *before*
-    /// each iteration" semantics (count == 0 performs zero iterations). The
-    /// counter register (`RCX`/`ECX`/`CX`) tracks the instruction's address size.
-    /// The body receives `(element_size, addr_size)`.
+    /// The count is tested before each iteration; the body receives `(element_size, addr_size)`.
     fn emit_string_op(
         &mut self,
         instruction: &Instruction,
@@ -378,14 +327,12 @@ impl<'a> Lifter<'a> {
         let body_block = self.builder.create_block();
         let done_block = self.builder.create_block();
 
-        // header: skip the whole loop when the count is already zero.
         let count = self.get_reg_val(count_reg)?;
         let is_zero = self.builder.ins().icmp_imm_s(IntCC::Equal, count, 0);
         self.builder
             .ins()
             .brif(is_zero, done_block, &[], body_block, &[]);
 
-        // body: one element, decrement the counter, loop while it stays nonzero.
         self.builder.switch_to_block(body_block);
         body(self, size, addr_size)?;
         let cur = self.get_reg_val(count_reg)?;
@@ -430,14 +377,12 @@ impl<'a> Lifter<'a> {
         let val = self.builder.ins().load(ty, self.guest_flags, sptr, 0);
         let dptr = self.string_ptr(di)?;
         self.builder.ins().store(self.guest_flags, val, dptr, 0);
-        // DF=0: increment both pointers; DF=1: decrement.
         self.string_advance(si, size)?;
         self.string_advance(di, size)?;
         Ok(())
     }
 
-    /// The accumulator register (AL/AX/EAX/RAX) implied by a string element
-    /// `size`, used by STOS (source) and LODS (destination).
+    /// The accumulator (AL/AX/EAX/RAX) for element `size`, used by STOS and LODS.
     fn string_acc_reg(size: usize) -> Register {
         match size {
             1 => Register::AL,
@@ -511,11 +456,7 @@ impl<'a> Lifter<'a> {
         self.emit_ins(instruction, 4)
     }
 
-    /// `INS` reads from an I/O port, which cannot be done from lifted userspace
-    /// code. Emit a [`ExitReason::PortInput`] VM exit so the host can emulate the
-    /// access: RIP points *at* the instruction and `exit_code` carries the
-    /// element size. The port (`DX`), destination (`ES:[RDI]`), `DF`, and `RCX`
-    /// (for `REP INS`) are all available in the synced register context.
+    /// `PortInput` VM exit: RIP at the instruction, `exit_code` = element size; port, destination, `DF` and `RCX` are in the synced context.
     fn emit_ins(&mut self, instruction: &Instruction, size: usize) -> crate::Result<()> {
         self.emit_io_string_exit(instruction, size, ExitReason::PortInput)
     }
@@ -531,17 +472,12 @@ impl<'a> Lifter<'a> {
         self.emit_outs(instruction, 4)
     }
 
-    /// `OUTS` writes to an I/O port - the mirror of `INS`. Emit a
-    /// [`ExitReason::PortOutput`] VM exit so the host can emulate the access. The
-    /// port (`DX`), source (`DS:[RSI]`), `DF`, and `RCX` (for `REP OUTS`) are all
-    /// available in the synced register context.
+    /// `PortOutput` VM exit, mirror of `INS`; the source is `DS:[RSI]`.
     fn emit_outs(&mut self, instruction: &Instruction, size: usize) -> crate::Result<()> {
         self.emit_io_string_exit(instruction, size, ExitReason::PortOutput)
     }
 
-    /// Shared exit emitter for the port I/O string instructions (`INS`/`OUTS`):
-    /// RIP points *at* the instruction and `exit_code` carries the element size
-    /// so the host can emulate the access and resume past it.
+    /// Shared exit for `INS`/`OUTS`: RIP at the instruction, `exit_code` = element size; the host resumes past it.
     fn emit_io_string_exit(
         &mut self,
         instruction: &Instruction,
@@ -552,8 +488,7 @@ impl<'a> Lifter<'a> {
         let rip_at = self.runtime_addr(instruction.ip());
 
         self.sync_to_context(Some(rip_at), reason)?;
-        // The exit reports the instruction's own address, and the host advances
-        // past it once the access is served - so that is where it comes back to.
+        // The host advances past the instruction once the access is served.
         self.resumes_at(instruction.next_ip());
         self.write_exit_code(size as u32);
         self.emit_host_return();
@@ -561,18 +496,13 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// PUSHFQ - assemble RFLAGS from the tracked status flags and push the
-    /// 64-bit value onto the stack.
-    ///
-    /// The tracked flags are CF/PF/AF/ZF/SF/OF and DF; any other RFLAGS bit
-    /// reads back as 0 except bit 1, which is architecturally always set.
+    /// PUSHFQ - push RFLAGS built from the tracked flags; untracked bits read 0 except bit 1 (always set).
     pub(super) fn handle_pushfq(&mut self, _instruction: &Instruction) -> crate::Result<()> {
         // Bit 1 of RFLAGS is reserved and always reads as 1.
         let mut rflags = self.builder.ins().iconst(types::I64, 0x2);
         for (flag, bit) in RFLAGS_FLAG_BITS {
             let raw = self.get_flag(flag);
             let wide = self.builder.ins().uextend(types::I64, raw);
-            // Flags are logically 1-bit; mask defensively before positioning.
             let one_bit = self.builder.ins().band_imm_u(wide, 1);
             let positioned = self.builder.ins().ishl_imm_u(one_bit, bit as i64);
             rflags = self.builder.ins().bor(rflags, positioned);
@@ -587,9 +517,7 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// POPFQ - pop a 64-bit value off the stack and distribute its bits into
-    /// the tracked flags (the six status flags plus DF). Bits for untracked
-    /// flags (IF, TF, etc.) and the reserved/system bits are simply discarded.
+    /// POPFQ - pop into the tracked flags (six status flags plus DF); other bits are discarded.
     pub(super) fn handle_popfq(&mut self, _instruction: &Instruction) -> crate::Result<()> {
         let rsp = self.get_reg_val(Register::RSP)?;
         let rflags = self
@@ -600,7 +528,6 @@ impl<'a> Lifter<'a> {
         self.set_reg_val(Register::RSP, new_rsp)?;
 
         for (flag, bit) in RFLAGS_FLAG_BITS {
-            // bit value = (rflags >> bit) & 1, narrowed to the I8 flag storage.
             let shifted = self.builder.ins().ushr_imm_u(rflags, bit as i64);
             let one_bit = self.builder.ins().band_imm_u(shifted, 1);
             let val = self.builder.ins().ireduce(types::I8, one_bit);
@@ -609,17 +536,11 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// LAHF - load the low byte of RFLAGS into AH: `AH = SF:ZF:0:AF:0:PF:1:CF`.
-    ///
-    /// The zero and one bits are architectural - RFLAGS bits 1, 3 and 5 read as 1,
-    /// 0 and 0. Overflow is not among them (it is bit 11, outside the byte), which
-    /// is why this is a list of five flags rather than a loop over
-    /// [`RFLAGS_FLAG_BITS`].
+    /// LAHF - `AH = SF:ZF:0:AF:0:PF:1:CF`; five flags, since OF (bit 11) is outside the byte.
     pub(super) fn handle_lahf(&mut self, _instruction: &Instruction) -> crate::Result<()> {
         let mut ah = self.builder.ins().iconst(types::I8, 0x2);
         for (flag, bit) in LOW_BYTE_FLAG_BITS {
             let raw = self.get_flag(flag);
-            // Flags are logically 1-bit; mask defensively before positioning.
             let one_bit = self.builder.ins().band_imm_u(raw, 1);
             let positioned = self.builder.ins().ishl_imm_u(one_bit, bit as i64);
             ah = self.builder.ins().bor(ah, positioned);
@@ -627,10 +548,7 @@ impl<'a> Lifter<'a> {
         self.set_reg_val(Register::AH, ah)
     }
 
-    /// SAHF - store AH into the low byte of RFLAGS.
-    ///
-    /// The inverse of [`handle_lahf`](Self::handle_lahf), over the same five flags.
-    /// Overflow and Direction are untouched: neither is in the byte.
+    /// SAHF - store AH into the low byte of RFLAGS; OF and DF are untouched.
     pub(super) fn handle_sahf(&mut self, _instruction: &Instruction) -> crate::Result<()> {
         let ah = self.get_reg_val(Register::AH)?;
         for (flag, bit) in LOW_BYTE_FLAG_BITS {
@@ -641,7 +559,6 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    // FS/GS base (FSGSBASE) instructions
 
     /// RDFSBASE r64 - read FS segment base into a GPR.
     pub(super) fn handle_rdfsbase(&mut self, instruction: &Instruction) -> crate::Result<()> {

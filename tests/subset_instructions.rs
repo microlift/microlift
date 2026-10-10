@@ -35,9 +35,7 @@ fn test_shifts_rotates() {
 
 #[test]
 fn test_rcr() {
-    // RCR rax, 1 with rax=1, CF=0:
-    // the 65-bit value CF:rax = 0:...0001 rotated right by 1 puts the LSB into
-    // CF and the old CF into bit 63 -> rax=0, CF=1.
+    // RCR rax, 1 with rax=1, CF=0: LSB goes to CF, old CF to bit 63 -> rax=0, CF=1.
     let bytes = [
         0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00, // mov rax, 1
         0x48, 0xD1, 0xD8, // rcr rax, 1
@@ -59,9 +57,7 @@ fn test_rcr() {
     assert_eq!(ctx.rax, 1u64 << 63);
     assert_eq!(ctx.cf, 0);
 
-    // RCR rax, CL (CL=4) with rax=0xF0, CF=0:
-    // 65-bit value 0:...0xF0 rotated right by 4 -> the low nibble (0) lands in
-    // bits [63:60] is empty; 0xF0 >> 4 = 0x0F, CF = bit 3 of 0xF0 = 0.
+    // RCR rax, CL (CL=4), rax=0xF0, CF=0: 0xF0 >> 4 = 0x0F, CF = bit 3 = 0.
     let bytes = [
         0x48, 0xC7, 0xC0, 0xF0, 0x00, 0x00, 0x00, // mov rax, 0xF0
         0x48, 0xC7, 0xC1, 0x04, 0x00, 0x00, 0x00, // mov rcx, 4
@@ -72,8 +68,7 @@ fn test_rcr() {
     assert_eq!(ctx.rax, 0x0F);
     assert_eq!(ctx.cf, 0);
 
-    // 8-bit RCR al, 2 with al=1, CF=0 exercises the modulo-(N+1) narrow path:
-    // bit 0 of al rotates to bit 7 -> al=0x80, CF=0.
+    // 8-bit RCR al, 2 (al=1, CF=0) exercises the modulo-(N+1) path -> al=0x80, CF=0.
     let bytes = [
         0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00, // mov rax, 1
         0xC0, 0xD8, 0x02, // rcr al, 2
@@ -86,8 +81,7 @@ fn test_rcr() {
 
 #[test]
 fn test_pushfq() {
-    // CLC clears CF; PUSHFQ then pushes RFLAGS. With every tracked flag clear,
-    // only the reserved bit 1 is set -> 0x2. POP RAX reads it back.
+    // CLC then PUSHFQ: only reserved bit 1 set -> 0x2.
     let bytes = [
         0xF8, // clc
         0x9C, // pushfq
@@ -100,8 +94,7 @@ fn test_pushfq() {
         "only the always-set reserved bit should be present"
     );
 
-    // STC sets CF; PUSHFQ should then report CF (bit 0) alongside the reserved
-    // bit -> 0x3.
+    // STC then PUSHFQ -> CF | reserved = 0x3.
     let bytes = [
         0xF9, // stc
         0x9C, // pushfq
@@ -114,8 +107,7 @@ fn test_pushfq() {
         "CF (bit 0) and the reserved bit (bit 1) should be set"
     );
 
-    // A subtraction that yields zero sets ZF (bit 6) and PF (bit 2); the result
-    // is non-negative so SF/OF/CF stay clear. RFLAGS = reserved | ZF | PF.
+    // Zero result sets ZF (bit 6) and PF (bit 2): reserved | ZF | PF.
     let bytes = [
         0x48, 0xC7, 0xC0, 0x05, 0x00, 0x00, 0x00, // mov rax, 5
         0x48, 0x2B, 0xC0, // sub rax, rax  (-> 0, ZF=1, PF=1)
@@ -133,10 +125,7 @@ fn test_pushfq() {
 
 #[test]
 fn test_popfq() {
-    // PUSH a crafted RFLAGS image, POPFQ it, then read flags back via PUSHFQ.
-    // Source bits: CF(0) | reserved(1) | ZF(6) | SF(7) = 0xC3. POPFQ must load
-    // CF/ZF/SF (the tracked bits); PUSHFQ then reproduces them (plus the
-    // always-set reserved bit) -> 0xC3.
+    // POPFQ of 0xC3 (CF | reserved | ZF | SF) loads the tracked bits; PUSHFQ reproduces them.
     let bytes = [
         0x48, 0xC7, 0xC0, 0xC3, 0x00, 0x00, 0x00, // mov rax, 0xC3
         0x50, // push rax
@@ -151,9 +140,7 @@ fn test_popfq() {
         "POPFQ should load CF/ZF/SF and PUSHFQ reproduce them"
     );
 
-    // POPFQ must also clear flags whose bit is 0 in the popped image. Start with
-    // CF preset, pop a value with CF clear (only reserved bit, 0x2), and confirm
-    // CF reads back as 0.
+    // POPFQ also clears flags that are 0 in the popped image: CF preset, popped 0x2 -> CF reads 0.
     let bytes = [
         0x48, 0xC7, 0xC0, 0x02, 0x00, 0x00, 0x00, // mov rax, 0x2
         0x50, // push rax
@@ -173,8 +160,7 @@ fn test_popfq() {
 
 #[test]
 fn test_lahf() {
-    // STC then LAHF: AH = reserved bit 1 | CF -> 0x03, and nothing else in RAX
-    // moves.
+    // STC then LAHF: AH = reserved | CF = 0x03; rest of RAX unmoved.
     let bytes = [
         0x48, 0xC7, 0xC0, 0x00, 0x00, 0x00, 0x00, // mov rax, 0
         0xF9, // stc
@@ -184,8 +170,7 @@ fn test_lahf() {
     let ctx = run_test(&bytes, RegisterContext::default());
     assert_eq!(ctx.rax, 0x0300, "AH should hold CF and the reserved bit");
 
-    // A subtraction that yields zero sets ZF (bit 6) and PF (bit 2) and clears
-    // CF -> AH = 0x40 | 0x04 | 0x02 = 0x46.
+    // Zero result: ZF, PF set, CF clear -> AH = 0x46.
     let bytes = [
         0x48, 0xC7, 0xC0, 0x05, 0x00, 0x00, 0x00, // mov rax, 5
         0x48, 0x2B, 0xC0, // sub rax, rax
@@ -196,11 +181,7 @@ fn test_lahf() {
     assert_eq!(ctx.rax & 0xFF00, 0x4600, "ZF, PF and the reserved bit");
     assert_eq!(ctx.rax & 0xFF, 0, "AL is not part of AH");
 
-    // Overflow lives at bit 11 of RFLAGS, outside the byte LAHF carries.
-    // 0x7fff_ffff + 1 overflows positive-to-negative: OF=1 and SF=1, with PF
-    // set because the result's low byte is zero and AF set because bit 3 of
-    // 0xf carried. AH is therefore SF | AF | PF | reserved = 0x96, with no
-    // trace of OF anywhere in it.
+    // OF is bit 11, outside LAHF's byte: 0x7fff_ffff + 1 gives OF, SF, PF, AF -> AH = 0x96 with no OF.
     let bytes = [
         0x48, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0x7F, // mov rax, 0x7fffffff
         0x83, 0xC0, 0x01, // add eax, 1  (-> 0x80000000, OF=1, SF=1)
@@ -218,10 +199,7 @@ fn test_lahf() {
 
 #[test]
 fn test_sahf() {
-    // AH = CF | reserved | ZF: SAHF must set both flags it names and clear the
-    // ones it does not, over whatever the context arrived with. AH is loaded
-    // with `mov`, which touches no flag - a `shl` would set OF itself and the
-    // second half of this test would be measuring the fixture.
+    // AH = CF | reserved | ZF: SAHF sets those and clears the rest. AH is loaded with `mov` since `shl` would set OF itself.
     let bytes = [
         0xB4, 0x43, // mov ah, 0x43
         0x9E, // sahf
@@ -236,8 +214,7 @@ fn test_sahf() {
     assert_eq!(ctx.sf, 0, "SAHF clears a flag whose bit is 0");
     assert_eq!(u8::from(ctx.pf()), 0, "SAHF clears a flag whose bit is 0");
 
-    // Overflow is not in the byte, so SAHF leaves it exactly as it found it -
-    // the property that makes this the inverse of LAHF rather than of POPFQ.
+    // SAHF leaves OF as found (inverse of LAHF, not POPFQ).
     let mut ctx_in = RegisterContext::default();
     ctx_in.of = 1;
     let ctx = run_test(&bytes, ctx_in);
@@ -260,8 +237,7 @@ fn test_lahf_sahf_round_trip() {
 
 #[test]
 fn test_loopne() {
-    // LOOPNE runs the body while RCX != 0 AND ZF == 0. Here the body keeps ZF=0
-    // (INC RAX always yields a nonzero result), so it runs the full count.
+    // LOOPNE runs while RCX != 0 and ZF == 0; INC keeps ZF=0 so the full count runs.
     let bytes = [
         0x48, 0xC7, 0xC1, 0x04, 0x00, 0x00, 0x00, // mov rcx, 4
         0x48, 0xC7, 0xC0, 0x00, 0x00, 0x00, 0x00, // mov rax, 0
@@ -276,9 +252,7 @@ fn test_loopne() {
     );
     assert_eq!(ctx.rcx, 0);
 
-    // LOOPNE must exit early when ZF becomes 1, even with RCX still nonzero.
-    // DEC RAX sets ZF when RAX reaches 0; starting at 3 it hits zero on the
-    // third iteration while RCX is still 2.
+    // LOOPNE exits early when ZF becomes 1: DEC RAX from 3 hits zero on iteration 3 with RCX still 2.
     let bytes = [
         0x48, 0xC7, 0xC1, 0x05, 0x00, 0x00, 0x00, // mov rcx, 5
         0x48, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00, // mov rax, 3
@@ -296,9 +270,7 @@ fn test_loopne() {
 
 #[test]
 fn test_loope() {
-    // LOOPE runs the body while RCX != 0 AND ZF == 1. DEC RAX from 1 yields 0
-    // (ZF=1) on the first iteration, then nonzero (ZF=0) afterwards, so it stops
-    // as soon as ZF clears.
+    // LOOPE runs while RCX != 0 and ZF == 1: DEC RAX from 1 gives ZF=1 once, then ZF=0 stops it.
     let bytes = [
         0x48, 0xC7, 0xC1, 0x05, 0x00, 0x00, 0x00, // mov rcx, 5
         0x48, 0xC7, 0xC0, 0x02, 0x00, 0x00, 0x00, // mov rax, 2
@@ -377,8 +349,7 @@ fn test_bit_scans() {
     assert_eq!(ctx.zf, 1);
 }
 
-/// TZCNT and LZCNT, whose whole reason to exist is that they are **defined** for
-/// a zero source where BSF and BSR are not.
+/// TZCNT/LZCNT are defined for a zero source, unlike BSF/BSR.
 #[test]
 fn test_count_leading_and_trailing_zeros() {
     // TZCNT rax, rcx (rcx = 0x10) -> 4, CF = 0
@@ -411,8 +382,7 @@ fn test_count_leading_and_trailing_zeros() {
     let ctx = run_test(&bytes, RegisterContext::default());
     assert_eq!(ctx.rax, 32);
 
-    // LZCNT counts the zeros *above* the highest set bit, which is not BSR's
-    // index: for 0x11 the highest set bit is 4, so LZCNT is 64 - 1 - 4 = 59.
+    // LZCNT counts zeros above the highest set bit: 0x11 -> 64 - 1 - 4 = 59.
     let bytes = [
         0x48, 0xC7, 0xC1, 0x11, 0x00, 0x00, 0x00, // mov rcx, 17
         0xF3, 0x48, 0x0F, 0xBD, 0xC1, // lzcnt rax, rcx
@@ -422,8 +392,7 @@ fn test_count_leading_and_trailing_zeros() {
     assert_eq!(ctx.rax, 59);
     assert_eq!(ctx.cf, 0);
 
-    // LZCNT of zero -> the operand width, CF set, and ZF *clear* because the
-    // flag follows the result rather than the source.
+    // LZCNT of zero -> operand width, CF set, ZF clear (ZF follows the result).
     let bytes = [
         0x48, 0x31, 0xC9, // xor rcx, rcx
         0xF3, 0x48, 0x0F, 0xBD, 0xC1, // lzcnt rax, rcx
@@ -433,7 +402,7 @@ fn test_count_leading_and_trailing_zeros() {
     assert_eq!(ctx.rax, 64);
     assert_eq!((ctx.cf, ctx.zf), (1, 0));
 
-    // A result of zero is the one case ZF is set: every bit already set.
+    // ZF is set only when the result is zero (every bit already set).
     let bytes = [
         0x48, 0xC7, 0xC1, 0x01, 0x00, 0x00, 0x00, // mov rcx, 1
         0xF3, 0x48, 0x0F, 0xBC, 0xC1, // tzcnt rax, rcx
@@ -464,13 +433,10 @@ fn test_movsx() {
     assert_eq!(ctx.rax, 0xFFFFFFFF80000000);
 }
 
-/// MOVSXD's two narrow forms, which the encoding permits and the manual
-/// discourages. Neither extends: the destination is no wider than the source, so
-/// the instruction is an ordinary `mov` of that width. Mono's JIT emits the
-/// 32-bit form, which is how the unconditional extension to 64 bits was found.
+/// MOVSXD's narrow forms do not extend: they are ordinary same-width moves. Mono's JIT emits the 32-bit form.
 #[test]
 fn test_movsxd_narrow_forms_do_not_extend() {
-    // MOVSXD ecx, eax without REX.W: a 32-bit move, which zeroes RCX's top half.
+    // MOVSXD ecx, eax without REX.W: 32-bit move zeroing RCX's top half.
     let bytes = [
         0x48, 0xB8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // mov rax, ...
         0x48, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF, // mov rcx, -1
@@ -493,7 +459,7 @@ fn test_movsxd_narrow_forms_do_not_extend() {
         "no sign extension, and the top half zeroed"
     );
 
-    // MOVSXD cx, ax under a 0x66 prefix: a 16-bit move, upper bits preserved.
+    // MOVSXD cx, ax under 0x66: 16-bit move, upper bits preserved.
     let bytes = [
         0x48, 0xB8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // mov rax, ...
         0x48, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF, // mov rcx, -1
@@ -546,8 +512,7 @@ fn test_string_ops() {
     let ctx_out = run_test(&bytes, ctx);
     assert_eq!(ctx_out.rax & 0xFF, 0x77);
     assert_eq!(ctx_out.rsi, mem_ptr + 33);
-    // Also proves the buffer is read back through `mem` after the lifted code
-    // wrote/read it through `mem_ptr`.
+    // Buffer is read back through `mem` after the lifted code used `mem_ptr`.
     assert_eq!(mem[32], 0x77, "lodsb must not modify its source");
 }
 
@@ -556,7 +521,7 @@ fn test_direction_flag() {
     let mut mem = [0u8; 256];
     let mem_ptr = mem.as_mut_ptr() as u64;
 
-    // STD makes string ops decrement: STOSB at [rdi] then rdi -= 1.
+    // STD: STOSB at [rdi] then rdi -= 1.
     let mut ctx = RegisterContext::default();
     ctx.rax = 0x42;
     ctx.rdi = mem_ptr + 16;
@@ -569,7 +534,7 @@ fn test_direction_flag() {
     assert_eq!(mem[16], 0x42, "stosb should still write [rdi]");
     assert_eq!(ctx_out.rdi, mem_ptr + 15, "DF=1 should decrement rdi");
 
-    // CLD makes string ops increment again, even if DF was set on entry.
+    // CLD restores incrementing even if DF was set on entry.
     let mut ctx = RegisterContext::default();
     ctx.df = 1; // start with DF set
     ctx.rax = 0x99;
@@ -601,8 +566,7 @@ fn test_direction_flag() {
 
 #[test]
 fn test_direction_flag_in_rflags() {
-    // STD sets DF; PUSHFQ must report it at bit 10 (0x400), plus the reserved
-    // bit 1 -> 0x402.
+    // STD sets DF: PUSHFQ reports bit 10 plus reserved -> 0x402.
     let bytes = [
         0xFD, // std
         0x9C, // pushfq
@@ -612,8 +576,7 @@ fn test_direction_flag_in_rflags() {
     let ctx = run_test(&bytes, RegisterContext::default());
     assert_eq!(ctx.rax, 0x402, "PUSHFQ should report DF at bit 10");
 
-    // POPFQ must load DF from the popped image: push 0x400 (DF set), popfq,
-    // then a STOSB should decrement rdi.
+    // POPFQ loads DF from the popped image (0x400); STOSB then decrements rdi.
     let mut mem = [0u8; 64];
     let mem_ptr = mem.as_mut_ptr() as u64;
     let mut ctx = RegisterContext::default();

@@ -1,11 +1,5 @@
-//! Exercises the `testkit::oracle` differential abstraction end-to-end using
-//! two in-process Microlift oracles (compiled at different optimization levels).
-//! This is the same machinery an external emulator (Unicorn) will plug into via
-//! the `CpuOracle` trait; here it validates the state conversion, the
-//! differential driver, and the identity-mapped arena without needing an
-//! external dependency.
-//!
-//! Run: `cargo test --features testkit --test oracle_tests`
+//! Exercises `testkit::oracle` end-to-end with two in-process Microlift oracles at different opt levels.
+//! Validates state conversion, the differential driver and the identity-mapped arena.
 
 #![cfg(feature = "testkit")]
 
@@ -14,8 +8,7 @@ use microlift::testkit::oracle::*;
 
 const CODE_VA: u64 = 0x1000;
 
-/// `mov rax, imm ; add rax, rcx ; ret` with rcx seeded - two oracles at
-/// different opt levels must agree on the resulting state.
+/// Two oracles at different opt levels must agree.
 #[test]
 fn microlift_vs_microlift_opt_levels_agree() {
     // mov rax, 100 ; add rax, rcx ; ret
@@ -45,14 +38,13 @@ fn microlift_vs_microlift_opt_levels_agree() {
 
     assert!(diff.is_empty(), "opt levels disagreed: {diff:?}");
 
-    // And the computed value is correct: 100 + 42 = 142.
+    // 100 + 42 = 142.
     let out = a.run(&code, CODE_VA, &init, &[], 1000);
     assert!(out.is_halted());
     assert_eq!(out.state().gpr[gpr::RAX], 142);
 }
 
-/// A non-diffable instruction (`cpuid`) must surface as an exit, and the
-/// differential driver must decline to compare (returns `None`).
+/// A non-diffable instruction (`cpuid`) exits and the driver declines to compare.
 #[test]
 fn non_diffable_exit_is_not_compared() {
     // cpuid ; ret
@@ -84,10 +76,7 @@ fn non_diffable_exit_is_not_compared() {
     assert!(diff.is_none(), "non-diffable runs must not be compared");
 }
 
-/// The identity-mapped arena places host memory at a fixed guest VA so a lifted
-/// load reads exactly what was written there - the reconciliation primitive an
-/// external emulator will mirror. Skipped gracefully if the fixed mapping is
-/// unavailable on this host.
+/// The identity-mapped arena puts host memory at a fixed guest VA. Skipped if the mapping is unavailable.
 #[cfg(unix)]
 #[test]
 fn identity_arena_backs_a_guest_load() {
@@ -100,7 +89,7 @@ fn identity_arena_backs_a_guest_load() {
     };
     assert_eq!(arena.base(), ARENA_VA);
 
-    // Put a known 64-bit value at ARENA_VA.
+    // Known value at ARENA_VA.
     let sentinel: u64 = 0xDEAD_BEEF_CAFE_F00D;
     arena.write_at(0, &sentinel.to_le_bytes());
 

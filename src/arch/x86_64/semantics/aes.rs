@@ -1,27 +1,8 @@
-//! AES-NI - `AESENC`, `AESENCLAST`, `AESDEC`, `AESDECLAST`, `AESIMC` and
-//! `AESKEYGENASSIST`.
+//! AES-NI: `AESENC`, `AESENCLAST`, `AESDEC`, `AESDECLAST`, `AESIMC`, `AESKEYGENASSIST`.
 //!
-//! Five of the six are one AES round in some form; the sixth folds the S-box
-//! into a key-schedule step. All of them are built out of `SubBytes`,
-//! `ShiftRows` and `MixColumns`, and all three are table work: the S-box, its
-//! inverse, and `xtime` (multiply by `x` in GF(2^8)) are computed by `const fn`
-//! at our build time and emitted into the artifact as one read-only
-//! [`DataObject`](crate::core::DataObject), the way
-//! [`CRC32`](super::crc32)'s table is. Nothing is derived at run time and no
-//! guest memory is involved.
-//!
-//! A round is then 16 S-box loads and, where `MixColumns` runs, 16 `xtime`
-//! loads over bytes unpacked from the two halves of the state: 233 IR
-//! instructions for an `AESENC` body, against 1621 for the bitsliced circuit
-//! this replaces, which folded a GF(2^8) inverse chain on every invocation. The
-//! object for one `AESENC` region goes from 7104 bytes to 2224, tables and all.
-//! Each instruction is still one [`AesKernel`], outlined like the x87 and CRC32
-//! kernels, since a region usually holds ten of the calls.
-//!
-//! This is a table-driven AES, so it is not constant-time: the load
-//! addresses depend on the state, where the guest's own AES-NI would not. A
-//! guest whose key material must survive a cache-timing attacker cannot get
-//! that property from a lift that touches memory at data-dependent addresses.
+//! Table-driven: S-box, inverse and `xtime` tables are `const fn`-built and emitted as one read-only [`DataObject`](crate::core::DataObject).
+//! Not constant-time: load addresses depend on the state.
+//! Each instruction is an outlined [`AesKernel`].
 
 use crate::lifter::Lifter;
 use cranelift::prelude::*;
@@ -29,15 +10,10 @@ use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::FunctionBuilder;
 use iced_x86::Instruction;
 
-/// The sixteen bytes of a 128-bit state, each an `I64` holding `0..=255`.
-///
-/// Byte `4c + r` is row `r` of column `c`, the order AES numbers the state in
-/// and the order the little-endian halves of an XMM register already hold.
+/// The sixteen bytes of a 128-bit state, each an `I64` in `0..=255`; byte `4c + r` is row `r` of column `c`.
 type State = [Value; 16];
 
-/// Symbol the tables are emitted under. Namespaced and stable for the same
-/// reason the kernels' symbols are: two AOT-lifted regions linked together must
-/// share one copy.
+/// Symbol the tables are emitted under; stable so AOT regions linked together share one copy.
 pub const AES_TABLE_SYMBOL: &str = "__microlift_aes_tables";
 
 /// Byte offsets of the three tables within that blob.
@@ -69,9 +45,7 @@ const fn gf_mul(a: u8, b: u8) -> u8 {
     acc
 }
 
-/// The multiplicative inverse, with `0` mapping to `0`. Found by search: this
-/// runs once at compile time, so the addition chain the bitsliced version needed
-/// buys nothing here.
+/// The multiplicative inverse, `0` mapping to `0`, found by search (compile-time only).
 const fn gf_inverse(a: u8) -> u8 {
     if a == 0 {
         return 0;
@@ -100,8 +74,7 @@ const fn sbox_table() -> [u8; 256] {
     table
 }
 
-/// The S-box inverted by scanning it, rather than by writing the inverse affine
-/// map out a second time.
+/// The S-box inverted by scanning it.
 const fn inv_sbox_table(sbox: &[u8; 256]) -> [u8; 256] {
     let mut table = [0u8; 256];
     let mut i = 0;
@@ -137,19 +110,15 @@ pub fn table_bytes() -> Vec<u8> {
     bytes
 }
 
-/// Where the tables are and how to read them, threaded through the round so no
-/// layer has to name the blob itself.
+/// Where the tables are and how to read them.
 #[derive(Copy, Clone)]
 pub struct Tables {
-    /// Base address of the blob.
     pub base: Value,
-    /// Memflags for a load out of it.
     pub flags: MemFlagsData,
 }
 
 impl Tables {
-    /// `table[index]`, zero-extended. `index` must already be masked to a byte,
-    /// which every caller here gets from an unpack or a previous lookup.
+    /// `table[index]`, zero-extended; `index` must already be a byte.
     fn get(self, b: &mut FunctionBuilder, table: i32, index: Value) -> Value {
         let address = b.ins().iadd(self.base, index);
         b.ins().uload8(types::I64, self.flags, address, table)
@@ -160,7 +129,6 @@ fn xor(b: &mut FunctionBuilder, x: Value, y: Value) -> Value {
     b.ins().bxor(x, y)
 }
 
-/// Unpack a `(lo, hi)` state into its sixteen bytes.
 fn split_state(b: &mut FunctionBuilder, lo: Value, hi: Value) -> State {
     core::array::from_fn(|j| {
         let half = if j < 8 { lo } else { hi };
@@ -172,7 +140,6 @@ fn split_state(b: &mut FunctionBuilder, lo: Value, hi: Value) -> State {
     })
 }
 
-/// Pack sixteen bytes back into a `(lo, hi)` state.
 fn pack_state(b: &mut FunctionBuilder, s: &State) -> (Value, Value) {
     let mut half = |bytes: &[Value]| {
         let mut acc = bytes[0];
@@ -185,8 +152,7 @@ fn pack_state(b: &mut FunctionBuilder, s: &State) -> (Value, Value) {
     (half(&s[..8]), half(&s[8..]))
 }
 
-/// `ShiftRows`, or its inverse: row `r` rotates left by `r` columns. A pure
-/// renumbering of the bytes - it emits nothing.
+/// `ShiftRows` or its inverse; a pure renumbering, emits nothing.
 fn shift_rows(s: &State, inverse: bool) -> State {
     core::array::from_fn(|j| {
         let (row, column) = (j % 4, j / 4);
@@ -204,8 +170,7 @@ fn sub_bytes(b: &mut FunctionBuilder, s: &State, tables: Tables, inverse: bool) 
     core::array::from_fn(|j| tables.get(b, table, s[j]))
 }
 
-/// `MixColumns`: `d_r = xtime(a_r ^ a_r+1) ^ a_r+1 ^ a_r+2 ^ a_r+3`, which is
-/// the `{2,3,1,1}` column with the two doublings shared.
+/// `MixColumns`: `d_r = xtime(a_r ^ a_r+1) ^ a_r+1 ^ a_r+2 ^ a_r+3`.
 fn mix_columns(b: &mut FunctionBuilder, s: &State, tables: Tables) -> State {
     core::array::from_fn(|j| {
         let (row, column) = (j % 4, j / 4);
@@ -218,9 +183,7 @@ fn mix_columns(b: &mut FunctionBuilder, s: &State, tables: Tables) -> State {
     })
 }
 
-/// `InvMixColumns` is `MixColumns` over a pre-mixed state: adding
-/// `xtime^2(a_r ^ a_r+2)` to each byte turns the `{2,3,1,1}` column into the
-/// `{14,11,13,9}` one.
+/// `InvMixColumns` as `MixColumns` after adding `xtime^2(a_r ^ a_r+2)` to each byte.
 fn inv_mix_columns(b: &mut FunctionBuilder, s: &State, tables: Tables) -> State {
     let pre: State = core::array::from_fn(|j| {
         let (row, column) = (j % 4, j / 4);
@@ -287,8 +250,7 @@ pub fn emit_keygen_assist(
     rcon: Value,
     tables: Tables,
 ) -> (Value, Value) {
-    // The S-box runs over all sixteen bytes: only two dwords are wanted, but
-    // the unpack costs the same either way and the rest simply goes unused.
+    // Only two dwords are wanted; the rest goes unused.
     let s = split_state(b, src.0, src.1);
     let s = sub_bytes(b, &s, tables, false);
     let (lo, hi) = pack_state(b, &s);
@@ -297,8 +259,7 @@ pub fn emit_keygen_assist(
     (keygen_half(b, lo, rcon), keygen_half(b, hi, rcon))
 }
 
-/// One outlinable AES expansion. The key-schedule round constant is a parameter
-/// rather than part of the kernel, so all 256 `imm8`s share one body.
+/// One outlinable AES expansion; `RCON` is a parameter so all 256 `imm8`s share a body.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum AesKernel {
     Enc,
@@ -309,7 +270,6 @@ pub enum AesKernel {
     KeygenAssist,
 }
 
-/// Every kernel, for callers that want to pre-emit or enumerate them.
 pub const AES_KERNELS: [AesKernel; 6] = [
     AesKernel::Enc,
     AesKernel::EncLast,
@@ -320,8 +280,7 @@ pub const AES_KERNELS: [AesKernel; 6] = [
 ];
 
 impl AesKernel {
-    /// The symbol the helper is declared under, namespaced and stable so two
-    /// AOT-lifted regions linked together share one copy.
+    /// Helper symbol; stable so AOT regions linked together share one copy.
     pub fn symbol(self) -> &'static str {
         match self {
             AesKernel::Enc => "__microlift_aesenc",
@@ -333,8 +292,7 @@ impl AesKernel {
         }
     }
 
-    /// Number of `I64` parameters: state, the round key or `RCON`, and the
-    /// table base last.
+    /// Number of `I64` parameters: state, round key or `RCON`, table base.
     fn arity(self) -> usize {
         let operands = match self {
             AesKernel::InvMixColumns => 2,
@@ -344,8 +302,7 @@ impl AesKernel {
         operands + 1
     }
 
-    /// `(state_lo, state_hi, ..., tables) -> (lo, hi)`. `call_conv` should match
-    /// the calling function's, so a call needs no convention bridging.
+    /// `(state_lo, state_hi, ..., tables) -> (lo, hi)`.
     pub fn signature(self, call_conv: CallConv) -> Signature {
         let mut sig = Signature::new(call_conv);
         for _ in 0..self.arity() {
@@ -356,8 +313,7 @@ impl AesKernel {
         sig
     }
 
-    /// Emit the operation over `args`, whose length is [`arity`](Self::arity)
-    /// and whose last element is the table base.
+    /// Emit the operation over `args`; the last is the table base.
     pub fn emit(self, b: &mut FunctionBuilder, args: &[Value], flags: MemFlagsData) -> (Value, Value) {
         debug_assert_eq!(args.len(), self.arity());
         let tables = Tables {
@@ -375,8 +331,6 @@ impl AesKernel {
         }
     }
 
-    /// Emit the kernel's body into `b`, whose function must already have been
-    /// given [`signature`](Self::signature).
     pub fn build_body(self, b: &mut FunctionBuilder) {
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
@@ -395,10 +349,7 @@ impl AesKernel {
 }
 
 impl<'a> Lifter<'a> {
-    /// `AESENC` / `AESENCLAST` / `AESDEC` / `AESDECLAST xmm1, xmm2/m128`.
-    ///
-    /// The state is the destination register, the round key the source; the
-    /// result replaces the destination.
+    /// `AESENC`/`AESENCLAST`/`AESDEC`/`AESDECLAST xmm1, xmm2/m128`: state is the destination, round key the source.
     pub(super) fn handle_aes_round(
         &mut self,
         instruction: &Instruction,
@@ -414,8 +365,7 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// `AESIMC xmm1, xmm2/m128` - the key-schedule half of decryption, where the
-    /// source is the operand rather than the destination.
+    /// `AESIMC xmm1, xmm2/m128`.
     pub(super) fn handle_aesimc(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let kernel = AesKernel::InvMixColumns;
         let dst = self.xmm_operand_index(instruction, 0, kernel.symbol())?;
@@ -442,9 +392,7 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Emit one AES kernel, as a call to the shared helper or - when outlining
-    /// is off - inline at this site. Both paths run the identical builder over
-    /// the same emitted tables, whose base is the kernel's last argument.
+    /// Emit one AES kernel as a call to the shared helper, or inline when outlining is off.
     fn aes_kernel(&mut self, kernel: AesKernel, operands: &[Value]) -> (Value, Value) {
         let base = self.data_constant(AES_TABLE_SYMBOL, 16, table_bytes);
         let mut args = operands.to_vec();

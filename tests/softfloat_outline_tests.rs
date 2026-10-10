@@ -1,13 +1,5 @@
-//! Outlining of the 80-bit x87 softfloat kernels into shared helper functions.
-//!
-//! The kernels in `semantics/softfloat.rs` are large (the divide and square
-//! root each contain a 128-bit shift/subtract loop). Emitting them once per
-//! region and `call`ing them, rather than inlining a copy at every x87 site, is
-//! what keeps a float-heavy region's code size sane. These tests pin what that
-//! has to satisfy: the same answers as inlining, a real code-size win, one
-//! helper per kernel however many sites use it, helper bodies that reach the
-//! object file, and a namespace-0 index space that stays consistent when a
-//! region has both imports and helpers.
+//! Outlining of the 80-bit softfloat kernels into shared helpers.
+//! Pins: same answers as inlining, a code-size win, one helper per kernel, helper bodies in the object, and a consistent namespace-0 index space with imports.
 
 use microlift::arch::x86_64::X86_64;
 use microlift::arch::x86_64::semantics::softfloat::F80Kernel;
@@ -17,11 +9,7 @@ use microlift::testkit::DEFAULT_LIFT_BASE;
 use microlift::testkit::prelude::*;
 use object::{Object, ObjectSymbol};
 
-/// `fldt [rdi]; fldt [rsi]; f<op> st1, st0; fstpt [rdx]` - one x87 arithmetic
-/// op on two 80-bit memory operands, result stored back to memory.
-///
-/// Registers are seeded with the addresses at run time, so the guest program
-/// needs no relocations of its own.
+/// `fldt [rdi]; fldt [rsi]; f<op> st1, st0; fstpt [rdx]`: one x87 op on two memory operands. Registers hold addresses at run time.
 fn f80_program(op: &[u8]) -> Vec<u8> {
     let mut b = Vec::new();
     b.extend_from_slice(&[0xDB, 0x2F]); // fld tbyte [rdi]
@@ -32,12 +20,12 @@ fn f80_program(op: &[u8]) -> Vec<u8> {
     b
 }
 
-/// `faddp st1, st0` / `fmulp` / `fdivp` - pop-form binary arithmetic.
+/// Pop-form binary arithmetic.
 const FADDP: [u8; 2] = [0xDE, 0xC1];
 const FMULP: [u8; 2] = [0xDE, 0xC9];
 const FDIVP: [u8; 2] = [0xDE, 0xF9];
 
-/// Run one `f80_program` over two 80-bit inputs and return the 80-bit result.
+/// Run one `f80_program` over two inputs and return the 80-bit result.
 fn run_f80(op: &[u8], a: [u64; 2], b: [u64; 2], outline: bool) -> [u64; 2] {
     let bytes = f80_program(op);
     let mut lhs = a;
@@ -51,14 +39,14 @@ fn run_f80(op: &[u8], a: [u64; 2], b: [u64; 2], outline: bool) -> [u64; 2] {
             c.rsi = rhs.as_mut_ptr() as u64;
             c.rdx = out.as_mut_ptr() as u64;
         })
-        // The x87 stack is not part of the oracle's comparable state.
+        // The x87 stack is not in the oracle's comparable state.
         .no_unicorn()
         .run();
 
     out
 }
 
-/// 80-bit encodings of a few exact values (`[mantissa, sign_exp]`).
+/// 80-bit encodings `[mantissa, sign_exp]` of exact values.
 const F80_ONE: [u64; 2] = [0x8000_0000_0000_0000, 0x3FFF];
 const F80_TWO: [u64; 2] = [0x8000_0000_0000_0000, 0x4000];
 const F80_THREE: [u64; 2] = [0xC000_0000_0000_0000, 0x4000];
@@ -66,8 +54,7 @@ const F80_SIX: [u64; 2] = [0xC000_0000_0000_0000, 0x4001];
 
 #[test]
 fn outlined_kernels_match_inline_emission() {
-    // Every binary kernel, over operands chosen so the answer is exact and the
-    // two emission strategies must agree bit-for-bit.
+    // Exact operands: both emission strategies must agree bit for bit.
     let cases: [(&[u8], [u64; 2], [u64; 2]); 3] = [
         (&FADDP, F80_ONE, F80_TWO),   // 1 + 2
         (&FMULP, F80_TWO, F80_THREE), // 2 * 3
@@ -83,8 +70,7 @@ fn outlined_kernels_match_inline_emission() {
         );
     }
 
-    // Spot-check one absolute value so this is not just two identical bugs:
-    // 2 * 3 == 6.
+    // Absolute spot-check, so this is not two identical bugs: 2 * 3 == 6.
     assert_eq!(run_f80(&FMULP, F80_TWO, F80_THREE, true), F80_SIX);
     // 6 / 3 == 2.
     assert_eq!(run_f80(&FDIVP, F80_SIX, F80_THREE, true), F80_TWO);
@@ -92,8 +78,7 @@ fn outlined_kernels_match_inline_emission() {
 
 #[test]
 fn outlined_trig_matches_inline_emission() {
-    // The transcendental kernel is unary, so it takes its own program shape:
-    // `fld tbyte [rdi]; <op>; fstp tbyte [rdx]; ret`.
+    // Unary kernel: `fld tbyte [rdi]; <op>; fstp tbyte [rdx]; ret`.
     let run = |op: u8, arg: [u64; 2], outline: bool| {
         let bytes = [0xDB, 0x2F, 0xD9, op, 0xDB, 0x3A, 0xC3];
         let mut input = arg;
@@ -109,7 +94,7 @@ fn outlined_trig_matches_inline_emission() {
         out
     };
 
-    // 0xFF = fcos, 0xFE = fsin: one shared kernel body, two phases.
+    // 0xFF = fcos, 0xFE = fsin: one body, two phases.
     for op in [0xFFu8, 0xFE] {
         for arg in [F80_ONE, F80_TWO, F80_THREE, F80_SIX] {
             assert_eq!(
@@ -119,7 +104,7 @@ fn outlined_trig_matches_inline_emission() {
             );
         }
     }
-    // cos(0) == 1 and sin(0) == 0 exactly, in both strategies.
+    // cos(0) == 1, sin(0) == 0 in both strategies.
     let zero = [0u64, 0];
     assert_eq!(run(0xFF, zero, true), F80_ONE);
     assert_eq!(run(0xFF, zero, false), F80_ONE);
@@ -129,13 +114,9 @@ fn outlined_trig_matches_inline_emission() {
 
 #[test]
 fn trig_kernel_cross_compiles() {
-    // The kernel is written out of Cranelift ops that lower everywhere; the
-    // 128-bit fixed-point sequences in particular must not need a host x86-64.
+    // Kernel ops must lower everywhere (no host x86-64 needed).
     let bytes = [0xDB, 0x2F, 0xD9, 0xFF, 0xDB, 0x3A, 0xC3];
-    // aarch64 is the interesting target: it is the one that would reject an op
-    // that only lowers on the x64 backend. (Cross-compiling *any* x87 region to
-    // a non-host x86-64 triple panics inside Cranelift's x64 ABI code, which
-    // predates this kernel and is not specific to it.)
+    // aarch64 is the target that rejects x64-only ops.
     let triple = "aarch64-unknown-linux-gnu";
     let code =
         lift_to_code::<X86_64>(&bytes, DEFAULT_LIFT_BASE, LifterConfig::default()).expect("lift");
@@ -151,10 +132,7 @@ fn trig_kernel_cross_compiles() {
 
 #[test]
 fn every_trig_instruction_shares_one_helper() {
-    // FSIN/FCOS/FSINCOS/FPTAN differ only in a runtime phase argument and what
-    // they leave on the stack, so a region using all four must outline exactly
-    // one trig body (plus the divide FPTAN needs).
-    // `fsin; fcos; fsincos; fptan; ret`
+    // FSIN/FCOS/FSINCOS/FPTAN differ only in a phase argument: one trig body plus the FPTAN divide.
     let bytes = [0xD9, 0xFE, 0xD9, 0xFF, 0xD9, 0xFB, 0xD9, 0xF2, 0xC3];
     let code =
         lift_to_code::<X86_64>(&bytes, DEFAULT_LIFT_BASE, LifterConfig::default()).expect("lift");
@@ -173,8 +151,7 @@ fn every_trig_instruction_shares_one_helper() {
     );
 }
 
-/// Compile a region both ways and return `(outlined_bytes, inlined_bytes)` of
-/// emitted machine code.
+/// Compile both ways; return `(outlined_bytes, inlined_bytes)`.
 fn text_sizes(bytes: &[u8]) -> (usize, usize) {
     let mut sizes = Vec::new();
     for outline in [true, false] {
@@ -189,8 +166,7 @@ fn text_sizes(bytes: &[u8]) -> (usize, usize) {
     (sizes[0], sizes[1])
 }
 
-/// `fld tbyte [rsi]; fdivp st1, st0` repeated `n` times, bracketed by a load
-/// and a store.
+/// `fld tbyte [rsi]; fdivp st1, st0` repeated `n` times between a load and a store.
 fn n_divides(n: usize) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&[0xDB, 0x2F]); // fld tbyte [rdi]
@@ -215,11 +191,7 @@ fn outlining_shrinks_code_for_repeated_x87_ops() {
 
 #[test]
 fn outlining_makes_each_extra_x87_site_cheap() {
-    // The point of outlining is the *marginal* cost: one more divide should add
-    // a call sequence, not another copy of the long-division kernel. Comparing
-    // the 2-site and 12-site regions isolates that from the fixed cost both
-    // strategies pay (prologue, dispatch, the x87 stack plumbing around each
-    // op, and - for the outlined build - the single kernel body).
+    // Outlining pays in marginal cost: 2-site vs 12-site isolates the per-site call from fixed costs.
     let (outlined_small, inlined_small) = text_sizes(&n_divides(2));
     let (outlined_big, inlined_big) = text_sizes(&n_divides(12));
 
@@ -234,7 +206,7 @@ fn outlining_makes_each_extra_x87_site_cheap() {
 
 #[test]
 fn one_helper_per_kernel_however_many_sites() {
-    // Two adds, two divides, one square root: five sites, three kernels.
+    // Two adds, two divides, one sqrt: five sites, three kernels.
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&[0xDB, 0x2F]); // fld tbyte [rdi]
     bytes.extend_from_slice(&[0xDB, 0x2E]); // fld tbyte [rsi]
@@ -280,10 +252,7 @@ fn helpers_reach_the_object_file() {
     assert!(has("lifted_func"), "symbols: {symbols:?}");
     assert!(has(F80Kernel::Div.symbol()), "symbols: {symbols:?}");
 
-    // Helper bodies are *declared* before `lifted_func` (that is what fixes the
-    // namespace-0 index space) but *defined* after it, so the lifted function
-    // still starts the text section - which is all `compile_to_raw` callers,
-    // who get bytes with no symbol table, have to go on.
+    // Helpers are declared before but defined after `lifted_func`, so it still starts the text section (all `compile_to_raw` callers have to go on).
     let lifted = obj
         .symbols()
         .find(|s| s.name().is_ok_and(|n| n.contains("lifted_func")))
@@ -293,8 +262,7 @@ fn helpers_reach_the_object_file() {
 
 #[test]
 fn lift_to_function_refuses_to_drop_helpers() {
-    // The bare-`Function` entry point cannot carry helper bodies, so rather
-    // than hand back IR with unresolvable calls it must fail loudly.
+    // The bare-`Function` entry cannot carry helpers and must fail loudly.
     let bytes = f80_program(&FADDP);
     let err = microlift::core::lift_to_function::<X86_64>(
         &bytes,
@@ -307,7 +275,7 @@ fn lift_to_function_refuses_to_drop_helpers() {
         "error should point at the fix, got: {err}"
     );
 
-    // ...and with outlining off it succeeds, self-contained.
+    // With outlining off it succeeds, self-contained.
     let config = LifterConfig {
         outline_helpers: false,
         ..LifterConfig::default()
@@ -316,7 +284,7 @@ fn lift_to_function_refuses_to_drop_helpers() {
         .expect("inline emission should yield a standalone function");
 }
 
-/// Pure-Rust `strlen` for the import in the mixed test below.
+/// Pure-Rust `strlen` for the mixed test.
 unsafe extern "C" fn host_strlen(s: *const u8) -> u64 {
     let mut n = 0u64;
     while unsafe { *s.add(n as usize) } != 0 {
@@ -325,11 +293,7 @@ unsafe extern "C" fn host_strlen(s: *const u8) -> u64 {
     n
 }
 
-/// Imports and helpers share one `ExternalName::user(0, i)` index space, and a
-/// helper's final index depends on how many imports the *rest* of the lift
-/// turns up - so a region that has both is the case where the renumbering in
-/// `finish()` can go wrong. Silently: the call would just land on the other
-/// callee.
+/// Imports and helpers share one `ExternalName::user(0, i)` space; renumbering in `finish()` fails silently (the call lands on the other callee).
 #[test]
 fn imports_and_helpers_share_one_index_space() {
     use microlift::core::ExecutionMode;
@@ -368,8 +332,7 @@ fn imports_and_helpers_share_one_index_space() {
 
     let mut config = LifterConfig {
         execution_mode: ExecutionMode::RuntimeAssisted,
-        // Declared so the closing `ret` to the sentinel pushed below is a clean
-        // `Return` exit rather than an `UnknownJump`.
+        // Makes the closing `ret` a clean `Return` exit.
         exit_trampoline_address: Some(0xFFFF_FFFF_FFFF_FFFF),
         ..LifterConfig::default()
     };
@@ -382,7 +345,7 @@ fn imports_and_helpers_share_one_index_space() {
     let code = lift_to_code::<X86_64>(&bytes, LIFT_BASE, config).expect("lift");
     assert_eq!(code.imports.len(), 1, "one fast import");
     assert_eq!(code.helpers.len(), 1, "one softfloat helper (add)");
-    // The import took index 0, so the helper must have been renumbered to 1.
+    // Import took index 0, so the helper must be renumbered to 1.
     assert!(
         code.func.display().to_string().contains("u0:1"),
         "helper call should reference u0:1:\n{}",
@@ -415,8 +378,7 @@ fn imports_and_helpers_share_one_index_space() {
 
 #[test]
 fn analysis_mode_stays_self_contained() {
-    // Inspection IR must not sprout calls into helper functions a consumer
-    // reading the CFG has no way to resolve.
+    // Inspection IR must not call helpers a CFG consumer cannot resolve.
     let bytes = f80_program(&FADDP);
     let config = LifterConfig {
         analysis_mode: true,

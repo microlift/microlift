@@ -2,7 +2,7 @@ use thiserror::Error;
 
 pub use function_traits;
 
-// We use our own Cranelift fork, so this is incredibly necessary and not just convenience.
+// Own Cranelift fork: use these re-exports, not a second crate copy.
 pub use cranelift;
 pub use cranelift_codegen;
 pub use cranelift_frontend;
