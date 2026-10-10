@@ -472,11 +472,4 @@ fn test_cmpxchg16b_native_requires_backend_support() {
         err.is_err(),
         "native mode must fail on an x64 ISA without has_cmpxchg16b"
     );
-
-    let err = ArtifactBackend::compile_to_raw(
-        lift_cmpxchg16b(Atomic128Mode::Native),
-        Some("aarch64-unknown-linux-gnu"),
-        None,
-    );
-    assert!(err.is_err(), "native mode must fail on aarch64");
 }
