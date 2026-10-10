@@ -387,6 +387,7 @@ impl<'a> LiftTest<'a> {
 /// - **No non-stack memory writes**: Microlift runs first and would feed Unicorn mutated inputs.
 /// - **No syscalls**: Unicorn does not run the host syscall callback.
 /// - **Undefined flags masked**: `MUL`/`IMUL` (SF/ZF) and variable shifts/rotates/`BT*` (OF).
+/// - **No undefined flag reads**: a flag copied out (`LAHF`, `SETcc`, `PUSHF`) escapes the mask.
 #[cfg(feature = "unicorn-oracle")]
 fn cross_check_unicorn(bytes: &[u8], ip: u64, init: &oracle::CpuState, outcome: &RunOutcome) {
     use oracle::{CpuOracle, CpuState, DiffOptions, OracleOutcome, diff_states};
@@ -401,9 +402,10 @@ fn cross_check_unicorn(bytes: &[u8], ip: u64, init: &oracle::CpuState, outcome: 
         undefined_rflags,
         writes_data_mem,
         has_syscall,
+        reads_undefined_flags,
     } = analyze_program(bytes, ip);
 
-    if has_syscall {
+    if has_syscall || reads_undefined_flags {
         return;
     }
 
@@ -445,6 +447,8 @@ struct ProgramFacts {
     /// Whether any instruction writes memory that is not `RSP`-relative.
     writes_data_mem: bool,
     has_syscall: bool,
+    /// Whether any instruction reads a flag an earlier instruction left undefined.
+    reads_undefined_flags: bool,
 }
 
 /// Linear-sweep decode from `ip` to derive [`ProgramFacts`]; stops at the first invalid byte.
@@ -485,6 +489,7 @@ fn analyze_program(bytes: &[u8], ip: u64) -> ProgramFacts {
     let mut undefined = 0u32;
     let mut writes_data_mem = false;
     let mut has_syscall = false;
+    let mut reads_undefined_flags = false;
 
     while decoder.can_decode() {
         let insn = decoder.decode();
@@ -492,6 +497,8 @@ fn analyze_program(bytes: &[u8], ip: u64) -> ProgramFacts {
             break;
         }
         has_syscall |= insn.mnemonic() == Mnemonic::Syscall;
+
+        reads_undefined_flags |= undefined & insn.rflags_read() != 0;
 
         // Last writer wins: defined values re-define a flag, undefined ones undefine it.
         undefined = (undefined & !insn.rflags_modified()) | insn.rflags_undefined();
@@ -516,6 +523,7 @@ fn analyze_program(bytes: &[u8], ip: u64) -> ProgramFacts {
         undefined_rflags: iced_to_eflags(undefined),
         writes_data_mem,
         has_syscall,
+        reads_undefined_flags,
     }
 }
 
