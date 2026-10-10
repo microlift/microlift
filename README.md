@@ -1,44 +1,111 @@
 # Microlift
 
-Microlift is a crate for lifting x86_64 and AArch64 to Cranelift IR, with the goal of providing a simple and efficient way to run foreign machine code on different architectures in JIT and AOT recompilation scenarios. It is primarily intended to be used as the basis for a recompilation based usermode hypervisor.
+Microlift is a crate for lifting x86-64 and AArch64 machine code into [Cranelift](https://cranelift.dev) IR, then using Cranelift, JIT or AOT compiles it for the host. Its primary purpose is to be the engine of a recompilation-based usermode hypervisor, and doubles as a general binary lifter and analysis backend.
 
-Due to its ability to also be used as a general purpose binary lifter, it has also been used for various other projects despite its primary goal as a hypervisor base, such as in the Microreverse binary analysis framework.
+A lifted region is a single Cranelift function taking one `*mut RegisterContext`. It runs guest code against that context and leaves through an embedded `ControlHeader` that gives an exit reason, it is up to the host to decide how to handle each exit reason.
+
+Microlift's main user is [Rosemary](https://github.com/microlift/rosemary), a high-level emulator and compatibility layer combo that runs macOS applications across architectures and operating systems. It builds its `emulated` backend on top of Microlift, using it to run x86-64 macOS apps on AArch64 macOS, Linux, and FreeBSD.
+
+## Status
+
+| Guest | State |
+| --- | --- |
+| x86-64 | Mature - Good baseline of what usermode programs utilize, SSE through SSE4.2, AES-NI, atomics, and 80-bit x87 FPU written as pure IR. |
+| AArch64 | Early - Only trivial programs will run, many instructions are still missing. |
+
+Host code generation goes through Cranelift, so any Cranelift backend can be a target. The test suite compiles against x86-64, AArch64 and RISC-V64.
+
+## Getting started
+
+Microlift builds against our [fork of Wasmtime/Cranelift](https://github.com/microlift/wasmtime), which has experimental improvements that we aim to upstream if in-scope for Cranelift. The primary difference between our fork and upstream Cranelift is a wider register ABI for register pinning in block linking, and a `spin_hint` opcode, which emits to `PAUSE` on x86-64, and `YIELD` on AArch64.
+
+The Nix flake is the recommended way to run Microlift's test suite. Using it on a system with Nix installed is simple:
+
+```sh
+nix develop --command cargo build
+nix develop --command cargo test --release --features testkit
+```
+
+Lifting and running code with Microlift is easy. The below x86-64 code is lifted to a standard Cranelift function with Microlift, JIT-compiled with Cranelift, and called with a `RegisterContext`:
+
+```rust
+use microlift::arch::x86_64::X86_64;
+use microlift::backend::CraneliftBackend;
+use microlift::context::{ExitReason, RegisterContext};
+use microlift::core::{LifterConfig, lift_to_code};
+
+let code = [0x48, 0xC7, 0xC0, 0x2A, 0, 0, 0, 0xC3];
+let base = 0x1000;
+
+let lifted = lift_to_code::<X86_64>(&code, base, LifterConfig::default())?;
+let mut backend = CraneliftBackend::new()?;
+let entry = backend.compile_lifted(lifted)?;
+let entry: extern "C" fn(*mut RegisterContext) = unsafe { std::mem::transmute(entry) };
+
+let mut stack = vec![0u64; 64];
+let mut ctx = RegisterContext::default();
+ctx.image_base = base;
+ctx.rsp = stack.as_mut_ptr() as u64 + 63 * 8;
+
+entry(&mut ctx);
+assert_eq!(ExitReason::try_from(ctx.exit_reason), Ok(ExitReason::UnknownJump));
+assert_eq!(ctx.rax, 42);
+```
+
+A lifted region is a function taking one `*mut RegisterContext`. It runs the guest code against that context and reports why it stopped in `ctx.exit_reason`. Here the `ret` leaves the region, so the host sees an `UnknownJump` to the return address; the backend and its code must outlive the call. `CraneliftBackend` JIT-compiles in-process, and `ArtifactBackend` produces object code for any target triple.
+
+## Testing
+
+The `testkit` feature wraps the above in a common module that supplies the stack, the exit sentinel, and optional Unicorn cross-checking.
+
+```rust
+use microlift::testkit::prelude::*;
+
+let out = LiftTest::new(&[0x48, 0xC7, 0xC0, 0x2A, 0, 0, 0, 0xC3]).run();
+assert_eq!(out.ctx.rax, 42);
+```
+
+`LiftTest` takes its starting state and configuration through builder methods (`.at(ip)`, `.ctx(..)`, and so on). `.run()` panics if lifting fails, while `.try_run()` returns the error. Register every new test target in `Cargo.toml` with `required-features = ["testkit"]`, and run the suite with `cargo test --features testkit`. Adding `--features unicorn-oracle` makes every `run()` also execute the program on Unicorn and compare the resulting state.
 
 ## Features
 
-* Most common instructions are implemented
-* VSA for more efficient code generation and dead store elimination
-* Hints intended for use by high-level emulators such as information about entire memory segments, which assist in VSA and code analysis
-* Support for x86_64 and AArch64
+* Address-keyed lifting. Decoding follows control flow into an address-keyed map, so overlapping and sub-encoded instructions lift correctly.
+* CPU state as SSA. Registers and flags are Cranelift variables, not memory, so unused flag math disappears at lowering.
+* Dead flag elimination and lazy register sync to optimize flag computation and register context loads/stores.
+* Imports: guest calls to known addresses become inline native calls (fast), and VM exits (slow), or bridged calls (slated for removal).
+* Syscall and interpreter callbacks that let the code carry on inline instead of exiting.
+* Block linking, with link cells, pinned registers, a call-return stack and host call frames, to keep execution inside generated code.
+* Host runtime with a page-indexed code cache, invalidation, and per-thread link tables.
+* Source maps from host code back to guest addresses, for faults and debugger integration.
+* Target specialization that picks cheaper lowerings per host without changing a single result bit.
+* Static analysis: linear-sweep CFG, value-set analysis for indirect targets, and Clang jump-table recovery.
+* Analysis mode that produces inspection-only IR.
 
 ## Accuracy
 
-Microlift takes an accuracy-first approach to all instructions. If an instruction is not implemented accurately, for any reason, it is required that the divergence is documented, and that the divergence eventually is fixed.
+Microlift is accuracy-first. An instruction that is not implemented accurately must have its divergence documented, and the divergence is expected to be fixed eventually.
 
-It is differentially tested against Unicorn, with the only exemption to differential testing being Microlift-specific features and documented inaccuracies in the oracle we are testing against. Thanks to this approach, differential testing has found a dozen or so bugs in Unicorn (and consequently the QEMU TCG version Unicorn uses) thanks to its vast test suite. We plan on working directly with Unicorn and QEMU's developers to fix these bugs rather than let them sit around as trophies.
+It is differentially tested against [Unicorn](https://www.unicorn-engine.org) (`--features unicorn-oracle`), with exemptions only for Microlift-specific features and documented inaccuracies in Unicorn itself. The suite has found a number of bugs in Unicorn and the QEMU TCG version it uses.
+
+Optimizations are held to the same standard. A target specialization may not change a result bit. The exceptions are explicit opt-ins named `Unsafe*`.
 
 ## Performance
 
-Microlift integrates various techniques to maximize performance - the primary feature that gains the most performance is the elimination of unused CPU flags. CPU flags are represented as SSA variables, which allows them to be eliminated if they are set but unused by an instruction. This optimization is performed by Cranelift at lowering time. Due to this design choice, Cranelift IR emitted by Microlift may appear far messier than the source at first, but then compile into much cleaner assembly. If you wish to look at the Cranelift IR directly, it may help to run a dead store/load pass on it to eliminate unused CPU flags. Optimization passes from Cranelift should not affect the semantic equivalence of the code, although it will definitely mutate its structure.
+* Flags are SSA. Dead flag math is removed by Cranelift in optimization phases, which is why emitted IR looks far messier than the source assembly and compiles into much cleaner machine code. When reading IR, it helps to run Cranelift's optimization passes first.
+* Register-context load/store is removed by the lifter's own optimizations (`lazy_register_sync`, on by default) and at `opt_level = speed` or above, by per-field alias regions Cranelift's egraph can see through.
+* Vectors. With `use_vector_xmm`, XMM state is native `I64X2` and SSE instructions become Cranelift vector ops. x86 NaN behavior is still emulated for exactness, which costs extra compares on hosts with different NaN rules.
+* Linking. Block linking is the biggest optimization: it lets lifted code resolve its own successors instead of returning to a dispatch loop, which can achieve performance improvements of ~20x depending on the guest.
 
-Vectorized instructions such as the ones in SSE are emitted as native vectorized instructions via Cranelift's 128-bit integer support. By default, this will still be slower because Microlift opts for semantic accuracy first and performance second. This means we have to accurately emulate NaN behavior by doing manual calculations.
+## Execution modes
 
-Some instructions do not have peephole optimizations necessary for efficient emulation of some x86-64 semantics. We plan to address this by directly contributing CLIF passes to Cranelift from our fork where not domain-specific, and by adding our own optimizations at lift time.
+`ExecutionMode::Jit` is the default. `RuntimeAssisted` assumes the lifter is gone at run time and a custom runtime exists, so helpers become relocatable imports and exits. It is slower and needs more VM entry dispatch points.
 
-Additionally, compile with `opt_level = "speed"` (or `speed_and_size`) if you care about the register-context traffic: Cranelift's alias analysis runs inside the egraph pass, which only runs above `opt_level = none`, and the lifter tags every context field with its own alias region so that analysis can see the exit stores writing back exactly what the entry loads read.
+## Known limitations
 
-The lifter also drops that traffic itself, unconditionally and at any opt level, via `LifterConfig::lazy_register_sync` (on by default) - a region never stores back a register it did not write.
-
-## Notes for non-JIT users
-
-Microlift is primarily designed for JIT recompilation, however, it also has support for a RuntimeAssisted execution mode. In RuntimeAssisted, helper code is adjusted to assume that the `lifter` is gone, and that instead a custom runtime will be present specific to your architecture and platform. RuntimeAssisted code may be slower or lower quality than JIT code due to the extra VM exits and necessity for more VM entry dispatch points.
-
-## Warnings and known limitations
-
-We want to make sure all known issues are documented, as they are usually symptoms of correctness bugs rather than something inherit to recompilation. These are the currently known semantic accuracy and performance issues:
-
-* `MXCSR` is not respected yet - do not use Microlift in scientific applications, and expect it to be detected by adversial guest programs if they are looking for quirks.
-* x87 floating points are slow and software-based, even on x86 CPUs due to a lack of support for native 80-bit floats in Cranelift. This will be addressed by implementing custom CLIF opcodes in our fork of Cranelift, though it is unlikely this work will ever be merged upstream as 80-bit floats is not in any WASM spec, and even on x86-64 there are few programs that utilize them. In particular, only `libstdc++` appears to use these features, and it's only for randomness distribution.
-* Even with native vectorization support, x86 NaN behavior is emulated on platforms that do not have its semantics such as AArch64. This can cause overhead in programs using heavy floating point vectorization due to the additional comparisons for NaN emulation. This will eventually be togglable if eliding it is not required for program correctness, however, any optimizations that change semantics are potentially unsafe, and this is one of them.
-* AES-NI (`AESENC` and friends) is not constant time. Do not expect software that uses AES-NI to be secure against timing attacks. We are working on a custom CLIF opcode that will allow us to directly emit AES acceleration helpers on capable hardware.
-* `PAUSE` is only emitted under the `SpinLoopHint` specialization, and is discarded otherwise - a tight loop relying on the CPU to listen to its hint will appear to use tons of processing power. Not required for semantic accuracy, but can cause performance issues across various programs depending on what the loop does (ie if it uses atomics a bunch it can thrash fences required for TSO emulation on AArch64). Enable it by lifting under a `Specialization` naming your target; there is no portable lowering to fall back on, since only the target knows what its spin-loop hint is.
+* MXCSR is not honored. Rounding mode, FZ/DAZ and sticky flags are stored faithfully but do not affect lifted arithmetic. Do not use Microlift for scientific work, and expect adversarial guests to detect it.
+* x87 is software. Cranelift has no 80-bit float, so the FPU is pure IR, apfloat-verified. Transcendentals share an outlined kernel that is faithful to about 1 ulp, not bit-exact. `FPATAN`, `F2XM1`, `FYL2X` and `FYL2XP1` are unimplemented.
+* NaN emulation overhead. Hosts whose NaN rules differ from x86 (such as AArch64) pay extra comparisons in vectorized floating point.
+* AES-NI is not constant time. Do not rely on guest AES-NI for timing-attack resistance.
+* `PAUSE` is dropped unless a `Specialization` is used with a target with the spin-loop hint, so spin loops can burn CPU and on AArch64 thrash TSO fences.
+* `atomic128`: the default `Emulated` mode is not atomic. Use `Native` (x86-64 `lock cmpxchg16b`, or `caspal` with LSE on AArch64) or `Interpret`. `Emulated` is slated for removal due to its inherit unsafety.
+* Segments: writing `FS`/`GS` stores the selector only, with no descriptor reload.
