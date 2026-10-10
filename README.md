@@ -2,8 +2,6 @@
 
 Microlift is a crate for lifting x86-64 and AArch64 machine code into [Cranelift](https://cranelift.dev) IR, then using Cranelift, JIT or AOT compiles it for the host. Its primary purpose is to be the engine of a recompilation-based usermode hypervisor, and doubles as a general binary lifter and analysis backend.
 
-A lifted region is a single Cranelift function taking one `*mut RegisterContext`. It runs guest code against that context and leaves through an embedded `ControlHeader` that gives an exit reason, it is up to the host to decide how to handle each exit reason.
-
 Microlift's main user is [Rosemary](https://github.com/microlift/rosemary), a high-level emulator and compatibility layer combo that runs macOS applications across architectures and operating systems. It builds its `emulated` backend on top of Microlift, using it to run x86-64 macOS apps on AArch64 macOS, Linux, and FreeBSD.
 
 ## Status
