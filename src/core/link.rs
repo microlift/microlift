@@ -7,7 +7,7 @@
 //! - The table has `entries` rows and is at least 8-byte aligned (loads are `notrap`).
 //!
 //! A row naming an older translation of unchanged bytes is harmless, so a
-//! direct-mapped collision is a miss, not an error. A row outliving its bytes
+//! collision is a miss, not an error. A row outliving its bytes
 //! (self-modifying code, unmapping, eviction) is not: the host retracts it via
 //! [`LiftedCode::covered`] and [`LiftedCode::data_dependencies`].
 //! [`crate::runtime::CodeCache`] implements this protocol.
@@ -74,17 +74,28 @@ pub const CELL_SYMBOL: &str = "lifted_cells";
 
 /// Geometry of the host's link table, baked into the emitted probe.
 ///
-/// Changing either field invalidates translations lifted under the old value.
-/// [`slot`](Self::slot) is the single definition of where a PC lives.
+/// Changing any field invalidates translations lifted under the old value.
+/// [`set`](Self::set) is the single definition of where a PC lives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockLinkConfig {
     /// Row count; a power of two so the index is a mask.
     pub entries: u32,
     /// Right shift applied to a PC before masking (low bits of code addresses carry little entropy).
     pub shift: u32,
+    /// Rows a PC may occupy: the probe compares this many adjacent rows.
+    ///
+    /// Direct mapping (1) lets two hot PCs that share a row evict each other on every
+    /// transfer, and contiguous code ranges alias wholesale whenever their offsets
+    /// overlap modulo the table's span. A set is one 16-byte granule's rows, not a
+    /// run of neighbouring granules: JIT code dense in call sites would fill the
+    /// latter on its own.
+    pub ways: u32,
     /// What the probe does once it finds a row.
     pub dispatch: LinkDispatch,
 }
+
+/// The most rows [`BlockLinkConfig::ways`] may name; each is one more compare per probe.
+pub const MAX_WAYS: u32 = 4;
 
 /// What a region does with a resolved successor. The probe is identical up to the address compare.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,8 +123,24 @@ impl BlockLinkConfig {
         Self {
             entries,
             shift: 4,
+            ways: 1,
             dispatch: LinkDispatch::HostResume,
         }
+    }
+
+    /// The same table with `ways` rows per set.
+    ///
+    /// # Panics
+    ///
+    /// If `ways` is not a power of two in `1..=MAX_WAYS`, or exceeds `entries`.
+    #[must_use]
+    pub fn with_ways(mut self, ways: u32) -> Self {
+        assert!(
+            ways.is_power_of_two() && ways <= MAX_WAYS && ways <= self.entries,
+            "a block-link table needs a power-of-two way count of at most {MAX_WAYS}, not {ways}"
+        );
+        self.ways = ways;
+        self
     }
 
     /// The same table, resolved by branching to the successor with `abi` held in registers.
@@ -133,13 +160,30 @@ impl BlockLinkConfig {
         }
     }
 
-    /// The row `pc` belongs to; shared by emitted code and the host.
+    /// The row `pc` hashes to, ignoring ways. A host keeping its own direct-mapped
+    /// side table may index it with this; the link table itself is indexed by [`set`](Self::set).
     pub fn slot(&self, pc: u64) -> usize {
         ((pc >> self.shift) as usize) & (self.entries as usize - 1)
     }
 
+    /// The first of the [`ways`](Self::ways) adjacent rows `pc` may occupy; shared by
+    /// emitted code and the host.
+    pub fn set(&self, pc: u64) -> usize {
+        (((pc >> self.shift) as usize) & self.set_mask() as usize) * self.ways as usize
+    }
+
     pub(crate) fn mask(&self) -> i64 {
         self.entries as i64 - 1
+    }
+
+    /// The set index mask: there are `entries / ways` sets.
+    pub(crate) fn set_mask(&self) -> i64 {
+        (self.entries / self.ways) as i64 - 1
+    }
+
+    /// Bytes of guest address space between two PCs that share a set.
+    pub fn span(&self) -> u64 {
+        ((self.entries / self.ways) as u64) << self.shift
     }
 }
 
@@ -191,6 +235,32 @@ mod tests {
         let config = BlockLinkConfig::new(16);
         assert_ne!(config.slot(0x400), config.slot(0x410));
         assert_eq!(config.slot(0x400), config.slot(0x40f));
+    }
+
+    #[test]
+    fn a_set_is_one_granules_ways() {
+        let config = BlockLinkConfig::new(16).with_ways(2);
+        assert_eq!(config.set_mask(), 7);
+        assert_eq!(config.span(), 128);
+        // Neighbouring granules are different sets, so dense code spreads out.
+        assert_ne!(config.set(0x400), config.set(0x410));
+        assert_eq!(config.set(0x400), config.set(0x40f));
+        assert_eq!(config.set(0x400), config.set(0x400 + config.span()));
+        for pc in [0x400u64, 0x410, 0x1234_5670] {
+            assert_eq!(config.set(pc) % 2, 0, "a set starts on a way boundary");
+            assert!(config.set(pc) + 2 <= 16);
+        }
+        // One way is the direct-mapped slot.
+        let direct = BlockLinkConfig::new(16);
+        for pc in [0x400u64, 0x410, 0x1234_5670] {
+            assert_eq!(direct.set(pc), direct.slot(pc));
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "way count")]
+    fn a_way_count_that_is_not_a_power_of_two_is_refused() {
+        let _ = BlockLinkConfig::new(16).with_ways(3);
     }
 
     #[test]

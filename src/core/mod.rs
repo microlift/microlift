@@ -2435,12 +2435,14 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         }
     }
 
-    /// Emit the probe itself: one masked shift, one address compare, one store.
+    /// Emit the probe itself: one masked shift, an address compare per way, one store.
     ///
     /// ```text
     ///   link(pc):  tbl = ctx.link_table;      if tbl == 0 goto out
-    ///              ent = tbl + slot(pc)*32;   if ent.guest_pc != pc goto out
-    ///              ctx.pc = pc; ctx.link_hit = ent
+    ///              ent = tbl + set(pc)*32;    if ent.guest_pc == pc goto hit(ent)
+    ///              ent += 32 ...              ; once per further way
+    ///              goto out
+    ///   hit(ent):  ctx.pc = pc; ctx.link_hit = ent
     ///   out:       return
     /// ```
     ///
@@ -2496,16 +2498,42 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
 
         self.builder.switch_to_block(probe);
         let slot = self.builder.ins().ushr_imm_u(pc, link.shift as i64);
-        let slot = self.builder.ins().band_imm_u(slot, link.mask());
+        let slot = self.builder.ins().band_imm_u(slot, link.set_mask());
+        // A set is `ways` rows, so one shift scales the set index to its first row's offset.
+        let set_bytes = crate::core::link::ENTRY_SIZE * link.ways as u64;
         let offset = self
             .builder
             .ins()
-            .ishl_imm_u(slot, crate::core::link::ENTRY_SIZE.trailing_zeros() as i64);
-        let entry = self.builder.ins().iadd(table, offset);
+            .ishl_imm_u(slot, set_bytes.trailing_zeros() as i64);
+        let first = self.builder.ins().iadd(table, offset);
         let row = self.link_table_flags;
-        let key = self.builder.ins().load(types::I64, row, entry, 0);
-        let matches = self.builder.ins().icmp(IntCC::Equal, key, pc);
-        self.builder.ins().brif(matches, hit, &[], out, &[]);
+        let entry = self.builder.append_block_param(hit, types::I64);
+        // The newest row is the first way, so a hit there costs what a direct-mapped probe does.
+        for way in 0..link.ways {
+            let at = match way {
+                0 => first,
+                _ => self
+                    .builder
+                    .ins()
+                    .iadd_imm_s(first, (way as u64 * crate::core::link::ENTRY_SIZE) as i64),
+            };
+            let key = self.builder.ins().load(types::I64, row, at, 0);
+            let matches = self.builder.ins().icmp(IntCC::Equal, key, pc);
+            let next = if way + 1 == link.ways {
+                out
+            } else {
+                let next = self.builder.create_block();
+                self.visited_blocks.insert(next);
+                next
+            };
+            self.builder
+                .ins()
+                .brif(matches, hit, &[at.into()], next, &[]);
+            if next != out {
+                self.builder.switch_to_block(next);
+                self.builder.seal_block(next);
+            }
+        }
 
         for block in [probe, hit, out] {
             self.visited_blocks.insert(block);

@@ -351,3 +351,82 @@ fn an_indirect_call_does_not_take_a_row_about_another_address() {
     assert_eq!(caller.ctx.link_hit, 0);
     assert_eq!(caller.ctx.rsp, entry_rsp);
 }
+
+fn two_way_config() -> BlockLinkConfig {
+    BlockLinkConfig::new(ROWS).with_ways(2)
+}
+
+fn two_way_caller() -> Harness {
+    LiftTest::new(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00, 0xC3])
+        .with_config(|c| {
+            c.block_link = Some(two_way_config());
+        })
+        .compile()
+        .expect("the caller region compiles")
+}
+
+fn two_way_callee() -> Harness {
+    LiftTest::new(&[0x48, 0xC7, 0xC3, 0x07, 0x00, 0x00, 0x00, 0xC3])
+        .at(CALLEE)
+        .image_base(CALLEE)
+        .with_config(|c| {
+            c.block_link = Some(two_way_config());
+        })
+        .compile()
+        .expect("the callee region compiles")
+}
+
+fn row(pc: u64, code: *const u8, base: u64) -> BlockLinkEntry {
+    BlockLinkEntry {
+        guest_pc: pc,
+        code: code as u64,
+        image_base: base,
+        reserved: 0,
+    }
+}
+
+/// The second way is probed: a PC behind a colliding row still links, to its own row.
+#[test]
+fn a_two_way_probe_links_through_the_second_way() {
+    let mut caller = two_way_caller();
+    let callee = two_way_callee();
+    let mut table = table();
+    let set = two_way_config().set(CALLEE);
+    let colliding = CALLEE + two_way_config().span();
+    assert_eq!(two_way_config().set(colliding), set);
+    table[set] = row(colliding, callee.code_ptr, CALLEE);
+    table[set + 1] = row(CALLEE, callee.code_ptr, CALLEE);
+
+    let exit = run_caller(&mut caller, CALLEE, &mut table);
+
+    assert_eq!(exit, ExitReason::UnknownJump);
+    assert_eq!(caller.ctx.rip, CALLEE);
+    assert_eq!(
+        caller.ctx.link_hit,
+        &table[set + 1] as *const _ as u64,
+        "the probe should name the second way, not the colliding first"
+    );
+    assert_eq!(follow(&mut caller.ctx), ExitReason::Return);
+    assert_eq!(caller.ctx.rbx, 7);
+}
+
+/// Every way of the set full of other PCs is still a miss.
+#[test]
+fn a_two_way_probe_misses_when_neither_way_matches() {
+    let mut caller = two_way_caller();
+    let callee = two_way_callee();
+    let mut table = table();
+    let set = two_way_config().set(CALLEE);
+    let span = two_way_config().span();
+    table[set] = row(CALLEE + span, callee.code_ptr, CALLEE);
+    table[set + 1] = row(CALLEE + 2 * span, callee.code_ptr, CALLEE);
+    // The row just past the set is not part of it.
+    table[(set + 2) % ROWS as usize] = row(CALLEE, callee.code_ptr, CALLEE);
+    assert_ne!(two_way_config().set(CALLEE + 16), set, "and belongs to a neighbouring granule");
+
+    let exit = run_caller(&mut caller, CALLEE, &mut table);
+
+    assert_eq!(exit, ExitReason::UnknownJump);
+    assert_eq!(caller.ctx.link_hit, 0);
+    assert_eq!(caller.ctx.rbx, 0, "the callee must not have run");
+}
