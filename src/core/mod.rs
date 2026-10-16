@@ -17,6 +17,7 @@ pub mod pin;
 pub mod regsync;
 pub mod specialize;
 pub mod srcloc;
+pub mod tso;
 
 use std::collections::BTreeSet;
 use std::ops::Range;
@@ -684,6 +685,10 @@ pub struct LifterConfig {
     pub specialization: Specialization,
     /// How `CMPXCHG16B` is lowered. See [`Atomic128Mode`].
     pub atomic128: Atomic128Mode,
+    /// Fence guest memory accesses so a weakly ordered host keeps x86's total store
+    /// order. Multithreaded guests need it on AArch64; an x86 host is already TSO and
+    /// would only pay for the fences. See [`tso`].
+    pub total_store_order: bool,
     /// Bit pattern of SSE-generated NaNs. See [`GeneratedNan`].
     pub generated_nan: GeneratedNan,
     /// Inspection IR for static analysis: **never execute it.**
@@ -761,6 +766,7 @@ impl Default for LifterConfig {
             use_vector_xmm: false,
             specialization: Specialization::generic(),
             atomic128: Atomic128Mode::default(),
+            total_store_order: false,
             generated_nan: GeneratedNan::default(),
             analysis_mode: false,
             exit_trampoline_address: None,
@@ -2947,6 +2953,9 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         self.prune_untouched_sync();
         if self.config.eliminate_dead_flags {
             flags::eliminate(self.builder.func, &self.flag_values);
+        }
+        if self.config.total_store_order {
+            tso::insert_fences(self.builder.func, self.guest_flags.alias_region());
         }
         self.finalize_helper_indices();
         self.finalize_data_indices();
