@@ -1,7 +1,9 @@
 //! Pinned register files: guest state kept in machine registers across links ([`crate::core::link`]).
 //!
-//! - A pinned region is `tail (ctx, slot0, ...) -> (ctx, slot0, ...)`; results == parameters is
-//!   load-bearing (a link lowers to a branch).
+//! - A pinned region is `tail_preserve_none (ctx, slot0, ...) -> (ctx, slot0, ...)`; results ==
+//!   parameters is load-bearing (a link lowers to a branch).
+//! - Regions save no registers: only the entry thunk returns to host code, and it saves what
+//!   the host keeps once per entry rather than every link saving it again.
 //! - Every region sharing a link table must use the **same** [`PinnedAbi`]; nothing checks at run time.
 //! - Full `sync_to_context` skips pinned slots; masked syncs never do.
 
@@ -208,7 +210,7 @@ impl std::error::Error for BudgetError {}
 
 /// Context pointer plus one parameter per slot, returning the same list.
 pub(crate) fn pinned_signature(slot_types: &[Type]) -> Signature {
-    let mut sig = Signature::new(CallConv::Tail);
+    let mut sig = Signature::new(CallConv::TailPreserveNone);
     sig.params.push(AbiParam::new(types::I64));
     for &ty in slot_types {
         sig.params.push(AbiParam::new(ty));
@@ -255,7 +257,7 @@ mod tests {
     #[test]
     fn results_are_the_parameters_so_a_link_moves_nothing() {
         let sig = pinned_signature(&[types::I64, types::I64X2]);
-        assert_eq!(sig.call_conv, CallConv::Tail);
+        assert_eq!(sig.call_conv, CallConv::TailPreserveNone);
         assert_eq!(sig.params.len(), 3, "the context pointer plus two slots");
         let params: Vec<Type> = sig.params.iter().map(|p| p.value_type).collect();
         let returns: Vec<Type> = sig.returns.iter().map(|p| p.value_type).collect();

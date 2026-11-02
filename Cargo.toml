@@ -287,6 +287,10 @@ required-features = ["testkit"]
 name = "pinned_link_tests"
 required-features = ["testkit"]
 
+[[test]]
+name = "link_glue_tests"
+required-features = ["testkit"]
+
 # Cross-compiles the same lift for x86-64, aarch64 and riscv64, so it needs
 # those backends compiled in.
 [[test]]
