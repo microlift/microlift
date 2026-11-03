@@ -1,7 +1,7 @@
 //! Relocatable lifts and the multi-region image: no host pointer reaches the code, and an
 //! image loaded at any slide runs like the JIT.
 
-use std::sync::atomic::AtomicPtr;
+use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 use microlift::arch::x86_64::X86_64;
 use microlift::backend::ArtifactBackend;
@@ -154,8 +154,13 @@ struct Resolver {
 
 impl SymbolResolver for Resolver {
     fn resolve(&self, symbol: &HostSymbol) -> Option<usize> {
-        (&*symbol.name == "_add_one" && matches!(symbol.kind, HostSymbolKind::Function(_)))
-            .then_some(add_one as *const () as usize)
+        match &*symbol.name {
+            "_add_one" if matches!(symbol.kind, HostSymbolKind::Function(_)) => {
+                Some(add_one as *const () as usize)
+            }
+            "record" => Some(record_callee as *const () as usize),
+            _ => None,
+        }
     }
 
     fn guest_slide(&self) -> u64 {
@@ -207,6 +212,44 @@ fn a_loaded_image_runs_at_its_slide() {
         assert_eq!(ctx.exit_reason, ExitReason::Return as u32);
         assert_eq!(ctx.rax, 42);
         assert_eq!(ctx.rdx, DEFAULT_LIFT_BASE + 12 + slide);
+    }
+}
+
+static RECORDED_CALLEE: AtomicU64 = AtomicU64::new(0);
+
+unsafe extern "C" fn record_callee(_ctx: *mut RegisterContext, callee: u64) -> u32 {
+    RECORDED_CALLEE.store(callee, Ordering::Relaxed);
+    0
+}
+
+#[test]
+fn an_import_handed_to_the_host_is_slid() {
+    // call BRIDGE_VA; call FAST_VA; ret
+    let mut bytes = Vec::new();
+    for target in [BRIDGE_VA, FAST_VA] {
+        let next = DEFAULT_LIFT_BASE + bytes.len() as u64 + 5;
+        bytes.push(0xE8);
+        bytes.extend_from_slice(&((target as i64 - next as i64) as i32).to_le_bytes());
+    }
+    bytes.push(0xC3);
+    let mut config = LifterConfig {
+        address_mode: AddressMode::Relocated,
+        exit_trampoline_address: Some(EXIT_TRAMPOLINE),
+        ..LifterConfig::default()
+    };
+    config.register_bridge_import(
+        BRIDGE_VA,
+        BridgeImport::direct("record", record_callee as *const u8),
+    );
+    config.register_slow_import(FAST_VA);
+    let bytes = image_bytes(config, &bytes);
+
+    for slide in [0, 0x5_0000_0000] {
+        let regions = load(&bytes, &Resolver { slide }).expect("load");
+        let ctx = run(regions[0].translation.entry, DEFAULT_LIFT_BASE + slide, 0);
+        assert_eq!(RECORDED_CALLEE.load(Ordering::Relaxed), BRIDGE_VA + slide);
+        assert_eq!(ctx.exit_reason, ExitReason::ImportedFunctionCall as u32);
+        assert_eq!(ctx.imported_function_va, FAST_VA + slide);
     }
 }
 

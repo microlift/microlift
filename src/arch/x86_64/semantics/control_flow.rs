@@ -295,7 +295,7 @@ impl<'a> Lifter<'a> {
         if let Some(ImportKind::Bridge(bridge)) = self.lookup_import(import_va) {
             // A bridge that exits parks the resume PC at the next instruction, which needs a block.
             self.get_block(self.current_ip);
-            let callee = self.builder.ins().iconst(types::I64, import_va as i64);
+            let callee = self.runtime_addr(import_va);
             return self.emit_bridge_call(&bridge, callee, None, ExitReason::ImportedFunctionCall);
         }
         match self.fast_call_for(import_va) {
@@ -330,7 +330,7 @@ impl<'a> Lifter<'a> {
 
         match (bridge, fast) {
             (Some(bridge), _) => {
-                let callee = self.builder.ins().iconst(types::I64, import_va as i64);
+                let callee = self.runtime_addr(import_va);
                 // An exiting bridge leaves the guest past the stub: resume at the popped return address.
                 self.emit_bridge_call(
                     &bridge,
@@ -353,7 +353,7 @@ impl<'a> Lifter<'a> {
         self.get_block(self.current_ip);
 
         let ctx_ptr = self.builder.use_var(self.state.context_ptr);
-        let va_val = self.builder.ins().iconst(types::I64, import_va as i64);
+        let va_val = self.runtime_addr(import_va);
         let va_offset = <X86_64 as GuestArch>::imported_function_va_offset();
         self.ctx_store(va_val, ctx_ptr, va_offset);
 
