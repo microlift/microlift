@@ -10,15 +10,32 @@
 
 use std::sync::atomic::AtomicPtr;
 
+use cranelift_codegen::ir::{AbiParam, Signature, types};
+
+use crate::core::symbol::{DataTarget, HostSymbol, RUNTIME_PROVIDER};
+use crate::os::get_host_calling_conv;
+
 /// Bridge return meaning "exit, and you may link".
 ///
 /// Asserts guest state is complete and `rip` is a destination; a bare non-zero may owe the host work a link would skip.
 pub const RESUME_LINKED: u32 = 2;
 
+/// The host signature every bridge is called with.
+pub fn bridge_signature() -> Signature {
+    let mut sig = Signature::new(get_host_calling_conv());
+    sig.params.push(AbiParam::new(types::I64)); // *mut RegisterContext
+    sig.params.push(AbiParam::new(types::I64)); // import VA / target
+    sig.returns.push(AbiParam::new(types::I32)); // 0 = handled
+    sig
+}
+
 /// Where the lifted code finds the bridge function's address.
+///
+/// Either way the code names the bridge by [`BridgeImport::name`]; the pointer is what
+/// a JIT definition resolves that name to.
 #[derive(Debug, Clone, Copy)]
 pub enum BridgeTarget {
-    /// Baked in as an `iconst`.
+    /// Called as the function [`BridgeImport::symbol`].
     Direct(*const u8),
     /// Loaded from a runtime-owned slot before each call, so it can be re-pointed without re-lifting.
     ///
@@ -29,7 +46,7 @@ pub enum BridgeTarget {
 /// Which guest registers a bridge touches; only `reads` is stored before the call, only `writes` reloaded after.
 ///
 /// Defaults to [`BridgeEffects::full`]. A mask that is too narrow is a miscompile: widen when in doubt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BridgeEffects {
     /// Stored before the call; the stack pointer is always stored.
     pub reads: RegMask,
@@ -57,7 +74,7 @@ impl Default for BridgeEffects {
 }
 
 /// A bitmask over the frontend's register indices (x86-64: `RAX`=0..`R15`=15, `XMM0`..`XMM15`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RegMask {
     pub gprs: u32,
     pub vecs: u32,
@@ -154,7 +171,7 @@ impl Default for RegMask {
 /// A bridge registered for one import address (see the [module docs](self)).
 #[derive(Debug, Clone)]
 pub struct BridgeImport {
-    /// Diagnostics only.
+    /// Its identity in artifacts: unique among the runtime's bridges.
     pub name: &'static str,
     pub target: BridgeTarget,
     /// Defaults to [`BridgeEffects::full`].
@@ -183,6 +200,16 @@ impl BridgeImport {
     pub fn with_effects(mut self, effects: BridgeEffects) -> Self {
         self.effects = effects;
         self
+    }
+
+    /// The function a [`BridgeTarget::Direct`] bridge is called as.
+    pub fn symbol(&self) -> HostSymbol {
+        HostSymbol::function(RUNTIME_PROVIDER, self.name, &bridge_signature())
+    }
+
+    /// The slot a [`BridgeTarget::Slot`] bridge is loaded from.
+    pub fn slot_target(&self) -> DataTarget {
+        DataTarget::Host(HostSymbol::data(RUNTIME_PROVIDER, self.name))
     }
 }
 

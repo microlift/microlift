@@ -17,6 +17,7 @@ pub mod backend;
 pub mod cfg;
 pub mod context;
 pub mod core;
+pub mod image;
 pub mod lifter;
 pub mod os;
 #[cfg(feature = "runtime")]

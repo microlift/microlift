@@ -340,10 +340,11 @@ struct FastRegistry;
 impl ImportRegistry for FastRegistry {
     fn lookup(&self, va: u64) -> Option<ImportKind> {
         (va == IMPORT_VA).then(|| {
-            ImportKind::Fast(microlift::core::FastImport {
-                symbol: double_symbol(),
-                abi: microlift::core::abi::CallAbi::sysv_amd64(),
-            })
+            ImportKind::Fast(microlift::core::FastImport::new(
+                "",
+                double_symbol(),
+                microlift::core::abi::CallAbi::sysv_amd64(),
+            ))
         })
     }
 }

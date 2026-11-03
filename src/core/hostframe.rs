@@ -1,5 +1,5 @@
 /// How deep guest calls may nest as host frames before falling back.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HostFrameConfig {
     /// Bounds host stack use; set against the thread's stack size. Exceeding it falls back to the linked exit.
     pub max_depth: u32,

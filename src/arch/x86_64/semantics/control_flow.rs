@@ -6,7 +6,7 @@ use crate::context::{ExitReason, TransferKind};
 use crate::core::GuestArch;
 use crate::core::abi::ArgLocation;
 use crate::core::bridge::ImportKind;
-use crate::core::{FastCall, FastCallTarget, fat_to_cl_type};
+use crate::core::{FastCall, fat_to_cl_type};
 use crate::function_traits::FunctionArgumentType;
 use crate::lifter::Lifter;
 use cranelift::prelude::*;
@@ -407,8 +407,7 @@ impl<'a> Lifter<'a> {
     ///
     /// Arguments are read per the import's [`CallAbi`] (GPR, XMM, or stack slot at `RSP + offset`; no return address was pushed)
     /// and the result is written to the ABI's return register.
-    /// [`FastCallTarget::Absolute`] (`Jit`) uses `call_indirect`; [`FastCallTarget::Relocatable`] (`RuntimeAssisted`)
-    /// calls a declared function so the object gets a named relocation.
+    /// The callee is a declared function, so every backend sees a named relocation.
     ///
     /// # A fast import must not touch the `RegisterContext`
     ///
@@ -441,15 +440,7 @@ impl<'a> Lifter<'a> {
         // Pinned registers must be in the context while host code runs; it may read the stack or re-enter guest code.
         self.publish_pinned()?;
 
-        let call = match target {
-            FastCallTarget::Absolute { sig_ref, fn_ptr } => {
-                let fn_ptr_val = self.builder.ins().iconst(types::I64, fn_ptr);
-                self.builder
-                    .ins()
-                    .call_indirect(sig_ref, fn_ptr_val, &call_args)
-            }
-            FastCallTarget::Relocatable(func_ref) => self.builder.ins().call(func_ref, &call_args),
-        };
+        let call = self.builder.ins().call(target, &call_args);
 
         let results: Vec<Value> = self.builder.inst_results(call).to_vec();
         let ret_ty = arg_types[0];

@@ -7,11 +7,12 @@ use crate::{
 
 mod cache;
 mod callret;
+pub mod image;
 mod links;
 mod table;
 mod thread;
 
-pub use cache::{CacheStats, CodeCache, Translation};
+pub use cache::{CacheStats, CodeCache, CodeOwner, Translation};
 pub use callret::CallRetStack;
 pub use links::{Entered, ThreadLinks, enter, enter_with, follow_links, follow_links_with};
 pub use table::LinkTable;

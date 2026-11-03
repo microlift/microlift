@@ -123,7 +123,7 @@ impl Spec {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Specialization {
     target: SpecTarget,
     enabled: u32,

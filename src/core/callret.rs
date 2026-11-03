@@ -18,7 +18,7 @@ pub const FRAME_SIZE: u64 = 16;
 pub const CELL_OFFSET: i32 = 8;
 
 /// Shape of the host's call-return ring; baked into every region, so changing it discards translations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CallRetConfig {
     /// Frame count; a power of two (the wrap is a mask). Deeper recursion loses the oldest frames.
     pub entries: u32,

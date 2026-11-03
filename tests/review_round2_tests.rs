@@ -7,7 +7,7 @@ use microlift::arch::x86_64::X86_64;
 use microlift::backend::CraneliftBackend;
 use microlift::context::{ExitReason, RegisterContext};
 use microlift::core::abi::CallAbi;
-use microlift::core::{LifterConfig, lift_to_function};
+use microlift::core::{LifterConfig, lift_to_code, lift_to_function};
 use microlift::function_traits::{DynamicSymbol, FunctionArgumentType};
 use microlift::lifter::Lifter;
 use microlift::os::get_host_calling_conv;
@@ -332,10 +332,10 @@ fn fast_import_with_seven_int_args_compiles() {
     bytes.push(0xC3);
 
     // Must lift and compile without a verifier error.
-    let func = lift_to_function::<X86_64>(&bytes, LIFT_BASE, config).unwrap();
+    let code = lift_to_code::<X86_64>(&bytes, LIFT_BASE, config).unwrap();
     let mut backend = CraneliftBackend::new().unwrap();
     backend
-        .compile(func)
+        .compile_lifted(code)
         .expect("import with a stack-passed argument must compile");
 }
 

@@ -38,7 +38,7 @@ impl Optimization {
 }
 
 /// A set of enabled [`Optimization`]s; defaults to none.
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Optimizations {
     enabled: u32,
 }

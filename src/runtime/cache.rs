@@ -23,7 +23,7 @@ pub struct Translation {
     pub image_base: u64,
     /// Addresses this region can be entered at: the set it may be published under.
     ///
-    /// **In `ctx.rip`'s space.** Under `AddressMode::Direct` this is
+    /// **In `ctx.rip`'s space.** Under `AddressMode::Direct`, or `Relocated` at a zero slide, this is
     /// [`LiftedCode::resume_points`](crate::core::LiftedCode::resume_points); under
     /// [`ImageBaseRelative`](crate::core::AddressMode::ImageBaseRelative) the host must relocate them
     /// (unchecked; wrong values publish rows that never match).
@@ -35,11 +35,17 @@ pub struct Translation {
     pub link_sites: Vec<LinkSite>,
     /// The zeroed-until-installed cell array; null when empty.
     cells: *mut BlockLinkEntry,
-    /// Keeps the JIT pages mapped; dropping the last `Arc` unmaps them.
-    _module: CraneliftBackend,
+    /// Keeps the code mapped; dropping the last `Arc` unmaps it.
+    _owner: Arc<dyn CodeOwner>,
 }
 
-// SAFETY: the raw pointers name pages owned by `_module`, and nothing is mutated after construction.
+/// Whatever keeps a translation's pages mapped: a JIT module, or a loaded image shared
+/// by many translations.
+pub trait CodeOwner {}
+
+impl CodeOwner for CraneliftBackend {}
+
+// SAFETY: the raw pointers name pages owned by `_owner`, and nothing is mutated after construction.
 unsafe impl Send for Translation {}
 unsafe impl Sync for Translation {}
 
@@ -73,6 +79,8 @@ impl Translation {
 
     /// `module` must own the pages `region` points into.
     #[allow(clippy::too_many_arguments)]
+    // `Translation` carries its own `Send`/`Sync` claim for the module it owns.
+    #[allow(clippy::arc_with_non_send_sync)]
     pub fn from_compiled(
         region: CompiledRegion,
         image_base: u64,
@@ -81,6 +89,28 @@ impl Translation {
         data_dependencies: Vec<Range<u64>>,
         link_sites: Vec<LinkSite>,
         module: CraneliftBackend,
+    ) -> Self {
+        Self::from_owned(
+            region,
+            image_base,
+            resume_points,
+            covered,
+            data_dependencies,
+            link_sites,
+            Arc::new(module),
+        )
+    }
+
+    /// [`from_compiled`](Self::from_compiled) for code `owner` keeps mapped.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_owned(
+        region: CompiledRegion,
+        image_base: u64,
+        resume_points: Vec<u64>,
+        covered: Vec<Range<u64>>,
+        data_dependencies: Vec<Range<u64>>,
+        link_sites: Vec<LinkSite>,
+        owner: Arc<dyn CodeOwner>,
     ) -> Self {
         Self {
             entry: region.entry,
@@ -91,7 +121,7 @@ impl Translation {
             data_dependencies,
             link_sites,
             cells: region.link_cells,
-            _module: module,
+            _owner: owner,
         }
     }
 
@@ -279,11 +309,8 @@ impl CodeCache {
 
     /// Distinct published translations (not `inserts`, not resume points).
     pub fn len(&self) -> usize {
-        let mut seen: Vec<*const Translation> = self
-            .by_resume_point
-            .values()
-            .map(Arc::as_ptr)
-            .collect();
+        let mut seen: Vec<*const Translation> =
+            self.by_resume_point.values().map(Arc::as_ptr).collect();
         seen.sort_unstable();
         seen.dedup();
         seen.len()
@@ -320,12 +347,12 @@ impl CodeCache {
             match self.by_resume_point.get(&site.target) {
                 Some(target) => {
                     let row = target.row(site.target);
-            // SAFETY: the cell is in `translation`'s own bounds-checked array.
+                    // SAFETY: the cell is in `translation`'s own bounds-checked array.
                     unsafe { write_cell(cell.cell, Some(row)) };
                     self.links.entry(site.target).or_default().push(cell);
                     bump(&self.stats.cells_installed, 1);
                 }
-            // Not compiled yet: the exit falls through to the table probe.
+                // Not compiled yet: the exit falls through to the table probe.
                 None => self.pending.entry(site.target).or_default().push(cell),
             }
         }
@@ -337,7 +364,7 @@ impl CodeCache {
             };
             let row = translation.row(pc);
             for cell in waiting {
-            // SAFETY: `owner` is alive via the `CellRef`.
+                // SAFETY: `owner` is alive via the `CellRef`.
                 unsafe { write_cell(cell.cell, Some(row)) };
                 bump(&self.stats.cells_installed, 1);
                 self.links.entry(pc).or_default().push(cell);

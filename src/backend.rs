@@ -1,21 +1,37 @@
 use crate::Result;
-use crate::core::srcloc::{GuestCodeMap, SourceLocMap};
 use crate::core::link::{BlockLinkEntry, CELL_SYMBOL, ENTRY_SIZE};
+use crate::core::srcloc::{GuestCodeMap, SourceLocMap};
+use crate::core::symbol::{DataImport, DataTarget, HostImport, HostSymbol};
 use crate::core::{DataObject, HelperFunction, LiftedCode};
+use crate::image::{Image, ImageRegion, ImageReloc, ImageSymbol, RelocTarget, Section, TEXT_ALIGN};
 use cranelift::prelude::*;
+use cranelift_codegen::binemit::Reloc;
+use cranelift_codegen::control::ControlPlane;
 use cranelift_codegen::ir::Function;
+use cranelift_codegen::ir::{ExternalName, UserExternalName};
 use cranelift_codegen::settings::Configurable;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{DataDescription, DataId, Linkage, Module};
 use cranelift_native::builder as native_builder;
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use object::{Object, ObjectSection};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use target_lexicon::Triple;
 
-/// An external function the IR references as `ExternalName::user(0, i)`: `(symbol, host_fn_ptr, signature)`.
-/// AOT backends need only the name and signature.
-pub type AotImport = (&'static str, *const u8, Signature);
+/// What an object file calls a data target; host symbols keep their own names.
+const GUEST_SLIDE_SYMBOL: &str = "__microlift_guest_slide";
+
+fn object_function_name(import: &HostImport) -> String {
+    import.symbol.name.to_string()
+}
+
+fn object_data_name(import: &DataImport) -> String {
+    match &import.target {
+        DataTarget::Host(symbol) => symbol.name.to_string(),
+        DataTarget::GuestSlide => GUEST_SLIDE_SYMBOL.to_string(),
+    }
+}
 
 /// A declared-but-uncompiled helper ([`declare_externals`] / [`define_helpers`]).
 type PendingHelper = (cranelift_module::FuncId, Function);
@@ -24,15 +40,23 @@ type PendingHelper = (cranelift_module::FuncId, Function);
 /// so `FuncId(i) == i`. Helper bodies are compiled later by [`define_helpers`].
 ///
 /// The module must be fresh: helper symbols are per-body.
+/// `names[i]` is what the module calls `imports[i]`; two equal names are one function.
 fn declare_externals<M: Module>(
     module: &mut M,
-    imports: &[AotImport],
+    imports: &[HostImport],
+    names: &[String],
     helpers: Vec<HelperFunction>,
 ) -> Result<Vec<PendingHelper>> {
-    for &(name, _, ref sig) in imports {
-        module
-            .declare_function(name, Linkage::Import, sig)
+    for (index, (import, name)) in imports.iter().zip(names).enumerate() {
+        let id = module
+            .declare_function(name, Linkage::Import, &import.signature)
             .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
+        if id.as_u32() as usize != index {
+            return Err(crate::MicroliftError::CraneliftError(format!(
+                "`{}` and an earlier import share the name `{name}`",
+                import.symbol
+            )));
+        }
     }
 
     helpers
@@ -44,6 +68,27 @@ fn declare_externals<M: Module>(
             Ok((id, helper.func))
         })
         .collect()
+}
+
+/// Refuses a body naming an external nothing was declared for: a dropped import's
+/// `user(0, i)` would otherwise bind to whatever function holds `FuncId(i)`.
+fn check_names(code: &LiftedCode) -> Result<()> {
+    let functions = code.imports.len() + code.helpers.len();
+    let data = !code.link_sites.is_empty() as usize + code.data_objects.len() + code.data_imports.len();
+    for name in code.func.params.user_named_funcs().values() {
+        let declared = match name.namespace {
+            0 => functions,
+            1 => data,
+            _ => 0,
+        };
+        if name.index as usize >= declared {
+            return Err(crate::MicroliftError::CraneliftError(format!(
+                "the body names {name:?}, which the lift did not declare; \
+                 compile the `LiftedCode` from `lift_to_code`, not a bare `Function`"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The guest-instruction map for a function just compiled into `ctx`; empty when
@@ -93,13 +138,15 @@ fn define_cell_array<M: Module>(module: &mut M, sites: usize) -> Result<Option<D
     Ok(Some(id))
 }
 
-/// Declares and defines the namespace-1 data: the link-cell array, then read-only constant tables.
+/// Declares and defines the namespace-1 data: the link-cell array, read-only constant
+/// tables, then the external data named `data_names`.
 ///
 /// Shares one index space (the cell array takes `DataId(0)`); the module must be fresh, asserted.
 fn define_module_data<M: Module>(
     module: &mut M,
     sites: usize,
     tables: &[DataObject],
+    data_names: &[String],
 ) -> Result<Option<DataId>> {
     let cells = define_cell_array(module, sites)?;
     let mut next = cells.is_some() as u32;
@@ -120,6 +167,17 @@ fn define_module_data<M: Module>(
         module
             .define_data(id, &description)
             .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
+        next += 1;
+    }
+    for name in data_names {
+        let id = module
+            .declare_data(name, Linkage::Import, false, false)
+            .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
+        if id.as_u32() != next {
+            return Err(crate::MicroliftError::CraneliftError(format!(
+                "external data `{name}` must be DataId({next}); the name is taken"
+            )));
+        }
         next += 1;
     }
     Ok(cells)
@@ -213,6 +271,8 @@ use capstone::prelude::*;
 
 pub struct CraneliftBackend {
     module: JITModule,
+    /// Name -> address for this module's imports, filled before each definition.
+    resolved: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl CraneliftBackend {
@@ -245,16 +305,47 @@ impl CraneliftBackend {
     pub fn with_flags(flags: settings::Flags, isa_settings: &[(&str, &str)]) -> Result<Self> {
         let isa = Self::native_isa(flags, isa_settings)?;
 
-        let jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+        let resolved: Arc<Mutex<HashMap<String, usize>>> = Arc::default();
+        let mut jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+        let lookup = Arc::clone(&resolved);
+        jit_builder.symbol_lookup_fn(Box::new(move |name| {
+            let resolved = lookup.lock().unwrap_or_else(|e| e.into_inner());
+            resolved.get(name).map(|&address| address as *const u8)
+        }));
         let module = JITModule::new(jit_builder);
 
-        Ok(Self { module })
+        Ok(Self { module, resolved })
+    }
+
+    /// Names this module's imports and records what each resolves to.
+    fn resolve_imports(&self, code: &LiftedCode) -> (Vec<String>, Vec<String>) {
+        let mut resolved = self.resolved.lock().unwrap_or_else(|e| e.into_inner());
+        let functions = code
+            .imports
+            .iter()
+            .enumerate()
+            .map(|(i, import)| {
+                let name = format!("import{i}");
+                resolved.insert(name.clone(), import.address);
+                name
+            })
+            .collect();
+        let data = code
+            .data_imports
+            .iter()
+            .enumerate()
+            .map(|(i, import)| {
+                let name = format!("data{i}");
+                resolved.insert(name.clone(), import.address as usize);
+                name
+            })
+            .collect();
+        (functions, data)
     }
 
     /// JIT-compiles a [`LiftedCode`] including outlined helpers (use for x87).
     ///
-    /// `code.imports` must be empty; for `RuntimeAssisted` use
-    /// [`compile_lifted_with_fast_imports`](Self::compile_lifted_with_fast_imports).
+    /// Imports resolve to the addresses the lift recorded beside their symbols.
     pub fn compile_lifted(&mut self, code: LiftedCode) -> Result<*const u8> {
         Ok(self.compile_lifted_with_map(code)?.0)
     }
@@ -278,19 +369,22 @@ impl CraneliftBackend {
         &mut self,
         code: LiftedCode,
     ) -> Result<(CompiledRegion, GuestCodeMap)> {
-        if !code.imports.is_empty() {
-            return Err(crate::MicroliftError::CraneliftError(
-                "lifted code has relocatable imports; use compile_lifted_with_fast_imports".into(),
-            ));
-        }
+        check_names(&code)?;
         let source_map = code.source_map;
+        let (function_names, data_names) = self.resolve_imports(&code);
         // First, so it is `DataId(0)` (`ExternalName::user(1, 0)`).
         let cells = define_module_data(
             &mut self.module,
             code.link_sites.len(),
             &code.data_objects,
+            &data_names,
         )?;
-        let pending = declare_externals(&mut self.module, &[], code.helpers)?;
+        let pending = declare_externals(
+            &mut self.module,
+            &code.imports,
+            &function_names,
+            code.helpers,
+        )?;
 
         // Read inside `define_region`, before the owning context is recycled.
         let (ids, map) = define_region(&mut self.module, code.func, code.entry_thunk, source_map)?;
@@ -317,60 +411,23 @@ impl CraneliftBackend {
         self.compile_lifted(LiftedCode::from_function(func))
     }
 
-    /// JIT-compiles a `RuntimeAssisted` function with relocatable fast imports.
-    ///
-    /// `imports` is `Lifter::aot_imports()`: element `i` is `ExternalName::user(0, i)`, declared
-    /// first so it gets `FuncId(i)`.
-    pub fn compile_with_fast_imports(
-        func: Function,
-        imports: &[AotImport],
-        flags: settings::Flags,
-        isa_settings: &[(&str, &str)],
-    ) -> Result<*const u8> {
-        Self::compile_lifted_with_fast_imports(
-            LiftedCode::from_function_with_imports(func, imports.to_vec()),
-            flags,
-            isa_settings,
-        )
+    /// The ISA this backend compiles for, as [`isa_fingerprint`] hashes it.
+    pub fn isa(&self) -> &dyn isa::TargetIsa {
+        self.module.isa()
     }
+}
 
-    /// [`compile_with_fast_imports`](Self::compile_with_fast_imports) for a full [`LiftedCode`] (with helpers).
-    pub fn compile_lifted_with_fast_imports(
-        code: LiftedCode,
-        flags: settings::Flags,
-        isa_settings: &[(&str, &str)],
-    ) -> Result<*const u8> {
-        Ok(Self::compile_lifted_with_fast_imports_and_map(code, flags, isa_settings)?.0)
+/// Everything about `isa` compiled code depends on: the triple, the shared flags and
+/// the ISA flags, each by name and value.
+pub fn isa_fingerprint(isa: &dyn isa::TargetIsa) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = crate::core::fingerprint::StableHasher::new();
+    hasher.str(&isa.triple().to_string());
+    hasher.str(&isa.flags().to_string());
+    for value in isa.isa_flags() {
+        hasher.str(&value.to_string());
     }
-
-    /// [`compile_lifted_with_fast_imports`](Self::compile_lifted_with_fast_imports) plus the map.
-    pub fn compile_lifted_with_fast_imports_and_map(
-        code: LiftedCode,
-        flags: settings::Flags,
-        isa_settings: &[(&str, &str)],
-    ) -> Result<(*const u8, GuestCodeMap)> {
-        let source_map = code.source_map;
-        let isa = Self::native_isa(flags, isa_settings)?;
-
-        let mut jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
-        for &(name, ptr, _) in &code.imports {
-            jit_builder.symbol(name, ptr);
-        }
-        let mut module = JITModule::new(jit_builder);
-
-        define_module_data(&mut module, code.link_sites.len(), &code.data_objects)?;
-        let pending = declare_externals(&mut module, &code.imports, code.helpers)?;
-
-        let (ids, map) = define_region(&mut module, code.func, code.entry_thunk, source_map)?;
-
-        define_helpers(&mut module, pending)?;
-        module
-            .finalize_definitions()
-            .map_err(|e| crate::MicroliftError::CraneliftError(e.to_string()))?;
-
-        // Owns its module and returns a bare pointer; a linkable region wants `compile_lifted_region`.
-        Ok((module.get_finalized_function(ids.entry), map))
-    }
+    hasher.finish()
 }
 
 fn missing_arch_feature(triple: &Triple) -> Option<&'static str> {
@@ -393,6 +450,21 @@ fn missing_arch_feature(triple: &Triple) -> Option<&'static str> {
 pub struct ArtifactBackend;
 
 impl ArtifactBackend {
+    /// An [`ImageBuilder`] for `triple` (host when `None`); `config_fingerprint` is
+    /// [`LifterConfig::codegen_fingerprint`](crate::core::LifterConfig::codegen_fingerprint)
+    /// of the config every region added to it was lifted under.
+    pub fn image(
+        triple: Option<&str>,
+        flags: Option<settings::Flags>,
+        isa_settings: &[(&str, &str)],
+        config_fingerprint: u64,
+    ) -> Result<ImageBuilder> {
+        Ok(ImageBuilder::new(
+            Self::get_isa(triple, flags, isa_settings)?,
+            config_fingerprint,
+        ))
+    }
+
     /// A `TargetIsa` for `triple`; `isa_settings` as in the host variant.
     fn get_isa(
         triple: Option<&str>,
@@ -436,11 +508,11 @@ impl ArtifactBackend {
         Ok(isa)
     }
 
-    /// Compiles a `RuntimeAssisted` function to a relocatable object; `imports` is
+    /// Compiles a function with imports to a relocatable object; `imports` is
     /// `Lifter::aot_imports()`, declared before `lifted_func` so `FuncId(i) == i`.
     pub fn compile_to_object_with_fast_imports(
         func: Function,
-        imports: &[AotImport],
+        imports: &[HostImport],
         triple: Option<&str>,
         flags: Option<settings::Flags>,
         isa_settings: &[(&str, &str)],
@@ -479,8 +551,16 @@ impl ArtifactBackend {
         let mut module = ObjectModule::new(obj_builder);
 
         // First, so it is `DataId(0)`; in an object it lands in `.bss` (the uninstalled state).
-        define_module_data(&mut module, code.link_sites.len(), &code.data_objects)?;
-        let pending = declare_externals(&mut module, &code.imports, code.helpers)?;
+        check_names(&code)?;
+        let data_names: Vec<String> = code.data_imports.iter().map(object_data_name).collect();
+        let function_names: Vec<String> = code.imports.iter().map(object_function_name).collect();
+        define_module_data(
+            &mut module,
+            code.link_sites.len(),
+            &code.data_objects,
+            &data_names,
+        )?;
+        let pending = declare_externals(&mut module, &code.imports, &function_names, code.helpers)?;
 
         let (_id, map) = define_region(&mut module, code.func, code.entry_thunk, source_map)?;
 
@@ -641,5 +721,276 @@ impl ArtifactBackend {
         }
 
         Ok(output)
+    }
+}
+
+/// Many compiled regions in one [`Image`]: unique per-region code and cells, helpers and
+/// constant tables emitted once.
+///
+/// Compiles each function with a bare `Context` and keeps its relocations symbolic, so
+/// the result needs no object file, no `dlopen` and no code signing.
+pub struct ImageBuilder {
+    isa: Arc<dyn isa::TargetIsa>,
+    config_fingerprint: u64,
+    text: Vec<u8>,
+    rodata: Vec<u8>,
+    rodata_align: u64,
+    bss_len: u64,
+    symbols: Vec<ImageSymbol>,
+    symbol_index: HashMap<ImageSymbol, u32>,
+    relocs: Vec<ImageReloc>,
+    helpers: HashMap<&'static str, u64>,
+    tables: HashMap<&'static str, u64>,
+    regions: Vec<ImageRegion>,
+}
+
+/// Where one lift's `ExternalName::user(ns, i)` names point inside the image.
+struct RegionNames<'a> {
+    imports: &'a [HostImport],
+    helpers: Vec<u64>,
+    /// Set once the body is placed; only the thunk refers to it.
+    body: Option<u64>,
+    cells: Option<u64>,
+    tables: Vec<u64>,
+    data_imports: &'a [DataImport],
+}
+
+impl ImageBuilder {
+    fn new(isa: Arc<dyn isa::TargetIsa>, config_fingerprint: u64) -> Self {
+        Self {
+            isa,
+            config_fingerprint,
+            text: Vec::new(),
+            rodata: Vec::new(),
+            rodata_align: TEXT_ALIGN,
+            bss_len: 0,
+            symbols: Vec::new(),
+            symbol_index: HashMap::new(),
+            relocs: Vec::new(),
+            helpers: HashMap::new(),
+            tables: HashMap::new(),
+            regions: Vec::new(),
+        }
+    }
+
+    pub fn region_count(&self) -> usize {
+        self.regions.len()
+    }
+
+    /// Compiles `code` into the image. Regions are kept in the order added.
+    pub fn add_region(&mut self, code: LiftedCode) -> Result<()> {
+        let mut helpers = Vec::with_capacity(code.helpers.len());
+        for helper in code.helpers {
+            let offset = match self.helpers.get(helper.name) {
+                Some(&offset) => offset,
+                None => {
+                    // Helper bodies call nothing outside themselves.
+                    let names = RegionNames {
+                        imports: &[],
+                        helpers: Vec::new(),
+                        body: None,
+                        cells: None,
+                        tables: Vec::new(),
+                        data_imports: &[],
+                    };
+                    let (offset, _) = self.compile_function(helper.func, None, &names)?;
+                    self.helpers.insert(helper.name, offset);
+                    offset
+                }
+            };
+            helpers.push(offset);
+        }
+
+        let cells = (!code.link_sites.is_empty()).then(|| {
+            let at = self.bss_len.next_multiple_of(ENTRY_SIZE);
+            self.bss_len = at + code.link_sites.len() as u64 * ENTRY_SIZE;
+            at
+        });
+        let tables = code
+            .data_objects
+            .iter()
+            .map(|table| self.place_table(table))
+            .collect();
+
+        let mut names = RegionNames {
+            imports: &code.imports,
+            helpers,
+            body: None,
+            cells,
+            tables,
+            data_imports: &code.data_imports,
+        };
+        let (body, map) = self.compile_function(code.func, Some(code.source_map), &names)?;
+        names.body = Some(body);
+        let entry = match code.entry_thunk {
+            Some(thunk) => self.compile_function(thunk, None, &names)?.0,
+            None => body,
+        };
+
+        self.regions.push(ImageRegion {
+            lift_base: code.lift_base,
+            entry,
+            link_target: body,
+            cells,
+            resume_points: code.resume_points,
+            covered: code.covered,
+            data_dependencies: code.data_dependencies,
+            link_sites: code.link_sites,
+            import_decisions: code.import_decisions,
+            map,
+        });
+        Ok(())
+    }
+
+    pub fn finish(self) -> Image {
+        Image {
+            isa_fingerprint: isa_fingerprint(&*self.isa),
+            config_fingerprint: self.config_fingerprint,
+            text: self.text,
+            rodata: self.rodata,
+            rodata_align: self.rodata_align,
+            bss_len: self.bss_len,
+            symbols: self.symbols,
+            relocs: self.relocs,
+            regions: self.regions,
+        }
+    }
+
+    /// One copy per table name, which identifies the contents.
+    fn place_table(&mut self, table: &DataObject) -> u64 {
+        if let Some(&offset) = self.tables.get(table.name) {
+            return offset;
+        }
+        let align = table.align.max(1);
+        let offset = (self.rodata.len() as u64).next_multiple_of(align);
+        self.rodata.resize(offset as usize, 0);
+        self.rodata.extend_from_slice(&table.bytes);
+        self.rodata_align = self.rodata_align.max(align);
+        self.tables.insert(table.name, offset);
+        offset
+    }
+
+    fn symbol(&mut self, symbol: ImageSymbol) -> u32 {
+        if let Some(&index) = self.symbol_index.get(&symbol) {
+            return index;
+        }
+        let index = self.symbols.len() as u32;
+        self.symbols.push(symbol.clone());
+        self.symbol_index.insert(symbol, index);
+        index
+    }
+
+    /// Compiles `func`, appends it to `.text` and records its relocations; returns its offset
+    /// and, given the lift's source map, its guest map.
+    fn compile_function(
+        &mut self,
+        func: Function,
+        source_map: Option<SourceLocMap>,
+        names: &RegionNames<'_>,
+    ) -> Result<(u64, GuestCodeMap)> {
+        let mut ctx = cranelift_codegen::Context::for_function(func);
+        let compiled = ctx
+            .compile(&*self.isa, &mut ControlPlane::default())
+            .map_err(|e| crate::MicroliftError::CraneliftError(format!("{:?}", e.inner)))?;
+        let offset = (self.text.len() as u64).next_multiple_of(TEXT_ALIGN);
+        self.text.resize(offset as usize, 0);
+        self.text.extend_from_slice(compiled.code_buffer());
+        let map = source_map
+            .map(|source_map| GuestCodeMap::from_compiled(compiled, source_map))
+            .unwrap_or_default();
+        let relocs: Vec<_> = compiled.buffer.relocs().to_vec();
+
+        for reloc in relocs {
+            if reloc.kind != Reloc::Abs8 {
+                return Err(crate::MicroliftError::CraneliftError(format!(
+                    "relocation {:?} cannot go in an image; every external must be far",
+                    reloc.kind
+                )));
+            }
+            let cranelift_codegen::RelocTarget::ExternalName(name) = &reloc.target else {
+                return Err(crate::MicroliftError::CraneliftError(
+                    "a label relocation cannot go in an image".into(),
+                ));
+            };
+            let target = match name {
+                ExternalName::User(user) => {
+                    let user = ctx.func.params.user_named_funcs()[*user].clone();
+                    self.user_target(user, names)?
+                }
+                ExternalName::LibCall(libcall) => {
+                    let name = (cranelift_module::default_libcall_names())(*libcall);
+                    RelocTarget::Symbol(self.symbol(ImageSymbol::Host(HostSymbol::libcall(&name))))
+                }
+                other => {
+                    return Err(crate::MicroliftError::CraneliftError(format!(
+                        "external {other:?} cannot go in an image"
+                    )));
+                }
+            };
+            self.relocs.push(ImageReloc {
+                offset: offset + u64::from(reloc.offset),
+                target,
+                addend: reloc.addend,
+            });
+        }
+        Ok((offset, map))
+    }
+
+    fn user_target(
+        &mut self,
+        user: UserExternalName,
+        names: &RegionNames<'_>,
+    ) -> Result<RelocTarget> {
+        let unknown = || {
+            crate::MicroliftError::CraneliftError(format!(
+                "relocation to {user:?} names nothing the lift declared"
+            ))
+        };
+        let index = user.index as usize;
+        let text = |offset| RelocTarget::Local {
+            section: Section::Text,
+            offset,
+        };
+        match user.namespace {
+            0 => {
+                if let Some(import) = names.imports.get(index) {
+                    let symbol = self.symbol(ImageSymbol::Host(import.symbol.clone()));
+                    return Ok(RelocTarget::Symbol(symbol));
+                }
+                let local = index - names.imports.len();
+                match names.helpers.get(local) {
+                    Some(&offset) => Ok(text(offset)),
+                    None if local == names.helpers.len() => {
+                        names.body.map(text).ok_or_else(unknown)
+                    }
+                    None => Err(unknown()),
+                }
+            }
+            1 => {
+                let cells = names.cells.is_some() as usize;
+                if index < cells {
+                    return Ok(RelocTarget::Local {
+                        section: Section::Bss,
+                        offset: names.cells.expect("counted above"),
+                    });
+                }
+                if let Some(&offset) = names.tables.get(index - cells) {
+                    return Ok(RelocTarget::Local {
+                        section: Section::Rodata,
+                        offset,
+                    });
+                }
+                let import = names
+                    .data_imports
+                    .get(index - cells - names.tables.len())
+                    .ok_or_else(unknown)?;
+                let symbol = match &import.target {
+                    DataTarget::Host(symbol) => ImageSymbol::Host(symbol.clone()),
+                    DataTarget::GuestSlide => ImageSymbol::GuestSlide,
+                };
+                Ok(RelocTarget::Symbol(self.symbol(symbol)))
+            }
+            _ => Err(unknown()),
+        }
     }
 }

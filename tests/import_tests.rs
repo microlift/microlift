@@ -5,6 +5,7 @@ use cranelift::prelude::*;
 use cranelift_codegen::ir::{Function, UserFuncName};
 use microlift::backend::CraneliftBackend;
 use microlift::context::{ExitReason, RegisterContext};
+use microlift::core::LiftedCode;
 use microlift::core::abi::CallAbi;
 use microlift::function_traits::{DynamicSymbol, trampoline_func};
 use microlift::lifter::{ExecutionMode, Lifter, LifterConfig};
@@ -55,10 +56,13 @@ fn lift_and_compile(bytes: &[u8], mut config: LifterConfig) -> (CraneliftBackend
     let mut lifter = Lifter::with_config(builder, config);
 
     lifter.lift(bytes, LIFT_BASE).expect("lifting failed");
+    let imports = lifter.aot_imports().to_vec();
     drop(lifter); // finalises the FunctionBuilder, releasing &mut func
 
     let mut backend = CraneliftBackend::new().expect("backend init failed");
-    let code_ptr = backend.compile(func).expect("compilation failed");
+    let code_ptr = backend
+        .compile_lifted(LiftedCode::from_function_with_imports(func, imports))
+        .expect("compilation failed");
     (backend, code_ptr)
 }
 
@@ -153,7 +157,7 @@ fn test_import_slow_call_strlen_with_resume() {
     assert_eq!(ctx.rax, 9, "strlen(\"microlift\") should be 9");
 }
 
-/// `RuntimeAssisted` fast-call via `compile_with_fast_imports`: the call is an `ExternalName::user(0, i)` relocation.
+/// A fast call is an `ExternalName::user(0, i)` relocation the JIT resolves.
 #[test]
 fn test_runtime_assisted_fast_call_strlen() {
     let test_string = b"hello, world!\0"; // strlen == 13
@@ -185,13 +189,11 @@ fn test_runtime_assisted_fast_call_strlen() {
     let aot_imports: Vec<_> = lifter.aot_imports().to_vec();
     drop(lifter);
 
-    let code_ptr = CraneliftBackend::compile_with_fast_imports(
-        func,
-        &aot_imports,
-        settings::Flags::new(settings::builder()),
-        &[],
-    )
-    .expect("JIT compilation with fast imports failed");
+    let mut backend =
+        CraneliftBackend::with_flags(settings::Flags::new(settings::builder()), &[]).unwrap();
+    let code_ptr = backend
+        .compile_lifted(LiftedCode::from_function_with_imports(func, aot_imports))
+        .expect("JIT compilation with fast imports failed");
 
     let (mut ctx, _stack) = make_ctx_and_stack();
     let f: fn(*mut RegisterContext) = unsafe { std::mem::transmute(code_ptr) };
@@ -298,13 +300,11 @@ fn test_runtime_assisted_fast_call_two_imports() {
     assert_eq!(aot_imports.len(), 2, "should have exactly 2 AOT imports");
     drop(lifter);
 
-    let code_ptr = CraneliftBackend::compile_with_fast_imports(
-        func,
-        &aot_imports,
-        settings::Flags::new(settings::builder()),
-        &[],
-    )
-    .expect("JIT compilation with fast imports failed");
+    let mut backend =
+        CraneliftBackend::with_flags(settings::Flags::new(settings::builder()), &[]).unwrap();
+    let code_ptr = backend
+        .compile_lifted(LiftedCode::from_function_with_imports(func, aot_imports))
+        .expect("JIT compilation with fast imports failed");
 
     let (mut ctx, _stack) = make_ctx_and_stack();
     let f: fn(*mut RegisterContext) = unsafe { std::mem::transmute(code_ptr) };

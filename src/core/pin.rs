@@ -46,7 +46,7 @@ impl PinnedReg {
 }
 
 /// Ordered guest registers pinned into the link ABI; order is the parameter order, duplicates are refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PinnedAbi {
     slots: [PinnedReg; MAX_PINNED_SLOTS],
     len: u8,

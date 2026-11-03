@@ -352,12 +352,8 @@ fn imports_and_helpers_share_one_index_space() {
         code.func.display()
     );
 
-    let code_ptr = microlift::backend::CraneliftBackend::compile_lifted_with_fast_imports(
-        code,
-        cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder()),
-        &[],
-    )
-    .expect("compile");
+    let mut backend = microlift::backend::CraneliftBackend::new().expect("backend");
+    let code_ptr = backend.compile_lifted(code).expect("compile");
 
     let stack = vec![0u64; 1024];
     let rsp = stack.as_ptr() as u64 + 1024 * 8 - 8;

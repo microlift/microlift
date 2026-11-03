@@ -52,7 +52,8 @@ pub const IMAGE_BASE_OFFSET: i32 = 16;
 /// Reported as [`LiftedCode::link_sites`], in cell order.
 ///
 /// [`LiftedCode::link_sites`]: crate::core::LiftedCode::link_sites
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct LinkSite {
     /// Lift-time VA; relocate it as `runtime_addr` would before matching.
     pub target: u64,
@@ -61,7 +62,8 @@ pub struct LinkSite {
 }
 
 /// What kind of transfer a [`LinkSite`] serves.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum LinkSiteKind {
     /// Branch, call or fallthrough leaving the region for a constant address.
     StaticEdge,
@@ -76,7 +78,7 @@ pub const CELL_SYMBOL: &str = "lifted_cells";
 ///
 /// Changing any field invalidates translations lifted under the old value.
 /// [`set`](Self::set) is the single definition of where a PC lives.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BlockLinkConfig {
     /// Row count; a power of two so the index is a mask.
     pub entries: u32,
@@ -98,7 +100,7 @@ pub struct BlockLinkConfig {
 pub const MAX_WAYS: u32 = 4;
 
 /// What a region does with a resolved successor. The probe is identical up to the address compare.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LinkDispatch {
     /// Publish the row in [`BlockLinkOffsets::hit`] and return; the host calls its `code`.
     HostResume,

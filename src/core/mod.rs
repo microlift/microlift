@@ -9,6 +9,7 @@ pub mod callback;
 pub mod callret;
 pub mod dce;
 pub mod exit;
+pub mod fingerprint;
 pub mod flags;
 pub mod hostframe;
 pub mod link;
@@ -17,9 +18,11 @@ pub mod pin;
 pub mod regsync;
 pub mod specialize;
 pub mod srcloc;
+pub mod symbol;
 pub mod tso;
 
-use std::collections::BTreeSet;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
 use crate::arch::{ControlFlow, ControlFlowKind, InstructionEffects};
@@ -35,6 +38,9 @@ use crate::core::optimize::Optimizations;
 use crate::core::pin::{PinnedAbi, PinnedReg};
 use crate::core::specialize::Specialization;
 use crate::core::srcloc::SourceLocMap;
+use crate::core::symbol::{
+    DataImport, DataTarget, HostImport, HostSymbol, ImportDecision, RUNTIME_PROVIDER,
+};
 use crate::function_traits::{DynamicSymbol, FunctionArgumentType};
 use crate::os::get_host_calling_conv;
 use cranelift::prelude::*;
@@ -183,8 +189,15 @@ pub struct DataObject {
 /// that order so `FuncId(i) == i`.
 pub struct LiftedCode {
     pub func: Function,
-    /// Host symbols for `RuntimeAssisted` fast imports; same as [`LiftEngine::aot_imports`].
-    pub imports: Vec<(&'static str, *const u8, Signature)>,
+    /// The address the region was lifted at.
+    pub lift_base: u64,
+    /// Host functions called: fast imports and bridges, `ExternalName::user(0, i)`.
+    pub imports: Vec<HostImport>,
+    /// Host data and the guest slide, `ExternalName::user(1, i)` after the cells and tables.
+    pub data_imports: Vec<DataImport>,
+    /// Every import lookup the lift made, by address, ascending: a region is valid only
+    /// where the same lookups give the same answers.
+    pub import_decisions: Vec<(u64, ImportDecision)>,
     /// Local helper bodies, e.g. outlined x87 kernels.
     pub helpers: Vec<HelperFunction>,
     /// Analysis-mode call targets; see [`lift_to_function_with_call_targets`].
@@ -225,7 +238,10 @@ impl LiftedCode {
     pub fn from_function(func: Function) -> Self {
         Self {
             func,
+            lift_base: 0,
             imports: Vec::new(),
+            data_imports: Vec::new(),
+            import_decisions: Vec::new(),
             helpers: Vec::new(),
             analysis_call_targets: Vec::new(),
             source_map: SourceLocMap::default(),
@@ -239,10 +255,7 @@ impl LiftedCode {
     }
 
     /// [`from_function`](Self::from_function) with fast-call imports; index `i` is `ExternalName::user(0, i)`.
-    pub fn from_function_with_imports(
-        func: Function,
-        imports: Vec<(&'static str, *const u8, Signature)>,
-    ) -> Self {
+    pub fn from_function_with_imports(func: Function, imports: Vec<HostImport>) -> Self {
         Self {
             imports,
             ..Self::from_function(func)
@@ -365,6 +378,9 @@ pub fn lift_to_code<A: GuestArch>(
     engine.lift(bytes, ip)?;
     let analysis_call_targets = std::mem::take(&mut engine.analysis_call_targets);
     let imports = std::mem::take(&mut engine.aot_imports);
+    let data_imports = engine.take_data_imports();
+    let import_decisions = engine.import_decisions.take().into_iter().collect();
+    let lift_base = engine.lift_base;
     let source_map = engine.source_map;
     let resume_points = std::mem::take(&mut engine.emitted_resume_points);
     let covered = std::mem::take(&mut engine.covered);
@@ -383,7 +399,10 @@ pub fn lift_to_code<A: GuestArch>(
 
     Ok(LiftedCode {
         func,
+        lift_base,
         imports,
+        data_imports,
+        import_decisions,
         helpers,
         analysis_call_targets,
         source_map,
@@ -483,93 +502,70 @@ pub(crate) fn build_import_sig(
     sig
 }
 
-/// Build the [`FastCall`] for one fast import, declaring its signature (and, in
-/// `RuntimeAssisted`, its external function and `aot_imports` entry).
+/// Build the [`FastCall`] for one fast import, importing its host symbol.
 ///
 /// `None` when it can't be fast-called; the caller falls back to the slow exit.
-/// Keeps one `FuncRef` per symbol name.
-fn build_fast_call(
-    builder: &mut FunctionBuilder,
-    execution_mode: ExecutionMode,
-    aot_imports: &mut Vec<(&'static str, *const u8, Signature)>,
-    fast_call_by_name: &mut HashMap<&'static str, FastCall>,
+fn build_fast_call<A: GuestArch>(
+    engine: &mut LiftEngine<'_, A>,
     import: &FastImport,
 ) -> Option<FastCall> {
     let sym = &import.symbol;
     if sym.is_ellipsis_function || !import.abi.can_fast_call(&sym.arg_types) {
         return None;
     }
-    // The signature is the host callee; the ABI is where the guest left arguments.
-    let host_cc = import
-        .abi
-        .host_call_conv
-        .unwrap_or_else(get_host_calling_conv);
-    Some(match execution_mode {
-        ExecutionMode::Jit => {
-            let sig = build_import_sig(&sym.arg_types, host_cc);
-            FastCall {
-                target: FastCallTarget::Absolute {
-                    sig_ref: builder.import_signature(sig),
-                    fn_ptr: sym.value as i64,
-                },
-                arg_types: sym.arg_types.clone(),
-                abi: import.abi.clone(),
-            }
-        }
-        ExecutionMode::RuntimeAssisted => match fast_call_by_name.get(sym.name) {
-            Some(existing) => existing.clone(),
-            None => {
-                let index = aot_imports.len() as u32;
-                let sig = build_import_sig(&sym.arg_types, host_cc);
-                let sig_ref = builder.import_signature(sig.clone());
-                let user_name = builder
-                    .func
-                    .declare_imported_user_function(UserExternalName {
-                        namespace: 0,
-                        index,
-                    });
-                let func_ref = builder.import_function(ExtFuncData {
-                    name: ExternalName::user(user_name),
-                    signature: sig_ref,
-                    colocated: false,
-                    patchable: false,
-                });
-                aot_imports.push((sym.name, sym.value as *const u8, sig));
-                let fast_call = FastCall {
-                    target: FastCallTarget::Relocatable(func_ref),
-                    arg_types: sym.arg_types.clone(),
-                    abi: import.abi.clone(),
-                };
-                fast_call_by_name.insert(sym.name, fast_call.clone());
-                fast_call
-            }
-        },
+    let sig = import.host_signature();
+    // A symbol already bound elsewhere in this lift demotes the site to a slow exit.
+    let target = engine.host_function(import.host_symbol(), sym.value as usize, sig)?;
+    Some(FastCall {
+        target,
+        arg_types: sym.arg_types.clone(),
+        abi: import.abi.clone(),
     })
 }
 
 /// A fast-call import: host function plus the guest convention of its call sites.
 #[derive(Debug, Clone)]
 pub struct FastImport {
+    /// The library that binds the site; with the name and signature, the callee's identity.
+    pub provider: Arc<str>,
     pub symbol: DynamicSymbol,
     pub abi: CallAbi,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum FastCallTarget {
-    /// `Jit`: `call_indirect` through the absolute address.
-    Absolute { sig_ref: SigRef, fn_ptr: i64 },
-    /// `RuntimeAssisted`: `call` a declared external so the object backend emits a relocation.
-    Relocatable(FuncRef),
+impl FastImport {
+    pub fn new(provider: &str, symbol: DynamicSymbol, abi: CallAbi) -> Self {
+        Self {
+            provider: provider.into(),
+            symbol,
+            abi,
+        }
+    }
+
+    /// The host signature the callee is called with; the ABI is where the guest left arguments.
+    pub fn host_signature(&self) -> Signature {
+        let host_cc = self
+            .abi
+            .host_call_conv
+            .unwrap_or_else(get_host_calling_conv);
+        build_import_sig(&self.symbol.arg_types, host_cc)
+    }
+
+    /// What lifted code calls this import as.
+    pub fn host_symbol(&self) -> HostSymbol {
+        HostSymbol::function(&self.provider, self.symbol.name, &self.host_signature())
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct FastCall {
-    pub target: FastCallTarget,
+    /// A declared external, so both backends see a named relocation rather than an address.
+    pub target: FuncRef,
     /// `[0]` is the return type; `[1..]` the parameter types.
     pub arg_types: Vec<FunctionArgumentType>,
     pub abi: CallAbi,
 }
 
+/// Selects nothing: every host reference is a relocation in every mode ([`crate::core::symbol`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ExecutionMode {
     #[default]
@@ -579,12 +575,15 @@ pub enum ExecutionMode {
 
 /// How lifted code materializes lift-time guest VAs (RIP-relative operands, exit
 /// PCs, return addresses, dispatch).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum AddressMode {
-    /// `image_base + (va - lift_base)`: relocatable, so compiled code can be cached
-    /// across runs. Required by `RuntimeAssisted`.
+    /// `image_base + (va - lift_base)`, with `image_base` read from the context.
     #[default]
     ImageBaseRelative,
+    /// `slide + va`, the slide a [`DataTarget::GuestSlide`] relocation patched in once at
+    /// definition or load, so no use pays an add. JIT definitions take
+    /// [`LifterConfig::guest_slide`].
+    Relocated,
     /// Baked-in `iconst` VAs, valid only at the lift base; for JITs that re-lift each run.
     /// `RegisterContext::image_base` is ignored and exit PCs are plain lift-time VAs.
     Direct,
@@ -594,7 +593,7 @@ pub enum AddressMode {
 ///
 /// Cranelift lowers `I128` `atomic_cas` only on x64 with `has_cmpxchg16b` (off in
 /// the baseline feature set; AOT callers pass it via `isa_settings`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Atomic128Mode {
     /// Plain 128-bit load/compare/store: portable, **not atomic**. Default.
     #[default]
@@ -614,7 +613,7 @@ pub enum Atomic128Mode {
 /// x86 yields the floating indefinite (`0xFFC0_0000` single); AArch64's default is
 /// `0x7FC0_0000`. Propagated NaNs are untouched either way. Exactness costs about
 /// six instructions on every FP operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum GeneratedNan {
     /// Materialise x86's floating indefinite; bit-exact. Default.
     #[default]
@@ -631,7 +630,7 @@ pub enum GeneratedNan {
 /// The main lever on compile time of large regions: each arm makes every register
 /// live into it (128 KiB of `__text`: 1.42s per leader vs 19.36s per instruction).
 /// Pick the smallest mode covering everywhere the host can leave from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum VmResumptionPoints {
     /// No dispatch: enterable only at the entry, so entering elsewhere *silently* runs
     /// from the top. For hosts that translate a fresh region at every exit PC.
@@ -650,6 +649,9 @@ pub struct LifterConfig {
     pub execution_mode: ExecutionMode,
     /// How guest VAs are materialized. Default `ImageBaseRelative` (relocatable artifacts).
     pub address_mode: AddressMode,
+    /// What a JIT definition resolves the guest slide to under [`AddressMode::Relocated`].
+    /// Never in the code, so never in [`codegen_fingerprint`](Self::codegen_fingerprint).
+    pub guest_slide: u64,
     /// Immutable segments at lift time, letting VSA fold loads to constants.
     ///
     /// **Never list writable data.** `Arc` because cloning per region deep-copied
@@ -756,6 +758,7 @@ impl Default for LifterConfig {
         Self {
             execution_mode: ExecutionMode::Jit,
             address_mode: AddressMode::ImageBaseRelative,
+            guest_slide: 0,
             segments: Arc::new(Vec::new()),
             interpreter_fallback: false,
             resumption: VmResumptionPoints::default(),
@@ -803,7 +806,19 @@ impl LifterConfig {
     /// in machine registers. Use a [bridge](crate::core::bridge) or
     /// [slow import](Self::register_slow_import) instead.
     pub fn register_fast_import(&mut self, va: u64, symbol: DynamicSymbol, abi: CallAbi) {
-        Arc::make_mut(&mut self.imports).insert(va, ImportKind::Fast(FastImport { symbol, abi }));
+        self.register_fast_import_from(va, RUNTIME_PROVIDER, symbol, abi);
+    }
+
+    /// [`register_fast_import`](Self::register_fast_import) for a symbol `provider` exports.
+    pub fn register_fast_import_from(
+        &mut self,
+        va: u64,
+        provider: &str,
+        symbol: DynamicSymbol,
+        abi: CallAbi,
+    ) {
+        Arc::make_mut(&mut self.imports)
+            .insert(va, ImportKind::Fast(FastImport::new(provider, symbol, abi)));
     }
 
     /// Register an import that always takes an `ImportedFunctionCall` VM exit.
@@ -813,8 +828,7 @@ impl LifterConfig {
 
     /// Register an import reached through a bridge; see [`crate::core::bridge`].
     ///
-    /// More general than a fast import and cheaper than a slow exit. The bridge
-    /// address is baked in, so AOT output is valid only where it maps at that address.
+    /// More general than a fast import and cheaper than a slow exit.
     pub fn register_bridge_import(&mut self, va: u64, bridge: BridgeImport) {
         Arc::make_mut(&mut self.imports).insert(va, ImportKind::Bridge(bridge));
     }
@@ -899,12 +913,17 @@ pub struct LiftEngine<'a, A: GuestArch = crate::arch::x86_64::X86_64> {
     callback_sigs: HashMap<usize, SigRef>,
     /// Fast-call data for non-variadic imports by VA, filled lazily.
     pub fast_calls: HashMap<u64, FastCall>,
-    /// One [`FastCall`] per symbol *name* (a PLT stub and its GOT slot share one); a
-    /// duplicate would break `FuncId(i) == i` in the object backend.
-    fast_call_by_name: HashMap<&'static str, FastCall>,
+    /// One callee per [`HostSymbol`] (a PLT stub and its GOT slot share one); a
+    /// duplicate would break `FuncId(i) == i` in the module backends.
+    host_func_refs: HashMap<HostSymbol, (FuncRef, usize)>,
     bridge_sig: Option<SigRef>,
     /// External functions; index `i` is `ExternalName::user(0, i)`.
-    pub aot_imports: Vec<(&'static str, *const u8, Signature)>,
+    pub aot_imports: Vec<HostImport>,
+    /// External data in first-use order; indices provisional until [`Self::finish`].
+    data_imports: Vec<DataImportEntry>,
+    data_import_refs: HashMap<DataTarget, (cranelift_codegen::ir::GlobalValue, u64)>,
+    /// [`LiftedCode::import_decisions`]; behind a cell because lookups are `&self`.
+    import_decisions: RefCell<BTreeMap<u64, ImportDecision>>,
     /// Transfer kind of each unvisited block, for `finish()`.
     pub block_transfer_kinds: HashMap<Block, TransferKind>,
     /// Analysis mode: callee VA per `call`, indexed by `ExternalName::user(ANALYSIS_CALL_NAMESPACE, i)`;
@@ -978,6 +997,12 @@ struct DataEntry {
     name_ref: UserExternalNameRef,
 }
 
+/// An external data reference under construction; [`LiftEngine::finish`] rewrites its name index.
+struct DataImportEntry {
+    import: DataImport,
+    name_ref: UserExternalNameRef,
+}
+
 /// A helper under construction; [`LiftEngine::finish`] rewrites its name index.
 struct HelperEntry {
     name: &'static str,
@@ -992,6 +1017,9 @@ const PROVISIONAL_HELPER_INDEX: u32 = 0x8000_0000;
 /// Provisional namespace-1 index; index 0 is the link-cell array, whose presence is
 /// unknown until the last exit stub.
 const PROVISIONAL_DATA_INDEX: u32 = 0x8000_0000;
+
+/// Provisional namespace-1 index of external data, which follows the tables.
+const PROVISIONAL_DATA_IMPORT_INDEX: u32 = 0xC000_0000;
 
 /// One recovered jump table in guest-agnostic terms, crossing [`GuestArch::jump_table_targets`].
 /// `extent` travels with the targets because `targets` is de-duplicated.
@@ -1055,8 +1083,6 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
 
         // Built lazily by `fast_call_for`; eager building cost the whole import table per region.
         let fast_calls: HashMap<u64, FastCall> = HashMap::new();
-        let aot_imports: Vec<(&'static str, *const u8, Signature)> = Vec::new();
-        let fast_call_by_name: HashMap<&'static str, FastCall> = HashMap::new();
 
         Self {
             builder,
@@ -1073,9 +1099,12 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             flag_values: Vec::new(),
             callback_sigs: HashMap::new(),
             fast_calls,
-            fast_call_by_name,
+            host_func_refs: HashMap::new(),
             bridge_sig: None,
-            aot_imports,
+            aot_imports: Vec::new(),
+            data_imports: Vec::new(),
+            data_import_refs: HashMap::new(),
+            import_decisions: RefCell::new(BTreeMap::new()),
             block_transfer_kinds: HashMap::new(),
             analysis_call_targets: Vec::new(),
             analysis_call_sig: None,
@@ -1456,9 +1485,11 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
     /// the region has one, which is settled only after the exit stubs.
     fn finalize_data_indices(&mut self) {
         let base = !self.link_sites.is_empty() as u32;
-        for (ordinal, data) in self.data_objects.iter().enumerate() {
+        let tables = self.data_objects.iter().map(|d| d.name_ref);
+        let imports = self.data_imports.iter().map(|d| d.name_ref);
+        for (ordinal, name_ref) in tables.chain(imports).enumerate() {
             self.builder.func.params.reset_user_func_name(
-                data.name_ref,
+                name_ref,
                 UserExternalName {
                     namespace: 1,
                     index: base + ordinal as u32,
@@ -1557,22 +1588,23 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
     /// Config imports win over the registry, which is queried per call site so a lift
     /// after `dlopen` sees the new stubs.
     pub fn lookup_import(&self, va: u64) -> Option<ImportKind> {
-        if let Some(kind) = self.config.imports.get(&va) {
-            return Some(kind.clone());
-        }
-        self.config
-            .import_registry
-            .as_ref()
-            .and_then(|r| r.lookup(va))
-    }
-
-    pub fn is_import(&self, va: u64) -> bool {
-        self.config.imports.contains_key(&va)
-            || self
+        let kind = match self.config.imports.get(&va) {
+            Some(kind) => Some(kind.clone()),
+            None => self
                 .config
                 .import_registry
                 .as_ref()
-                .is_some_and(|r| r.lookup(va).is_some())
+                .and_then(|r| r.lookup(va)),
+        };
+        self.import_decisions
+            .borrow_mut()
+            .entry(va)
+            .or_insert_with(|| ImportDecision::of(kind.as_ref()));
+        kind
+    }
+
+    pub fn is_import(&self, va: u64) -> bool {
+        self.lookup_import(va).is_some()
     }
 
     /// The [`FastCall`] for import `va`, built and cached on first use. `None` falls back
@@ -1584,13 +1616,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         let ImportKind::Fast(import) = self.lookup_import(va)? else {
             return None;
         };
-        let fast_call = build_fast_call(
-            &mut self.builder,
-            self.config.execution_mode,
-            &mut self.aot_imports,
-            &mut self.fast_call_by_name,
-            &import,
-        )?;
+        let fast_call = build_fast_call(self, &import)?;
         self.fast_calls.insert(va, fast_call.clone());
         Some(fast_call)
     }
@@ -1710,19 +1736,125 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         match self.bridge_sig {
             Some(sig) => sig,
             None => {
-                let mut sig = Signature::new(get_host_calling_conv());
-                sig.params.push(AbiParam::new(types::I64)); // *mut RegisterContext
-                sig.params.push(AbiParam::new(types::I64)); // import VA / target
-                sig.returns.push(AbiParam::new(types::I32)); // 0 = handled
-                let sig_ref = self.builder.import_signature(sig);
+                let sig_ref = self
+                    .builder
+                    .import_signature(crate::core::bridge::bridge_signature());
                 self.bridge_sig = Some(sig_ref);
                 sig_ref
             }
         }
     }
 
-    pub fn aot_imports(&self) -> &[(&'static str, *const u8, Signature)] {
+    pub fn aot_imports(&self) -> &[HostImport] {
         &self.aot_imports
+    }
+
+    /// A callable reference to host function `symbol`, imported on first use.
+    ///
+    /// `address` is only what a JIT definition resolves it to; the code names `symbol`.
+    /// `None` when `symbol` already stands for another address in this lift: one name
+    /// cannot mean two functions.
+    pub fn host_function(
+        &mut self,
+        symbol: HostSymbol,
+        address: usize,
+        signature: Signature,
+    ) -> Option<FuncRef> {
+        if let Some(&(func_ref, bound)) = self.host_func_refs.get(&symbol) {
+            return (bound == address).then_some(func_ref);
+        }
+        let index = self.aot_imports.len() as u32;
+        let sig_ref = self.builder.import_signature(signature.clone());
+        let name_ref = self
+            .builder
+            .func
+            .declare_imported_user_function(UserExternalName {
+                namespace: 0,
+                index,
+            });
+        let func_ref = self.builder.import_function(ExtFuncData {
+            name: ExternalName::user(name_ref),
+            signature: sig_ref,
+            // Far: a non-colocated call loads an absolute address, so any distance resolves.
+            colocated: false,
+            patchable: false,
+        });
+        self.aot_imports.push(HostImport {
+            symbol: symbol.clone(),
+            address,
+            signature,
+        });
+        self.host_func_refs.insert(symbol, (func_ref, address));
+        Some(func_ref)
+    }
+
+    /// The address of `target` plus `offset`, as one relocated constant; `None` when
+    /// `target` already stands for another address in this lift.
+    pub fn data_address(&mut self, target: DataTarget, address: u64, offset: i64) -> Option<Value> {
+        let base = match self.data_import_refs.get(&target) {
+            Some(&(gv, bound)) if bound == address => gv,
+            Some(_) => return None,
+            None => {
+                let name_ref = self
+                    .builder
+                    .func
+                    .declare_imported_user_function(UserExternalName {
+                        namespace: 1,
+                        index: PROVISIONAL_DATA_IMPORT_INDEX + self.data_imports.len() as u32,
+                    });
+                let gv = self.builder.func.create_global_value(
+                    cranelift_codegen::ir::GlobalValueData::Symbol {
+                        name: ExternalName::user(name_ref),
+                        offset: 0.into(),
+                        // Far, for the same `adrp` range reason as the cell array.
+                        colocated: false,
+                        tls: false,
+                    },
+                );
+                self.data_imports.push(DataImportEntry {
+                    import: DataImport {
+                        target: target.clone(),
+                        address,
+                    },
+                    name_ref,
+                });
+                self.data_import_refs.insert(target, (gv, address));
+                gv
+            }
+        };
+        if offset == 0 {
+            return Some(self.builder.ins().symbol_value(types::I64, base));
+        }
+        let cranelift_codegen::ir::GlobalValueData::Symbol { name, .. } =
+            self.builder.func.global_values[base].clone()
+        else {
+            unreachable!("data imports are symbols")
+        };
+        let gv =
+            self.builder
+                .func
+                .create_global_value(cranelift_codegen::ir::GlobalValueData::Symbol {
+                    name,
+                    offset: offset.into(),
+                    colocated: false,
+                    tls: false,
+                });
+        Some(self.builder.ins().symbol_value(types::I64, gv))
+    }
+
+    /// `slide + offset` under [`AddressMode::Relocated`].
+    fn slid(&mut self, offset: u64) -> Value {
+        let slide = self.config.guest_slide;
+        self.data_address(DataTarget::GuestSlide, slide, offset as i64)
+            .expect("a lift has one slide")
+    }
+
+    /// Take the external data references; valid only after [`Self::finish`].
+    pub fn take_data_imports(&mut self) -> Vec<DataImport> {
+        std::mem::take(&mut self.data_imports)
+            .into_iter()
+            .map(|d| d.import)
+            .collect()
     }
 
     pub fn get_block(&mut self, offset: u64) -> Block {
@@ -1842,6 +1974,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                 let base = self.lift_base;
                 self.builder.ins().iconst(types::I64, base as i64)
             }
+            AddressMode::Relocated => self.slid(self.lift_base),
         }
     }
 
@@ -1855,6 +1988,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                 self.builder.ins().iadd_imm_s(image_base, offset as i64)
             }
             AddressMode::Direct => self.builder.ins().iconst(types::I64, va as i64),
+            AddressMode::Relocated => self.slid(va),
         }
     }
 
@@ -1872,6 +2006,10 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                 self.builder.ins().iadd_imm_s(rel, self.lift_base as i64)
             }
             AddressMode::Direct => addr,
+            AddressMode::Relocated => {
+                let slide = self.slid(0);
+                self.builder.ins().isub(addr, slide)
+            }
         }
     }
 

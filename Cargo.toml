@@ -70,6 +70,10 @@ name = "bridge_tests"
 required-features = ["testkit"]
 
 [[test]]
+name = "image_tests"
+required-features = ["testkit"]
+
+[[test]]
 name = "jump_table_tests"
 required-features = ["testkit"]
 

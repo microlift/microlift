@@ -8,7 +8,7 @@ use crate::arch::x86_64::Lifter;
 use crate::arch::x86_64::X86_64;
 use crate::context::ExitReason;
 use crate::core::GuestArch;
-use crate::core::bridge::{BridgeImport, BridgeTarget, RESUME_LINKED, RegMask};
+use crate::core::bridge::{BridgeImport, BridgeTarget, RESUME_LINKED, RegMask, bridge_signature};
 use cranelift::prelude::*;
 
 impl<'a> Lifter<'a> {
@@ -35,12 +35,7 @@ impl<'a> Lifter<'a> {
         self.publish_pinned()?;
         self.flush_rip_and_reason(pc, reason)?;
 
-        let bridge_ptr = self.bridge_target_ptr(&bridge.target);
-        let sig = self.bridge_sig();
-        let call = self
-            .builder
-            .ins()
-            .call_indirect(sig, bridge_ptr, &[ctx_ptr, callee]);
+        let call = self.emit_bridge_invoke(bridge, &[ctx_ptr, callee])?;
         let handled = self.builder.inst_results(call)[0];
 
         let exit_block = self.builder.create_block();
@@ -94,17 +89,40 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Materialise the address to `call_indirect` through.
-    fn bridge_target_ptr(&mut self, target: &BridgeTarget) -> Value {
-        match *target {
-            BridgeTarget::Direct(ptr) => self.builder.ins().iconst(types::I64, ptr as i64),
+    /// Call the bridge by name, or through the named slot.
+    fn emit_bridge_invoke(
+        &mut self,
+        bridge: &BridgeImport,
+        args: &[Value],
+    ) -> crate::Result<cranelift_codegen::ir::Inst> {
+        Ok(match bridge.target {
+            BridgeTarget::Direct(ptr) => {
+                let callee = self
+                    .host_function(bridge.symbol(), ptr as usize, bridge_signature())
+                    .ok_or_else(|| {
+                        crate::MicroliftError::CraneliftError(format!(
+                            "two bridges are named `{}`; a bridge's name is its identity",
+                            bridge.name
+                        ))
+                    })?;
+                self.builder.ins().call(callee, args)
+            }
             BridgeTarget::Slot(slot) => {
-                let slot_addr = self.builder.ins().iconst(types::I64, slot as i64);
+                let slot_addr = self
+                    .data_address(bridge.slot_target(), slot as u64, 0)
+                    .ok_or_else(|| {
+                        crate::MicroliftError::CraneliftError(format!(
+                            "two bridge slots are named `{}`; a bridge's name is its identity",
+                            bridge.name
+                        ))
+                    })?;
                 // Not readonly: the slot is live-updatable (see `BridgeTarget::Slot`); own alias region.
                 let flags = self.host_slot_flags;
-                self.builder.ins().load(types::I64, flags, slot_addr, 0)
+                let bridge_ptr = self.builder.ins().load(types::I64, flags, slot_addr, 0);
+                let sig = self.bridge_sig();
+                self.builder.ins().call_indirect(sig, bridge_ptr, args)
             }
-        }
+        })
     }
 }
 
