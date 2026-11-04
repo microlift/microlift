@@ -94,6 +94,9 @@ pub fn gpr_index(reg: Register) -> Option<u8> {
     GPR_ORDER.iter().position(|&r| r == full).map(|i| i as u8)
 }
 
+/// A lift-local XMM slot past the sixteen guest ones: never loaded, synced or marked written.
+pub const XMM_SCRATCH: u8 = 16;
+
 /// Mapping of x86 registers to Cranelift variables. Written-register tracking lives on the engine
 /// ([`LiftEngine::mark_written`](crate::core::LiftEngine::mark_written)).
 pub struct RegisterState {
@@ -134,11 +137,11 @@ impl RegisterState {
         let mut xmms_hi = HashMap::new();
         let mut xmms_vec = HashMap::new();
         if use_vector_xmm {
-            for i in 0u8..16 {
+            for i in 0u8..=XMM_SCRATCH {
                 xmms_vec.insert(i, builder.declare_var(types::I64X2));
             }
         } else {
-            for i in 0u8..16 {
+            for i in 0u8..=XMM_SCRATCH {
                 xmms_lo.insert(i, builder.declare_var(types::I64));
                 xmms_hi.insert(i, builder.declare_var(types::I64));
             }

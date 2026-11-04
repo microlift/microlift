@@ -5,6 +5,7 @@
 use iced_x86::{Instruction, Mnemonic, Register, RflagsBits};
 
 use crate::arch::x86_64::regs::X86Flag;
+use crate::arch::x86_64::vex::{legacy_form, vex_lowering};
 use crate::core::flags::{FlagEffects, FlagSet};
 
 /// One flag, as a set; the bit index is the `X86Flag` discriminant, which the semantics also pass to
@@ -36,6 +37,13 @@ pub fn flag_effects(i: &Instruction) -> Option<FlagEffects> {
         || i.is_invalid()
     {
         return None;
+    }
+
+    if let Some(lowering) = vex_lowering(i) {
+        return match legacy_form(i, lowering) {
+            Some(legacy) => flag_effects(&legacy),
+            None => Some(FlagEffects::TRANSPARENT),
+        };
     }
 
     let effects = match i.mnemonic() {
@@ -292,6 +300,7 @@ fn is_flag_free(m: Mnemonic) -> bool {
             | Mnemonic::Pavgw
             | Mnemonic::Pblendvb
             | Mnemonic::Pblendw
+            | Mnemonic::Pclmulqdq
             | Mnemonic::Pcmpeqb
             | Mnemonic::Pcmpeqd
             | Mnemonic::Pcmpeqq

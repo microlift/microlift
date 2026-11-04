@@ -6,8 +6,10 @@ pub mod aes;
 pub mod arith_spec;
 pub mod arithmetic;
 pub mod atomics;
+pub mod avx;
 pub mod bitops;
 pub mod bridge;
+pub mod clmul;
 pub mod cond;
 pub mod control_flow;
 pub mod crc32;
@@ -31,6 +33,7 @@ use crate::arch::x86_64::semantics::fpu::FpuOp;
 use crate::arch::x86_64::semantics::sse::{PackedLaneOp, PackedShiftOp, PackedWidth};
 use crate::arch::x86_64::semantics::sse_int::HorizOp;
 use crate::arch::x86_64::semantics::sse_str::PcmpstrForm;
+use crate::arch::x86_64::vex::vex_lowering;
 use crate::lifter::Lifter;
 use iced_x86::{Instruction, Mnemonic, OpKind, Register};
 
@@ -44,6 +47,10 @@ impl<'a> Lifter<'a> {
         // MMX encodings alias the unmodelled x87 stack: exit to the host.
         if uses_mmx_register(instruction) {
             return self.handle_unimplemented_instruction(instruction);
+        }
+
+        if let Some(lowering) = vex_lowering(instruction) {
+            return self.handle_vex(instruction, lowering);
         }
 
         match instruction.mnemonic() {
@@ -335,6 +342,7 @@ impl<'a> Lifter<'a> {
             Mnemonic::Aesdeclast => self.handle_aes_round(instruction, AesKernel::DecLast),
             Mnemonic::Aesimc => self.handle_aesimc(instruction),
             Mnemonic::Aeskeygenassist => self.handle_aeskeygenassist(instruction),
+            Mnemonic::Pclmulqdq => self.handle_pclmulqdq(instruction),
 
             // SSE4.2 packed string compares share one handler; the `REX.W` spellings are separate mnemonics.
             Mnemonic::Pcmpistri

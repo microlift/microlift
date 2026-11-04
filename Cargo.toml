@@ -208,6 +208,10 @@ name = "sse_vec_equiv_tests"
 required-features = ["testkit"]
 
 [[test]]
+name = "avx_tests"
+required-features = ["testkit"]
+
+[[test]]
 name = "generated_nan_tests"
 required-features = ["testkit"]
 

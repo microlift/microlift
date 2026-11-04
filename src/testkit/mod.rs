@@ -403,9 +403,10 @@ fn cross_check_unicorn(bytes: &[u8], ip: u64, init: &oracle::CpuState, outcome: 
         writes_data_mem,
         has_syscall,
         reads_undefined_flags,
+        has_vex,
     } = analyze_program(bytes, ip);
 
-    if has_syscall || reads_undefined_flags {
+    if has_syscall || reads_undefined_flags || has_vex {
         return;
     }
 
@@ -449,12 +450,16 @@ struct ProgramFacts {
     has_syscall: bool,
     /// Whether any instruction reads a flag an earlier instruction left undefined.
     reads_undefined_flags: bool,
+    /// Unicorn's QEMU core predates AVX: it runs a VEX encoding as its legacy form, ignoring `VEX.vvvv`.
+    has_vex: bool,
 }
 
 /// Linear-sweep decode from `ip` to derive [`ProgramFacts`]; stops at the first invalid byte.
 #[cfg(feature = "unicorn-oracle")]
 fn analyze_program(bytes: &[u8], ip: u64) -> ProgramFacts {
-    use iced_x86::{Decoder, DecoderOptions, InstructionInfoFactory, Mnemonic, OpAccess, Register};
+    use iced_x86::{
+        Decoder, DecoderOptions, EncodingKind, InstructionInfoFactory, Mnemonic, OpAccess, Register,
+    };
 
     // Translate iced's `RflagsBits` to packed EFLAGS positions.
     fn iced_to_eflags(bits: u32) -> u64 {
@@ -490,6 +495,7 @@ fn analyze_program(bytes: &[u8], ip: u64) -> ProgramFacts {
     let mut writes_data_mem = false;
     let mut has_syscall = false;
     let mut reads_undefined_flags = false;
+    let mut has_vex = false;
 
     while decoder.can_decode() {
         let insn = decoder.decode();
@@ -497,6 +503,7 @@ fn analyze_program(bytes: &[u8], ip: u64) -> ProgramFacts {
             break;
         }
         has_syscall |= insn.mnemonic() == Mnemonic::Syscall;
+        has_vex |= insn.encoding() != EncodingKind::Legacy;
 
         reads_undefined_flags |= undefined & insn.rflags_read() != 0;
 
@@ -524,6 +531,7 @@ fn analyze_program(bytes: &[u8], ip: u64) -> ProgramFacts {
         writes_data_mem,
         has_syscall,
         reads_undefined_flags,
+        has_vex,
     }
 }
 

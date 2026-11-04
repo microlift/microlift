@@ -1,5 +1,7 @@
 use crate::MicroliftError;
-use crate::arch::x86_64::regs::{FLAG_ORDER, RegisterState, gpr_index, is_segment_register};
+use crate::arch::x86_64::regs::{
+    FLAG_ORDER, RegisterState, XMM_SCRATCH, gpr_index, is_segment_register,
+};
 use crate::arch::x86_64::sync::{FS_BASE_SLOT, GS_BASE_SLOT};
 use crate::core::regsync::RegSlot;
 use crate::lifter::{Lifter, X86Flag};
@@ -24,7 +26,10 @@ pub fn size_to_type(size: usize) -> Type {
     }
 }
 
-/// The XMM register index (0-15), or `None` if not an XMM register.
+/// Legacy encodings cannot name it, so it is free to stand for [`XMM_SCRATCH`].
+pub const XMM_SCRATCH_REGISTER: Register = Register::XMM16;
+
+/// The XMM register index (0-15, or [`XMM_SCRATCH`]), or `None` if not an XMM register.
 pub fn xmm_register_index(reg: Register) -> Option<u8> {
     match reg {
         Register::XMM0 => Some(0),
@@ -43,6 +48,7 @@ pub fn xmm_register_index(reg: Register) -> Option<u8> {
         Register::XMM13 => Some(13),
         Register::XMM14 => Some(14),
         Register::XMM15 => Some(15),
+        XMM_SCRATCH_REGISTER => Some(XMM_SCRATCH),
         _ => None,
     }
 }

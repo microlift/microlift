@@ -10,6 +10,7 @@ pub mod pin;
 pub mod regs;
 pub mod semantics;
 pub mod sync;
+pub mod vex;
 
 use crate::core::exit::ExitReason;
 use crate::core::{GuestArch, LiftEngine, LifterConfig};
