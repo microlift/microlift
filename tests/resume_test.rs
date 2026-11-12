@@ -59,3 +59,70 @@ fn test_unimplemented_instruction_runs_through_the_callback() {
         "one instruction - the rest of the region is already compiled"
     );
 }
+
+thread_local! {
+    /// `(offset of the PC, instruction count)` per interpreter call on this thread.
+    static RUNS: std::cell::RefCell<Vec<(u64, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Treats every instruction it is given as a `WBINVD` no-op.
+unsafe extern "C" fn interpret_wbinvd_run(ctx: *mut RegisterContext, num_instructions: u64) {
+    let ctx = unsafe { &mut *ctx };
+    RUNS.with(|runs| {
+        runs.borrow_mut()
+            .push((ctx.rip - DEFAULT_LIFT_BASE, num_instructions))
+    });
+    ctx.rip += num_instructions * WBINVD.len() as u64;
+}
+
+/// Runs `bytes` with `rax` preset and returns the interpreter calls it made.
+fn interpreted_runs(bytes: &[u8], rax: u64) -> Vec<(u64, u64)> {
+    RUNS.with(|runs| runs.borrow_mut().clear());
+    let out = LiftTest::new(bytes)
+        .no_unicorn()
+        .with_config(|c| c.interpreter_fallback = true)
+        .reg(|c| {
+            c.rax = rax;
+            c.callbacks = X86_64Callbacks {
+                interpreter_fallback: interpret_wbinvd_run,
+                ..X86_64Callbacks::default()
+            }
+        })
+        .run();
+    assert_eq!(out.exit, ExitReason::Return, "the region ran to its RET");
+    RUNS.with(|runs| runs.borrow().clone())
+}
+
+#[test]
+fn consecutive_unimplemented_instructions_share_one_callback() {
+    let mut bytes = WBINVD.repeat(3);
+    bytes.push(0xC3); // ret
+
+    assert_eq!(interpreted_runs(&bytes, 0), vec![(0, 3)]);
+}
+
+#[test]
+fn a_branch_target_splits_an_interpreted_run() {
+    let mut bytes = vec![0x48, 0x85, 0xC0]; // test rax, rax
+    bytes.extend_from_slice(&[0x74, 0x02]); // jz over the first WBINVD
+    bytes.extend_from_slice(&WBINVD);
+    bytes.extend_from_slice(&WBINVD); // the jump target
+    bytes.push(0xC3); // ret
+
+    assert_eq!(
+        interpreted_runs(&bytes, 1),
+        vec![(5, 1), (7, 1)],
+        "falling through enters the target as its own run"
+    );
+    assert_eq!(interpreted_runs(&bytes, 0), vec![(7, 1)]);
+}
+
+#[test]
+fn a_lifted_instruction_ends_an_interpreted_run() {
+    let mut bytes = WBINVD.repeat(2);
+    bytes.extend_from_slice(&[0x48, 0xFF, 0xC0]); // inc rax
+    bytes.extend_from_slice(&WBINVD);
+    bytes.push(0xC3); // ret
+
+    assert_eq!(interpreted_runs(&bytes, 0), vec![(0, 2), (7, 1)]);
+}

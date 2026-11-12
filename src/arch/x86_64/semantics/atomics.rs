@@ -146,11 +146,6 @@ impl<'a> Lifter<'a> {
             });
         }
 
-        if self.config.atomic128 == Atomic128Mode::Interpret {
-            // The host performs the whole operation, per the unimplemented-instruction contract.
-            return self.handle_unimplemented_instruction(instruction);
-        }
-
         let ptr = self.get_mem_ptr(instruction, 0)?;
         let rax = self.get_reg_val(Register::RAX)?;
         let rdx = self.get_reg_val(Register::RDX)?;
@@ -170,8 +165,9 @@ impl<'a> Lifter<'a> {
                 let (lo, hi) = self.builder.ins().isplit(old);
                 (lo, hi, succeeded)
             }
+            Atomic128Mode::Interpret => unreachable!("`lowering` hands it to the interpreter"),
             // Emulated: two 64-bit halves; the store is unconditional since `CMPXCHG16B` writes the destination back on failure.
-            _ => {
+            Atomic128Mode::Emulated => {
                 let flags = self.guest_flags;
                 let lo = self.builder.ins().load(types::I64, flags, ptr, 0);
                 let hi = self.builder.ins().load(types::I64, flags, ptr, 8);

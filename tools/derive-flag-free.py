@@ -78,13 +78,13 @@ def tainted(bodies: dict[str, str]) -> dict[str, bool]:
 
 
 def dispatch() -> dict[str, str]:
-    """Mnemonic -> handler, from `handle_instruction`'s match."""
+    """Mnemonic -> handler, from the `semantics` table."""
     src = open(f"{SEMANTICS}/mod.rs").read()
-    i = src.index("pub fn handle_instruction")
-    j = src.index("\n    }\n", src.index("match instruction.mnemonic()", i))
+    i = src.index("fn semantics<")
+    j = src.index("\n    };\n", src.index("match instruction.mnemonic()", i))
     body = src[i:j]
     arms = re.findall(
-        r"((?:\s*(?:\|\s*)?Mnemonic::\w+(?:\s*//[^\n]*\n)?)+)\s*=>\s*(?:\{)?\s*self\.(\w+)",
+        r"((?:\s*(?:\|\s*)?Mnemonic::\w+(?:\s*//[^\n]*\n)?)+)(?:\s+if\s[^\n]*?)?\s*=>\s*\|\w+,\s*\w+\|\s*(?:\{)?\s*this\.(\w+)",
         body,
     )
     handlers: dict[str, str] = {}

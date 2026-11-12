@@ -33,786 +33,851 @@ use crate::arch::x86_64::semantics::fpu::FpuOp;
 use crate::arch::x86_64::semantics::sse::{PackedLaneOp, PackedShiftOp, PackedWidth};
 use crate::arch::x86_64::semantics::sse_int::HorizOp;
 use crate::arch::x86_64::semantics::sse_str::PcmpstrForm;
-use crate::arch::x86_64::vex::vex_lowering;
-use crate::lifter::Lifter;
+use crate::arch::x86_64::vex::{VexLowering, legacy_form, vex_lowering};
+use crate::lifter::{Atomic128Mode, Lifter};
 use iced_x86::{Instruction, Mnemonic, OpKind, Register};
+
+/// Lifts one instruction.
+pub type Semantics<'a> = fn(&mut Lifter<'a>, &Instruction) -> crate::Result<()>;
+
+/// How an instruction is realized, decided without emitting IR.
+pub enum Lowering<'a> {
+    Lift(Semantics<'a>),
+    /// Run by the host's interpreter callback ([`crate::core::callback`]).
+    Interpret,
+    Unsupported,
+}
 
 impl<'a> Lifter<'a> {
     pub fn handle_instruction(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        match self.lowering(instruction) {
+            Lowering::Lift(lift) => lift(self, instruction),
+            Lowering::Interpret => self.handle_unimplemented_instruction(instruction),
+            Lowering::Unsupported => Err(MicroliftError::UnsupportedInstruction {
+                mnemonic: format!("{:?}", instruction.mnemonic()),
+            }),
+        }
+    }
+
+    pub fn lowering(&self, instruction: &Instruction) -> Lowering<'a> {
+        if self.interprets_cmpxchg16b(instruction) {
+            return Lowering::Interpret;
+        }
+
         // LOCK-prefixed instructions dispatch first so ADD, SUB, etc. only see unlocked forms.
         if instruction.has_lock_prefix() {
-            return self.handle_locked_instruction(instruction);
+            return Lowering::Lift(Self::handle_locked_instruction);
         }
 
-        // MMX encodings alias the unmodelled x87 stack: exit to the host.
+        // MMX encodings alias the unmodelled x87 stack.
         if uses_mmx_register(instruction) {
-            return self.handle_unimplemented_instruction(instruction);
+            return Lowering::Interpret;
         }
 
-        if let Some(lowering) = vex_lowering(instruction) {
-            return self.handle_vex(instruction, lowering);
+        if let Some(vex) = vex_lowering(instruction) {
+            return self.vex_instruction_lowering(instruction, vex);
         }
 
-        match instruction.mnemonic() {
-            // Memory / Data Movement
-            Mnemonic::Mov => self.handle_mov(instruction),
-            Mnemonic::Movzx => self.handle_movzx(instruction),
-            Mnemonic::Movsx => self.handle_movsx(instruction),
-            Mnemonic::Movsxd => self.handle_movsxd(instruction),
-            Mnemonic::Lea => self.handle_lea(instruction),
-            Mnemonic::Push => self.handle_push(instruction),
-            Mnemonic::Pop => self.handle_pop(instruction),
-            Mnemonic::Pushfq => self.handle_pushfq(instruction),
-            Mnemonic::Popfq => self.handle_popfq(instruction),
-            Mnemonic::Lahf => self.handle_lahf(instruction),
-            Mnemonic::Sahf => self.handle_sahf(instruction),
-            Mnemonic::Leave => self.handle_leave(instruction),
-            Mnemonic::Xchg => self.handle_xchg(instruction),
-            Mnemonic::Nop | Mnemonic::Reservednop => self.handle_nop(instruction),
+        // A VEX spelling this frontend does not decode: interpret rather than lift wrongly.
+        if is_pcmpstr(instruction.mnemonic()) && PcmpstrForm::of(instruction).is_none() {
+            return Lowering::Interpret;
+        }
 
-            // Atomics / synchronisation
-            Mnemonic::Cmpxchg => self.handle_cmpxchg(instruction),
-            Mnemonic::Cmpxchg8b => self.handle_cmpxchg8b(instruction),
-            Mnemonic::Cmpxchg16b => self.handle_cmpxchg16b(instruction),
-            Mnemonic::Mfence | Mnemonic::Sfence | Mnemonic::Lfence | Mnemonic::Serialize => {
-                self.handle_mfence(instruction)
-            }
-            Mnemonic::Pause => self.handle_pause(instruction),
-            // Cache flushes: nothing to do under a coherent view; ordering comes from fences.
-            Mnemonic::Clflush | Mnemonic::Clflushopt | Mnemonic::Clwb => {
-                self.handle_nop(instruction)
-            }
-            // Prefetch hints: no architectural effect.
-            Mnemonic::Prefetch
-            | Mnemonic::Prefetcht0
-            | Mnemonic::Prefetcht1
-            | Mnemonic::Prefetcht2
-            | Mnemonic::Prefetchnta
-            | Mnemonic::Prefetchw
-            | Mnemonic::Prefetchwt1
-            | Mnemonic::Prefetchit0
-            | Mnemonic::Prefetchit1 => self.handle_nop(instruction),
+        match semantics(instruction) {
+            Some(lift) => Lowering::Lift(lift),
+            None if self.config.interpreter_fallback => Lowering::Interpret,
+            None => Lowering::Unsupported,
+        }
+    }
 
-            // CET
-            Mnemonic::Endbr64 | Mnemonic::Endbr32 => self.handle_endbr64(instruction),
+    /// A VEX instruction is interpreted whole when its legacy form would be.
+    fn vex_instruction_lowering(
+        &self,
+        instruction: &Instruction,
+        vex: VexLowering,
+    ) -> Lowering<'a> {
+        let lift = Lowering::Lift(|lifter, instruction| {
+            let vex = vex_lowering(instruction).expect("a VEX lowering");
+            lifter.handle_vex(instruction, vex)
+        });
+        let Some(legacy) = legacy_form(instruction, vex) else {
+            return lift;
+        };
+        match self.lowering(&legacy) {
+            Lowering::Lift(_) => lift,
+            other => other,
+        }
+    }
 
-            // SSE / SSE2 - XMM data movement
-            Mnemonic::Movaps
-            | Mnemonic::Movapd
-            | Mnemonic::Movups
-            | Mnemonic::Movupd
-            | Mnemonic::Movdqa
-            | Mnemonic::Movdqu
-            // Non-temporal stores differ only in cache hint, which is not modelled.
-            | Mnemonic::Movntps
-            | Mnemonic::Movntpd
-            | Mnemonic::Movntdq
-            // LDDQU and MOVNTDQA differ from a 128-bit load only in cache hints.
-            | Mnemonic::Lddqu
-            | Mnemonic::Movntdqa => self.handle_movaps(instruction),
-            Mnemonic::Movq => self.handle_movq_sse(instruction),
-            Mnemonic::Movss => self.handle_movss(instruction),
-            Mnemonic::Movd => self.handle_movd(instruction),
-            Mnemonic::Movhps | Mnemonic::Movhpd => self.handle_movhps(instruction),
-            Mnemonic::Movlps | Mnemonic::Movlpd => self.handle_movlps(instruction),
-            Mnemonic::Movhlps => self.handle_movhlps(instruction),
-            Mnemonic::Movlhps => self.handle_movlhps(instruction),
-            Mnemonic::Movddup => self.handle_movddup(instruction),
-            // SSE2 - packed per-lane shifts
-            Mnemonic::Psrlw => {
-                self.handle_packed_shift(instruction, PackedShiftOp::Srl, PackedWidth::Word)
-            }
-            Mnemonic::Psrld => {
-                self.handle_packed_shift(instruction, PackedShiftOp::Srl, PackedWidth::Dword)
-            }
-            Mnemonic::Psrlq => {
-                self.handle_packed_shift(instruction, PackedShiftOp::Srl, PackedWidth::Qword)
-            }
-            Mnemonic::Psllw => {
-                self.handle_packed_shift(instruction, PackedShiftOp::Sll, PackedWidth::Word)
-            }
-            Mnemonic::Pslld => {
-                self.handle_packed_shift(instruction, PackedShiftOp::Sll, PackedWidth::Dword)
-            }
-            Mnemonic::Psllq => {
-                self.handle_packed_shift(instruction, PackedShiftOp::Sll, PackedWidth::Qword)
-            }
-            Mnemonic::Psraw => {
-                self.handle_packed_shift(instruction, PackedShiftOp::Sra, PackedWidth::Word)
-            }
-            Mnemonic::Psrad => {
-                self.handle_packed_shift(instruction, PackedShiftOp::Sra, PackedWidth::Dword)
-            }
-            Mnemonic::Pshufd => self.handle_pshufd(instruction),
-            // SSE2 - whole-register byte shifts
-            Mnemonic::Pslldq => self.handle_byte_shift_dq(instruction, true),
-            Mnemonic::Psrldq => self.handle_byte_shift_dq(instruction, false),
+    fn interprets_cmpxchg16b(&self, instruction: &Instruction) -> bool {
+        instruction.mnemonic() == Mnemonic::Cmpxchg16b
+            && instruction.op0_kind() == OpKind::Memory
+            && self.config.atomic128 == Atomic128Mode::Interpret
+    }
+}
 
-            // SSE / SSE2 - unpack / interleave; the `pd`/`ps` forms alias the integer ones.
-            Mnemonic::Punpcklbw => {
-                self.handle_punpck(instruction, "punpcklbw", PackedWidth::Byte, false)
-            }
-            Mnemonic::Punpcklwd => {
-                self.handle_punpck(instruction, "punpcklwd", PackedWidth::Word, false)
-            }
-            Mnemonic::Punpckldq | Mnemonic::Unpcklps => {
-                self.handle_punpck(instruction, "punpckldq", PackedWidth::Dword, false)
-            }
-            Mnemonic::Punpcklqdq | Mnemonic::Unpcklpd => {
-                self.handle_punpck(instruction, "punpcklqdq", PackedWidth::Qword, false)
-            }
-            Mnemonic::Punpckhbw => {
-                self.handle_punpck(instruction, "punpckhbw", PackedWidth::Byte, true)
-            }
-            Mnemonic::Punpckhwd => {
-                self.handle_punpck(instruction, "punpckhwd", PackedWidth::Word, true)
-            }
-            Mnemonic::Punpckhdq | Mnemonic::Unpckhps => {
-                self.handle_punpck(instruction, "punpckhdq", PackedWidth::Dword, true)
-            }
-            Mnemonic::Punpckhqdq | Mnemonic::Unpckhpd => {
-                self.handle_punpck(instruction, "punpckhqdq", PackedWidth::Qword, true)
-            }
-
-            // SSE3 - horizontal arithmetic
-            Mnemonic::Haddpd => self.handle_haddpd(instruction),
-            Mnemonic::Hsubpd => self.handle_hsubpd(instruction),
-            Mnemonic::Haddps => self.handle_haddps(instruction),
-            Mnemonic::Hsubps => self.handle_hsubps(instruction),
-            Mnemonic::Addsubps => self.handle_addsubps(instruction),
-            Mnemonic::Addsubpd => self.handle_addsubpd(instruction),
-
-            // SSE2 - scalar / packed double-precision arithmetic
-            Mnemonic::Addpd => self.handle_addpd(instruction),
-            Mnemonic::Subpd => self.handle_subpd(instruction),
-            Mnemonic::Mulpd => self.handle_mulpd(instruction),
-            Mnemonic::Divpd => self.handle_divpd(instruction),
-            Mnemonic::Addsd => self.handle_addsd(instruction),
-            Mnemonic::Subsd => self.handle_subsd(instruction),
-            Mnemonic::Mulsd => self.handle_mulsd(instruction),
-            Mnemonic::Divsd => self.handle_divsd(instruction),
-            Mnemonic::Sqrtsd => self.handle_sqrtsd(instruction),
-            Mnemonic::Sqrtpd => self.handle_sqrtpd(instruction),
-            Mnemonic::Roundsd => self.handle_roundsd(instruction),
-            Mnemonic::Roundss => self.handle_roundss(instruction),
-            Mnemonic::Roundpd => self.handle_roundpd(instruction),
-            Mnemonic::Roundps => self.handle_roundps(instruction),
-            Mnemonic::Minsd => self.handle_minmaxsd(instruction, true),
-            Mnemonic::Maxsd => self.handle_minmaxsd(instruction, false),
-            Mnemonic::Minpd => self.handle_minmaxpd(instruction, true),
-            Mnemonic::Maxpd => self.handle_minmaxpd(instruction, false),
-            Mnemonic::Ucomisd | Mnemonic::Comisd => self.handle_ucomisd(instruction),
-
-            // SSE - scalar / packed single-precision arithmetic
-            Mnemonic::Addss => self.handle_addss(instruction),
-            Mnemonic::Subss => self.handle_subss(instruction),
-            Mnemonic::Mulss => self.handle_mulss(instruction),
-            Mnemonic::Divss => self.handle_divss(instruction),
-            Mnemonic::Sqrtss => self.handle_sqrtss(instruction),
-            Mnemonic::Addps => self.handle_addps(instruction),
-            Mnemonic::Subps => self.handle_subps(instruction),
-            Mnemonic::Mulps => self.handle_mulps(instruction),
-            Mnemonic::Divps => self.handle_divps(instruction),
-            Mnemonic::Sqrtps => self.handle_sqrtps(instruction),
-            Mnemonic::Minss => self.handle_minmaxss(instruction, true),
-            Mnemonic::Maxss => self.handle_minmaxss(instruction, false),
-            Mnemonic::Minps => self.handle_minmaxps(instruction, true),
-            Mnemonic::Maxps => self.handle_minmaxps(instruction, false),
-            Mnemonic::Ucomiss | Mnemonic::Comiss => self.handle_ucomiss(instruction),
-
-            // SSE / SSE2 - integer <-> floating-point conversion
-            Mnemonic::Cvtsi2ss => self.handle_cvtsi2ss(instruction),
-            Mnemonic::Cvttss2si => self.handle_cvtss2si(instruction, true),
-            Mnemonic::Cvtss2si => self.handle_cvtss2si(instruction, false),
-            Mnemonic::Cvtsi2sd => self.handle_cvtsi2sd(instruction),
-            Mnemonic::Cvttsd2si => self.handle_cvtsd2si(instruction, true),
-            Mnemonic::Cvtsd2si => self.handle_cvtsd2si(instruction, false),
-            Mnemonic::Cvtss2sd => self.handle_cvtss2sd(instruction),
-            Mnemonic::Cvtsd2ss => self.handle_cvtsd2ss(instruction),
-            Mnemonic::Cvtpd2ps => self.handle_cvtpd2ps(instruction),
-            Mnemonic::Cvtps2pd => self.handle_cvtps2pd(instruction),
-            Mnemonic::Cvtdq2ps => self.handle_cvtdq2ps(instruction),
-            Mnemonic::Cvtps2dq => self.handle_cvtps2dq(instruction, false),
-            Mnemonic::Cvttps2dq => self.handle_cvtps2dq(instruction, true),
-            Mnemonic::Cvtdq2pd => self.handle_cvtdq2pd(instruction),
-            Mnemonic::Cvtpd2dq => self.handle_cvtpd2dq(instruction, false),
-            Mnemonic::Cvttpd2dq => self.handle_cvtpd2dq(instruction, true),
-
-            // SSE / SSE2 - packed compares, shuffles and approximate reciprocals
-            Mnemonic::Cmpps => self.handle_cmpps(instruction),
-            Mnemonic::Cmppd => self.handle_cmppd(instruction),
-            Mnemonic::Cmpss => self.handle_cmpss(instruction),
-            // CMPSD is shared between string compare and SSE2 scalar compare, like MOVSD.
-            Mnemonic::Cmpsd if matches!(instruction.op0_kind(), OpKind::Register) => {
-                self.handle_cmpsd_sse(instruction)
-            }
-            Mnemonic::Shufps => self.handle_shufps(instruction),
-            Mnemonic::Shufpd => self.handle_shufpd(instruction),
-            Mnemonic::Pshuflw => self.handle_pshuflhw(instruction, false),
-            Mnemonic::Pshufhw => self.handle_pshuflhw(instruction, true),
-            Mnemonic::Rcpps => self.handle_rcpps(instruction, false),
-            Mnemonic::Rsqrtps => self.handle_rcpps(instruction, true),
-            Mnemonic::Rcpss => self.handle_rcpss(instruction, false),
-            Mnemonic::Rsqrtss => self.handle_rcpss(instruction, true),
-            Mnemonic::Movsldup => self.handle_movsldup(instruction, false),
-            Mnemonic::Movshdup => self.handle_movsldup(instruction, true),
-
-            // SSE / SSE2 - XMM logic
-            Mnemonic::Xorps | Mnemonic::Xorpd => self.handle_xorps(instruction),
-            Mnemonic::Pxor => self.handle_pxor(instruction),
-            Mnemonic::Andps | Mnemonic::Andpd | Mnemonic::Pand => self.handle_andps(instruction),
-            Mnemonic::Orps | Mnemonic::Orpd | Mnemonic::Por => self.handle_orps(instruction),
-            Mnemonic::Andnps | Mnemonic::Andnpd | Mnemonic::Pandn => {
-                self.handle_andnps(instruction)
-            }
-
-            // SSE2 - packed integer add / subtract
-            Mnemonic::Paddb => self.handle_padd(instruction, PackedWidth::Byte),
-            Mnemonic::Paddw => self.handle_padd(instruction, PackedWidth::Word),
-            Mnemonic::Paddd => self.handle_padd(instruction, PackedWidth::Dword),
-            Mnemonic::Paddq => self.handle_padd(instruction, PackedWidth::Qword),
-            Mnemonic::Psubb => self.handle_psub(instruction, PackedWidth::Byte),
-            Mnemonic::Psubw => self.handle_psub(instruction, PackedWidth::Word),
-            Mnemonic::Psubd => self.handle_psub(instruction, PackedWidth::Dword),
-            Mnemonic::Psubq => self.handle_psub(instruction, PackedWidth::Qword),
-            Mnemonic::Paddsb => self.handle_padds(instruction, PackedWidth::Byte),
-            Mnemonic::Paddsw => self.handle_padds(instruction, PackedWidth::Word),
-            Mnemonic::Paddusb => self.handle_paddus(instruction, PackedWidth::Byte),
-            Mnemonic::Paddusw => self.handle_paddus(instruction, PackedWidth::Word),
-            Mnemonic::Psubsb => self.handle_psubs(instruction, PackedWidth::Byte),
-            Mnemonic::Psubsw => self.handle_psubs(instruction, PackedWidth::Word),
-            Mnemonic::Psubusb => self.handle_psubus(instruction, PackedWidth::Byte),
-            Mnemonic::Psubusw => self.handle_psubus(instruction, PackedWidth::Word),
-
-            // SSE2 - packed integer compare (all-ones / all-zeros lane masks)
-            Mnemonic::Pcmpeqb => self.handle_packed_lane_op(
-                instruction,
-                "pcmpeqb",
-                PackedLaneOp::CmpEq,
-                PackedWidth::Byte,
-            ),
-            Mnemonic::Pcmpeqw => self.handle_packed_lane_op(
-                instruction,
-                "pcmpeqw",
-                PackedLaneOp::CmpEq,
-                PackedWidth::Word,
-            ),
-            Mnemonic::Pcmpeqd => self.handle_packed_lane_op(
-                instruction,
-                "pcmpeqd",
-                PackedLaneOp::CmpEq,
-                PackedWidth::Dword,
-            ),
-            // PCMPEQQ / PCMPGTQ: SSE4.1 / SSE4.2, lane-wise one width up.
-            Mnemonic::Pcmpeqq => self.handle_packed_lane_op(
-                instruction,
-                "pcmpeqq",
-                PackedLaneOp::CmpEq,
-                PackedWidth::Qword,
-            ),
-            Mnemonic::Pcmpgtb => self.handle_packed_lane_op(
-                instruction,
-                "pcmpgtb",
-                PackedLaneOp::CmpGt,
-                PackedWidth::Byte,
-            ),
-            Mnemonic::Pcmpgtw => self.handle_packed_lane_op(
-                instruction,
-                "pcmpgtw",
-                PackedLaneOp::CmpGt,
-                PackedWidth::Word,
-            ),
-            Mnemonic::Pcmpgtd => self.handle_packed_lane_op(
-                instruction,
-                "pcmpgtd",
-                PackedLaneOp::CmpGt,
-                PackedWidth::Dword,
-            ),
-            Mnemonic::Pcmpgtq => self.handle_packed_lane_op(
-                instruction,
-                "pcmpgtq",
-                PackedLaneOp::CmpGt,
-                PackedWidth::Qword,
-            ),
-
-            // AES-NI: one kernel family.
-            Mnemonic::Aesenc => self.handle_aes_round(instruction, AesKernel::Enc),
-            Mnemonic::Aesenclast => self.handle_aes_round(instruction, AesKernel::EncLast),
-            Mnemonic::Aesdec => self.handle_aes_round(instruction, AesKernel::Dec),
-            Mnemonic::Aesdeclast => self.handle_aes_round(instruction, AesKernel::DecLast),
-            Mnemonic::Aesimc => self.handle_aesimc(instruction),
-            Mnemonic::Aeskeygenassist => self.handle_aeskeygenassist(instruction),
-            Mnemonic::Pclmulqdq => self.handle_pclmulqdq(instruction),
-
-            // SSE4.2 packed string compares share one handler; the `REX.W` spellings are separate mnemonics.
-            Mnemonic::Pcmpistri
+fn is_pcmpstr(mnemonic: Mnemonic) -> bool {
+    matches!(
+        mnemonic,
+        Mnemonic::Pcmpistri
             | Mnemonic::Pcmpistrm
             | Mnemonic::Pcmpestri
             | Mnemonic::Pcmpestrm
             | Mnemonic::Pcmpestri64
-            | Mnemonic::Pcmpestrm64 => match PcmpstrForm::of(instruction) {
-                Some(form) => self.handle_pcmpstr(instruction, form),
-                // A VEX spelling this frontend does not decode: exit rather than lift wrongly.
-                None => self.handle_unimplemented_instruction(instruction),
-            },
+            | Mnemonic::Pcmpestrm64
+    )
+}
 
-            // SSE / SSE2 - packed integer min / max / average / multiply
-            Mnemonic::Pminub => self.handle_packed_lane_op(
-                instruction,
-                "pminub",
-                PackedLaneOp::MinU,
-                PackedWidth::Byte,
-            ),
-            Mnemonic::Pmaxub => self.handle_packed_lane_op(
-                instruction,
-                "pmaxub",
-                PackedLaneOp::MaxU,
-                PackedWidth::Byte,
-            ),
-            Mnemonic::Pminsw => self.handle_packed_lane_op(
-                instruction,
-                "pminsw",
-                PackedLaneOp::MinS,
-                PackedWidth::Word,
-            ),
-            Mnemonic::Pmaxsw => self.handle_packed_lane_op(
-                instruction,
-                "pmaxsw",
-                PackedLaneOp::MaxS,
-                PackedWidth::Word,
-            ),
-            Mnemonic::Pavgb => self.handle_packed_lane_op(
-                instruction,
-                "pavgb",
-                PackedLaneOp::Avg,
-                PackedWidth::Byte,
-            ),
-            Mnemonic::Pavgw => self.handle_packed_lane_op(
-                instruction,
-                "pavgw",
-                PackedLaneOp::Avg,
-                PackedWidth::Word,
-            ),
-            Mnemonic::Pmullw => self.handle_packed_lane_op(
-                instruction,
-                "pmullw",
-                PackedLaneOp::MulLow,
-                PackedWidth::Word,
-            ),
-            Mnemonic::Pmulhw => self.handle_packed_lane_op(
-                instruction,
-                "pmulhw",
-                PackedLaneOp::MulHighS,
-                PackedWidth::Word,
-            ),
-            Mnemonic::Pmulhuw => self.handle_packed_lane_op(
-                instruction,
-                "pmulhuw",
-                PackedLaneOp::MulHighU,
-                PackedWidth::Word,
-            ),
+/// The lift for an unprefixed, non-VEX `instruction`, `None` when it has none.
+fn semantics<'a>(instruction: &Instruction) -> Option<Semantics<'a>> {
+    let semantics: Semantics<'a> = match instruction.mnemonic() {
+        // Memory / Data Movement
+        Mnemonic::Mov => |this, i| this.handle_mov(i),
+        Mnemonic::Movzx => |this, i| this.handle_movzx(i),
+        Mnemonic::Movsx => |this, i| this.handle_movsx(i),
+        Mnemonic::Movsxd => |this, i| this.handle_movsxd(i),
+        Mnemonic::Lea => |this, i| this.handle_lea(i),
+        Mnemonic::Push => |this, i| this.handle_push(i),
+        Mnemonic::Pop => |this, i| this.handle_pop(i),
+        Mnemonic::Pushfq => |this, i| this.handle_pushfq(i),
+        Mnemonic::Popfq => |this, i| this.handle_popfq(i),
+        Mnemonic::Lahf => |this, i| this.handle_lahf(i),
+        Mnemonic::Sahf => |this, i| this.handle_sahf(i),
+        Mnemonic::Leave => |this, i| this.handle_leave(i),
+        Mnemonic::Xchg => |this, i| this.handle_xchg(i),
+        Mnemonic::Nop | Mnemonic::Reservednop => |this, i| this.handle_nop(i),
 
-            // SSE4.1 - the min / max forms the earlier generations lacked.
-            Mnemonic::Pminsb => self.handle_packed_lane_op(
-                instruction,
-                "pminsb",
-                PackedLaneOp::MinS,
-                PackedWidth::Byte,
-            ),
-            Mnemonic::Pmaxsb => self.handle_packed_lane_op(
-                instruction,
-                "pmaxsb",
-                PackedLaneOp::MaxS,
-                PackedWidth::Byte,
-            ),
-            Mnemonic::Pminuw => self.handle_packed_lane_op(
-                instruction,
-                "pminuw",
-                PackedLaneOp::MinU,
-                PackedWidth::Word,
-            ),
-            Mnemonic::Pmaxuw => self.handle_packed_lane_op(
-                instruction,
-                "pmaxuw",
-                PackedLaneOp::MaxU,
-                PackedWidth::Word,
-            ),
-            Mnemonic::Pminsd => self.handle_packed_lane_op(
-                instruction,
-                "pminsd",
-                PackedLaneOp::MinS,
-                PackedWidth::Dword,
-            ),
-            Mnemonic::Pmaxsd => self.handle_packed_lane_op(
-                instruction,
-                "pmaxsd",
-                PackedLaneOp::MaxS,
-                PackedWidth::Dword,
-            ),
-            Mnemonic::Pminud => self.handle_packed_lane_op(
-                instruction,
-                "pminud",
-                PackedLaneOp::MinU,
-                PackedWidth::Dword,
-            ),
-            Mnemonic::Pmaxud => self.handle_packed_lane_op(
-                instruction,
-                "pmaxud",
-                PackedLaneOp::MaxU,
-                PackedWidth::Dword,
-            ),
-            Mnemonic::Pmulld => self.handle_packed_lane_op(
-                instruction,
-                "pmulld",
-                PackedLaneOp::MulLow,
-                PackedWidth::Dword,
-            ),
+        // Atomics / synchronisation
+        Mnemonic::Cmpxchg => |this, i| this.handle_cmpxchg(i),
+        Mnemonic::Cmpxchg8b => |this, i| this.handle_cmpxchg8b(i),
+        Mnemonic::Cmpxchg16b => |this, i| this.handle_cmpxchg16b(i),
+        Mnemonic::Mfence | Mnemonic::Sfence | Mnemonic::Lfence | Mnemonic::Serialize => |this, i| {
+            this.handle_mfence(i)
+        },
+        Mnemonic::Pause => |this, i| this.handle_pause(i),
+        // Cache flushes: nothing to do under a coherent view; ordering comes from fences.
+        Mnemonic::Clflush | Mnemonic::Clflushopt | Mnemonic::Clwb => |this, i| {
+            this.handle_nop(i)
+        },
+        // Prefetch hints: no architectural effect.
+        Mnemonic::Prefetch
+        | Mnemonic::Prefetcht0
+        | Mnemonic::Prefetcht1
+        | Mnemonic::Prefetcht2
+        | Mnemonic::Prefetchnta
+        | Mnemonic::Prefetchw
+        | Mnemonic::Prefetchwt1
+        | Mnemonic::Prefetchit0
+        | Mnemonic::Prefetchit1 => |this, i| this.handle_nop(i),
 
-            // SSSE3 - byte shuffle, concat-rotate, sign ops and horizontal arithmetic.
-            Mnemonic::Pshufb => self.handle_pshufb(instruction),
-            Mnemonic::Palignr => self.handle_palignr(instruction),
-            Mnemonic::Pabsb => self.handle_pabs(instruction, PackedWidth::Byte),
-            Mnemonic::Pabsw => self.handle_pabs(instruction, PackedWidth::Word),
-            Mnemonic::Pabsd => self.handle_pabs(instruction, PackedWidth::Dword),
-            Mnemonic::Psignb => self.handle_psign(instruction, PackedWidth::Byte),
-            Mnemonic::Psignw => self.handle_psign(instruction, PackedWidth::Word),
-            Mnemonic::Psignd => self.handle_psign(instruction, PackedWidth::Dword),
-            Mnemonic::Phaddw => {
-                self.handle_horizontal(instruction, HorizOp::Add, PackedWidth::Word)
+        // CET
+        Mnemonic::Endbr64 | Mnemonic::Endbr32 => |this, i| this.handle_endbr64(i),
+
+        // SSE / SSE2 - XMM data movement
+        Mnemonic::Movaps
+        | Mnemonic::Movapd
+        | Mnemonic::Movups
+        | Mnemonic::Movupd
+        | Mnemonic::Movdqa
+        | Mnemonic::Movdqu
+        // Non-temporal stores differ only in cache hint, which is not modelled.
+        | Mnemonic::Movntps
+        | Mnemonic::Movntpd
+        | Mnemonic::Movntdq
+        // LDDQU and MOVNTDQA differ from a 128-bit load only in cache hints.
+        | Mnemonic::Lddqu
+        | Mnemonic::Movntdqa => |this, i| this.handle_movaps(i),
+        Mnemonic::Movq => |this, i| this.handle_movq_sse(i),
+        Mnemonic::Movss => |this, i| this.handle_movss(i),
+        Mnemonic::Movd => |this, i| this.handle_movd(i),
+        Mnemonic::Movhps | Mnemonic::Movhpd => |this, i| this.handle_movhps(i),
+        Mnemonic::Movlps | Mnemonic::Movlpd => |this, i| this.handle_movlps(i),
+        Mnemonic::Movhlps => |this, i| this.handle_movhlps(i),
+        Mnemonic::Movlhps => |this, i| this.handle_movlhps(i),
+        Mnemonic::Movddup => |this, i| this.handle_movddup(i),
+        // SSE2 - packed per-lane shifts
+        Mnemonic::Psrlw => |this, i| {
+            this.handle_packed_shift(i, PackedShiftOp::Srl, PackedWidth::Word)
+        },
+        Mnemonic::Psrld => |this, i| {
+            this.handle_packed_shift(i, PackedShiftOp::Srl, PackedWidth::Dword)
+        },
+        Mnemonic::Psrlq => |this, i| {
+            this.handle_packed_shift(i, PackedShiftOp::Srl, PackedWidth::Qword)
+        },
+        Mnemonic::Psllw => |this, i| {
+            this.handle_packed_shift(i, PackedShiftOp::Sll, PackedWidth::Word)
+        },
+        Mnemonic::Pslld => |this, i| {
+            this.handle_packed_shift(i, PackedShiftOp::Sll, PackedWidth::Dword)
+        },
+        Mnemonic::Psllq => |this, i| {
+            this.handle_packed_shift(i, PackedShiftOp::Sll, PackedWidth::Qword)
+        },
+        Mnemonic::Psraw => |this, i| {
+            this.handle_packed_shift(i, PackedShiftOp::Sra, PackedWidth::Word)
+        },
+        Mnemonic::Psrad => |this, i| {
+            this.handle_packed_shift(i, PackedShiftOp::Sra, PackedWidth::Dword)
+        },
+        Mnemonic::Pshufd => |this, i| this.handle_pshufd(i),
+        // SSE2 - whole-register byte shifts
+        Mnemonic::Pslldq => |this, i| this.handle_byte_shift_dq(i, true),
+        Mnemonic::Psrldq => |this, i| this.handle_byte_shift_dq(i, false),
+
+        // SSE / SSE2 - unpack / interleave; the `pd`/`ps` forms alias the integer ones.
+        Mnemonic::Punpcklbw => |this, i| {
+            this.handle_punpck(i, "punpcklbw", PackedWidth::Byte, false)
+        },
+        Mnemonic::Punpcklwd => |this, i| {
+            this.handle_punpck(i, "punpcklwd", PackedWidth::Word, false)
+        },
+        Mnemonic::Punpckldq | Mnemonic::Unpcklps => |this, i| {
+            this.handle_punpck(i, "punpckldq", PackedWidth::Dword, false)
+        },
+        Mnemonic::Punpcklqdq | Mnemonic::Unpcklpd => |this, i| {
+            this.handle_punpck(i, "punpcklqdq", PackedWidth::Qword, false)
+        },
+        Mnemonic::Punpckhbw => |this, i| {
+            this.handle_punpck(i, "punpckhbw", PackedWidth::Byte, true)
+        },
+        Mnemonic::Punpckhwd => |this, i| {
+            this.handle_punpck(i, "punpckhwd", PackedWidth::Word, true)
+        },
+        Mnemonic::Punpckhdq | Mnemonic::Unpckhps => |this, i| {
+            this.handle_punpck(i, "punpckhdq", PackedWidth::Dword, true)
+        },
+        Mnemonic::Punpckhqdq | Mnemonic::Unpckhpd => |this, i| {
+            this.handle_punpck(i, "punpckhqdq", PackedWidth::Qword, true)
+        },
+
+        // SSE3 - horizontal arithmetic
+        Mnemonic::Haddpd => |this, i| this.handle_haddpd(i),
+        Mnemonic::Hsubpd => |this, i| this.handle_hsubpd(i),
+        Mnemonic::Haddps => |this, i| this.handle_haddps(i),
+        Mnemonic::Hsubps => |this, i| this.handle_hsubps(i),
+        Mnemonic::Addsubps => |this, i| this.handle_addsubps(i),
+        Mnemonic::Addsubpd => |this, i| this.handle_addsubpd(i),
+
+        // SSE2 - scalar / packed double-precision arithmetic
+        Mnemonic::Addpd => |this, i| this.handle_addpd(i),
+        Mnemonic::Subpd => |this, i| this.handle_subpd(i),
+        Mnemonic::Mulpd => |this, i| this.handle_mulpd(i),
+        Mnemonic::Divpd => |this, i| this.handle_divpd(i),
+        Mnemonic::Addsd => |this, i| this.handle_addsd(i),
+        Mnemonic::Subsd => |this, i| this.handle_subsd(i),
+        Mnemonic::Mulsd => |this, i| this.handle_mulsd(i),
+        Mnemonic::Divsd => |this, i| this.handle_divsd(i),
+        Mnemonic::Sqrtsd => |this, i| this.handle_sqrtsd(i),
+        Mnemonic::Sqrtpd => |this, i| this.handle_sqrtpd(i),
+        Mnemonic::Roundsd => |this, i| this.handle_roundsd(i),
+        Mnemonic::Roundss => |this, i| this.handle_roundss(i),
+        Mnemonic::Roundpd => |this, i| this.handle_roundpd(i),
+        Mnemonic::Roundps => |this, i| this.handle_roundps(i),
+        Mnemonic::Minsd => |this, i| this.handle_minmaxsd(i, true),
+        Mnemonic::Maxsd => |this, i| this.handle_minmaxsd(i, false),
+        Mnemonic::Minpd => |this, i| this.handle_minmaxpd(i, true),
+        Mnemonic::Maxpd => |this, i| this.handle_minmaxpd(i, false),
+        Mnemonic::Ucomisd | Mnemonic::Comisd => |this, i| this.handle_ucomisd(i),
+
+        // SSE - scalar / packed single-precision arithmetic
+        Mnemonic::Addss => |this, i| this.handle_addss(i),
+        Mnemonic::Subss => |this, i| this.handle_subss(i),
+        Mnemonic::Mulss => |this, i| this.handle_mulss(i),
+        Mnemonic::Divss => |this, i| this.handle_divss(i),
+        Mnemonic::Sqrtss => |this, i| this.handle_sqrtss(i),
+        Mnemonic::Addps => |this, i| this.handle_addps(i),
+        Mnemonic::Subps => |this, i| this.handle_subps(i),
+        Mnemonic::Mulps => |this, i| this.handle_mulps(i),
+        Mnemonic::Divps => |this, i| this.handle_divps(i),
+        Mnemonic::Sqrtps => |this, i| this.handle_sqrtps(i),
+        Mnemonic::Minss => |this, i| this.handle_minmaxss(i, true),
+        Mnemonic::Maxss => |this, i| this.handle_minmaxss(i, false),
+        Mnemonic::Minps => |this, i| this.handle_minmaxps(i, true),
+        Mnemonic::Maxps => |this, i| this.handle_minmaxps(i, false),
+        Mnemonic::Ucomiss | Mnemonic::Comiss => |this, i| this.handle_ucomiss(i),
+
+        // SSE / SSE2 - integer <-> floating-point conversion
+        Mnemonic::Cvtsi2ss => |this, i| this.handle_cvtsi2ss(i),
+        Mnemonic::Cvttss2si => |this, i| this.handle_cvtss2si(i, true),
+        Mnemonic::Cvtss2si => |this, i| this.handle_cvtss2si(i, false),
+        Mnemonic::Cvtsi2sd => |this, i| this.handle_cvtsi2sd(i),
+        Mnemonic::Cvttsd2si => |this, i| this.handle_cvtsd2si(i, true),
+        Mnemonic::Cvtsd2si => |this, i| this.handle_cvtsd2si(i, false),
+        Mnemonic::Cvtss2sd => |this, i| this.handle_cvtss2sd(i),
+        Mnemonic::Cvtsd2ss => |this, i| this.handle_cvtsd2ss(i),
+        Mnemonic::Cvtpd2ps => |this, i| this.handle_cvtpd2ps(i),
+        Mnemonic::Cvtps2pd => |this, i| this.handle_cvtps2pd(i),
+        Mnemonic::Cvtdq2ps => |this, i| this.handle_cvtdq2ps(i),
+        Mnemonic::Cvtps2dq => |this, i| this.handle_cvtps2dq(i, false),
+        Mnemonic::Cvttps2dq => |this, i| this.handle_cvtps2dq(i, true),
+        Mnemonic::Cvtdq2pd => |this, i| this.handle_cvtdq2pd(i),
+        Mnemonic::Cvtpd2dq => |this, i| this.handle_cvtpd2dq(i, false),
+        Mnemonic::Cvttpd2dq => |this, i| this.handle_cvtpd2dq(i, true),
+
+        // SSE / SSE2 - packed compares, shuffles and approximate reciprocals
+        Mnemonic::Cmpps => |this, i| this.handle_cmpps(i),
+        Mnemonic::Cmppd => |this, i| this.handle_cmppd(i),
+        Mnemonic::Cmpss => |this, i| this.handle_cmpss(i),
+        // CMPSD is shared between string compare and SSE2 scalar compare, like MOVSD.
+        Mnemonic::Cmpsd if matches!(instruction.op0_kind(), OpKind::Register) => |this, i| {
+            this.handle_cmpsd_sse(i)
+        },
+        Mnemonic::Shufps => |this, i| this.handle_shufps(i),
+        Mnemonic::Shufpd => |this, i| this.handle_shufpd(i),
+        Mnemonic::Pshuflw => |this, i| this.handle_pshuflhw(i, false),
+        Mnemonic::Pshufhw => |this, i| this.handle_pshuflhw(i, true),
+        Mnemonic::Rcpps => |this, i| this.handle_rcpps(i, false),
+        Mnemonic::Rsqrtps => |this, i| this.handle_rcpps(i, true),
+        Mnemonic::Rcpss => |this, i| this.handle_rcpss(i, false),
+        Mnemonic::Rsqrtss => |this, i| this.handle_rcpss(i, true),
+        Mnemonic::Movsldup => |this, i| this.handle_movsldup(i, false),
+        Mnemonic::Movshdup => |this, i| this.handle_movsldup(i, true),
+
+        // SSE / SSE2 - XMM logic
+        Mnemonic::Xorps | Mnemonic::Xorpd => |this, i| this.handle_xorps(i),
+        Mnemonic::Pxor => |this, i| this.handle_pxor(i),
+        Mnemonic::Andps | Mnemonic::Andpd | Mnemonic::Pand => |this, i| this.handle_andps(i),
+        Mnemonic::Orps | Mnemonic::Orpd | Mnemonic::Por => |this, i| this.handle_orps(i),
+        Mnemonic::Andnps | Mnemonic::Andnpd | Mnemonic::Pandn => |this, i| {
+            this.handle_andnps(i)
+        },
+
+        // SSE2 - packed integer add / subtract
+        Mnemonic::Paddb => |this, i| this.handle_padd(i, PackedWidth::Byte),
+        Mnemonic::Paddw => |this, i| this.handle_padd(i, PackedWidth::Word),
+        Mnemonic::Paddd => |this, i| this.handle_padd(i, PackedWidth::Dword),
+        Mnemonic::Paddq => |this, i| this.handle_padd(i, PackedWidth::Qword),
+        Mnemonic::Psubb => |this, i| this.handle_psub(i, PackedWidth::Byte),
+        Mnemonic::Psubw => |this, i| this.handle_psub(i, PackedWidth::Word),
+        Mnemonic::Psubd => |this, i| this.handle_psub(i, PackedWidth::Dword),
+        Mnemonic::Psubq => |this, i| this.handle_psub(i, PackedWidth::Qword),
+        Mnemonic::Paddsb => |this, i| this.handle_padds(i, PackedWidth::Byte),
+        Mnemonic::Paddsw => |this, i| this.handle_padds(i, PackedWidth::Word),
+        Mnemonic::Paddusb => |this, i| this.handle_paddus(i, PackedWidth::Byte),
+        Mnemonic::Paddusw => |this, i| this.handle_paddus(i, PackedWidth::Word),
+        Mnemonic::Psubsb => |this, i| this.handle_psubs(i, PackedWidth::Byte),
+        Mnemonic::Psubsw => |this, i| this.handle_psubs(i, PackedWidth::Word),
+        Mnemonic::Psubusb => |this, i| this.handle_psubus(i, PackedWidth::Byte),
+        Mnemonic::Psubusw => |this, i| this.handle_psubus(i, PackedWidth::Word),
+
+        // SSE2 - packed integer compare (all-ones / all-zeros lane masks)
+        Mnemonic::Pcmpeqb => |this, i| this.handle_packed_lane_op(
+            i,
+            "pcmpeqb",
+            PackedLaneOp::CmpEq,
+            PackedWidth::Byte,
+        ),
+        Mnemonic::Pcmpeqw => |this, i| this.handle_packed_lane_op(
+            i,
+            "pcmpeqw",
+            PackedLaneOp::CmpEq,
+            PackedWidth::Word,
+        ),
+        Mnemonic::Pcmpeqd => |this, i| this.handle_packed_lane_op(
+            i,
+            "pcmpeqd",
+            PackedLaneOp::CmpEq,
+            PackedWidth::Dword,
+        ),
+        // PCMPEQQ / PCMPGTQ: SSE4.1 / SSE4.2, lane-wise one width up.
+        Mnemonic::Pcmpeqq => |this, i| this.handle_packed_lane_op(
+            i,
+            "pcmpeqq",
+            PackedLaneOp::CmpEq,
+            PackedWidth::Qword,
+        ),
+        Mnemonic::Pcmpgtb => |this, i| this.handle_packed_lane_op(
+            i,
+            "pcmpgtb",
+            PackedLaneOp::CmpGt,
+            PackedWidth::Byte,
+        ),
+        Mnemonic::Pcmpgtw => |this, i| this.handle_packed_lane_op(
+            i,
+            "pcmpgtw",
+            PackedLaneOp::CmpGt,
+            PackedWidth::Word,
+        ),
+        Mnemonic::Pcmpgtd => |this, i| this.handle_packed_lane_op(
+            i,
+            "pcmpgtd",
+            PackedLaneOp::CmpGt,
+            PackedWidth::Dword,
+        ),
+        Mnemonic::Pcmpgtq => |this, i| this.handle_packed_lane_op(
+            i,
+            "pcmpgtq",
+            PackedLaneOp::CmpGt,
+            PackedWidth::Qword,
+        ),
+
+        // AES-NI: one kernel family.
+        Mnemonic::Aesenc => |this, i| this.handle_aes_round(i, AesKernel::Enc),
+        Mnemonic::Aesenclast => |this, i| this.handle_aes_round(i, AesKernel::EncLast),
+        Mnemonic::Aesdec => |this, i| this.handle_aes_round(i, AesKernel::Dec),
+        Mnemonic::Aesdeclast => |this, i| this.handle_aes_round(i, AesKernel::DecLast),
+        Mnemonic::Aesimc => |this, i| this.handle_aesimc(i),
+        Mnemonic::Aeskeygenassist => |this, i| this.handle_aeskeygenassist(i),
+        Mnemonic::Pclmulqdq => |this, i| this.handle_pclmulqdq(i),
+
+        // SSE4.2 packed string compares share one handler; the `REX.W` spellings are separate mnemonics.
+        Mnemonic::Pcmpistri
+        | Mnemonic::Pcmpistrm
+        | Mnemonic::Pcmpestri
+        | Mnemonic::Pcmpestrm
+        | Mnemonic::Pcmpestri64
+        | Mnemonic::Pcmpestrm64 => |this, i| this.handle_pcmpstr(i),
+
+        // SSE / SSE2 - packed integer min / max / average / multiply
+        Mnemonic::Pminub => |this, i| this.handle_packed_lane_op(
+            i,
+            "pminub",
+            PackedLaneOp::MinU,
+            PackedWidth::Byte,
+        ),
+        Mnemonic::Pmaxub => |this, i| this.handle_packed_lane_op(
+            i,
+            "pmaxub",
+            PackedLaneOp::MaxU,
+            PackedWidth::Byte,
+        ),
+        Mnemonic::Pminsw => |this, i| this.handle_packed_lane_op(
+            i,
+            "pminsw",
+            PackedLaneOp::MinS,
+            PackedWidth::Word,
+        ),
+        Mnemonic::Pmaxsw => |this, i| this.handle_packed_lane_op(
+            i,
+            "pmaxsw",
+            PackedLaneOp::MaxS,
+            PackedWidth::Word,
+        ),
+        Mnemonic::Pavgb => |this, i| this.handle_packed_lane_op(
+            i,
+            "pavgb",
+            PackedLaneOp::Avg,
+            PackedWidth::Byte,
+        ),
+        Mnemonic::Pavgw => |this, i| this.handle_packed_lane_op(
+            i,
+            "pavgw",
+            PackedLaneOp::Avg,
+            PackedWidth::Word,
+        ),
+        Mnemonic::Pmullw => |this, i| this.handle_packed_lane_op(
+            i,
+            "pmullw",
+            PackedLaneOp::MulLow,
+            PackedWidth::Word,
+        ),
+        Mnemonic::Pmulhw => |this, i| this.handle_packed_lane_op(
+            i,
+            "pmulhw",
+            PackedLaneOp::MulHighS,
+            PackedWidth::Word,
+        ),
+        Mnemonic::Pmulhuw => |this, i| this.handle_packed_lane_op(
+            i,
+            "pmulhuw",
+            PackedLaneOp::MulHighU,
+            PackedWidth::Word,
+        ),
+
+        // SSE4.1 - the min / max forms the earlier generations lacked.
+        Mnemonic::Pminsb => |this, i| this.handle_packed_lane_op(
+            i,
+            "pminsb",
+            PackedLaneOp::MinS,
+            PackedWidth::Byte,
+        ),
+        Mnemonic::Pmaxsb => |this, i| this.handle_packed_lane_op(
+            i,
+            "pmaxsb",
+            PackedLaneOp::MaxS,
+            PackedWidth::Byte,
+        ),
+        Mnemonic::Pminuw => |this, i| this.handle_packed_lane_op(
+            i,
+            "pminuw",
+            PackedLaneOp::MinU,
+            PackedWidth::Word,
+        ),
+        Mnemonic::Pmaxuw => |this, i| this.handle_packed_lane_op(
+            i,
+            "pmaxuw",
+            PackedLaneOp::MaxU,
+            PackedWidth::Word,
+        ),
+        Mnemonic::Pminsd => |this, i| this.handle_packed_lane_op(
+            i,
+            "pminsd",
+            PackedLaneOp::MinS,
+            PackedWidth::Dword,
+        ),
+        Mnemonic::Pmaxsd => |this, i| this.handle_packed_lane_op(
+            i,
+            "pmaxsd",
+            PackedLaneOp::MaxS,
+            PackedWidth::Dword,
+        ),
+        Mnemonic::Pminud => |this, i| this.handle_packed_lane_op(
+            i,
+            "pminud",
+            PackedLaneOp::MinU,
+            PackedWidth::Dword,
+        ),
+        Mnemonic::Pmaxud => |this, i| this.handle_packed_lane_op(
+            i,
+            "pmaxud",
+            PackedLaneOp::MaxU,
+            PackedWidth::Dword,
+        ),
+        Mnemonic::Pmulld => |this, i| this.handle_packed_lane_op(
+            i,
+            "pmulld",
+            PackedLaneOp::MulLow,
+            PackedWidth::Dword,
+        ),
+
+        // SSSE3 - byte shuffle, concat-rotate, sign ops and horizontal arithmetic.
+        Mnemonic::Pshufb => |this, i| this.handle_pshufb(i),
+        Mnemonic::Palignr => |this, i| this.handle_palignr(i),
+        Mnemonic::Pabsb => |this, i| this.handle_pabs(i, PackedWidth::Byte),
+        Mnemonic::Pabsw => |this, i| this.handle_pabs(i, PackedWidth::Word),
+        Mnemonic::Pabsd => |this, i| this.handle_pabs(i, PackedWidth::Dword),
+        Mnemonic::Psignb => |this, i| this.handle_psign(i, PackedWidth::Byte),
+        Mnemonic::Psignw => |this, i| this.handle_psign(i, PackedWidth::Word),
+        Mnemonic::Psignd => |this, i| this.handle_psign(i, PackedWidth::Dword),
+        Mnemonic::Phaddw => |this, i| {
+            this.handle_horizontal(i, HorizOp::Add, PackedWidth::Word)
+        },
+        Mnemonic::Phaddd => |this, i| {
+            this.handle_horizontal(i, HorizOp::Add, PackedWidth::Dword)
+        },
+        Mnemonic::Phaddsw => |this, i| {
+            this.handle_horizontal(i, HorizOp::AddSat, PackedWidth::Word)
+        },
+        Mnemonic::Phsubw => |this, i| {
+            this.handle_horizontal(i, HorizOp::Sub, PackedWidth::Word)
+        },
+        Mnemonic::Phsubd => |this, i| {
+            this.handle_horizontal(i, HorizOp::Sub, PackedWidth::Dword)
+        },
+        Mnemonic::Phsubsw => |this, i| {
+            this.handle_horizontal(i, HorizOp::SubSat, PackedWidth::Word)
+        },
+        Mnemonic::Pmaddubsw => |this, i| this.handle_pmaddubsw(i),
+        Mnemonic::Pmulhrsw => |this, i| this.handle_pmulhrsw(i),
+
+        // SSE2 / SSE4.1 - widening multiply, dot product and SAD.
+        Mnemonic::Pmuludq => |this, i| this.handle_pmuldq(i, false),
+        Mnemonic::Pmuldq => |this, i| this.handle_pmuldq(i, true),
+        Mnemonic::Pmaddwd => |this, i| this.handle_pmaddwd(i),
+        Mnemonic::Psadbw => |this, i| this.handle_psadbw(i),
+
+        // SSE2 / SSE4.1 - saturating narrowing packs.
+        Mnemonic::Packsswb => |this, i| this.handle_pack(i, PackedWidth::Word, true),
+        Mnemonic::Packssdw => |this, i| this.handle_pack(i, PackedWidth::Dword, true),
+        Mnemonic::Packuswb => |this, i| this.handle_pack(i, PackedWidth::Word, false),
+        Mnemonic::Packusdw => |this, i| this.handle_pack(i, PackedWidth::Dword, false),
+
+        // SSE4.1 - sign / zero extending widening.
+        Mnemonic::Pmovzxbw => |this, i| this.handle_pmovx(i, 8, 16, false),
+        Mnemonic::Pmovzxbd => |this, i| this.handle_pmovx(i, 8, 32, false),
+        Mnemonic::Pmovzxbq => |this, i| this.handle_pmovx(i, 8, 64, false),
+        Mnemonic::Pmovzxwd => |this, i| this.handle_pmovx(i, 16, 32, false),
+        Mnemonic::Pmovzxwq => |this, i| this.handle_pmovx(i, 16, 64, false),
+        Mnemonic::Pmovzxdq => |this, i| this.handle_pmovx(i, 32, 64, false),
+        Mnemonic::Pmovsxbw => |this, i| this.handle_pmovx(i, 8, 16, true),
+        Mnemonic::Pmovsxbd => |this, i| this.handle_pmovx(i, 8, 32, true),
+        Mnemonic::Pmovsxbq => |this, i| this.handle_pmovx(i, 8, 64, true),
+        Mnemonic::Pmovsxwd => |this, i| this.handle_pmovx(i, 16, 32, true),
+        Mnemonic::Pmovsxwq => |this, i| this.handle_pmovx(i, 16, 64, true),
+        Mnemonic::Pmovsxdq => |this, i| this.handle_pmovx(i, 32, 64, true),
+
+        // SSE2 / SSE4.1 - lane insert and extract.
+        Mnemonic::Pinsrb => |this, i| this.handle_pinsr(i, PackedWidth::Byte),
+        Mnemonic::Pinsrw => |this, i| this.handle_pinsr(i, PackedWidth::Word),
+        Mnemonic::Pinsrd => |this, i| this.handle_pinsr(i, PackedWidth::Dword),
+        Mnemonic::Pinsrq => |this, i| this.handle_pinsr(i, PackedWidth::Qword),
+        Mnemonic::Insertps => |this, i| this.handle_insertps(i),
+        Mnemonic::Pextrb => |this, i| this.handle_pextr(i, PackedWidth::Byte),
+        Mnemonic::Pextrw => |this, i| this.handle_pextr(i, PackedWidth::Word),
+        Mnemonic::Pextrd => |this, i| this.handle_pextr(i, PackedWidth::Dword),
+        Mnemonic::Pextrq => |this, i| this.handle_pextr(i, PackedWidth::Qword),
+        Mnemonic::Extractps => |this, i| this.handle_extractps(i),
+
+        // SSE4.1 - dot products and the two cross-lane reductions.
+        Mnemonic::Dpps => |this, i| this.handle_dpps(i),
+        Mnemonic::Dppd => |this, i| this.handle_dppd(i),
+        Mnemonic::Phminposuw => |this, i| this.handle_phminposuw(i),
+        Mnemonic::Mpsadbw => |this, i| this.handle_mpsadbw(i),
+
+        // SSE4.1 - blends and the 128-bit bitwise test.
+        Mnemonic::Pblendw => |this, i| this.handle_blend_imm(i, PackedWidth::Word),
+        Mnemonic::Blendps => |this, i| this.handle_blend_imm(i, PackedWidth::Dword),
+        Mnemonic::Blendpd => |this, i| this.handle_blend_imm(i, PackedWidth::Qword),
+        Mnemonic::Pblendvb => |this, i| this.handle_blendv(i, PackedWidth::Byte),
+        Mnemonic::Blendvps => |this, i| this.handle_blendv(i, PackedWidth::Dword),
+        Mnemonic::Blendvpd => |this, i| this.handle_blendv(i, PackedWidth::Qword),
+        Mnemonic::Ptest => |this, i| this.handle_ptest(i),
+
+        // SSE / SSE2 - sign-bit extraction into a GPR
+        Mnemonic::Pmovmskb => |this, i| this.handle_movmsk(i, "pmovmskb", PackedWidth::Byte),
+        Mnemonic::Movmskps => |this, i| this.handle_movmsk(i, "movmskps", PackedWidth::Dword),
+        Mnemonic::Movmskpd => |this, i| this.handle_movmsk(i, "movmskpd", PackedWidth::Qword),
+
+        // String Operations
+        Mnemonic::Movsb => |this, i| this.handle_movsb(i),
+        Mnemonic::Movsw => |this, i| this.handle_movsw(i),
+        // MOVSD is shared with SSE2 scalar-double; disambiguate on a memory-string op0.
+        Mnemonic::Movsd => |this, i| {
+            if matches!(
+                i.op0_kind(),
+                OpKind::MemoryESDI | OpKind::MemoryESRDI
+            ) {
+                this.handle_movsd_mem(i)
+            } else {
+                this.handle_movsd_sse(i)
             }
-            Mnemonic::Phaddd => {
-                self.handle_horizontal(instruction, HorizOp::Add, PackedWidth::Dword)
-            }
-            Mnemonic::Phaddsw => {
-                self.handle_horizontal(instruction, HorizOp::AddSat, PackedWidth::Word)
-            }
-            Mnemonic::Phsubw => {
-                self.handle_horizontal(instruction, HorizOp::Sub, PackedWidth::Word)
-            }
-            Mnemonic::Phsubd => {
-                self.handle_horizontal(instruction, HorizOp::Sub, PackedWidth::Dword)
-            }
-            Mnemonic::Phsubsw => {
-                self.handle_horizontal(instruction, HorizOp::SubSat, PackedWidth::Word)
-            }
-            Mnemonic::Pmaddubsw => self.handle_pmaddubsw(instruction),
-            Mnemonic::Pmulhrsw => self.handle_pmulhrsw(instruction),
+        },
+        Mnemonic::Movsq => |this, i| this.handle_movsq(i),
+        Mnemonic::Stosb => |this, i| this.handle_stosb(i),
+        Mnemonic::Stosw => |this, i| this.handle_stosw(i),
+        Mnemonic::Stosd => |this, i| this.handle_stosd(i),
+        Mnemonic::Stosq => |this, i| this.handle_stosq(i),
+        Mnemonic::Lodsb => |this, i| this.handle_lodsb(i),
+        Mnemonic::Lodsw => |this, i| this.handle_lodsw(i),
+        Mnemonic::Lodsd => |this, i| this.handle_lodsd(i),
+        Mnemonic::Lodsq => |this, i| this.handle_lodsq(i),
+        Mnemonic::Insb => |this, i| this.handle_insb(i),
+        Mnemonic::Insw => |this, i| this.handle_insw(i),
+        Mnemonic::Insd => |this, i| this.handle_insd(i),
+        Mnemonic::Outsb => |this, i| this.handle_outsb(i),
+        Mnemonic::Outsw => |this, i| this.handle_outsw(i),
+        Mnemonic::Outsd => |this, i| this.handle_outsd(i),
 
-            // SSE2 / SSE4.1 - widening multiply, dot product and SAD.
-            Mnemonic::Pmuludq => self.handle_pmuldq(instruction, false),
-            Mnemonic::Pmuldq => self.handle_pmuldq(instruction, true),
-            Mnemonic::Pmaddwd => self.handle_pmaddwd(instruction),
-            Mnemonic::Psadbw => self.handle_psadbw(instruction),
+        // Arithmetic
+        Mnemonic::Add => |this, i| this.handle_add(i),
+        Mnemonic::Adc => |this, i| this.handle_adc(i),
+        Mnemonic::Sub => |this, i| this.handle_sub(i),
+        Mnemonic::Sbb => |this, i| this.handle_sbb(i),
+        // Sign-extension conversions (implicit operand form)
+        Mnemonic::Cbw => |this, i| this.handle_cbw(i),
+        Mnemonic::Cwde => |this, i| this.handle_cwde(i),
+        Mnemonic::Cdqe => |this, i| this.handle_cdqe(i),
+        Mnemonic::Cwd => |this, i| this.handle_cwd(i),
+        Mnemonic::Cdq => |this, i| this.handle_cdq(i),
+        Mnemonic::Cqo => |this, i| this.handle_cqo(i),
+        Mnemonic::Xadd => |this, i| this.handle_xadd(i),
+        Mnemonic::Cmp => |this, i| this.handle_cmp(i),
+        Mnemonic::Inc => |this, i| this.handle_inc(i),
+        Mnemonic::Dec => |this, i| this.handle_dec(i),
+        Mnemonic::Neg => |this, i| this.handle_neg(i),
+        Mnemonic::Imul => |this, i| this.handle_imul(i),
+        Mnemonic::Mul => |this, i| this.handle_mul(i),
+        Mnemonic::Idiv => |this, i| this.handle_idiv(i),
+        Mnemonic::Div => |this, i| this.handle_div(i),
 
-            // SSE2 / SSE4.1 - saturating narrowing packs.
-            Mnemonic::Packsswb => self.handle_pack(instruction, PackedWidth::Word, true),
-            Mnemonic::Packssdw => self.handle_pack(instruction, PackedWidth::Dword, true),
-            Mnemonic::Packuswb => self.handle_pack(instruction, PackedWidth::Word, false),
-            Mnemonic::Packusdw => self.handle_pack(instruction, PackedWidth::Dword, false),
+        // Bitwise / Logical
+        Mnemonic::And => |this, i| this.handle_and(i),
+        Mnemonic::Or => |this, i| this.handle_or(i),
+        Mnemonic::Xor => |this, i| this.handle_xor(i),
+        Mnemonic::Not => |this, i| this.handle_not(i),
+        Mnemonic::Test => |this, i| this.handle_test(i),
 
-            // SSE4.1 - sign / zero extending widening.
-            Mnemonic::Pmovzxbw => self.handle_pmovx(instruction, 8, 16, false),
-            Mnemonic::Pmovzxbd => self.handle_pmovx(instruction, 8, 32, false),
-            Mnemonic::Pmovzxbq => self.handle_pmovx(instruction, 8, 64, false),
-            Mnemonic::Pmovzxwd => self.handle_pmovx(instruction, 16, 32, false),
-            Mnemonic::Pmovzxwq => self.handle_pmovx(instruction, 16, 64, false),
-            Mnemonic::Pmovzxdq => self.handle_pmovx(instruction, 32, 64, false),
-            Mnemonic::Pmovsxbw => self.handle_pmovx(instruction, 8, 16, true),
-            Mnemonic::Pmovsxbd => self.handle_pmovx(instruction, 8, 32, true),
-            Mnemonic::Pmovsxbq => self.handle_pmovx(instruction, 8, 64, true),
-            Mnemonic::Pmovsxwd => self.handle_pmovx(instruction, 16, 32, true),
-            Mnemonic::Pmovsxwq => self.handle_pmovx(instruction, 16, 64, true),
-            Mnemonic::Pmovsxdq => self.handle_pmovx(instruction, 32, 64, true),
+        // Shifts / Rotates
+        Mnemonic::Shl => |this, i| this.handle_shl(i),
+        Mnemonic::Shr => |this, i| this.handle_shr(i),
+        Mnemonic::Sar => |this, i| this.handle_sar(i),
+        Mnemonic::Rol => |this, i| this.handle_rol(i),
+        Mnemonic::Ror => |this, i| this.handle_ror(i),
+        Mnemonic::Rcl => |this, i| this.handle_rcl(i),
+        Mnemonic::Rcr => |this, i| this.handle_rcr(i),
+        Mnemonic::Shld => |this, i| this.handle_shld(i),
+        Mnemonic::Shrd => |this, i| this.handle_shrd(i),
 
-            // SSE2 / SSE4.1 - lane insert and extract.
-            Mnemonic::Pinsrb => self.handle_pinsr(instruction, PackedWidth::Byte),
-            Mnemonic::Pinsrw => self.handle_pinsr(instruction, PackedWidth::Word),
-            Mnemonic::Pinsrd => self.handle_pinsr(instruction, PackedWidth::Dword),
-            Mnemonic::Pinsrq => self.handle_pinsr(instruction, PackedWidth::Qword),
-            Mnemonic::Insertps => self.handle_insertps(instruction),
-            Mnemonic::Pextrb => self.handle_pextr(instruction, PackedWidth::Byte),
-            Mnemonic::Pextrw => self.handle_pextr(instruction, PackedWidth::Word),
-            Mnemonic::Pextrd => self.handle_pextr(instruction, PackedWidth::Dword),
-            Mnemonic::Pextrq => self.handle_pextr(instruction, PackedWidth::Qword),
-            Mnemonic::Extractps => self.handle_extractps(instruction),
+        // Bit Manipulation
+        Mnemonic::Bt => |this, i| this.handle_bt(i),
+        Mnemonic::Bts => |this, i| this.handle_bts(i),
+        Mnemonic::Btr => |this, i| this.handle_btr(i),
+        Mnemonic::Btc => |this, i| this.handle_btc(i),
+        Mnemonic::Bsf => |this, i| this.handle_bsf(i),
+        Mnemonic::Bsr => |this, i| this.handle_bsr(i),
+        Mnemonic::Tzcnt => |this, i| this.handle_tzcnt(i),
+        Mnemonic::Lzcnt => |this, i| this.handle_lzcnt(i),
+        Mnemonic::Popcnt => |this, i| this.handle_popcnt(i),
+        // SSE4.2 - CRC-32C accumulation.
+        Mnemonic::Crc32 => |this, i| this.handle_crc32(i),
+        Mnemonic::Bswap => |this, i| this.handle_bswap(i),
 
-            // SSE4.1 - dot products and the two cross-lane reductions.
-            Mnemonic::Dpps => self.handle_dpps(instruction),
-            Mnemonic::Dppd => self.handle_dppd(instruction),
-            Mnemonic::Phminposuw => self.handle_phminposuw(instruction),
-            Mnemonic::Mpsadbw => self.handle_mpsadbw(instruction),
+        // Unconditional Control Flow
+        Mnemonic::Jmp => |this, i| this.handle_jmp(i),
+        Mnemonic::Call => |this, i| this.handle_call(i),
+        Mnemonic::Ret => |this, i| this.handle_ret(i),
+        Mnemonic::Retf => |this, i| this.handle_retf(i),
+        Mnemonic::Loop => |this, i| this.handle_loop(i),
+        Mnemonic::Loope => |this, i| this.handle_loope(i),
+        Mnemonic::Loopne => |this, i| this.handle_loopne(i),
 
-            // SSE4.1 - blends and the 128-bit bitwise test.
-            Mnemonic::Pblendw => self.handle_blend_imm(instruction, PackedWidth::Word),
-            Mnemonic::Blendps => self.handle_blend_imm(instruction, PackedWidth::Dword),
-            Mnemonic::Blendpd => self.handle_blend_imm(instruction, PackedWidth::Qword),
-            Mnemonic::Pblendvb => self.handle_blendv(instruction, PackedWidth::Byte),
-            Mnemonic::Blendvps => self.handle_blendv(instruction, PackedWidth::Dword),
-            Mnemonic::Blendvpd => self.handle_blendv(instruction, PackedWidth::Qword),
-            Mnemonic::Ptest => self.handle_ptest(instruction),
+        // Conditional jumps via `Cond`; JRCXZ and LOOP test a register and stay separate.
+        Mnemonic::Jb => |this, i| this.handle_jcc(i, Cond::B),
+        Mnemonic::Jbe => |this, i| this.handle_jcc(i, Cond::Be),
+        Mnemonic::Ja => |this, i| this.handle_jcc(i, Cond::A),
+        Mnemonic::Jae => |this, i| this.handle_jcc(i, Cond::Ae),
+        Mnemonic::Je => |this, i| this.handle_jcc(i, Cond::E),
+        Mnemonic::Jne => |this, i| this.handle_jcc(i, Cond::Ne),
+        Mnemonic::Jg => |this, i| this.handle_jcc(i, Cond::G),
+        Mnemonic::Jge => |this, i| this.handle_jcc(i, Cond::Ge),
+        Mnemonic::Jl => |this, i| this.handle_jcc(i, Cond::L),
+        Mnemonic::Jle => |this, i| this.handle_jcc(i, Cond::Le),
+        Mnemonic::Js => |this, i| this.handle_jcc(i, Cond::S),
+        Mnemonic::Jns => |this, i| this.handle_jcc(i, Cond::Ns),
+        Mnemonic::Jo => |this, i| this.handle_jcc(i, Cond::O),
+        Mnemonic::Jno => |this, i| this.handle_jcc(i, Cond::No),
+        Mnemonic::Jp => |this, i| this.handle_jcc(i, Cond::P),
+        Mnemonic::Jnp => |this, i| this.handle_jcc(i, Cond::Np),
+        Mnemonic::Jrcxz => |this, i| this.handle_jrcxz(i),
 
-            // SSE / SSE2 - sign-bit extraction into a GPR
-            Mnemonic::Pmovmskb => self.handle_movmsk(instruction, "pmovmskb", PackedWidth::Byte),
-            Mnemonic::Movmskps => self.handle_movmsk(instruction, "movmskps", PackedWidth::Dword),
-            Mnemonic::Movmskpd => self.handle_movmsk(instruction, "movmskpd", PackedWidth::Qword),
+        // SETcc - set byte on condition
+        Mnemonic::Sete => |this, i| this.handle_setcc(i, Cond::E),
+        Mnemonic::Setne => |this, i| this.handle_setcc(i, Cond::Ne),
+        Mnemonic::Setb => |this, i| this.handle_setcc(i, Cond::B),
+        Mnemonic::Setae => |this, i| this.handle_setcc(i, Cond::Ae),
+        Mnemonic::Setbe => |this, i| this.handle_setcc(i, Cond::Be),
+        Mnemonic::Seta => |this, i| this.handle_setcc(i, Cond::A),
+        Mnemonic::Setl => |this, i| this.handle_setcc(i, Cond::L),
+        Mnemonic::Setge => |this, i| this.handle_setcc(i, Cond::Ge),
+        Mnemonic::Setle => |this, i| this.handle_setcc(i, Cond::Le),
+        Mnemonic::Setg => |this, i| this.handle_setcc(i, Cond::G),
+        Mnemonic::Sets => |this, i| this.handle_setcc(i, Cond::S),
+        Mnemonic::Setns => |this, i| this.handle_setcc(i, Cond::Ns),
+        Mnemonic::Seto => |this, i| this.handle_setcc(i, Cond::O),
+        Mnemonic::Setno => |this, i| this.handle_setcc(i, Cond::No),
+        Mnemonic::Setp => |this, i| this.handle_setcc(i, Cond::P),
+        Mnemonic::Setnp => |this, i| this.handle_setcc(i, Cond::Np),
 
-            // String Operations
-            Mnemonic::Movsb => self.handle_movsb(instruction),
-            Mnemonic::Movsw => self.handle_movsw(instruction),
-            // MOVSD is shared with SSE2 scalar-double; disambiguate on a memory-string op0.
-            Mnemonic::Movsd => {
-                if matches!(
-                    instruction.op0_kind(),
-                    OpKind::MemoryESDI | OpKind::MemoryESRDI
-                ) {
-                    self.handle_movsd_mem(instruction)
-                } else {
-                    self.handle_movsd_sse(instruction)
-                }
-            }
-            Mnemonic::Movsq => self.handle_movsq(instruction),
-            Mnemonic::Stosb => self.handle_stosb(instruction),
-            Mnemonic::Stosw => self.handle_stosw(instruction),
-            Mnemonic::Stosd => self.handle_stosd(instruction),
-            Mnemonic::Stosq => self.handle_stosq(instruction),
-            Mnemonic::Lodsb => self.handle_lodsb(instruction),
-            Mnemonic::Lodsw => self.handle_lodsw(instruction),
-            Mnemonic::Lodsd => self.handle_lodsd(instruction),
-            Mnemonic::Lodsq => self.handle_lodsq(instruction),
-            Mnemonic::Insb => self.handle_insb(instruction),
-            Mnemonic::Insw => self.handle_insw(instruction),
-            Mnemonic::Insd => self.handle_insd(instruction),
-            Mnemonic::Outsb => self.handle_outsb(instruction),
-            Mnemonic::Outsw => self.handle_outsw(instruction),
-            Mnemonic::Outsd => self.handle_outsd(instruction),
+        // Conditional Move (CMOVcc)
+        Mnemonic::Cmove => |this, i| this.handle_cmovcc(i, Cond::E),
+        Mnemonic::Cmovne => |this, i| this.handle_cmovcc(i, Cond::Ne),
+        Mnemonic::Cmovb => |this, i| this.handle_cmovcc(i, Cond::B),
+        Mnemonic::Cmovae => |this, i| this.handle_cmovcc(i, Cond::Ae),
+        Mnemonic::Cmovbe => |this, i| this.handle_cmovcc(i, Cond::Be),
+        Mnemonic::Cmova => |this, i| this.handle_cmovcc(i, Cond::A),
+        Mnemonic::Cmovl => |this, i| this.handle_cmovcc(i, Cond::L),
+        Mnemonic::Cmovge => |this, i| this.handle_cmovcc(i, Cond::Ge),
+        Mnemonic::Cmovle => |this, i| this.handle_cmovcc(i, Cond::Le),
+        Mnemonic::Cmovg => |this, i| this.handle_cmovcc(i, Cond::G),
+        Mnemonic::Cmovs => |this, i| this.handle_cmovcc(i, Cond::S),
+        Mnemonic::Cmovns => |this, i| this.handle_cmovcc(i, Cond::Ns),
+        Mnemonic::Cmovo => |this, i| this.handle_cmovcc(i, Cond::O),
+        Mnemonic::Cmovno => |this, i| this.handle_cmovcc(i, Cond::No),
+        Mnemonic::Cmovp => |this, i| this.handle_cmovcc(i, Cond::P),
+        Mnemonic::Cmovnp => |this, i| this.handle_cmovcc(i, Cond::Np),
 
-            // Arithmetic
-            Mnemonic::Add => self.handle_add(instruction),
-            Mnemonic::Adc => self.handle_adc(instruction),
-            Mnemonic::Sub => self.handle_sub(instruction),
-            Mnemonic::Sbb => self.handle_sbb(instruction),
-            // Sign-extension conversions (implicit operand form)
-            Mnemonic::Cbw => self.handle_cbw(instruction),
-            Mnemonic::Cwde => self.handle_cwde(instruction),
-            Mnemonic::Cdqe => self.handle_cdqe(instruction),
-            Mnemonic::Cwd => self.handle_cwd(instruction),
-            Mnemonic::Cdq => self.handle_cdq(instruction),
-            Mnemonic::Cqo => self.handle_cqo(instruction),
-            Mnemonic::Xadd => self.handle_xadd(instruction),
-            Mnemonic::Cmp => self.handle_cmp(instruction),
-            Mnemonic::Inc => self.handle_inc(instruction),
-            Mnemonic::Dec => self.handle_dec(instruction),
-            Mnemonic::Neg => self.handle_neg(instruction),
-            Mnemonic::Imul => self.handle_imul(instruction),
-            Mnemonic::Mul => self.handle_mul(instruction),
-            Mnemonic::Idiv => self.handle_idiv(instruction),
-            Mnemonic::Div => self.handle_div(instruction),
+        // Traps / faults
+        Mnemonic::Ud2 => |this, i| this.handle_ud2(i),
+        Mnemonic::Int3 => |this, i| this.handle_int3(i),
+        Mnemonic::Int => |this, i| this.handle_int(i),
+        Mnemonic::Int1 => |this, i| this.handle_int1(i),
 
-            // Bitwise / Logical
-            Mnemonic::And => self.handle_and(instruction),
-            Mnemonic::Or => self.handle_or(instruction),
-            Mnemonic::Xor => self.handle_xor(instruction),
-            Mnemonic::Not => self.handle_not(instruction),
-            Mnemonic::Test => self.handle_test(instruction),
+        // System
+        Mnemonic::Syscall => |this, i| this.handle_syscall(i),
+        Mnemonic::Cpuid => |this, i| this.handle_cpuid(i),
+        Mnemonic::Xgetbv => |this, i| this.handle_xgetbv(i),
+        Mnemonic::Rdtsc => |this, i| this.handle_rdtsc(i),
 
-            // Shifts / Rotates
-            Mnemonic::Shl => self.handle_shl(instruction),
-            Mnemonic::Shr => self.handle_shr(instruction),
-            Mnemonic::Sar => self.handle_sar(instruction),
-            Mnemonic::Rol => self.handle_rol(instruction),
-            Mnemonic::Ror => self.handle_ror(instruction),
-            Mnemonic::Rcl => self.handle_rcl(instruction),
-            Mnemonic::Rcr => self.handle_rcr(instruction),
-            Mnemonic::Shld => self.handle_shld(instruction),
-            Mnemonic::Shrd => self.handle_shrd(instruction),
+        // FS/GS base (FSGSBASE extension)
+        Mnemonic::Rdfsbase => |this, i| this.handle_rdfsbase(i),
+        Mnemonic::Wrfsbase => |this, i| this.handle_wrfsbase(i),
+        Mnemonic::Rdgsbase => |this, i| this.handle_rdgsbase(i),
+        Mnemonic::Wrgsbase => |this, i| this.handle_wrgsbase(i),
 
-            // Bit Manipulation
-            Mnemonic::Bt => self.handle_bt(instruction),
-            Mnemonic::Bts => self.handle_bts(instruction),
-            Mnemonic::Btr => self.handle_btr(instruction),
-            Mnemonic::Btc => self.handle_btc(instruction),
-            Mnemonic::Bsf => self.handle_bsf(instruction),
-            Mnemonic::Bsr => self.handle_bsr(instruction),
-            Mnemonic::Tzcnt => self.handle_tzcnt(instruction),
-            Mnemonic::Lzcnt => self.handle_lzcnt(instruction),
-            Mnemonic::Popcnt => self.handle_popcnt(instruction),
-            // SSE4.2 - CRC-32C accumulation.
-            Mnemonic::Crc32 => self.handle_crc32(instruction),
-            Mnemonic::Bswap => self.handle_bswap(instruction),
+        // x87 FPU - loads / stores
+        Mnemonic::Fld => |this, i| this.handle_fld(i),
+        Mnemonic::Fild => |this, i| this.handle_fild(i),
+        Mnemonic::Fldz => |this, _| this.handle_fld_const(0.0),
+        Mnemonic::Fld1 => |this, _| this.handle_fld_const(1.0),
+        Mnemonic::Fldpi => |this, _| this.handle_fld_const(std::f64::consts::PI),
+        Mnemonic::Fst => |this, i| this.handle_fst(i, false),
+        Mnemonic::Fstp => |this, i| this.handle_fst(i, true),
+        Mnemonic::Fist => |this, i| this.handle_fist(i, false, false),
+        Mnemonic::Fistp => |this, i| this.handle_fist(i, true, false),
+        Mnemonic::Fisttp => |this, i| this.handle_fist(i, true, true),
+        Mnemonic::Fxch => |this, i| this.handle_fxch(i),
 
-            // Unconditional Control Flow
-            Mnemonic::Jmp => self.handle_jmp(instruction),
-            Mnemonic::Call => self.handle_call(instruction),
-            Mnemonic::Ret => self.handle_ret(instruction),
-            Mnemonic::Retf => self.handle_retf(instruction),
-            Mnemonic::Loop => self.handle_loop(instruction),
-            Mnemonic::Loope => self.handle_loope(instruction),
-            Mnemonic::Loopne => self.handle_loopne(instruction),
+        // x87 FPU - arithmetic
+        Mnemonic::Fadd => |this, i| this.handle_farith(i, FpuOp::Add, false),
+        Mnemonic::Faddp => |this, i| this.handle_farith(i, FpuOp::Add, true),
+        Mnemonic::Fsub => |this, i| this.handle_farith(i, FpuOp::Sub, false),
+        Mnemonic::Fsubp => |this, i| this.handle_farith(i, FpuOp::Sub, true),
+        Mnemonic::Fsubr => |this, i| this.handle_farith(i, FpuOp::Subr, false),
+        Mnemonic::Fsubrp => |this, i| this.handle_farith(i, FpuOp::Subr, true),
+        Mnemonic::Fmul => |this, i| this.handle_farith(i, FpuOp::Mul, false),
+        Mnemonic::Fmulp => |this, i| this.handle_farith(i, FpuOp::Mul, true),
+        Mnemonic::Fdiv => |this, i| this.handle_farith(i, FpuOp::Div, false),
+        Mnemonic::Fdivp => |this, i| this.handle_farith(i, FpuOp::Div, true),
+        Mnemonic::Fdivr => |this, i| this.handle_farith(i, FpuOp::Divr, false),
+        Mnemonic::Fdivrp => |this, i| this.handle_farith(i, FpuOp::Divr, true),
+        Mnemonic::Fabs => |this, i| this.handle_fabs(i),
+        Mnemonic::Fchs => |this, i| this.handle_fchs(i),
+        Mnemonic::Fsqrt => |this, i| this.handle_fsqrt(i),
+        Mnemonic::Fcos => |this, i| this.handle_fcos(i),
+        Mnemonic::Fsin => |this, i| this.handle_fsin(i),
+        Mnemonic::Fsincos => |this, i| this.handle_fsincos(i),
+        Mnemonic::Fptan => |this, i| this.handle_fptan(i),
 
-            // Conditional jumps via `Cond`; JRCXZ and LOOP test a register and stay separate.
-            Mnemonic::Jb => self.handle_jcc(instruction, Cond::B),
-            Mnemonic::Jbe => self.handle_jcc(instruction, Cond::Be),
-            Mnemonic::Ja => self.handle_jcc(instruction, Cond::A),
-            Mnemonic::Jae => self.handle_jcc(instruction, Cond::Ae),
-            Mnemonic::Je => self.handle_jcc(instruction, Cond::E),
-            Mnemonic::Jne => self.handle_jcc(instruction, Cond::Ne),
-            Mnemonic::Jg => self.handle_jcc(instruction, Cond::G),
-            Mnemonic::Jge => self.handle_jcc(instruction, Cond::Ge),
-            Mnemonic::Jl => self.handle_jcc(instruction, Cond::L),
-            Mnemonic::Jle => self.handle_jcc(instruction, Cond::Le),
-            Mnemonic::Js => self.handle_jcc(instruction, Cond::S),
-            Mnemonic::Jns => self.handle_jcc(instruction, Cond::Ns),
-            Mnemonic::Jo => self.handle_jcc(instruction, Cond::O),
-            Mnemonic::Jno => self.handle_jcc(instruction, Cond::No),
-            Mnemonic::Jp => self.handle_jcc(instruction, Cond::P),
-            Mnemonic::Jnp => self.handle_jcc(instruction, Cond::Np),
-            Mnemonic::Jrcxz => self.handle_jrcxz(instruction),
+        // x87 FPU - comparisons
+        Mnemonic::Fcom => |this, i| this.handle_fcom(i, false),
+        Mnemonic::Fcomp => |this, i| this.handle_fcom(i, true),
+        Mnemonic::Fucom => |this, i| this.handle_fcom(i, false),
+        Mnemonic::Fucomp => |this, i| this.handle_fcom(i, true),
+        Mnemonic::Ftst => |this, i| this.handle_ftst(i),
+        Mnemonic::Fcomi => |this, i| this.handle_fcomi(i, false),
+        Mnemonic::Fcomip => |this, i| this.handle_fcomi(i, true),
+        Mnemonic::Fucomi => |this, i| this.handle_fcomi(i, false),
+        Mnemonic::Fucomip => |this, i| this.handle_fcomi(i, true),
 
-            // SETcc - set byte on condition
-            Mnemonic::Sete => self.handle_setcc(instruction, Cond::E),
-            Mnemonic::Setne => self.handle_setcc(instruction, Cond::Ne),
-            Mnemonic::Setb => self.handle_setcc(instruction, Cond::B),
-            Mnemonic::Setae => self.handle_setcc(instruction, Cond::Ae),
-            Mnemonic::Setbe => self.handle_setcc(instruction, Cond::Be),
-            Mnemonic::Seta => self.handle_setcc(instruction, Cond::A),
-            Mnemonic::Setl => self.handle_setcc(instruction, Cond::L),
-            Mnemonic::Setge => self.handle_setcc(instruction, Cond::Ge),
-            Mnemonic::Setle => self.handle_setcc(instruction, Cond::Le),
-            Mnemonic::Setg => self.handle_setcc(instruction, Cond::G),
-            Mnemonic::Sets => self.handle_setcc(instruction, Cond::S),
-            Mnemonic::Setns => self.handle_setcc(instruction, Cond::Ns),
-            Mnemonic::Seto => self.handle_setcc(instruction, Cond::O),
-            Mnemonic::Setno => self.handle_setcc(instruction, Cond::No),
-            Mnemonic::Setp => self.handle_setcc(instruction, Cond::P),
-            Mnemonic::Setnp => self.handle_setcc(instruction, Cond::Np),
+        // x87 FPU - conditional moves
+        Mnemonic::Fcmovb => |this, i| this.handle_fcmovb(i),
+        Mnemonic::Fcmovnb => |this, i| this.handle_fcmovnb(i),
+        Mnemonic::Fcmove => |this, i| this.handle_fcmove(i),
+        Mnemonic::Fcmovne => |this, i| this.handle_fcmovne(i),
+        Mnemonic::Fcmovbe => |this, i| this.handle_fcmovbe(i),
+        Mnemonic::Fcmovnbe => |this, i| this.handle_fcmovnbe(i),
+        Mnemonic::Fcmovu => |this, i| this.handle_fcmovu(i),
+        Mnemonic::Fcmovnu => |this, i| this.handle_fcmovnu(i),
 
-            // Conditional Move (CMOVcc)
-            Mnemonic::Cmove => self.handle_cmovcc(instruction, Cond::E),
-            Mnemonic::Cmovne => self.handle_cmovcc(instruction, Cond::Ne),
-            Mnemonic::Cmovb => self.handle_cmovcc(instruction, Cond::B),
-            Mnemonic::Cmovae => self.handle_cmovcc(instruction, Cond::Ae),
-            Mnemonic::Cmovbe => self.handle_cmovcc(instruction, Cond::Be),
-            Mnemonic::Cmova => self.handle_cmovcc(instruction, Cond::A),
-            Mnemonic::Cmovl => self.handle_cmovcc(instruction, Cond::L),
-            Mnemonic::Cmovge => self.handle_cmovcc(instruction, Cond::Ge),
-            Mnemonic::Cmovle => self.handle_cmovcc(instruction, Cond::Le),
-            Mnemonic::Cmovg => self.handle_cmovcc(instruction, Cond::G),
-            Mnemonic::Cmovs => self.handle_cmovcc(instruction, Cond::S),
-            Mnemonic::Cmovns => self.handle_cmovcc(instruction, Cond::Ns),
-            Mnemonic::Cmovo => self.handle_cmovcc(instruction, Cond::O),
-            Mnemonic::Cmovno => self.handle_cmovcc(instruction, Cond::No),
-            Mnemonic::Cmovp => self.handle_cmovcc(instruction, Cond::P),
-            Mnemonic::Cmovnp => self.handle_cmovcc(instruction, Cond::Np),
+        // x87 FPU - control / misc
+        Mnemonic::Fnstsw => |this, i| this.handle_fnstsw(i),
+        Mnemonic::Fnstcw => |this, i| this.handle_fnstcw(i),
+        Mnemonic::Fldcw => |this, i| this.handle_fldcw(i),
+        Mnemonic::Fincstp => |this, i| this.handle_fincstp(i),
+        Mnemonic::Fdecstp => |this, i| this.handle_fdecstp(i),
+        Mnemonic::Ffree => |this, i| this.handle_ffree(i),
+        Mnemonic::Emms => |this, i| this.handle_emms(i),
+        // `FNOP`/`WAIT` do nothing (`9B` is the prefix iced splits off `FSTENV`/`FCLEX`/`FINIT`).
+        Mnemonic::Fnop | Mnemonic::Wait => |this, i| this.handle_fpu_nop(i),
+        Mnemonic::Fnstenv => |this, i| this.handle_fnstenv(i),
+        Mnemonic::Fldenv => |this, i| this.handle_fldenv(i),
+        Mnemonic::Fnclex => |this, i| this.handle_fnclex(i),
+        Mnemonic::Fninit => |this, i| this.handle_fninit(i),
 
-            // Traps / faults
-            Mnemonic::Ud2 => self.handle_ud2(instruction),
-            Mnemonic::Int3 => self.handle_int3(instruction),
-            Mnemonic::Int => self.handle_int(instruction),
-            Mnemonic::Int1 => self.handle_int1(instruction),
+        // SSE control/status; the AVX spellings are identical.
+        Mnemonic::Stmxcsr | Mnemonic::Vstmxcsr => |this, i| this.handle_stmxcsr(i),
+        Mnemonic::Ldmxcsr | Mnemonic::Vldmxcsr => |this, i| this.handle_ldmxcsr(i),
 
-            // System
-            Mnemonic::Syscall => self.handle_syscall(instruction),
-            Mnemonic::Cpuid => self.handle_cpuid(instruction),
-            Mnemonic::Xgetbv => self.handle_xgetbv(instruction),
-            Mnemonic::Rdtsc => self.handle_rdtsc(instruction),
+        Mnemonic::Stc => |this, i| this.handle_stc(i),
+        Mnemonic::Clc => |this, i| this.handle_clc(i),
+        Mnemonic::Cmc => |this, i| this.handle_cmc(i),
+        Mnemonic::Std => |this, i| this.handle_std(i),
+        Mnemonic::Cld => |this, i| this.handle_cld(i),
 
-            // FS/GS base (FSGSBASE extension)
-            Mnemonic::Rdfsbase => self.handle_rdfsbase(instruction),
-            Mnemonic::Wrfsbase => self.handle_wrfsbase(instruction),
-            Mnemonic::Rdgsbase => self.handle_rdgsbase(instruction),
-            Mnemonic::Wrgsbase => self.handle_wrgsbase(instruction),
-
-            // x87 FPU - loads / stores
-            Mnemonic::Fld => self.handle_fld(instruction),
-            Mnemonic::Fild => self.handle_fild(instruction),
-            Mnemonic::Fldz => self.handle_fld_const(0.0),
-            Mnemonic::Fld1 => self.handle_fld_const(1.0),
-            Mnemonic::Fldpi => self.handle_fld_const(std::f64::consts::PI),
-            Mnemonic::Fst => self.handle_fst(instruction, false),
-            Mnemonic::Fstp => self.handle_fst(instruction, true),
-            Mnemonic::Fist => self.handle_fist(instruction, false, false),
-            Mnemonic::Fistp => self.handle_fist(instruction, true, false),
-            Mnemonic::Fisttp => self.handle_fist(instruction, true, true),
-            Mnemonic::Fxch => self.handle_fxch(instruction),
-
-            // x87 FPU - arithmetic
-            Mnemonic::Fadd => self.handle_farith(instruction, FpuOp::Add, false),
-            Mnemonic::Faddp => self.handle_farith(instruction, FpuOp::Add, true),
-            Mnemonic::Fsub => self.handle_farith(instruction, FpuOp::Sub, false),
-            Mnemonic::Fsubp => self.handle_farith(instruction, FpuOp::Sub, true),
-            Mnemonic::Fsubr => self.handle_farith(instruction, FpuOp::Subr, false),
-            Mnemonic::Fsubrp => self.handle_farith(instruction, FpuOp::Subr, true),
-            Mnemonic::Fmul => self.handle_farith(instruction, FpuOp::Mul, false),
-            Mnemonic::Fmulp => self.handle_farith(instruction, FpuOp::Mul, true),
-            Mnemonic::Fdiv => self.handle_farith(instruction, FpuOp::Div, false),
-            Mnemonic::Fdivp => self.handle_farith(instruction, FpuOp::Div, true),
-            Mnemonic::Fdivr => self.handle_farith(instruction, FpuOp::Divr, false),
-            Mnemonic::Fdivrp => self.handle_farith(instruction, FpuOp::Divr, true),
-            Mnemonic::Fabs => self.handle_fabs(instruction),
-            Mnemonic::Fchs => self.handle_fchs(instruction),
-            Mnemonic::Fsqrt => self.handle_fsqrt(instruction),
-            Mnemonic::Fcos => self.handle_fcos(instruction),
-            Mnemonic::Fsin => self.handle_fsin(instruction),
-            Mnemonic::Fsincos => self.handle_fsincos(instruction),
-            Mnemonic::Fptan => self.handle_fptan(instruction),
-
-            // x87 FPU - comparisons
-            Mnemonic::Fcom => self.handle_fcom(instruction, false),
-            Mnemonic::Fcomp => self.handle_fcom(instruction, true),
-            Mnemonic::Fucom => self.handle_fcom(instruction, false),
-            Mnemonic::Fucomp => self.handle_fcom(instruction, true),
-            Mnemonic::Ftst => self.handle_ftst(instruction),
-            Mnemonic::Fcomi => self.handle_fcomi(instruction, false),
-            Mnemonic::Fcomip => self.handle_fcomi(instruction, true),
-            Mnemonic::Fucomi => self.handle_fcomi(instruction, false),
-            Mnemonic::Fucomip => self.handle_fcomi(instruction, true),
-
-            // x87 FPU - conditional moves
-            Mnemonic::Fcmovb => self.handle_fcmovb(instruction),
-            Mnemonic::Fcmovnb => self.handle_fcmovnb(instruction),
-            Mnemonic::Fcmove => self.handle_fcmove(instruction),
-            Mnemonic::Fcmovne => self.handle_fcmovne(instruction),
-            Mnemonic::Fcmovbe => self.handle_fcmovbe(instruction),
-            Mnemonic::Fcmovnbe => self.handle_fcmovnbe(instruction),
-            Mnemonic::Fcmovu => self.handle_fcmovu(instruction),
-            Mnemonic::Fcmovnu => self.handle_fcmovnu(instruction),
-
-            // x87 FPU - control / misc
-            Mnemonic::Fnstsw => self.handle_fnstsw(instruction),
-            Mnemonic::Fnstcw => self.handle_fnstcw(instruction),
-            Mnemonic::Fldcw => self.handle_fldcw(instruction),
-            Mnemonic::Fincstp => self.handle_fincstp(instruction),
-            Mnemonic::Fdecstp => self.handle_fdecstp(instruction),
-            Mnemonic::Ffree => self.handle_ffree(instruction),
-            Mnemonic::Emms => self.handle_emms(instruction),
-            // `FNOP`/`WAIT` do nothing (`9B` is the prefix iced splits off `FSTENV`/`FCLEX`/`FINIT`).
-            Mnemonic::Fnop | Mnemonic::Wait => self.handle_fpu_nop(instruction),
-            Mnemonic::Fnstenv => self.handle_fnstenv(instruction),
-            Mnemonic::Fldenv => self.handle_fldenv(instruction),
-            Mnemonic::Fnclex => self.handle_fnclex(instruction),
-            Mnemonic::Fninit => self.handle_fninit(instruction),
-
-            // SSE control/status; the AVX spellings are identical.
-            Mnemonic::Stmxcsr | Mnemonic::Vstmxcsr => self.handle_stmxcsr(instruction),
-            Mnemonic::Ldmxcsr | Mnemonic::Vldmxcsr => self.handle_ldmxcsr(instruction),
-
-            Mnemonic::Stc => self.handle_stc(instruction),
-            Mnemonic::Clc => self.handle_clc(instruction),
-            Mnemonic::Cmc => self.handle_cmc(instruction),
-            Mnemonic::Std => self.handle_std(instruction),
-            Mnemonic::Cld => self.handle_cld(instruction),
-
-            _ => {
-                if self.config.interpreter_fallback {
-                    self.handle_unimplemented_instruction(instruction)
-                } else {
-                    Err(MicroliftError::UnsupportedInstruction {
-                        mnemonic: format!("{:?}", instruction.mnemonic()),
-                    })
-                }
-            }
-        }
-    }
+        _ => return None,
+    };
+    Some(semantics)
 }
 
 /// True when any operand names an MMX register (`MM0..MM7`).

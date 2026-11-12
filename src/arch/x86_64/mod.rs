@@ -17,6 +17,7 @@ use crate::core::{GuestArch, LiftEngine, LifterConfig};
 use cranelift::prelude::*;
 use cranelift_frontend::{FunctionBuilder, Variable};
 use iced_x86::Instruction;
+use semantics::Lowering;
 
 use context::RegisterContext;
 use regs::{
@@ -282,6 +283,10 @@ impl GuestArch for X86_64 {
                 )
             })
             .collect()
+    }
+
+    fn interprets(lifter: &LiftEngine<'_, Self>, i: &Self::Instr) -> bool {
+        matches!(lifter.lowering(i), Lowering::Interpret)
     }
 
     fn lift_instruction(lifter: &mut LiftEngine<'_, Self>, i: &Self::Instr) -> crate::Result<()> {

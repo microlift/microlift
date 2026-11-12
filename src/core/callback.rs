@@ -1,6 +1,7 @@
 //! Host callbacks (syscall, unlifted instruction) called inline through context fn pointers.
 //!
 //! - Runs with full state synced; PC is past a `syscall`, *at* an interpreted instruction.
+//! - Consecutive straight-line interpreted instructions share one call that names their count.
 //! - On return the guest resumes at the context's PC; a moved PC dispatches as an indirect jump.
 //! - Contexts always carry callbacks; defaults abort.
 

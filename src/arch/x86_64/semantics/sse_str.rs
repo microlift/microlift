@@ -277,11 +277,9 @@ pub fn emit_pcmpstr_agg(
 
 impl<'a> Lifter<'a> {
     /// `PCMPISTRI` / `PCMPISTRM` / `PCMPESTRI` / `PCMPESTRM`.
-    pub(super) fn handle_pcmpstr(
-        &mut self,
-        instruction: &Instruction,
-        form: PcmpstrForm,
-    ) -> crate::Result<()> {
+    /// `lowering` interprets the spellings without a [`PcmpstrForm`].
+    pub(super) fn handle_pcmpstr(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        let form = PcmpstrForm::of(instruction).expect("a pcmpstr form");
         let imm = instruction.immediate8();
         let ctl = imm & 0x0F;
         let bits = element_bits(ctl);

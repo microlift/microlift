@@ -51,6 +51,7 @@ use cranelift_codegen::ir::{
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch, Variable};
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -149,6 +150,12 @@ pub trait GuestArch: Sized {
         _segments: &[crate::context::MemorySegment],
     ) -> HashMap<u64, JumpTableInfo> {
         HashMap::new()
+    }
+
+    /// True when `i` goes to the interpreter callback instead of being lifted; must not emit IR.
+    /// Consecutive such instructions share one callback.
+    fn interprets(_lifter: &LiftEngine<'_, Self>, _i: &Self::Instr) -> bool {
+        false
     }
 
     fn lift_instruction(lifter: &mut LiftEngine<'_, Self>, i: &Self::Instr) -> crate::Result<()>;
@@ -1672,6 +1679,62 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         self.emit_callback(offset, pc, resume, &[instructions])
     }
 
+    /// The end and length of the interpreted run starting at `start`.
+    ///
+    /// The run continues while straight-line: it ends after a control transfer and before a
+    /// block leader, so every instruction in it was going to run anyway.
+    fn interpreted_run(
+        &self,
+        decoded: &mut HashMap<u64, A::Instr>,
+        bytes: &[u8],
+        start: u64,
+    ) -> (u64, u64) {
+        let mut last = start;
+        let mut count = 1;
+        loop {
+            let inst = &decoded[&last];
+            let next = A::instr_next_ip(inst);
+            let straight_line = A::control_flow(inst).kind == ControlFlowKind::Fallthrough;
+            if !straight_line || !self.in_region(next) || self.blocks.contains_key(&next) {
+                return (next, count);
+            }
+            let Some(following) = self.decode_cached(decoded, bytes, next) else {
+                return (next, count);
+            };
+            let joins = !self.runs_off_region(next, following)
+                && !A::is_invalid(following)
+                && A::interprets(self, following);
+            if !joins {
+                return (next, count);
+            }
+            last = next;
+            count += 1;
+        }
+    }
+
+    /// The instruction at in-region `addr`, decoding it on first use.
+    fn decode_cached<'d>(
+        &self,
+        decoded: &'d mut HashMap<u64, A::Instr>,
+        bytes: &[u8],
+        addr: u64,
+    ) -> Option<&'d A::Instr> {
+        match decoded.entry(addr) {
+            Entry::Occupied(slot) => Some(slot.into_mut()),
+            Entry::Vacant(slot) => {
+                let inst = A::decode_one(&bytes[(addr - self.lift_base) as usize..], addr)?;
+                Some(slot.insert(inst))
+            }
+        }
+    }
+
+    /// One interpreter callback for the `count` instructions in `start..end`.
+    fn emit_interpreted_run(&mut self, start: u64, end: u64, count: u64) -> crate::Result<()> {
+        let pc = self.runtime_addr(start);
+        let resume = self.runtime_addr(end);
+        self.emit_interpreter_callback(Some(pc), Some(resume), count)
+    }
+
     /// Sync state, call the callback at context `offset`, reload, and dispatch on the PC it left.
     ///
     /// The block is **not** terminated on return: the caller keeps emitting inline.
@@ -2992,6 +3055,18 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                     self.emit_host_return();
                     self.block_terminated = true;
                     break;
+                }
+
+                if A::interprets(self, inst) {
+                    let (end, count) = self.interpreted_run(&mut decoded, bytes, cur);
+                    self.set_source_loc(cur);
+                    self.current_ip = end;
+                    self.emit_interpreted_run(cur, end, count)?;
+                    if self.block_terminated {
+                        break;
+                    }
+                    cur = end;
+                    continue;
                 }
 
                 // Advance `current_ip` first so PC reads see the post-instruction value; the source
