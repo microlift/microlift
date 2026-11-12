@@ -23,7 +23,7 @@ pub fn region_flags(func: &mut Function, user_id: u32, description: &'static str
         description: description.into(),
     });
     MemFlagsData::trusted()
-        .with_can_move()
+        .with_can_move(true)
         .with_alias_region(Some(region))
 }
 

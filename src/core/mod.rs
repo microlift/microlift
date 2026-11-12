@@ -329,7 +329,7 @@ fn build_entry_thunk<A: GuestArch>(
     builder.seal_block(entry);
 
     let ctx_ptr = builder.block_params(entry)[0];
-    let flags = MemFlagsData::trusted().with_can_move();
+    let flags = MemFlagsData::trusted().with_can_move(true);
     let mut args = vec![ctx_ptr];
     for (&reg, &ty) in abi.slots().iter().zip(slot_types) {
         let offset =
@@ -1085,7 +1085,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             alias::region_flags(builder.func, alias::CALLRET_ID, "call-return ring");
         let const_data_flags =
             alias::region_flags(builder.func, alias::CONST_DATA_ID, "constant tables")
-                .with_readonly();
+                .with_readonly(true);
         let guest_flags = alias::guest_memory_flags(builder.func);
 
         // Built lazily by `fast_call_for`; eager building cost the whole import table per region.

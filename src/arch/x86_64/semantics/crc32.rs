@@ -148,7 +148,7 @@ impl Crc32Kernel {
             crate::core::alias::CONST_DATA_ID,
             "constant tables",
         )
-        .with_readonly();
+        .with_readonly(true);
         let r = emit_crc32c(b, p[0], p[1], self.bits(), p[2], flags);
         b.ins().return_(&[r]);
     }

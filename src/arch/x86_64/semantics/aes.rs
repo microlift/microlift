@@ -342,7 +342,7 @@ impl AesKernel {
             crate::core::alias::CONST_DATA_ID,
             "constant tables",
         )
-        .with_readonly();
+        .with_readonly(true);
         let (lo, hi) = self.emit(b, &params, flags);
         b.ins().return_(&[lo, hi]);
     }
