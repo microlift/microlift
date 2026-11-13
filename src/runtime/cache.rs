@@ -357,12 +357,17 @@ impl CodeCache {
             }
         }
 
-        // Cells elsewhere waiting for this address.
+        // Cells elsewhere waiting for this address, and cells linked to a translation this one
+        // displaces: a replacement that left them would never be reached by a static edge.
         for &pc in &translation.resume_points {
+            let row = translation.row(pc);
+            for cell in self.links.get(&pc).into_iter().flatten() {
+                // SAFETY: `owner` is alive via the `CellRef`.
+                unsafe { write_cell(cell.cell, Some(row)) };
+            }
             let Some(waiting) = self.pending.remove(&pc) else {
                 continue;
             };
-            let row = translation.row(pc);
             for cell in waiting {
                 // SAFETY: `owner` is alive via the `CellRef`.
                 unsafe { write_cell(cell.cell, Some(row)) };

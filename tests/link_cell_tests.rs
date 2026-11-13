@@ -313,6 +313,32 @@ fn a_retracted_cell_relinks_when_the_address_is_translated_again() {
 }
 
 #[test]
+fn a_replacement_takes_over_the_cells_that_named_the_translation_it_displaces() {
+    let cache = Arc::new(RwLock::new(CodeCache::new()));
+    let first = cache.write().unwrap().insert(callee(true));
+    let caller = cache.write().unwrap().insert(caller(true));
+    assert_eq!(caller.read_cell(0).code, first.link_target as u64);
+
+    let second = cache.write().unwrap().insert(callee(true));
+    assert_ne!(first.link_target, second.link_target);
+    assert_eq!(
+        caller.read_cell(0).code,
+        second.link_target as u64,
+        "the cell follows the address to its new translation"
+    );
+
+    let mut guest = Guest::new(&cache);
+    guest.runtime.publish(&caller);
+    guest.runtime.detach_table();
+    // SAFETY: as above.
+    assert_eq!(
+        unsafe { guest.runtime.step() },
+        Step::Exit(ExitReason::Return)
+    );
+    assert_eq!(guest.runtime.ctx.rbx, 7);
+}
+
+#[test]
 fn a_dying_region_stops_owning_cells() {
     // Cells owned by an invalidated translation must be forgotten, or an install writes into unmapped memory.
     let cache = Arc::new(RwLock::new(CodeCache::new()));
