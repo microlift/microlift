@@ -1851,8 +1851,8 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         Some(func_ref)
     }
 
-    /// The address of `target` plus `offset`, as one relocated constant; `None` when
-    /// `target` already stands for another address in this lift.
+    /// The address of `target` plus `offset`; `None` when `target` already stands for
+    /// another address in this lift.
     pub fn data_address(&mut self, target: DataTarget, address: u64, offset: i64) -> Option<Value> {
         let base = match self.data_import_refs.get(&target) {
             Some(&(gv, bound)) if bound == address => gv,
@@ -1885,24 +1885,14 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
                 gv
             }
         };
+        let address = self.builder.ins().symbol_value(types::I64, base);
         if offset == 0 {
-            return Some(self.builder.ins().symbol_value(types::I64, base));
+            return Some(address);
         }
-        let cranelift_codegen::ir::GlobalValueData::Symbol { name, .. } =
-            self.builder.func.global_values[base].clone()
-        else {
-            unreachable!("data imports are symbols")
-        };
-        let gv =
-            self.builder
-                .func
-                .create_global_value(cranelift_codegen::ir::GlobalValueData::Symbol {
-                    name,
-                    offset: offset.into(),
-                    colocated: false,
-                    tls: false,
-                });
-        Some(self.builder.ins().symbol_value(types::I64, gv))
+        // An add rather than a symbol offset: position-independent code loads a symbol
+        // from its GOT entry, which one load per function can serve, and x86-64 cannot
+        // fold an offset past 32 bits into it.
+        Some(self.builder.ins().iadd_imm_s(address, offset))
     }
 
     /// `slide + offset` under [`AddressMode::Relocated`].

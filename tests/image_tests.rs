@@ -4,14 +4,21 @@
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 use microlift::arch::x86_64::X86_64;
+use std::sync::Arc;
+
 use microlift::backend::ArtifactBackend;
 use microlift::core::abi::CallAbi;
 use microlift::core::bridge::BridgeImport;
 use microlift::core::symbol::{HostSymbol, HostSymbolKind};
 use microlift::core::{AddressMode, LifterConfig, lift_to_code};
+use microlift::cranelift_codegen::isa::TargetIsa;
+use microlift::cranelift_codegen::settings::{self, Configurable};
 use microlift::function_traits::{DynamicSymbol, FunctionArgumentType};
-use microlift::image::{Image, ImageSymbol};
-use microlift::runtime::image::{SymbolResolver, load};
+use microlift::image::GotTarget;
+use microlift::image::compile::PicCompiler;
+use microlift::image::file::Writer;
+use microlift::runtime::image::{LoadedRegion, MappedImage, SymbolResolver};
+use microlift::runtime::jit::JitCompiler;
 use microlift::testkit::prelude::*;
 use microlift::testkit::{DEFAULT_LIFT_BASE, EXIT_TRAMPOLINE};
 
@@ -64,12 +71,105 @@ fn config_at(host: usize, slide: u64, slot: &'static AtomicPtr<()>) -> LifterCon
     config
 }
 
-fn image_bytes(config: LifterConfig, bytes: &[u8]) -> Vec<u8> {
+fn pic_isa() -> Arc<dyn TargetIsa> {
+    let mut flags = settings::builder();
+    flags.set("is_pic", "true").unwrap();
+    ArtifactBackend::get_isa(None, Some(settings::Flags::new(flags)), &[]).expect("isa")
+}
+
+fn scratch_path() -> std::path::PathBuf {
+    use std::sync::atomic::AtomicUsize;
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    std::env::temp_dir().join(format!(
+        "microlift-image-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+/// A scratch file, already unlinked.
+fn scratch() -> std::fs::File {
+    let path = scratch_path();
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    std::fs::remove_file(&path).unwrap();
+    file
+}
+
+/// An image file, linked until dropped: Darwin will not map an unlinked file's code
+/// into a reservation.
+struct ImageFile {
+    file: std::fs::File,
+    path: std::path::PathBuf,
+}
+
+impl std::ops::Deref for ImageFile {
+    type Target = std::fs::File;
+    fn deref(&self) -> &std::fs::File {
+        &self.file
+    }
+}
+
+impl std::ops::DerefMut for ImageFile {
+    fn deref_mut(&mut self) -> &mut std::fs::File {
+        &mut self.file
+    }
+}
+
+impl Drop for ImageFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// An image file holding a region lifted at each of `at`, open read-only as a
+/// loader opens one: Darwin maps no file executable while it is open for writing.
+fn image_file(config: LifterConfig, bytes: &[u8], at: &[u64]) -> ImageFile {
     let fingerprint = config.codegen_fingerprint();
-    let code = lift_to_code::<X86_64>(bytes, DEFAULT_LIFT_BASE, config).expect("lift");
-    let mut image = ArtifactBackend::image(None, None, &[], fingerprint).expect("isa");
-    image.add_region(code).expect("compile");
-    image.finish().encode()
+    let compiler = PicCompiler::new(pic_isa()).unwrap();
+    let path = scratch_path();
+    let out = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    let mut writer = Writer::new(out, scratch(), 1, fingerprint).unwrap();
+    for &base in at {
+        let code = lift_to_code::<X86_64>(bytes, base, config.clone()).expect("lift");
+        writer
+            .add(&compiler.compile(code).expect("compile"))
+            .unwrap();
+    }
+    drop(writer.finish(b"user").unwrap());
+    ImageFile {
+        file: std::fs::File::open(&path).unwrap(),
+        path,
+    }
+}
+
+fn image_bytes(config: LifterConfig, bytes: &[u8]) -> Vec<u8> {
+    use std::io::{Read, Seek};
+    let mut file = image_file(config, bytes, &[DEFAULT_LIFT_BASE]);
+    let mut out = Vec::new();
+    file.rewind().unwrap();
+    file.read_to_end(&mut out).unwrap();
+    out
+}
+
+fn load(file: &std::fs::File, resolver: &Resolver) -> MappedImage {
+    let mut image = MappedImage::open(file).expect("map");
+    image.bind(resolver).expect("bind");
+    image.map_code().expect("map code");
+    image
+}
+
+fn region_at(image: &MappedImage, pc: u64) -> Option<LoadedRegion> {
+    image.region(image.lookup(pc)?).expect("region")
 }
 
 static SLOT_A: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
@@ -82,13 +182,22 @@ fn an_image_holds_no_host_or_guest_run_time_address() {
     let second = image_bytes(config_at(0x2222_0000, 0x7000_0000, &SLOT_B), &bytes);
     assert_eq!(first, second);
 
-    let image = Image::decode(&first).unwrap();
-    let names: Vec<String> = image
-        .symbols
+    let compiler = PicCompiler::new(pic_isa()).unwrap();
+    let code = lift_to_code::<X86_64>(
+        &bytes,
+        DEFAULT_LIFT_BASE,
+        config_at(0x1111_0000, 0, &SLOT_A),
+    )
+    .expect("lift");
+    let object = compiler.compile(code).unwrap();
+    let names: Vec<String> = object
+        .code
+        .targets
         .iter()
-        .map(|s| match s {
-            ImageSymbol::Host(host) => format!("{}`{}", host.provider, host.name),
-            ImageSymbol::GuestSlide => "slide".into(),
+        .filter_map(|t| match t {
+            GotTarget::Host(host) => Some(format!("{}`{}", host.provider, host.name)),
+            GotTarget::GuestSlide => Some("slide".into()),
+            _ => None,
         })
         .collect();
     for expected in ["libfast.dylib`_fast", "`direct", "`slotted", "slide"] {
@@ -201,12 +310,16 @@ fn a_loaded_image_runs_at_its_slide() {
         DynamicSymbol::new("_add_one", add_one as unsafe extern "C" fn(u64) -> u64),
         CallAbi::sysv_amd64(),
     );
-    let bytes = image_bytes(config, &bytes);
+    let file = image_file(config, &bytes, &[DEFAULT_LIFT_BASE]);
 
     for slide in [0, 0x5_0000_0000] {
-        let regions = load(&bytes, &Resolver { slide }).expect("load");
-        assert_eq!(regions.len(), 1);
-        let translation = &regions[0].translation;
+        let image = load(&file, &Resolver { slide });
+        assert_eq!(image.region_count(), 1);
+        assert_eq!(image.user(), b"user");
+        #[cfg(target_os = "macos")]
+        assert!(image.in_place(), "the signed code was copied, not mapped");
+        let region = region_at(&image, DEFAULT_LIFT_BASE + slide).expect("a region");
+        let translation = &region.translation;
         assert_eq!(translation.resume_points[0], DEFAULT_LIFT_BASE + slide);
         let ctx = run(translation.entry, DEFAULT_LIFT_BASE + slide, 41);
         assert_eq!(ctx.exit_reason, ExitReason::Return as u32);
@@ -242,11 +355,12 @@ fn an_import_handed_to_the_host_is_slid() {
         BridgeImport::direct("record", record_callee as *const u8),
     );
     config.register_slow_import(FAST_VA);
-    let bytes = image_bytes(config, &bytes);
+    let file = image_file(config, &bytes, &[DEFAULT_LIFT_BASE]);
 
     for slide in [0, 0x5_0000_0000] {
-        let regions = load(&bytes, &Resolver { slide }).expect("load");
-        let ctx = run(regions[0].translation.entry, DEFAULT_LIFT_BASE + slide, 0);
+        let image = load(&file, &Resolver { slide });
+        let region = region_at(&image, DEFAULT_LIFT_BASE + slide).expect("a region");
+        let ctx = run(region.translation.entry, DEFAULT_LIFT_BASE + slide, 0);
         assert_eq!(RECORDED_CALLEE.load(Ordering::Relaxed), BRIDGE_VA + slide);
         assert_eq!(ctx.exit_reason, ExitReason::ImportedFunctionCall as u32);
         assert_eq!(ctx.imported_function_va, FAST_VA + slide);
@@ -254,15 +368,18 @@ fn an_import_handed_to_the_host_is_slid() {
 }
 
 #[test]
-fn an_image_naming_a_missing_symbol_is_refused() {
-    let bytes = image_bytes(
+fn a_region_naming_a_missing_symbol_is_refused() {
+    let file = image_file(
         config_at(0x1111_0000, 0, &SLOT_A),
         &three_imports_and_a_guest_address(),
+        &[DEFAULT_LIFT_BASE],
     );
-    let Err(error) = load(&bytes, &Resolver { slide: 0 }) else {
-        panic!("loaded an image whose imports nothing provides");
-    };
-    assert!(error.to_string().contains("_fast"), "{error}");
+    let image = load(&file, &Resolver { slide: 0 });
+    let index = image.lookup(DEFAULT_LIFT_BASE).expect("indexed");
+    assert!(
+        image.region(index).unwrap().is_none(),
+        "published a region whose imports nothing provides"
+    );
 }
 
 #[test]
@@ -277,20 +394,72 @@ fn helpers_are_emitted_once_per_image() {
     let first = lift(0x1000);
     assert_eq!(first.helpers.len(), 1, "an x87 add is an outlined helper");
 
-    let mut image = ArtifactBackend::image(None, None, &[], 0).unwrap();
-    image.add_region(first).unwrap();
-    let one = image.finish().text.len();
+    let compiler = PicCompiler::new(pic_isa()).unwrap();
+    let object = compiler.compile(first).unwrap();
+    let helper = object.helpers[0].1.text.len() as u64;
+    let region = object.code.text.len() as u64;
 
-    let mut image = ArtifactBackend::image(None, None, &[], 0).unwrap();
-    image.add_region(lift(0x1000)).unwrap();
-    image.add_region(lift(0x5000)).unwrap();
-    let two = image.finish();
-    assert_eq!(two.regions.len(), 2);
+    let mut writer = Writer::new(scratch(), scratch(), 1, 0).unwrap();
+    writer.add(&object).unwrap();
+    writer
+        .add(&compiler.compile(lift(0x5000)).unwrap())
+        .unwrap();
+    assert_eq!(writer.region_count(), 2);
     assert!(
-        two.text.len() < 2 * one,
-        "a second region re-emitted the helper: {one} then {}",
-        two.text.len()
+        writer.text_len() < 2 * helper + 2 * region,
+        "a second region re-emitted the helper: {} bytes",
+        writer.text_len()
     );
+}
+
+#[test]
+fn regions_are_found_at_every_resume_point_and_nowhere_else() {
+    // lea rax, [rip]; ret
+    let bytes = [0x48, 0x8D, 0x05, 0, 0, 0, 0, 0xC3];
+    let config = LifterConfig {
+        address_mode: AddressMode::Relocated,
+        exit_trampoline_address: Some(EXIT_TRAMPOLINE),
+        ..LifterConfig::default()
+    };
+    let file = image_file(config, &bytes, &[0x1000, 0x9000, 0x5000]);
+    let image = load(&file, &Resolver { slide: 0x40_0000 });
+    for (pc, index) in [(0x1000, 0), (0x9000, 1), (0x5000, 2)] {
+        assert_eq!(image.lookup(pc + 0x40_0000), Some(index));
+        let region = image.region(index).unwrap().unwrap();
+        let ctx = run(region.translation.entry, pc + 0x40_0000, 0);
+        assert_eq!(ctx.rax, pc + 7 + 0x40_0000);
+    }
+    assert_eq!(image.lookup(0x1000), None);
+    assert_eq!(image.lookup(0x1004 + 0x40_0000), None);
+}
+
+#[test]
+fn the_position_independent_jit_runs_at_any_slide() {
+    // call 0x2000; lea rdx, [rip]; ret
+    let bytes = [
+        0xE8, 0xFB, 0x0F, 0x00, 0x00, 0x48, 0x8D, 0x15, 0, 0, 0, 0, 0xC3,
+    ];
+    let jit = JitCompiler::new(pic_isa()).unwrap();
+    for slide in [0, 0x5_0000_0000] {
+        let mut config = LifterConfig {
+            address_mode: AddressMode::Relocated,
+            guest_slide: slide,
+            exit_trampoline_address: Some(EXIT_TRAMPOLINE),
+            ..LifterConfig::default()
+        };
+        config.register_fast_import_from(
+            0x2000,
+            "libone.dylib",
+            DynamicSymbol::new("_add_one", add_one as unsafe extern "C" fn(u64) -> u64),
+            CallAbi::sysv_amd64(),
+        );
+        let code = lift_to_code::<X86_64>(&bytes, DEFAULT_LIFT_BASE, config).unwrap();
+        let compiled = jit.compile(code).unwrap();
+        let ctx = run(compiled.region.entry, DEFAULT_LIFT_BASE + slide, 41);
+        assert_eq!(ctx.exit_reason, ExitReason::Return as u32);
+        assert_eq!(ctx.rax, 42);
+        assert_eq!(ctx.rdx, DEFAULT_LIFT_BASE + 12 + slide);
+    }
 }
 
 #[test]

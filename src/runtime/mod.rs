@@ -5,9 +5,11 @@ use crate::{
     core::link::{BlockLinkConfig, BlockLinkEntry},
 };
 
+pub mod arena;
 mod cache;
 mod callret;
 pub mod image;
+pub mod jit;
 mod links;
 mod table;
 mod thread;

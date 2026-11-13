@@ -2,7 +2,7 @@
 //!
 //! Lifted code never bakes a host pointer: a fast import, a bridge, a bridge slot and
 //! the guest slide are relocations resolved when the code is defined (JIT) or loaded
-//! (an [`crate::backend::ImageBuilder`] artifact), so both paths emit the same code.
+//! (an [`crate::image::file`] image), so both paths emit the same code.
 
 use std::sync::Arc;
 
