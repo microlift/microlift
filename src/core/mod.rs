@@ -225,7 +225,8 @@ pub struct LiftedCode {
     ///
     /// **The invalidation key:** a write in these ranges invalidates the translation.
     /// Over-approximates decoded instructions ([`SourceLocMap::guest_addresses`] is a
-    /// subset, so keying on it would miss writes). See [`crate::core::link`].
+    /// subset, so keying on it would miss writes), less the immediates read at run time
+    /// under [`LifterConfig::live_immediates`]. See [`crate::core::link`].
     pub covered: Vec<Range<u64>>,
     /// Bytes outside `covered` read at lift time (today: [`LifterConfig::analyze_jump_tables`]
     /// tables). Staleness is benign: it only adds leaders and dispatch stays on the runtime address.
@@ -390,7 +391,10 @@ pub fn lift_to_code<A: GuestArch>(
     let lift_base = engine.lift_base;
     let source_map = engine.source_map;
     let resume_points = std::mem::take(&mut engine.emitted_resume_points);
-    let covered = std::mem::take(&mut engine.covered);
+    let covered = without_ranges(
+        std::mem::take(&mut engine.covered),
+        std::mem::take(&mut engine.live_immediates),
+    );
     let link_sites = std::mem::take(&mut engine.link_sites);
     let data_objects = engine.take_data_objects();
     let data_dependencies = engine.jump_table_extents();
@@ -756,6 +760,12 @@ pub struct LifterConfig {
     pub host_call_frames: Option<crate::core::hostframe::HostFrameConfig>,
     /// Emitted-code optimizations; some trade rarely-relied-on accuracy such as NaN payloads.
     pub optimizations: Optimizations,
+    /// Read the 8-byte immediate of `MOV r64, imm64` from guest memory at run time instead
+    /// of baking it in, and leave it out of [`LiftedCode::covered`].
+    ///
+    /// For code a JIT patches in place: rewriting a call target held in such an immediate
+    /// then neither changes nor invalidates the translation. Costs one load per such `MOV`.
+    pub live_immediates: bool,
 }
 
 // `Arc` is deliberate: a host may move a config across threads under its own safety argument.
@@ -795,6 +805,7 @@ impl Default for LifterConfig {
             call_return_stack: None,
             host_call_frames: None,
             optimizations: Optimizations::none(),
+            live_immediates: false,
         }
     }
 }
@@ -899,6 +910,31 @@ fn normalize_ranges(ranges: &[Range<u64>], base: u64, end: u64) -> Vec<Range<u64
     merged
 }
 
+/// `ranges` (ascending, disjoint) with every byte of `holes` removed.
+fn without_ranges(ranges: Vec<Range<u64>>, mut holes: Vec<Range<u64>>) -> Vec<Range<u64>> {
+    if holes.is_empty() {
+        return ranges;
+    }
+    holes.sort_unstable_by_key(|h| h.start);
+    let mut out = Vec::with_capacity(ranges.len() + holes.len());
+    for range in ranges {
+        let mut start = range.start;
+        for hole in holes
+            .iter()
+            .filter(|h| h.start < range.end && range.start < h.end)
+        {
+            if hole.start > start {
+                out.push(start..hole.start);
+            }
+            start = start.max(hole.end);
+        }
+        if start < range.end {
+            out.push(start..range.end);
+        }
+    }
+    out
+}
+
 /// The generic lift engine. `A` selects the guest architecture frontend.
 pub struct LiftEngine<'a, A: GuestArch = crate::arch::x86_64::X86_64> {
     pub builder: FunctionBuilder<'a>,
@@ -911,6 +947,9 @@ pub struct LiftEngine<'a, A: GuestArch = crate::arch::x86_64::X86_64> {
     /// Bytes of `[lift_base, lift_end)` this lift covers: normalised [`LifterConfig::block_ranges`]
     /// or the whole slice. Ask [`in_region`](Self::in_region); with holes the bounds aren't enough.
     covered: Vec<Range<u64>>,
+    /// Immediates read at run time ([`LifterConfig::live_immediates`]), cut out of `covered`
+    /// once the lift is done.
+    live_immediates: Vec<Range<u64>>,
     /// `next_ip` of the instruction being lifted.
     pub current_ip: u64,
     pub visited_blocks: HashSet<Block>,
@@ -1100,6 +1139,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             lift_base: 0,
             lift_end: 0,
             covered: Vec::new(),
+            live_immediates: Vec::new(),
             current_ip: 0,
             visited_blocks: HashSet::new(),
             block_terminated: false,
@@ -1508,6 +1548,12 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
     /// Analysis IR always inlines helpers to stay one self-contained function.
     pub fn outline_helpers(&self) -> bool {
         self.config.outline_helpers && !self.config.analysis_mode
+    }
+
+    /// Record that the bytes at `range` are read at run time rather than lifted
+    /// ([`LifterConfig::live_immediates`]).
+    pub fn note_live_immediate(&mut self, range: Range<u64>) {
+        self.live_immediates.push(range);
     }
 
     /// Guest bytes recovered jump tables occupy, normalized like `covered`

@@ -291,6 +291,10 @@ name = "code_extent_tests"
 required-features = ["testkit"]
 
 [[test]]
+name = "live_immediate_tests"
+required-features = ["testkit"]
+
+[[test]]
 name = "block_link_tests"
 required-features = ["testkit"]
 

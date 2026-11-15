@@ -327,9 +327,16 @@ impl CodeCache {
             self.by_resume_point.insert(pc, Arc::clone(&translation));
         }
         // Every resume point, so the sweep finds this after earlier invalidations removed some.
-        for page in translation.pages() {
+        // A replacement lists the same addresses again; keep each once, or every tier-up
+        // lengthens the sweep of its pages.
+        for page in translation
+            .pages()
+            .filter(|_| !translation.resume_points.is_empty())
+        {
             let slot = self.pages.entry(page).or_default();
             slot.extend_from_slice(&translation.resume_points);
+            slot.sort_unstable();
+            slot.dedup();
         }
         self.install_cells(&translation);
         bump(&self.stats.inserts, 1);
@@ -458,11 +465,13 @@ impl CodeCache {
         for translation in &doomed {
             for page in translation.pages() {
                 if let Some(entries) = self.pages.get_mut(&page) {
-                    entries.retain(|pc| !translation.resume_points.contains(pc));
+                    entries.retain(|pc| translation.resume_points.binary_search(pc).is_err());
+                    if entries.is_empty() {
+                        self.pages.remove(&page);
+                    }
                 }
             }
         }
-        self.pages.retain(|_, entries| !entries.is_empty());
 
         // Clear cells pointing at the dying translation and forget cells belonging to it.
         for pc in &unpublished {
@@ -480,14 +489,21 @@ impl CodeCache {
     }
 
     /// Drops every cell reference owned by `translation` (else its `Arc` lives forever and installs write into it).
+    ///
+    /// A cell is only ever filed under its own site's target, in `links` or `pending`, so
+    /// those keys are the only ones to look at.
     fn forget_cells_of(&mut self, translation: &Arc<Translation>) {
-        let owned = |cells: &mut Vec<CellRef>| {
-            cells.retain(|c| !Arc::ptr_eq(&c.owner, translation));
-        };
-        self.links.values_mut().for_each(owned);
-        self.pending.values_mut().for_each(owned);
-        self.links.retain(|_, cells| !cells.is_empty());
-        self.pending.retain(|_, cells| !cells.is_empty());
+        for site in &translation.link_sites {
+            for map in [&mut self.links, &mut self.pending] {
+                let Some(cells) = map.get_mut(&site.target) else {
+                    continue;
+                };
+                cells.retain(|c| !Arc::ptr_eq(&c.owner, translation));
+                if cells.is_empty() {
+                    map.remove(&site.target);
+                }
+            }
+        }
     }
 
     /// Installed and pending cell counts.

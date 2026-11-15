@@ -3,7 +3,7 @@ use crate::arch::x86_64::semantics::helpers::size_to_type;
 use crate::context::ExitReason;
 use crate::lifter::{Lifter, X86Flag};
 use cranelift::prelude::*;
-use iced_x86::{Instruction, OpKind, Register};
+use iced_x86::{Code, Instruction, OpKind, Register};
 
 /// Tracked flags and RFLAGS bit positions for PUSHFQ/POPFQ: six status flags plus DF.
 const RFLAGS_FLAG_BITS: [(X86Flag, u8); 7] = [
@@ -44,6 +44,9 @@ impl<'a> Lifter<'a> {
     }
 
     pub(super) fn handle_mov(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        if self.config.live_immediates && instruction.code() == Code::Mov_r64_imm64 {
+            return self.handle_mov_live_imm64(instruction);
+        }
         let size = self.operand_size(instruction, 0)?;
         let src_val = self.read_operand(instruction, 1, size)?;
         // `MOV r/m16, Sreg`: zero-extend the selector for a 32/64-bit register destination.
@@ -57,6 +60,22 @@ impl<'a> Lifter<'a> {
             src_val
         };
         self.write_operand(instruction, 0, src_val)?;
+        Ok(())
+    }
+
+    /// `MOV r64, imm64` whose immediate is loaded from the instruction's own bytes, so a
+    /// store to it takes effect without a new lift. The immediate is the encoding's last
+    /// eight bytes.
+    fn handle_mov_live_imm64(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        const IMM64_LEN: u64 = 8;
+        let at = instruction.next_ip() - IMM64_LEN;
+        let addr = self.runtime_addr(at);
+        let val = self
+            .builder
+            .ins()
+            .load(types::I64, self.guest_flags, addr, 0);
+        self.note_live_immediate(at..at + IMM64_LEN);
+        self.set_reg_val(instruction.op0_register(), val)?;
         Ok(())
     }
 
@@ -558,7 +577,6 @@ impl<'a> Lifter<'a> {
         }
         Ok(())
     }
-
 
     /// RDFSBASE r64 - read FS segment base into a GPR.
     pub(super) fn handle_rdfsbase(&mut self, instruction: &Instruction) -> crate::Result<()> {

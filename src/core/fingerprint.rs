@@ -109,6 +109,7 @@ impl LifterConfig {
             call_return_stack,
             host_call_frames,
             optimizations,
+            live_immediates,
         } = self;
         let mut hasher = StableHasher::new();
         address_mode.hash(&mut hasher);
@@ -125,6 +126,7 @@ impl LifterConfig {
         specialization.hash(&mut hasher);
         atomic128.hash(&mut hasher);
         total_store_order.hash(&mut hasher);
+        live_immediates.hash(&mut hasher);
         generated_nan.hash(&mut hasher);
         analysis_mode.hash(&mut hasher);
         exit_trampoline_address.hash(&mut hasher);
@@ -166,6 +168,10 @@ mod tests {
             },
             LifterConfig {
                 total_store_order: true,
+                ..LifterConfig::default()
+            },
+            LifterConfig {
+                live_immediates: true,
                 ..LifterConfig::default()
             },
             LifterConfig {
