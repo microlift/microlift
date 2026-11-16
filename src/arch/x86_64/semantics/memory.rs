@@ -5,6 +5,16 @@ use crate::lifter::{Lifter, X86Flag};
 use cranelift::prelude::*;
 use iced_x86::{Code, Instruction, OpKind, Register};
 
+/// Bytes a bulk string step moves at once.
+const BULK_BYTES: usize = 16;
+
+/// The `REP` string ops that can run in bulk ahead of their element loop.
+#[derive(Clone, Copy)]
+enum BulkChunk {
+    Move,
+    Store,
+}
+
 /// Tracked flags and RFLAGS bit positions for PUSHFQ/POPFQ: six status flags plus DF.
 const RFLAGS_FLAG_BITS: [(X86Flag, u8); 7] = [
     (X86Flag::Carry, 0),
@@ -336,6 +346,7 @@ impl<'a> Lifter<'a> {
         instruction: &Instruction,
         size: usize,
         body: fn(&mut Self, usize, usize) -> crate::Result<()>,
+        bulk: Option<BulkChunk>,
     ) -> crate::Result<()> {
         let addr_size = Self::string_addr_size(instruction);
         if !Self::has_rep_prefix(instruction) {
@@ -345,6 +356,10 @@ impl<'a> Lifter<'a> {
 
         let body_block = self.builder.create_block();
         let done_block = self.builder.create_block();
+
+        if let (Some(bulk), 8) = (bulk, addr_size) {
+            self.emit_string_bulk(size, bulk)?;
+        }
 
         let count = self.get_reg_val(count_reg)?;
         let is_zero = self.builder.ins().icmp_imm_s(IntCC::Equal, count, 0);
@@ -369,24 +384,109 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
+    /// Run a forward `REP MOVS`/`REP STOS` 16 bytes at a time while at least that much is
+    /// left, leaving `RCX`, `RSI` and `RDI` where the element loop picks up the rest.
+    ///
+    /// A move takes this path only when the destination does not start within 16 bytes
+    /// after the source, the one overlap where a chunk would read bytes the element-wise
+    /// copy writes first. Fast-string stores are unordered among themselves on x86 too.
+    fn emit_string_bulk(&mut self, size: usize, bulk: BulkChunk) -> crate::Result<()> {
+        let per_chunk = (BULK_BYTES / size) as i64;
+
+        let check_block = self.builder.create_block();
+        let bulk_block = self.builder.create_block();
+        let exit_block = self.builder.create_block();
+
+        let df = self.builder.use_var(self.state.flags[&X86Flag::Direction]);
+        let forward = self.builder.ins().icmp_imm_s(IntCC::Equal, df, 0);
+        let eligible = match bulk {
+            BulkChunk::Store => forward,
+            BulkChunk::Move => {
+                let src = self.get_reg_val(Register::RSI)?;
+                let dst = self.get_reg_val(Register::RDI)?;
+                let gap = self.builder.ins().isub(dst, src);
+                let apart = self.builder.ins().icmp_imm_u(
+                    IntCC::UnsignedGreaterThanOrEqual,
+                    gap,
+                    BULK_BYTES as i64,
+                );
+                self.builder.ins().band(forward, apart)
+            }
+        };
+        self.builder
+            .ins()
+            .brif(eligible, check_block, &[], exit_block, &[]);
+
+        self.builder.switch_to_block(check_block);
+        let count = self.get_reg_val(Register::RCX)?;
+        let enough =
+            self.builder
+                .ins()
+                .icmp_imm_u(IntCC::UnsignedGreaterThanOrEqual, count, per_chunk);
+        self.builder
+            .ins()
+            .brif(enough, bulk_block, &[], exit_block, &[]);
+
+        self.builder.switch_to_block(bulk_block);
+        let dst = self.get_reg_val(Register::RDI)?;
+        let chunk = match bulk {
+            BulkChunk::Move => {
+                let src = self.get_reg_val(Register::RSI)?;
+                let chunk = self
+                    .builder
+                    .ins()
+                    .load(types::I8X16, self.guest_flags, src, 0);
+                let src = self.builder.ins().iadd_imm_s(src, BULK_BYTES as i64);
+                self.set_reg_val(Register::RSI, src)?;
+                chunk
+            }
+            BulkChunk::Store => {
+                let element = self.get_reg_val(Self::string_acc_reg(size))?;
+                let lanes = size_to_type(size)
+                    .by((BULK_BYTES / size) as u32)
+                    .expect("a 16-byte vector of string elements");
+                self.builder.ins().splat(lanes, element)
+            }
+        };
+        self.builder.ins().store(self.guest_flags, chunk, dst, 0);
+        let dst = self.builder.ins().iadd_imm_s(dst, BULK_BYTES as i64);
+        self.set_reg_val(Register::RDI, dst)?;
+        let count = self.get_reg_val(Register::RCX)?;
+        let count = self.builder.ins().iadd_imm_s(count, -per_chunk);
+        self.set_reg_val(Register::RCX, count)?;
+        let more = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::UnsignedGreaterThanOrEqual, count, per_chunk);
+        self.builder
+            .ins()
+            .brif(more, bulk_block, &[], exit_block, &[]);
+
+        self.builder.seal_block(check_block);
+        self.builder.seal_block(bulk_block);
+        self.builder.seal_block(exit_block);
+        self.builder.switch_to_block(exit_block);
+        Ok(())
+    }
+
     /// MOVSB - move byte from [RSI] to [RDI], advance both by ±1.
     pub(super) fn handle_movsb(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        self.emit_string_op(instruction, 1, Self::emit_movs)
+        self.emit_string_op(instruction, 1, Self::emit_movs, Some(BulkChunk::Move))
     }
 
     /// MOVSW - move word (2 bytes) from [RSI] to [RDI].
     pub(super) fn handle_movsw(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        self.emit_string_op(instruction, 2, Self::emit_movs)
+        self.emit_string_op(instruction, 2, Self::emit_movs, Some(BulkChunk::Move))
     }
 
     /// MOVSD - move dword (4 bytes) from [RSI] to [RDI].
     pub(super) fn handle_movsd_mem(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        self.emit_string_op(instruction, 4, Self::emit_movs)
+        self.emit_string_op(instruction, 4, Self::emit_movs, Some(BulkChunk::Move))
     }
 
     /// MOVSQ - move qword (8 bytes) from [RSI] to [RDI].
     pub(super) fn handle_movsq(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        self.emit_string_op(instruction, 8, Self::emit_movs)
+        self.emit_string_op(instruction, 8, Self::emit_movs, Some(BulkChunk::Move))
     }
 
     fn emit_movs(&mut self, size: usize, addr_size: usize) -> crate::Result<()> {
@@ -413,22 +513,22 @@ impl<'a> Lifter<'a> {
 
     /// STOSB - store AL to [RDI], advance RDI by ±1.
     pub(super) fn handle_stosb(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        self.emit_string_op(instruction, 1, Self::emit_stos)
+        self.emit_string_op(instruction, 1, Self::emit_stos, Some(BulkChunk::Store))
     }
 
     /// STOSW - store AX to [RDI], advance RDI by ±2.
     pub(super) fn handle_stosw(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        self.emit_string_op(instruction, 2, Self::emit_stos)
+        self.emit_string_op(instruction, 2, Self::emit_stos, Some(BulkChunk::Store))
     }
 
     /// STOSD - store EAX to [RDI], advance RDI by ±4.
     pub(super) fn handle_stosd(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        self.emit_string_op(instruction, 4, Self::emit_stos)
+        self.emit_string_op(instruction, 4, Self::emit_stos, Some(BulkChunk::Store))
     }
 
     /// STOSQ - store RAX to [RDI], advance RDI by ±8.
     pub(super) fn handle_stosq(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        self.emit_string_op(instruction, 8, Self::emit_stos)
+        self.emit_string_op(instruction, 8, Self::emit_stos, Some(BulkChunk::Store))
     }
 
     fn emit_stos(&mut self, size: usize, addr_size: usize) -> crate::Result<()> {
@@ -442,16 +542,16 @@ impl<'a> Lifter<'a> {
 
     /// LODSB/W/D/Q - load from [RSI] into AL/AX/EAX/RAX, advance RSI.
     pub(super) fn handle_lodsb(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        self.emit_string_op(instruction, 1, Self::emit_lods)
+        self.emit_string_op(instruction, 1, Self::emit_lods, None)
     }
     pub(super) fn handle_lodsw(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        self.emit_string_op(instruction, 2, Self::emit_lods)
+        self.emit_string_op(instruction, 2, Self::emit_lods, None)
     }
     pub(super) fn handle_lodsd(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        self.emit_string_op(instruction, 4, Self::emit_lods)
+        self.emit_string_op(instruction, 4, Self::emit_lods, None)
     }
     pub(super) fn handle_lodsq(&mut self, instruction: &Instruction) -> crate::Result<()> {
-        self.emit_string_op(instruction, 8, Self::emit_lods)
+        self.emit_string_op(instruction, 8, Self::emit_lods, None)
     }
 
     fn emit_lods(&mut self, size: usize, addr_size: usize) -> crate::Result<()> {
