@@ -158,6 +158,11 @@ pub trait GuestArch: Sized {
         false
     }
 
+    /// The exit a return takes when its target is no block of the region.
+    fn emit_return_exit(lifter: &mut LiftEngine<'_, Self>, target: Value) -> crate::Result<()> {
+        lifter.emit_indirect_jump_exit(target)
+    }
+
     fn lift_instruction(lifter: &mut LiftEngine<'_, Self>, i: &Self::Instr) -> crate::Result<()>;
     fn load_state_from_context(lifter: &mut LiftEngine<'_, Self>) -> crate::Result<()>;
     fn sync_to_context(
@@ -935,6 +940,18 @@ fn without_ranges(ranges: Vec<Range<u64>>, mut holes: Vec<Range<u64>>) -> Vec<Ra
     out
 }
 
+/// Which of a region's shared dispatches a run-time transfer goes through; they differ in
+/// the exit taken when the target is outside the region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionDispatch {
+    IndirectJump,
+    Return,
+}
+
+impl RegionDispatch {
+    const ALL: [RegionDispatch; 2] = [RegionDispatch::IndirectJump, RegionDispatch::Return];
+}
+
 /// The generic lift engine. `A` selects the guest architecture frontend.
 pub struct LiftEngine<'a, A: GuestArch = crate::arch::x86_64::X86_64> {
     pub builder: FunctionBuilder<'a>,
@@ -992,6 +1009,9 @@ pub struct LiftEngine<'a, A: GuestArch = crate::arch::x86_64::X86_64> {
     /// The one block-link probe, created on first use and filled in [`Self::finish`].
     /// Its parameter is the PC to look up, which a bridge may have moved off `ctx.rip`.
     link_block: Option<Block>,
+    /// One block per [`RegionDispatch`], created on first use and filled in [`Self::finish`]:
+    /// a switch per transfer site grows as sites times blocks. Its parameter is the run-time target.
+    region_dispatch: [Option<Block>; 2],
     /// Pinned register file from [`pinned_abi_for`], with each slot's variable and type.
     /// Empty when unpinned, making the unpinned shape the degenerate case.
     pinned_slots: Vec<(PinnedReg, Variable, types::Type)>,
@@ -1162,6 +1182,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             emitted_resume_points: Vec::new(),
             exit_resumes: HashSet::new(),
             link_block: None,
+            region_dispatch: [None; 2],
             pinned_slots,
             pinned_sig: None,
             region_sig: None,
@@ -1674,19 +1695,56 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         Some(fast_call)
     }
 
-    /// Switch-based indirect jump to a known block, otherwise exit the VM.
+    /// Indirect jump to a known block, otherwise exit the VM.
     pub fn emit_runtime_indirect_jump(&mut self, target_val: Value) -> crate::Result<()> {
-        let target_offset = self.to_lift_va(target_val);
+        self.emit_region_dispatch(RegionDispatch::IndirectJump, target_val);
+        Ok(())
+    }
 
-        let external_block = self.builder.create_block();
-        self.emit_region_switch(target_offset, external_block);
+    /// Transfer to run-time address `target` through the region's shared dispatch of `kind`.
+    pub fn emit_region_dispatch(&mut self, kind: RegionDispatch, target: Value) {
+        let block = match self.region_dispatch[kind as usize] {
+            Some(block) => block,
+            None => {
+                let block = self.builder.create_block();
+                self.builder.append_block_param(block, types::I64);
+                self.region_dispatch[kind as usize] = Some(block);
+                block
+            }
+        };
+        self.builder.ins().jump(block, &[target.into()]);
+        self.block_terminated = true;
+    }
 
-        self.builder.switch_to_block(external_block);
-        self.builder.seal_block(external_block);
-        A::sync_to_context(self, Some(target_val), ExitReason::UnknownJump)?;
+    /// Emit each used dispatch: a switch over every in-region block, else the kind's exit.
+    fn fill_region_dispatches(&mut self) -> crate::Result<()> {
+        for kind in RegionDispatch::ALL {
+            let Some(block) = self.region_dispatch[kind as usize] else {
+                continue;
+            };
+            self.builder.switch_to_block(block);
+            self.visited_blocks.insert(block);
+            let target = self.builder.block_params(block)[0];
+            let target_offset = self.to_lift_va(target);
+
+            let external = self.builder.create_block();
+            self.emit_region_switch(target_offset, external);
+            self.builder.switch_to_block(external);
+            self.builder.seal_block(external);
+            match kind {
+                RegionDispatch::IndirectJump => self.emit_indirect_jump_exit(target)?,
+                RegionDispatch::Return => A::emit_return_exit(self, target)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// `UnknownJump` exit for an indirect jump leaving the region.
+    pub fn emit_indirect_jump_exit(&mut self, target: Value) -> crate::Result<()> {
+        A::sync_to_context(self, Some(target), ExitReason::UnknownJump)?;
         self.write_exit_code(TransferKind::IndirectJump as u32);
         // Linkable: an out-of-region register `jmp` is answered by entering whatever covers it.
-        self.emit_exit(Some(target_val));
+        self.emit_exit(Some(target));
         self.block_terminated = true;
         Ok(())
     }
@@ -3185,6 +3243,10 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
 
     /// Fill created-but-unvisited blocks: VM exits to addresses outside the region.
     pub fn finish(&mut self) -> crate::Result<()> {
+        // Before the stubs: shared by every site, so no one guest address is theirs.
+        self.clear_source_loc();
+        self.fill_region_dispatches()?;
+
         let mut processed_blocks = HashSet::new();
         // **Sorted**, load-bearing: `HashMap` order is per-instance and would permute block
         // numbering and link-cell indices, costing reproducibility.

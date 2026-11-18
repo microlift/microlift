@@ -289,6 +289,10 @@ impl GuestArch for X86_64 {
         matches!(lifter.lowering(i), Lowering::Interpret)
     }
 
+    fn emit_return_exit(lifter: &mut LiftEngine<'_, Self>, target: Value) -> crate::Result<()> {
+        lifter.emit_return_exit(target)
+    }
+
     fn lift_instruction(lifter: &mut LiftEngine<'_, Self>, i: &Self::Instr) -> crate::Result<()> {
         lifter.handle_instruction(i)
     }

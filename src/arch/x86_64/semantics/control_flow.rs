@@ -6,7 +6,7 @@ use crate::context::{ExitReason, TransferKind};
 use crate::core::GuestArch;
 use crate::core::abi::ArgLocation;
 use crate::core::bridge::ImportKind;
-use crate::core::{FastCall, fat_to_cl_type};
+use crate::core::{FastCall, RegionDispatch, fat_to_cl_type};
 use crate::function_traits::FunctionArgumentType;
 use crate::lifter::Lifter;
 use cranelift::prelude::*;
@@ -101,17 +101,20 @@ impl<'a> Lifter<'a> {
         self.emit_return_dispatch(target_ip)
     }
 
-    /// Transfer to a popped return address: dispatch in-region if known, else exit as `UnknownJump`/`Return`,
-    /// or via the [`exit_trampoline_address`](crate::core::LifterConfig::exit_trampoline_address) sentinel.
+    /// Transfer to a popped return address: in-region if known, else [`Self::emit_return_exit`].
     /// Split from [`Self::emit_return`] so an import tail `JMP` can perform its callee's return.
     fn emit_return_dispatch(&mut self, target_ip: Value) -> crate::Result<()> {
-        let target_offset = self.to_lift_va(target_ip);
+        self.emit_region_dispatch(RegionDispatch::Return, target_ip);
+        Ok(())
+    }
 
-        let external_check_block = self.builder.create_block();
-        self.emit_region_switch(target_offset, external_check_block);
-
-        self.builder.switch_to_block(external_check_block);
-        self.builder.seal_block(external_check_block);
+    /// Exit for a return leaving the region: `UnknownJump`/`Return`, or `Return` via the
+    /// [`exit_trampoline_address`](crate::core::LifterConfig::exit_trampoline_address) sentinel.
+    pub fn emit_return_exit(&mut self, target_ip: Value) -> crate::Result<()> {
+        let external_check_block = self
+            .builder
+            .current_block()
+            .expect("the dispatch's external arm");
 
         // The trampoline compare is only emitted when the host declared a sentinel.
         let unknown_block = if let Some(trampoline_addr) = self.config.exit_trampoline_address {
