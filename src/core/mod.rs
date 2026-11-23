@@ -970,6 +970,8 @@ pub struct LiftEngine<'a, A: GuestArch = crate::arch::x86_64::X86_64> {
     /// `next_ip` of the instruction being lifted.
     pub current_ip: u64,
     pub visited_blocks: HashSet<Block>,
+    /// In-region block addresses, possibly already visited, that phase 2 has yet to look at.
+    pending_leaders: BTreeSet<u64>,
     pub block_terminated: bool,
     /// Condition-flag values before dead-code removal; seeds the candidate graph.
     flag_values: Vec<Value>,
@@ -1162,6 +1164,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
             live_immediates: Vec::new(),
             current_ip: 0,
             visited_blocks: HashSet::new(),
+            pending_leaders: BTreeSet::new(),
             block_terminated: false,
             flag_values: Vec::new(),
             callback_sigs: HashMap::new(),
@@ -2020,8 +2023,21 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         } else {
             let block = self.builder.create_block();
             self.blocks.insert(offset, block);
+            if self.in_region(offset) {
+                self.pending_leaders.insert(offset);
+            }
             block
         }
+    }
+
+    /// The lowest in-region block address not yet emitted.
+    fn next_unvisited_leader(&mut self) -> Option<u64> {
+        while let Some(offset) = self.pending_leaders.pop_first() {
+            if !self.visited_blocks.contains(&self.blocks[&offset]) {
+                return Some(offset);
+            }
+        }
+        None
     }
 
     /// Like `get_block`, recording the transfer kind that reaches it (first caller wins).
@@ -3063,16 +3079,9 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         };
 
         // Phase 2: emit each block from its leader, following `instr_next_ip` (overlap makes list
-        // order diverge). Re-scan for the lowest unemitted in-region block since lifting creates
-        // blocks; out-of-region ones become exit stubs in `finish()`.
-        loop {
-            let next_leader = self
-                .blocks
-                .iter()
-                .filter(|(off, b)| self.in_region(**off) && !self.visited_blocks.contains(b))
-                .map(|(off, _)| *off)
-                .min();
-            let Some(leader) = next_leader else { break };
+        // order diverge), lowest unemitted in-region block first since lifting creates blocks;
+        // out-of-region ones become exit stubs in `finish()`.
+        while let Some(leader) = self.next_unvisited_leader() {
             let block = self.blocks[&leader];
 
             self.builder.switch_to_block(block);
