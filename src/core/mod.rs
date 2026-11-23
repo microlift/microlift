@@ -8,6 +8,7 @@ pub mod bridge;
 pub mod callback;
 pub mod callret;
 pub mod dce;
+pub mod edges;
 pub mod exit;
 pub mod fingerprint;
 pub mod flags;
@@ -3305,6 +3306,7 @@ impl<'a, A: GuestArch> LiftEngine<'a, A> {
         if self.config.total_store_order {
             tso::insert_fences(self.builder.func, self.guest_flags.alias_region());
         }
+        edges::split_argument_edges(self.builder.func);
         self.finalize_helper_indices();
         self.finalize_data_indices();
         Ok(())
