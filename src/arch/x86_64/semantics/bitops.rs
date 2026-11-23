@@ -18,6 +18,26 @@ enum ShiftKind {
     RightArithmetic,
 }
 
+/// x86 masks a count to 5 bits, 6 for 64-bit operands.
+fn shift_count_mask(ty: Type) -> u64 {
+    if ty == types::I64 { 0x3F } else { 0x1F }
+}
+
+/// A masked shift or rotate count. A static one lets the flag update be settled while lifting.
+#[derive(Clone, Copy)]
+pub enum ShiftCount {
+    Static { value: Value, count: u64 },
+    Dynamic(Value),
+}
+
+impl ShiftCount {
+    pub fn value(self) -> Value {
+        match self {
+            ShiftCount::Static { value, .. } | ShiftCount::Dynamic(value) => value,
+        }
+    }
+}
+
 impl<'a> Lifter<'a> {
     pub(super) fn handle_xor(&mut self, instruction: &Instruction) -> crate::Result<()> {
         self.logical_op(instruction, LogicalOp::Xor)
@@ -61,38 +81,37 @@ impl<'a> Lifter<'a> {
     }
 
 
-    /// Resolve the shift count to a value of the given type.
-    fn shift_count(&mut self, instruction: &Instruction, ty: Type) -> crate::Result<Value> {
-        let op1 = instruction.op1_kind();
-        let count = match op1 {
+    /// The masked shift/rotate count of operand `op_index`, as a value of `ty`.
+    fn shift_count(
+        &mut self,
+        instruction: &Instruction,
+        op_index: u32,
+        ty: Type,
+    ) -> crate::Result<ShiftCount> {
+        let mask = shift_count_mask(ty);
+        match self.operand_kind(instruction, op_index) {
             OpKind::Register => {
-                let cl_val = self.get_reg_val(iced_x86::Register::CL)?;
-                if ty == types::I8 {
-                    cl_val
+                let cl = self.get_reg_val(Register::CL)?;
+                let cl = if ty == types::I8 {
+                    cl
                 } else {
-                    self.builder.ins().uextend(ty, cl_val)
-                }
+                    self.builder.ins().uextend(ty, cl)
+                };
+                let masked = self.builder.ins().band_imm_u(cl, mask as i64);
+                Ok(ShiftCount::Dynamic(masked))
             }
             OpKind::Immediate8
             | OpKind::Immediate8to16
             | OpKind::Immediate8to32
-            | OpKind::Immediate8to64 => self
-                .builder
-                .ins()
-                .iconst(ty, instruction.immediate8() as i64),
-            _ => {
-                return Err(MicroliftError::UnsupportedInstruction {
-                    mnemonic: format!("shift-count-{:?}", op1),
-                });
+            | OpKind::Immediate8to64 => {
+                let masked = u64::from(instruction.immediate8()) & mask;
+                let value = self.builder.ins().iconst(ty, masked as i64);
+                Ok(ShiftCount::Static { value, count: masked })
             }
-        };
-        // x86 masks shift count to 5 bits (6 for 64-bit)
-        let mask = match ty {
-            types::I8 | types::I16 | types::I32 => self.builder.ins().iconst(ty, 0x1F),
-            types::I64 => self.builder.ins().iconst(ty, 0x3F),
-            _ => self.builder.ins().iconst(ty, 0x3F),
-        };
-        Ok(self.builder.ins().band(count, mask))
+            other => Err(MicroliftError::UnsupportedInstruction {
+                mnemonic: format!("shift-count-{op_index}-{other:?}"),
+            }),
+        }
     }
 
     pub(super) fn handle_shl(&mut self, instruction: &Instruction) -> crate::Result<()> {
@@ -114,7 +133,7 @@ impl<'a> Lifter<'a> {
         let (size, place, val) = self.read_unary_rmw(instruction)?;
         let ty = size_to_type(size);
         let bit_width = (size * 8) as i64;
-        let count = self.shift_count(instruction, ty)?;
+        let count = self.shift_count(instruction, 1, ty)?;
 
         let work_ty = if size < 4 { types::I32 } else { ty };
         let widen = work_ty != ty;
@@ -128,9 +147,9 @@ impl<'a> Lifter<'a> {
             self.builder.ins().uextend(work_ty, val)
         };
         let count_w = if !widen {
-            count
+            count.value()
         } else {
-            self.builder.ins().uextend(work_ty, count)
+            self.builder.ins().uextend(work_ty, count.value())
         };
         let one_w = self.builder.ins().iconst(work_ty, 1);
 
@@ -168,17 +187,17 @@ impl<'a> Lifter<'a> {
             shifted_w
         };
         self.write_place(place, result)?;
-        self.update_flags_shift(val, result, cf_bit, count_w, size)?;
+        self.update_flags_shift(val, result, cf_bit, count, size)?;
         Ok(())
     }
 
     pub(super) fn handle_rol(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let (size, place, val) = self.read_unary_rmw(instruction)?;
         let ty = size_to_type(size);
-        let count = self.shift_count(instruction, ty)?;
+        let count = self.shift_count(instruction, 1, ty)?;
         let bits = self.builder.ins().iconst(ty, (size * 8) as i64);
-        let right_count = self.builder.ins().isub(bits, count);
-        let left = self.builder.ins().ishl(val, count);
+        let right_count = self.builder.ins().isub(bits, count.value());
+        let left = self.builder.ins().ishl(val, count.value());
         let right = self.builder.ins().ushr(val, right_count);
         let result = self.builder.ins().bor(left, right);
         self.write_place(place, result)?;
@@ -196,10 +215,10 @@ impl<'a> Lifter<'a> {
     pub(super) fn handle_ror(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let (size, place, val) = self.read_unary_rmw(instruction)?;
         let ty = size_to_type(size);
-        let count = self.shift_count(instruction, ty)?;
+        let count = self.shift_count(instruction, 1, ty)?;
         let bits = self.builder.ins().iconst(ty, (size * 8) as i64);
-        let left_count = self.builder.ins().isub(bits, count);
-        let right = self.builder.ins().ushr(val, count);
+        let left_count = self.builder.ins().isub(bits, count.value());
+        let right = self.builder.ins().ushr(val, count.value());
         let left = self.builder.ins().ishl(val, left_count);
         let result = self.builder.ins().bor(right, left);
         self.write_place(place, result)?;
@@ -216,28 +235,32 @@ impl<'a> Lifter<'a> {
     }
 
     /// Set CF from a rotate's carried-out bit, unless the masked `count` is 0 (no flags affected).
-    fn set_rotate_cf(&mut self, cf_bit: Value, count: Value) -> crate::Result<()> {
-        let old_cf = self.builder.use_var(self.state.flags[&X86Flag::Carry]);
-        let new_cf = if self.builder.func.dfg.value_type(cf_bit) == types::I8 {
-            cf_bit
-        } else {
-            self.builder.ins().ireduce(types::I8, cf_bit)
+    fn set_rotate_cf(&mut self, cf_bit: Value, count: ShiftCount) -> crate::Result<()> {
+        let new_cf = self.narrow_to(types::I8, cf_bit);
+        let final_cf = match count {
+            ShiftCount::Static { count: 0, .. } => return Ok(()),
+            ShiftCount::Static { .. } => new_cf,
+            ShiftCount::Dynamic(count) => {
+                let old_cf = self.builder.use_var(self.state.flags[&X86Flag::Carry]);
+                let is_zero = self.builder.ins().icmp_imm_s(IntCC::Equal, count, 0);
+                self.builder.ins().select(is_zero, old_cf, new_cf)
+            }
         };
-        let is_zero = self.builder.ins().icmp_imm_s(IntCC::Equal, count, 0);
-        let final_cf = self.builder.ins().select(is_zero, old_cf, new_cf);
         self.set_flag(X86Flag::Carry, final_cf)
     }
 
     /// Set OF from a single-bit rotate when the masked `count` is 1; otherwise untouched (undefined for counts > 1).
-    fn set_rotate_of(&mut self, of_bit: Value, count: Value) -> crate::Result<()> {
-        let old_of = self.builder.use_var(self.state.flags[&X86Flag::Overflow]);
-        let new_of = if self.builder.func.dfg.value_type(of_bit) == types::I8 {
-            of_bit
-        } else {
-            self.builder.ins().ireduce(types::I8, of_bit)
+    fn set_rotate_of(&mut self, of_bit: Value, count: ShiftCount) -> crate::Result<()> {
+        let new_of = self.narrow_to(types::I8, of_bit);
+        let final_of = match count {
+            ShiftCount::Static { count: 1, .. } => new_of,
+            ShiftCount::Static { .. } => return Ok(()),
+            ShiftCount::Dynamic(count) => {
+                let old_of = self.builder.use_var(self.state.flags[&X86Flag::Overflow]);
+                let is_one = self.builder.ins().icmp_imm_s(IntCC::Equal, count, 1);
+                self.builder.ins().select(is_one, new_of, old_of)
+            }
         };
-        let is_one = self.builder.ins().icmp_imm_s(IntCC::Equal, count, 1);
-        let final_of = self.builder.ins().select(is_one, new_of, old_of);
         self.set_flag(X86Flag::Overflow, final_of)
     }
 
@@ -283,11 +306,11 @@ impl<'a> Lifter<'a> {
         let place = self.resolve_place(instruction, 0)?;
         let val = self.read_place(place, size)?;
         let cf = self.builder.use_var(self.state.flags[&X86Flag::Carry]);
-        let count = self.shift_count(instruction, ty)?;
+        let count = self.shift_count(instruction, 1, ty)?;
 
         let xval = self.builder.ins().uextend(work_ty, val);
         let cfw = self.builder.ins().uextend(work_ty, cf);
-        let count_w = self.builder.ins().uextend(work_ty, count);
+        let count_w = self.builder.ins().uextend(work_ty, count.value());
 
         // c = count mod N+1; a no-op for 32/64-bit (the mask suffices), which matters as there is no `urem.i128`.
         let np1 = self.wide_const(work_ty, n + 1);
@@ -348,7 +371,7 @@ impl<'a> Lifter<'a> {
         let place = self.resolve_place(instruction, 0)?;
         let val = self.read_place(place, size)?;
         let cf = self.builder.use_var(self.state.flags[&X86Flag::Carry]);
-        let count = self.shift_count(instruction, ty)?;
+        let count = self.shift_count(instruction, 1, ty)?;
 
         let xval = {
             let v = self.builder.ins().uextend(work_ty, val);
@@ -356,7 +379,7 @@ impl<'a> Lifter<'a> {
             let cf_hi = self.builder.ins().ishl_imm_u(cfw, n);
             self.builder.ins().bor(v, cf_hi)
         };
-        let count_w = self.builder.ins().uextend(work_ty, count);
+        let count_w = self.builder.ins().uextend(work_ty, count.value());
 
         // c = count mod N+1; a no-op for 32/64-bit (the mask suffices), which matters as there is no `urem.i128`.
         let np1 = self.wide_const(work_ty, n + 1);
@@ -390,33 +413,6 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
-    /// Resolve the SHLD/SHRD count: `imm8` or `CL`, masked to 5 bits (6 for 64-bit).
-    fn double_shift_count(&mut self, instruction: &Instruction, ty: Type) -> crate::Result<Value> {
-        let count_raw = match instruction.op2_kind() {
-            OpKind::Register => {
-                let cl = self.get_reg_val(Register::CL)?;
-                self.builder.ins().uextend(ty, cl)
-            }
-            OpKind::Immediate8
-            | OpKind::Immediate8to16
-            | OpKind::Immediate8to32
-            | OpKind::Immediate8to64 => self
-                .builder
-                .ins()
-                .iconst(ty, instruction.immediate8() as i64),
-            other => {
-                return Err(MicroliftError::UnsupportedInstruction {
-                    mnemonic: format!("double-shift-count-{:?}", other),
-                });
-            }
-        };
-        let mask = match ty {
-            types::I64 => self.builder.ins().iconst(ty, 0x3F),
-            _ => self.builder.ins().iconst(ty, 0x1F),
-        };
-        Ok(self.builder.ins().band(count_raw, mask))
-    }
-
     /// SHLD - Shift Left Double.
     ///
     /// `SHLD dst, src, count`: result = (dst << count) | (src >> (N - count)); CF = last bit shifted out of dst's MSB.
@@ -428,15 +424,15 @@ impl<'a> Lifter<'a> {
         let place = self.resolve_place(instruction, 0)?;
         let dst = self.read_place(place, size)?;
         let src = self.get_reg_val(instruction.op1_register())?;
-        let count = self.double_shift_count(instruction, ty)?;
+        let count = self.shift_count(instruction, 2, ty)?;
 
-        let right_count = self.builder.ins().isub(bits, count);
-        let shifted_dst = self.builder.ins().ishl(dst, count);
+        let right_count = self.builder.ins().isub(bits, count.value());
+        let shifted_dst = self.builder.ins().ishl(dst, count.value());
         let shifted_src = self.builder.ins().ushr(src, right_count);
         let combined = self.builder.ins().bor(shifted_dst, shifted_src);
 
         // A masked count of 0 leaves dst unchanged; the formula would give `dst | src` since `src >> N` re-masks to 0.
-        let is_zero = self.builder.ins().icmp_imm_s(IntCC::Equal, count, 0);
+        let is_zero = self.builder.ins().icmp_imm_s(IntCC::Equal, count.value(), 0);
         let result = self.builder.ins().select(is_zero, dst, combined);
 
         self.write_place(place, result)?;
@@ -459,21 +455,21 @@ impl<'a> Lifter<'a> {
         let place = self.resolve_place(instruction, 0)?;
         let dst = self.read_place(place, size)?;
         let src = self.get_reg_val(instruction.op1_register())?;
-        let count = self.double_shift_count(instruction, ty)?;
+        let count = self.shift_count(instruction, 2, ty)?;
 
-        let left_count = self.builder.ins().isub(bits, count);
+        let left_count = self.builder.ins().isub(bits, count.value());
         let shifted_src = self.builder.ins().ishl(src, left_count);
-        let shifted_dst = self.builder.ins().ushr(dst, count);
+        let shifted_dst = self.builder.ins().ushr(dst, count.value());
         let combined = self.builder.ins().bor(shifted_src, shifted_dst);
 
         // A masked count of 0 leaves the destination unchanged (see SHLD).
-        let is_zero = self.builder.ins().icmp_imm_s(IntCC::Equal, count, 0);
+        let is_zero = self.builder.ins().icmp_imm_s(IntCC::Equal, count.value(), 0);
         let result = self.builder.ins().select(is_zero, dst, combined);
 
         self.write_place(place, result)?;
 
         let one = self.builder.ins().iconst(ty, 1);
-        let cf_shift = self.builder.ins().isub(count, one);
+        let cf_shift = self.builder.ins().isub(count.value(), one);
         let cf_raw = self.builder.ins().ushr(dst, cf_shift);
         let cf_bit = self.builder.ins().band(cf_raw, one);
         self.update_flags_shift(dst, result, cf_bit, count, size)?;

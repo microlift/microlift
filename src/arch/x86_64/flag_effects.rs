@@ -25,7 +25,7 @@ const DF: FlagSet = f(X86Flag::Direction);
 const ARITH: FlagSet = CF.union(PF).union(AF).union(ZF).union(SF).union(OF);
 const LOGICAL: FlagSet = ARITH;
 const INC_DEC: FlagSet = PF.union(AF).union(ZF).union(SF).union(OF);
-const SHIFT: FlagSet = CF.union(PF).union(ZF).union(SF).union(OF);
+const SHIFT: FlagSet = ARITH;
 
 /// The flag effects of lifting `i`, or `None` where unaudited ([`FlagEffects::CONSERVATIVE`] to callers).
 pub fn flag_effects(i: &Instruction) -> Option<FlagEffects> {

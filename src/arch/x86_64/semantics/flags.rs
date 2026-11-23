@@ -2,6 +2,7 @@
 //!
 //! PF and AF are stored as source bytes and folded into booleans at their readers.
 
+use crate::arch::x86_64::semantics::bitops::ShiftCount;
 use crate::lifter::{Lifter, X86Flag};
 use cranelift::prelude::*;
 use iced_x86::Instruction;
@@ -434,89 +435,97 @@ impl<'a> Lifter<'a> {
         self.update_flags_zsap(lhs, rhs, res, size)
     }
 
-    /// Flags for SHL/SHR/SAR/SHLD/SHRD: `orig` pre-shift destination, `res` result, `cf_bit` last bit shifted out, `count` masked count, `size` bytes.
-    /// A zero masked count affects no flags, so prior values are preserved.
+    /// Flags for SHL/SHR/SAR/SHLD/SHRD: `orig` pre-shift destination, `res` result, `cf_bit` last bit shifted out, `size` bytes.
+    /// A zero masked count affects no flags; only a count known only at run time needs the old ones.
     /// OF is defined only for count == 1 (the sign changed: `MSB(orig) ^ MSB(res)`); cleared for larger counts.
+    /// AF is undefined and cleared, as QEMU does.
     pub fn update_flags_shift(
         &mut self,
         orig: Value,
         res: Value,
         cf_bit: Value,
-        count: Value,
+        count: ShiftCount,
         size: usize,
     ) -> crate::Result<()> {
+        let count_is_zero = match count {
+            ShiftCount::Static { count: 0, .. } => return Ok(()),
+            ShiftCount::Static { .. } => None,
+            ShiftCount::Dynamic(count) => {
+                Some(self.builder.ins().icmp_imm_s(IntCC::Equal, count, 0))
+            }
+        };
         let bit_width = (size * 8) as i64;
 
-        // Old flag sources feed the selects: a zero count preserves them.
-        let (zf, sf, cf, of, pf) = (
-            self.flag_needed(X86Flag::Zero),
-            self.flag_needed(X86Flag::Sign),
-            self.flag_needed(X86Flag::Carry),
-            self.flag_needed(X86Flag::Overflow),
-            self.flag_needed(X86Flag::Parity),
-        );
-        if !(zf || sf || cf || of || pf) {
-            return Ok(());
+        let zf = self.builder.ins().icmp_imm_s(IntCC::Equal, res, 0);
+        let sign = self.builder.ins().ushr_imm_u(res, bit_width - 1);
+        let sf = self.narrow_to(types::I8, sign);
+        let cf = self.narrow_to(types::I8, cf_bit);
+        let of = self.shift_overflow(orig, res, count, bit_width);
+        for (flag, new) in [
+            (X86Flag::Zero, zf),
+            (X86Flag::Sign, sf),
+            (X86Flag::Carry, cf),
+            (X86Flag::Overflow, of),
+        ] {
+            if self.flag_needed(flag) {
+                let value = self.unless_count_zero(count_is_zero, flag, new);
+                self.set_flag(flag, value)?;
+            }
         }
 
-        let is_zero = self.builder.ins().icmp_imm_s(IntCC::Equal, count, 0);
-
-        if zf {
-            let old_zf = self.builder.use_var(self.state.flags[&X86Flag::Zero]);
-            let new_zf = self.builder.ins().icmp_imm_s(IntCC::Equal, res, 0);
-            let final_zf = self.builder.ins().select(is_zero, old_zf, new_zf);
-            self.set_flag(X86Flag::Zero, final_zf)?;
+        let pf = self.parity_source(res);
+        let af = self.builder.ins().iconst(types::I8, 0);
+        for (flag, new) in [(X86Flag::Parity, pf), (X86Flag::Auxiliary, af)] {
+            if self.flag_needed(flag) {
+                let value = self.unless_count_zero(count_is_zero, flag, new);
+                self.set_flag_source(flag, value)?;
+            }
         }
-
-        if sf {
-            let old_sf = self.builder.use_var(self.state.flags[&X86Flag::Sign]);
-            // Reduced to `I8`, the flag variable type `select` needs.
-            let new_sf_w = self.builder.ins().ushr_imm_u(res, bit_width - 1);
-            let new_sf = if size == 1 {
-                new_sf_w
-            } else {
-                self.builder.ins().ireduce(types::I8, new_sf_w)
-            };
-            let final_sf = self.builder.ins().select(is_zero, old_sf, new_sf);
-            self.set_flag(X86Flag::Sign, final_sf)?;
+        if count_is_zero.is_none() {
+            self.note_flag_origin(FlagOrigin::Result { res });
         }
-
-        if cf {
-            let old_cf = self.builder.use_var(self.state.flags[&X86Flag::Carry]);
-            let new_cf = if self.builder.func.dfg.value_type(cf_bit) == types::I8 {
-                cf_bit
-            } else {
-                self.builder.ins().ireduce(types::I8, cf_bit)
-            };
-            let final_cf = self.builder.ins().select(is_zero, old_cf, new_cf);
-            self.set_flag(X86Flag::Carry, final_cf)?;
-        }
-
-        if of {
-            // OF for count == 1: sign change between operand and result.
-            let old_of = self.builder.use_var(self.state.flags[&X86Flag::Overflow]);
-            let sign_xor = self.builder.ins().bxor(orig, res);
-            let sign_change_w = self.builder.ins().ushr_imm_u(sign_xor, bit_width - 1);
-            let sign_change = if self.builder.func.dfg.value_type(sign_change_w) == types::I8 {
-                sign_change_w
-            } else {
-                self.builder.ins().ireduce(types::I8, sign_change_w)
-            };
-            let zero_i8 = self.builder.ins().iconst(types::I8, 0);
-            let is_one = self.builder.ins().icmp_imm_s(IntCC::Equal, count, 1);
-            let new_of = self.builder.ins().select(is_one, sign_change, zero_i8);
-            let final_of = self.builder.ins().select(is_zero, old_of, new_of);
-            self.set_flag(X86Flag::Overflow, final_of)?;
-        }
-
-        if pf {
-            // Select before the fold so a zero count leaves the stored PF source unchanged.
-            let old_pf = self.builder.use_var(self.state.flags[&X86Flag::Parity]);
-            let new_pf = self.parity_source(res);
-            let final_pf = self.builder.ins().select(is_zero, old_pf, new_pf);
-            self.set_flag_source(X86Flag::Parity, final_pf)?;
-        }
-
         Ok(())
+    }
+
+    /// A shift's OF: the sign change for a count of one, else zero.
+    fn shift_overflow(
+        &mut self,
+        orig: Value,
+        res: Value,
+        count: ShiftCount,
+        bit_width: i64,
+    ) -> Value {
+        let zero = self.builder.ins().iconst(types::I8, 0);
+        if let ShiftCount::Static { count, .. } = count
+            && count != 1
+        {
+            return zero;
+        }
+        let sign_xor = self.builder.ins().bxor(orig, res);
+        let sign_change_w = self.builder.ins().ushr_imm_u(sign_xor, bit_width - 1);
+        let sign_change = self.narrow_to(types::I8, sign_change_w);
+        match count {
+            ShiftCount::Static { .. } => sign_change,
+            ShiftCount::Dynamic(count) => {
+                let is_one = self.builder.ins().icmp_imm_s(IntCC::Equal, count, 1);
+                self.builder.ins().select(is_one, sign_change, zero)
+            }
+        }
+    }
+
+    /// `new`, or the stored value of `flag` (its raw source, for PF/AF) when the count is zero.
+    fn unless_count_zero(
+        &mut self,
+        count_is_zero: Option<Value>,
+        flag: X86Flag,
+        new: Value,
+    ) -> Value {
+        match count_is_zero {
+            None => new,
+            Some(is_zero) => {
+                let old = self.builder.use_var(self.state.flags[&flag]);
+                self.builder.ins().select(is_zero, old, new)
+            }
+        }
     }
 }
