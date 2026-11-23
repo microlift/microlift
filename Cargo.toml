@@ -117,6 +117,10 @@ name = "size_tests"
 required-features = ["testkit"]
 
 [[test]]
+name = "lift_shape_tests"
+required-features = ["testkit"]
+
+[[test]]
 name = "subencoded_tests"
 required-features = ["testkit"]
 
