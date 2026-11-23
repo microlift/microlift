@@ -6,7 +6,7 @@ use crate::core::LifterConfig;
 use cranelift::prelude::*;
 use cranelift_frontend::{FunctionBuilder, Variable};
 use iced_x86::Register;
-use std::collections::HashMap;
+use std::ops::Index;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum X86Flag {
@@ -90,8 +90,68 @@ pub fn is_segment_register(reg: Register) -> bool {
 
 /// [`GPR_ORDER`] index of `reg`'s 64-bit form; sub-registers map to their containing GPR.
 pub fn gpr_index(reg: Register) -> Option<u8> {
-    let full = reg.full_register();
-    GPR_ORDER.iter().position(|&r| r == full).map(|i| i as u8)
+    gpr64_index(reg.full_register())
+}
+
+/// [`GPR_ORDER`] index of a 64-bit GPR; iced numbers them contiguously in encoding order.
+fn gpr64_index(reg: Register) -> Option<u8> {
+    let index = (reg as usize).wrapping_sub(Register::RAX as usize);
+    (index < GPR_ORDER.len()).then_some(index as u8)
+}
+
+/// One variable per 64-bit GPR, indexed by [`GPR_ORDER`] position.
+pub struct GprVars([Variable; GPR_ORDER.len()]);
+
+impl GprVars {
+    /// The variable of a 64-bit GPR; `None` for anything else, sub-registers included.
+    pub fn get(&self, reg: &Register) -> Option<&Variable> {
+        gpr64_index(*reg).map(|i| &self.0[i as usize])
+    }
+}
+
+impl Index<&Register> for GprVars {
+    type Output = Variable;
+
+    fn index(&self, reg: &Register) -> &Variable {
+        self.get(reg)
+            .unwrap_or_else(|| panic!("{reg:?} is not a 64-bit GPR"))
+    }
+}
+
+/// One variable per flag, indexed by discriminant, which is the [`FLAG_ORDER`] position.
+pub struct FlagVars([Variable; FLAG_ORDER.len()]);
+
+impl Index<&X86Flag> for FlagVars {
+    type Output = Variable;
+
+    fn index(&self, flag: &X86Flag) -> &Variable {
+        &self.0[*flag as usize]
+    }
+}
+
+/// XMM variables indexed by register number, [`XMM_SCRATCH`] included; empty in the unused representation.
+pub struct XmmVars(Vec<Variable>);
+
+impl XmmVars {
+    fn declare(builder: &mut FunctionBuilder, ty: Type) -> Self {
+        Self((0..=XMM_SCRATCH).map(|_| builder.declare_var(ty)).collect())
+    }
+
+    fn none() -> Self {
+        Self(Vec::new())
+    }
+
+    pub fn get(&self, idx: &u8) -> Option<&Variable> {
+        self.0.get(*idx as usize)
+    }
+}
+
+impl Index<&u8> for XmmVars {
+    type Output = Variable;
+
+    fn index(&self, idx: &u8) -> &Variable {
+        &self.0[*idx as usize]
+    }
 }
 
 /// A lift-local XMM slot past the sixteen guest ones: never loaded, synced or marked written.
@@ -100,16 +160,16 @@ pub const XMM_SCRATCH: u8 = 16;
 /// Mapping of x86 registers to Cranelift variables. Written-register tracking lives on the engine
 /// ([`LiftEngine::mark_written`](crate::core::LiftEngine::mark_written)).
 pub struct RegisterState {
-    pub gprs: HashMap<Register, Variable>,
-    pub flags: HashMap<X86Flag, Variable>,
+    pub gprs: GprVars,
+    pub flags: FlagVars,
     pub context_ptr: Variable,
     pub image_base: Variable,
     /// XMM low halves; scalar mode only.
-    pub xmms_lo: HashMap<u8, Variable>,
+    pub xmms_lo: XmmVars,
     /// XMM high halves; scalar mode only.
-    pub xmms_hi: HashMap<u8, Variable>,
+    pub xmms_hi: XmmVars,
     /// XMMs as `I64X2`; vector mode only.
-    pub xmms_vec: HashMap<u8, Variable>,
+    pub xmms_vec: XmmVars,
     pub use_vector_xmm: bool,
     pub fs_base: Variable,
     pub gs_base: Variable,
@@ -117,35 +177,25 @@ pub struct RegisterState {
 
 impl RegisterState {
     pub fn new(builder: &mut FunctionBuilder, use_vector_xmm: bool) -> Self {
-        let mut gprs = HashMap::new();
+        let gprs = GprVars(GPR_ORDER.map(|_| builder.declare_var(types::I64)));
+        let flags = FlagVars(FLAG_ORDER.map(|_| builder.declare_var(types::I8)));
 
-        for &reg in &GPR_ORDER {
-            let var = builder.declare_var(types::I64);
-            gprs.insert(reg, var);
-        }
-
-        let mut flags = HashMap::new();
-        for &flag in &FLAG_ORDER {
-            let var = builder.declare_var(types::I8);
-            flags.insert(flag, var);
-        }
-
-        let context_ptr = builder.declare_var(types::I64); // Assume 64-bit pointer
+        let context_ptr = builder.declare_var(types::I64);
         let image_base = builder.declare_var(types::I64);
 
-        let mut xmms_lo = HashMap::new();
-        let mut xmms_hi = HashMap::new();
-        let mut xmms_vec = HashMap::new();
-        if use_vector_xmm {
-            for i in 0u8..=XMM_SCRATCH {
-                xmms_vec.insert(i, builder.declare_var(types::I64X2));
-            }
+        let (xmms_lo, xmms_hi, xmms_vec) = if use_vector_xmm {
+            (
+                XmmVars::none(),
+                XmmVars::none(),
+                XmmVars::declare(builder, types::I64X2),
+            )
         } else {
-            for i in 0u8..=XMM_SCRATCH {
-                xmms_lo.insert(i, builder.declare_var(types::I64));
-                xmms_hi.insert(i, builder.declare_var(types::I64));
-            }
-        }
+            (
+                XmmVars::declare(builder, types::I64),
+                XmmVars::declare(builder, types::I64),
+                XmmVars::none(),
+            )
+        };
 
         let fs_base = builder.declare_var(types::I64);
         let gs_base = builder.declare_var(types::I64);
@@ -232,5 +282,27 @@ impl RegisterState {
 
     pub fn get_gs_base_offset() -> i32 {
         std::mem::offset_of!(RegisterContext, gs_base) as i32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flag_discriminants_are_flag_order_positions() {
+        for (i, flag) in FLAG_ORDER.iter().enumerate() {
+            assert_eq!(*flag as usize, i);
+        }
+    }
+
+    #[test]
+    fn gpr_index_follows_gpr_order() {
+        for (i, reg) in GPR_ORDER.iter().enumerate() {
+            assert_eq!(gpr_index(*reg), Some(i as u8));
+        }
+        assert_eq!(gpr_index(Register::R9D), Some(9));
+        assert_eq!(gpr_index(Register::RIP), None);
+        assert_eq!(gpr64_index(Register::EAX), None);
     }
 }

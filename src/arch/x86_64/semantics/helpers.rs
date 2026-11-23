@@ -1,6 +1,6 @@
 use crate::MicroliftError;
 use crate::arch::x86_64::regs::{
-    FLAG_ORDER, RegisterState, XMM_SCRATCH, gpr_index, is_segment_register,
+    RegisterState, XMM_SCRATCH, gpr_index, is_segment_register,
 };
 use crate::arch::x86_64::sync::{FS_BASE_SLOT, GS_BASE_SLOT};
 use crate::core::regsync::RegSlot;
@@ -249,7 +249,7 @@ impl<'a> Lifter<'a> {
     /// Assign `flag` from its logical 0/1 value, encoding the two source-stored flags: `val ^ 1` for PF, `val << 4` for AF.
     pub fn set_flag(&mut self, flag: X86Flag, val: Value) -> crate::Result<()> {
         let encoded = match flag {
-            X86Flag::Parity | X86Flag::Auxiliary if self.state.flags.contains_key(&flag) => {
+            X86Flag::Parity | X86Flag::Auxiliary => {
                 let val_i8 = if self.builder.func.dfg.value_type(val) == types::I8 {
                     val
                 } else {
@@ -269,25 +269,11 @@ impl<'a> Lifter<'a> {
 
     /// Write `val` into `flag`'s variable verbatim; the tail of [`Self::set_flag`] and [`Self::set_flag_source`].
     fn store_flag(&mut self, flag: X86Flag, val: Value) -> crate::Result<()> {
-        if let Some(&var) = self.state.flags.get(&flag) {
-            let val_i8 = if self.builder.func.dfg.value_type(val) == types::I8 {
-                val
-            } else {
-                self.builder.ins().ireduce(types::I8, val)
-            };
-            self.record_flag_value(val_i8);
-            self.builder.def_var(var, val_i8);
-            let idx = FLAG_ORDER
-                .iter()
-                .position(|&f| f == flag)
-                .expect("a flag variable has a FLAG_ORDER index");
-            self.mark_written(RegSlot::Flag(idx as u8));
-            Ok(())
-        } else {
-            Err(MicroliftError::UnsupportedInstruction {
-                mnemonic: format!("flag-{:?}", flag),
-            })
-        }
+        let val_i8 = self.narrow_to(types::I8, val);
+        self.record_flag_value(val_i8);
+        self.builder.def_var(self.state.flags[&flag], val_i8);
+        self.mark_written(RegSlot::Flag(flag as u8));
+        Ok(())
     }
 
 
