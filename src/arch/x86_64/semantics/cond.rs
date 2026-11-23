@@ -2,7 +2,9 @@
 //!
 //! Sixteen conditions built from eight base predicates and their negations.
 
+use crate::arch::x86_64::semantics::flags::FlagOrigin;
 use crate::lifter::{Lifter, X86Flag};
+use cranelift::codegen::ir::condcodes::CondCode;
 use cranelift::prelude::*;
 use iced_x86::Instruction;
 
@@ -83,6 +85,56 @@ enum Base {
     ZfOrSfXorOf,
 }
 
+/// A condition settled from the last flag writer's own operands.
+enum Fused {
+    Compare(IntCC, Value, Value),
+    Constant(bool),
+}
+
+impl Fused {
+    fn complement(self) -> Self {
+        match self {
+            Fused::Compare(cc, a, b) => Fused::Compare(cc.complement(), a, b),
+            Fused::Constant(holds) => Fused::Constant(!holds),
+        }
+    }
+}
+
+impl Base {
+    /// `self` as one compare on what `origin` computed the flags from, where the table has one.
+    fn fused(self, origin: FlagOrigin, zero: Value) -> Option<Fused> {
+        use Fused::{Compare, Constant};
+        match (origin, self) {
+            (FlagOrigin::Sub { lhs, rhs, .. }, Base::Cf) => {
+                Some(Compare(IntCC::UnsignedLessThan, lhs, rhs))
+            }
+            (FlagOrigin::Sub { lhs, rhs, .. }, Base::Zf) => Some(Compare(IntCC::Equal, lhs, rhs)),
+            (FlagOrigin::Sub { lhs, rhs, .. }, Base::CfOrZf) => {
+                Some(Compare(IntCC::UnsignedLessThanOrEqual, lhs, rhs))
+            }
+            (FlagOrigin::Sub { lhs, rhs, .. }, Base::SfXorOf) => {
+                Some(Compare(IntCC::SignedLessThan, lhs, rhs))
+            }
+            (FlagOrigin::Sub { lhs, rhs, .. }, Base::ZfOrSfXorOf) => {
+                Some(Compare(IntCC::SignedLessThanOrEqual, lhs, rhs))
+            }
+            (FlagOrigin::Logical { .. }, Base::Cf | Base::Of) => Some(Constant(false)),
+            (FlagOrigin::Logical { res }, Base::Zf | Base::CfOrZf) => {
+                Some(Compare(IntCC::Equal, res, zero))
+            }
+            (FlagOrigin::Logical { res }, Base::SfXorOf) => {
+                Some(Compare(IntCC::SignedLessThan, res, zero))
+            }
+            (FlagOrigin::Logical { res }, Base::ZfOrSfXorOf) => {
+                Some(Compare(IntCC::SignedLessThanOrEqual, res, zero))
+            }
+            (origin, Base::Zf) => Some(Compare(IntCC::Equal, origin.result(), zero)),
+            (origin, Base::Sf) => Some(Compare(IntCC::SignedLessThan, origin.result(), zero)),
+            _ => None,
+        }
+    }
+}
+
 impl<'a> Lifter<'a> {
     fn flag(&mut self, flag: X86Flag) -> Value {
         // PF/AF are stored as source values; `get_flag` derives them.
@@ -93,8 +145,20 @@ impl<'a> Lifter<'a> {
         self.builder.ins().icmp_imm_s(IntCC::Equal, val, 0)
     }
 
-    /// `cond` as `(value, invert)`: holds when `value` is nonzero, unless `invert`.
-    /// `Jcc` spends the inversion on its branch destinations.
+    /// `cond` as one compare on the last flag writer's operands, when that writer is known here.
+    fn fused_cond(&mut self, cond: Cond) -> Option<Value> {
+        let origin = self.flag_origin()?;
+        let ty = self.builder.func.dfg.value_type(origin.result());
+        let zero = self.builder.ins().iconst(ty, 0);
+        let (base, negated) = cond.base();
+        let fused = base.fused(origin, zero)?;
+        Some(match if negated { fused.complement() } else { fused } {
+            Fused::Compare(cc, a, b) => self.builder.ins().icmp(cc, a, b),
+            Fused::Constant(holds) => self.builder.ins().iconst(types::I8, holds as i64),
+        })
+    }
+
+    /// The base of `cond` from the flag variables: `cond` holds when it is nonzero, unless `cond` negates it.
     fn eval_cond(&mut self, cond: Cond) -> Value {
         match cond.base().0 {
             Base::Cf => self.flag(X86Flag::Carry),
@@ -124,6 +188,9 @@ impl<'a> Lifter<'a> {
 
     /// `cond` as a plain `I8` boolean.
     fn eval_cond_value(&mut self, cond: Cond) -> Value {
+        if let Some(fused) = self.fused_cond(cond) {
+            return fused;
+        }
         let val = self.eval_cond(cond);
         if cond.base().1 {
             self.bool_not(val)
@@ -162,6 +229,9 @@ impl<'a> Lifter<'a> {
         instruction: &Instruction,
         cond: Cond,
     ) -> crate::Result<()> {
+        if let Some(fused) = self.fused_cond(cond) {
+            return self.handle_conditional_branch(instruction, fused);
+        }
         let val = self.eval_cond(cond);
         if cond.base().1 {
             self.handle_conditional_branch_inverted(instruction, val)

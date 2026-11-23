@@ -2,6 +2,7 @@
 
 use crate::MicroliftError;
 use crate::arch::x86_64::context::RegisterContext;
+use crate::arch::x86_64::semantics::flags::FlagOrigin;
 use crate::core::LifterConfig;
 use cranelift::prelude::*;
 use cranelift_frontend::{FunctionBuilder, Variable};
@@ -173,6 +174,8 @@ pub struct RegisterState {
     pub use_vector_xmm: bool,
     pub fs_base: Variable,
     pub gs_base: Variable,
+    /// What the current flags were computed from, valid only in the block that recorded it.
+    pub flag_origin: Option<(Block, FlagOrigin)>,
 }
 
 impl RegisterState {
@@ -211,6 +214,7 @@ impl RegisterState {
             use_vector_xmm,
             fs_base,
             gs_base,
+            flag_origin: None,
         }
     }
 

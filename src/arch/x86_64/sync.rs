@@ -84,6 +84,7 @@ impl<'a> Lifter<'a> {
         }
 
         if mask.flags {
+            self.state.flag_origin = None;
             for (i, &flag) in FLAG_ORDER.iter().enumerate() {
                 let var = self.state.flags[&flag];
                 let offset = RegisterState::get_flag_offset(flag)?;
@@ -217,6 +218,7 @@ impl<'a> Lifter<'a> {
             self.builder.def_var(var, val);
         }
 
+        self.state.flag_origin = None;
         for &flag in &FLAG_ORDER {
             let var = self.state.flags[&flag];
             let offset = RegisterState::get_flag_offset(flag)?;

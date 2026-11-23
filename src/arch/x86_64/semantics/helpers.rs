@@ -272,6 +272,7 @@ impl<'a> Lifter<'a> {
         let val_i8 = self.narrow_to(types::I8, val);
         self.record_flag_value(val_i8);
         self.builder.def_var(self.state.flags[&flag], val_i8);
+        self.state.flag_origin = None;
         self.mark_written(RegSlot::Flag(flag as u8));
         Ok(())
     }

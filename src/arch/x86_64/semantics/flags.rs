@@ -6,7 +6,40 @@ use crate::lifter::{Lifter, X86Flag};
 use cranelift::prelude::*;
 use iced_x86::Instruction;
 
+/// The operands the last instruction to write every condition flag computed them from.
+/// Lets a condition compare them directly instead of recombining the stored flag bytes.
+#[derive(Debug, Clone, Copy)]
+pub enum FlagOrigin {
+    /// `lhs - rhs`: CF, ZF, SF and OF.
+    Sub { lhs: Value, rhs: Value, res: Value },
+    /// CF = OF = 0; ZF and SF from `res`.
+    Logical { res: Value },
+    /// ZF and SF from `res`; CF and OF are not a function of it alone.
+    Result { res: Value },
+}
+
+impl FlagOrigin {
+    pub fn result(self) -> Value {
+        match self {
+            FlagOrigin::Sub { res, .. }
+            | FlagOrigin::Logical { res }
+            | FlagOrigin::Result { res } => res,
+        }
+    }
+}
+
 impl<'a> Lifter<'a> {
+    /// The origin of the current flags, if recorded in the block being emitted.
+    pub(super) fn flag_origin(&self) -> Option<FlagOrigin> {
+        let (block, origin) = self.state.flag_origin?;
+        (self.builder.current_block() == Some(block)).then_some(origin)
+    }
+
+    /// Record `origin` for the flags just written; any later flag write forgets it.
+    fn note_flag_origin(&mut self, origin: FlagOrigin) {
+        self.state.flag_origin = self.builder.current_block().map(|block| (block, origin));
+    }
+
     /// The byte PF is the parity of: the low byte of `res`, unchanged; the fold happens at the reader ([`Lifter::get_flag`]).
     fn parity_source(&mut self, res: Value) -> Value {
         if self.builder.func.dfg.value_type(res) == types::I8 {
@@ -167,32 +200,36 @@ impl<'a> Lifter<'a> {
 
     /// `lhs + rhs` and every flag an `ADD` writes (`ADD`, `XADD` and their locked forms).
     pub fn add_with_flags(&mut self, lhs: Value, rhs: Value, size: usize) -> crate::Result<Value> {
-        match self.try_native_add_flags(lhs, rhs)? {
+        let res = match self.try_native_add_flags(lhs, rhs)? {
             Some(res) => {
                 self.update_flags_zsap(lhs, rhs, res, size)?;
-                Ok(res)
+                res
             }
             None => {
                 let res = self.builder.ins().iadd(lhs, rhs);
                 self.update_flags_add(lhs, rhs, res, size)?;
-                Ok(res)
+                res
             }
-        }
+        };
+        self.note_flag_origin(FlagOrigin::Result { res });
+        Ok(res)
     }
 
     /// `lhs - rhs` and every flag a `SUB` writes (`SUB`, `CMP`, `NEG`, `CMPXCHG`'s compare, locked forms).
     pub fn sub_with_flags(&mut self, lhs: Value, rhs: Value, size: usize) -> crate::Result<Value> {
-        match self.try_native_sub_flags(lhs, rhs)? {
+        let res = match self.try_native_sub_flags(lhs, rhs)? {
             Some(res) => {
                 self.update_flags_zsap(lhs, rhs, res, size)?;
-                Ok(res)
+                res
             }
             None => {
                 let res = self.builder.ins().isub(lhs, rhs);
                 self.update_flags_sub(lhs, rhs, res, size)?;
-                Ok(res)
+                res
             }
-        }
+        };
+        self.note_flag_origin(FlagOrigin::Sub { lhs, rhs, res });
+        Ok(res)
     }
 
     /// `lhs ± 1` and every flag an `INC`/`DEC` writes (all but CF); `rhs` is the constant one in the operand's type.
@@ -203,10 +240,10 @@ impl<'a> Lifter<'a> {
         is_add: bool,
         size: usize,
     ) -> crate::Result<Value> {
-        match self.try_native_inc_dec_flags(lhs, rhs, is_add)? {
+        let res = match self.try_native_inc_dec_flags(lhs, rhs, is_add)? {
             Some(res) => {
                 self.update_flags_zsap(lhs, rhs, res, size)?;
-                Ok(res)
+                res
             }
             None => {
                 let res = if is_add {
@@ -215,9 +252,11 @@ impl<'a> Lifter<'a> {
                     self.builder.ins().isub(lhs, rhs)
                 };
                 self.update_flags_inc_dec(lhs, rhs, res, is_add, size)?;
-                Ok(res)
+                res
             }
-        }
+        };
+        self.note_flag_origin(FlagOrigin::Result { res });
+        Ok(res)
     }
 
     /// `lhs + rhs + cf_in` (`is_adc`) or `lhs - rhs - cf_in`, and every flag an `ADC`/`SBB` writes.
@@ -346,6 +385,7 @@ impl<'a> Lifter<'a> {
             self.set_flag_source(X86Flag::Auxiliary, zero)?;
         }
 
+        self.note_flag_origin(FlagOrigin::Logical { res });
         Ok(())
     }
 
