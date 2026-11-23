@@ -514,6 +514,10 @@ impl<'a> Lifter<'a> {
             xmm_register_index(dst_reg).ok_or_else(|| MicroliftError::UnsupportedInstruction {
                 mnemonic: format!("xorps-dst-not-xmm-{:?}", dst_reg),
             })?;
+        if Self::names_one_register_twice(instruction) {
+            self.zero_xmm(dst_idx);
+            return Ok(());
+        }
         if self.config.use_vector_xmm {
             let dst = self.get_xmm_vec(dst_idx);
             let src = self.read_xmm_src_vec(instruction, 1)?;
@@ -528,6 +532,18 @@ impl<'a> Lifter<'a> {
         self.set_xmm_lo(dst_idx, res_lo);
         self.set_xmm_hi(dst_idx, res_hi);
         Ok(())
+    }
+
+    /// Zero XMM `idx` without reading it.
+    pub(super) fn zero_xmm(&mut self, idx: u8) {
+        if self.config.use_vector_xmm {
+            let zero = self.vec_zero();
+            self.set_xmm_vec(idx, zero);
+        } else {
+            let zero = self.builder.ins().iconst(types::I64, 0);
+            self.set_xmm_lo(idx, zero);
+            self.set_xmm_hi(idx, zero);
+        }
     }
 
     /// PXOR - same bit-level semantics as XORPS.

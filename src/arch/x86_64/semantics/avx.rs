@@ -4,7 +4,6 @@ use crate::arch::x86_64::regs::XMM_SCRATCH;
 use crate::arch::x86_64::semantics::helpers::{XMM_SCRATCH_REGISTER, xmm_register_index};
 use crate::arch::x86_64::vex::{VexLowering, legacy_form};
 use crate::lifter::Lifter;
-use cranelift::prelude::*;
 use iced_x86::{Instruction, OpKind};
 
 const GUEST_XMM_COUNT: u8 = 16;
@@ -81,15 +80,8 @@ impl<'a> Lifter<'a> {
     }
 
     fn zero_all_xmm(&mut self) {
-        let zero = self.builder.ins().iconst(types::I64, 0);
         for idx in 0..GUEST_XMM_COUNT {
-            if self.state.use_vector_xmm {
-                let v = self.builder.ins().splat(types::I64X2, zero);
-                self.set_xmm_vec(idx, v);
-            } else {
-                self.set_xmm_lo(idx, zero);
-                self.set_xmm_hi(idx, zero);
-            }
+            self.zero_xmm(idx);
         }
     }
 }

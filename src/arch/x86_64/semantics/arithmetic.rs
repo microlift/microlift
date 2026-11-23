@@ -15,6 +15,9 @@ impl<'a> Lifter<'a> {
 
     pub(super) fn handle_sub(&mut self, instruction: &Instruction) -> crate::Result<()> {
         let size = self.operand_size(instruction, 0)?;
+        if Self::names_one_register_twice(instruction) {
+            return self.zero_idiom(instruction, size);
+        }
         let (place, dst, src) = self.read_binary_rmw(instruction, size)?;
         let result = self.sub_with_flags(dst, src, size)?;
         self.write_place(place, result)

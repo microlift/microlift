@@ -54,6 +54,9 @@ impl<'a> Lifter<'a> {
     /// Shared `AND`/`OR`/`XOR`: write the destination, then set the logical flags.
     fn logical_op(&mut self, instruction: &Instruction, op: LogicalOp) -> crate::Result<()> {
         let size = self.operand_size(instruction, 0)?;
+        if matches!(op, LogicalOp::Xor) && Self::names_one_register_twice(instruction) {
+            return self.zero_idiom(instruction, size);
+        }
         let (place, dst, src) = self.read_binary_rmw(instruction, size)?;
         let result = match op {
             LogicalOp::And => self.builder.ins().band(dst, src),
@@ -62,6 +65,21 @@ impl<'a> Lifter<'a> {
         };
         self.write_place(place, result)?;
         self.update_flags_logical(result, size)
+    }
+
+    /// Whether operands 0 and 1 are the same register, as in `xor eax, eax`.
+    pub(super) fn names_one_register_twice(instruction: &Instruction) -> bool {
+        instruction.op0_kind() == OpKind::Register
+            && instruction.op1_kind() == OpKind::Register
+            && instruction.op0_register() == instruction.op1_register()
+    }
+
+    /// `xor r, r` / `sub r, r`: zero and the flags of a zero result, without reading `r`.
+    /// Both leave CF = OF = SF = AF = 0, ZF = 1 and even parity, the logical flags of zero.
+    pub(super) fn zero_idiom(&mut self, instruction: &Instruction, size: usize) -> crate::Result<()> {
+        let zero = self.builder.ins().iconst(size_to_type(size), 0);
+        self.write_operand(instruction, 0, zero)?;
+        self.update_flags_logical(zero, size)
     }
 
     pub(super) fn handle_not(&mut self, instruction: &Instruction) -> crate::Result<()> {
