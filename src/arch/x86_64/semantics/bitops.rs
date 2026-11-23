@@ -31,7 +31,7 @@ impl<'a> Lifter<'a> {
         self.logical_op(instruction, LogicalOp::Or)
     }
 
-    /// Shared `AND`/`OR`/`XOR`: write the destination, then set the logical flags (CF/OF cleared, ZF/SF/PF from the result, AF untouched).
+    /// Shared `AND`/`OR`/`XOR`: write the destination, then set the logical flags.
     fn logical_op(&mut self, instruction: &Instruction, op: LogicalOp) -> crate::Result<()> {
         let size = self.operand_size(instruction, 0)?;
         let (place, dst, src) = self.read_binary_rmw(instruction, size)?;

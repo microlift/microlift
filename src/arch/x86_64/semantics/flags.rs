@@ -314,6 +314,7 @@ impl<'a> Lifter<'a> {
         }
     }
 
+    /// The flags of `AND`/`OR`/`XOR`/`TEST`: CF = OF = AF = 0, ZF/SF/PF from `res`.
     pub fn update_flags_logical(&mut self, res: Value, size: usize) -> crate::Result<()> {
         let bit_width = (size * 8) as i64;
 
@@ -339,7 +340,11 @@ impl<'a> Lifter<'a> {
             self.set_flag_source(X86Flag::Parity, pf)?;
         }
 
-        // AF is undefined for logical ops; its previous definition stays live across an `AND`.
+        // Undefined by Intel; cleared, as QEMU does, so the previous AF is not kept alive.
+        if self.flag_needed(X86Flag::Auxiliary) {
+            let zero = self.builder.ins().iconst(types::I8, 0);
+            self.set_flag_source(X86Flag::Auxiliary, zero)?;
+        }
 
         Ok(())
     }

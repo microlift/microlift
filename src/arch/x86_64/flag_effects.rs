@@ -23,7 +23,7 @@ const OF: FlagSet = f(X86Flag::Overflow);
 const DF: FlagSet = f(X86Flag::Direction);
 
 const ARITH: FlagSet = CF.union(PF).union(AF).union(ZF).union(SF).union(OF);
-const LOGICAL: FlagSet = CF.union(PF).union(ZF).union(SF).union(OF);
+const LOGICAL: FlagSet = ARITH;
 const INC_DEC: FlagSet = PF.union(AF).union(ZF).union(SF).union(OF);
 const SHIFT: FlagSet = CF.union(PF).union(ZF).union(SF).union(OF);
 
@@ -59,7 +59,7 @@ pub fn flag_effects(i: &Instruction) -> Option<FlagEffects> {
         // CF is untouched.
         Mnemonic::Inc | Mnemonic::Dec => FlagEffects::writing(INC_DEC),
 
-        // AF is left as it was, so not a write.
+        // AF is undefined; `update_flags_logical` clears it.
         Mnemonic::And | Mnemonic::Or | Mnemonic::Xor | Mnemonic::Test => {
             FlagEffects::writing(LOGICAL)
         }
@@ -548,9 +548,9 @@ mod tests {
     /// Pins entries that differ from the architecture; taking iced's answer would miscompile each.
     #[test]
     fn the_lift_and_the_manual_disagree_in_three_places() {
-        // AF is undefined here and `update_flags_logical` leaves it, so not a write.
+        // AF is undefined here and `update_flags_logical` clears it, so a write.
         let and = flag_effects(&decode(&[0x21, 0xC0])).expect("AND is classified");
-        assert!(!and.writes.contains(X86Flag::Auxiliary as u8));
+        assert!(and.writes.contains(X86Flag::Auxiliary as u8));
         assert!(and.writes.contains(X86Flag::Zero as u8));
 
         // Handler assigns CF and OF only.
