@@ -172,6 +172,63 @@ fn scalar_fp_ops_agree_across_xmm_representations() {
     }
 }
 
+/// `MOVSS`/`MOVSD` move lane 0 alone, and a scalar chain forwards lane 0 between
+/// instructions without disturbing the lanes above it. Stores go below `rsp`, over
+/// eight bytes written first, so the bytes a narrow store leaves are known.
+#[test]
+fn scalar_moves_and_chains_agree_across_xmm_representations() {
+    let cases: &[(&str, &[u8])] = &[
+        ("movss-reg", &[0xF3, 0x0F, 0x10, 0xC1]),
+        ("movsd-reg", &[0xF2, 0x0F, 0x10, 0xC1]),
+        ("movss-m32", &[0xF3, 0x0F, 0x10, 0x04, 0x24]),
+        ("movsd-m64", &[0xF2, 0x0F, 0x10, 0x04, 0x24]),
+        (
+            "movss-store",
+            &[
+                0xF2, 0x0F, 0x11, 0x54, 0x24, 0xF0, // movsd [rsp-16], xmm2
+                0xF3, 0x0F, 0x11, 0x4C, 0x24, 0xF0, // movss [rsp-16], xmm1
+                0xF2, 0x0F, 0x10, 0x44, 0x24, 0xF0, // movsd xmm0, [rsp-16]
+            ],
+        ),
+        (
+            "movsd-store",
+            &[
+                0xF2, 0x0F, 0x11, 0x4C, 0x24, 0xF0, // movsd [rsp-16], xmm1
+                0xF3, 0x0F, 0x10, 0x44, 0x24, 0xF0, // movss xmm0, [rsp-16]
+                0xF2, 0x0F, 0x10, 0x5C, 0x24, 0xF0, // movsd xmm3, [rsp-16]
+            ],
+        ),
+        (
+            "movss-load-chain",
+            &[
+                0xF3, 0x0F, 0x10, 0x04, 0x24, // movss xmm0, [rsp]
+                0xF3, 0x0F, 0x59, 0xC1, // mulss xmm0, xmm1
+                0xF3, 0x0F, 0x58, 0xC2, // addss xmm0, xmm2
+            ],
+        ),
+        (
+            "movsd-reg-chain",
+            &[
+                0xF2, 0x0F, 0x59, 0xC1, // mulsd xmm0, xmm1
+                0xF2, 0x0F, 0x10, 0xD0, // movsd xmm2, xmm0
+                0xF2, 0x0F, 0x58, 0xD0, // addsd xmm2, xmm0
+            ],
+        ),
+        (
+            "mixed-lane-widths",
+            &[
+                0xF3, 0x0F, 0x59, 0xC1, // mulss xmm0, xmm1
+                0xF2, 0x0F, 0x59, 0xC1, // mulsd xmm0, xmm1
+                0xF3, 0x0F, 0x58, 0xC1, // addss xmm0, xmm1
+                0x0F, 0x58, 0xC8, // addps xmm1, xmm0
+            ],
+        ),
+    ];
+    for (name, bytes) in cases {
+        assert_modes_agree(name, &snippet(bytes, None));
+    }
+}
+
 #[test]
 fn movmsk_and_conversions_agree_across_xmm_representations() {
     let cases: &[(&str, &[u8])] = &[
@@ -291,6 +348,9 @@ fn vector_fast_paths_lower_on_every_target() {
         ("ptest", &[0x66, 0x0F, 0x38, 0x17, 0xC1]),
         ("pmovmskb", &[0x66, 0x0F, 0xD7, 0xC1]),
         ("movmskpd", &[0x66, 0x0F, 0x50, 0xC1]),
+        ("movss-m32", &[0xF3, 0x0F, 0x10, 0x04, 0x24]),
+        ("movsd-reg", &[0xF2, 0x0F, 0x10, 0xC1]),
+        ("movss-store", &[0xF3, 0x0F, 0x11, 0x4C, 0x24, 0xF0]),
         ("addps", &[0x0F, 0x58, 0xC1]),
         ("divpd", &[0x66, 0x0F, 0x5E, 0xC1]),
         ("minps", &[0x0F, 0x5D, 0xC1]),

@@ -313,16 +313,63 @@ impl<'a> Lifter<'a> {
         let fty = if single { types::F32X4 } else { types::F64X2 };
 
         let dst = self.get_xmm_vec(dst_idx);
-        let dst = self.vec_bitcast(dst, fty);
-        let a = self.builder.ins().extractlane(dst, 0);
+        let a = self.xmm_lane(dst, fty, 0);
         let b = self.read_scalar_fp_vec_src(instruction, 1, fty, who)?;
 
         let r = op(&mut self.builder, a, b);
 
         // Lanes 1.. are untouched: the destination merge scalar forms specify.
-        let merged = self.builder.ins().insertlane(dst, r, 0);
+        let merged = self.xmm_with_lane(dst, fty, 0, r);
         let merged = self.vec_bitcast(merged, types::I64X2);
         self.set_xmm_vec(dst_idx, merged);
+        Ok(true)
+    }
+
+    /// `MOVSS`/`MOVSD` over lane 0 of `fty` when XMM is vector-backed; returns `false` in scalar mode.
+    /// A load zeroes the other lanes; a register move preserves them.
+    pub(super) fn try_scalar_move_vec(
+        &mut self,
+        instruction: &Instruction,
+        who: &str,
+        fty: Type,
+    ) -> crate::Result<bool> {
+        if !self.vec_mode() {
+            return Ok(false);
+        }
+        match (
+            self.operand_kind(instruction, 0),
+            self.operand_kind(instruction, 1),
+        ) {
+            (OpKind::Register, OpKind::Register) => {
+                let dst_idx = self.xmm_operand_index(instruction, 0, who)?;
+                let src_idx = self.xmm_operand_index(instruction, 1, who)?;
+                let src = self.get_xmm_vec(src_idx);
+                let value = self.xmm_lane(src, fty, 0);
+                let dst = self.get_xmm_vec(dst_idx);
+                let merged = self.xmm_with_lane(dst, fty, 0, value);
+                let merged = self.vec_bitcast(merged, types::I64X2);
+                self.set_xmm_vec(dst_idx, merged);
+            }
+            (OpKind::Register, OpKind::Memory) => {
+                let dst_idx = self.xmm_operand_index(instruction, 0, who)?;
+                let ptr = self.get_mem_ptr(instruction, 1)?;
+                let value = self
+                    .builder
+                    .ins()
+                    .load(fty.lane_type(), self.guest_flags, ptr, 0);
+                let vec = self.builder.ins().scalar_to_vector(fty, value);
+                let vec = self.vec_bitcast(vec, types::I64X2);
+                self.set_xmm_vec(dst_idx, vec);
+            }
+            (OpKind::Memory, OpKind::Register) => {
+                let src_idx = self.xmm_operand_index(instruction, 1, who)?;
+                let src = self.get_xmm_vec(src_idx);
+                let value = self.xmm_lane(src, fty, 0);
+                let ptr = self.get_mem_ptr(instruction, 0)?;
+                self.builder.ins().store(self.guest_flags, value, ptr, 0);
+            }
+            _ => return Ok(false),
+        }
         Ok(true)
     }
 
@@ -338,8 +385,7 @@ impl<'a> Lifter<'a> {
             OpKind::Register => {
                 let idx = self.xmm_operand_index(instruction, op_index, who)?;
                 let v = self.get_xmm_vec(idx);
-                let v = self.vec_bitcast(v, fty);
-                Ok(self.builder.ins().extractlane(v, 0))
+                Ok(self.xmm_lane(v, fty, 0))
             }
             OpKind::Memory => {
                 let ptr = self.get_mem_ptr(instruction, op_index)?;

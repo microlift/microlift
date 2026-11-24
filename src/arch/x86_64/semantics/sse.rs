@@ -628,6 +628,9 @@ impl<'a> Lifter<'a> {
     /// - `MOVSS xmm, m32`: load 32 bits into lo; upper 96 bits zeroed.
     /// - `MOVSS m32, xmm`: store bits[31:0] of src lo to memory.
     pub(super) fn handle_movss(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        if self.try_scalar_move_vec(instruction, "movss", types::F32X4)? {
+            return Ok(());
+        }
         match self.operand_kind(instruction, 0) {
             OpKind::Register => {
                 let dst_reg = self.operand_register(instruction, 0);
@@ -1132,6 +1135,9 @@ impl<'a> Lifter<'a> {
     /// - `MOVSD xmm, m64`: load 64 bits into lo; hi zeroed.
     /// - `MOVSD m64, xmm`: store lo of src to memory.
     pub(super) fn handle_movsd_sse(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        if self.try_scalar_move_vec(instruction, "movsd-sse", types::F64X2)? {
+            return Ok(());
+        }
         match self.operand_kind(instruction, 0) {
             OpKind::Register => {
                 let dst_reg = self.operand_register(instruction, 0);
@@ -1876,6 +1882,10 @@ impl<'a> Lifter<'a> {
     pub(super) fn vec_bitcast(&mut self, v: Value, ty: Type) -> Value {
         if self.builder.func.dfg.value_type(v) == ty {
             return v;
+        }
+        let source = self.vec_source(v);
+        if self.builder.func.dfg.value_type(source) == ty {
+            return source;
         }
         let flags = MemFlagsData::new().with_endianness(codegen::ir::Endianness::Little);
         self.builder.ins().bitcast(ty, flags, v)

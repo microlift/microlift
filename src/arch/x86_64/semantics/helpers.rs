@@ -5,9 +5,19 @@ use crate::arch::x86_64::regs::{
 use crate::arch::x86_64::sync::{FS_BASE_SLOT, GS_BASE_SLOT};
 use crate::core::regsync::RegSlot;
 use crate::lifter::{Lifter, X86Flag};
+use cranelift::codegen::ir::{InstructionData, Opcode, ValueDef};
 use cranelift::prelude::*;
 use iced_x86::{Instruction, OpKind, Register};
 
+
+/// One lane of a vector replaced: `base` with lane `lane` set to `value`, or a
+/// `scalar_to_vector` of `value` when `base` is `None`.
+struct LaneWrite {
+    ty: Type,
+    base: Option<Value>,
+    lane: u8,
+    value: Value,
+}
 
 /// A resolved operand: a guest register, or a memory operand's already-computed effective address (so RMW forms it once).
 #[derive(Debug, Clone, Copy)]
@@ -540,12 +550,93 @@ impl<'a> Lifter<'a> {
 
     // XMM accessors: lo/hi work in both representations; use `get_xmm_vec`/`set_xmm_vec` to move a whole 128-bit value.
 
+    /// `vec` with the vector bitcasts around it stripped.
+    pub(super) fn vec_source(&self, vec: Value) -> Value {
+        let dfg = &self.builder.func.dfg;
+        let mut v = dfg.resolve_aliases(vec);
+        while let ValueDef::Result(inst, 0) = dfg.value_def(v)
+            && dfg.insts[inst].opcode() == Opcode::Bitcast
+            && dfg.value_type(dfg.inst_args(inst)[0]).is_vector()
+        {
+            v = dfg.resolve_aliases(dfg.inst_args(inst)[0]);
+        }
+        v
+    }
+
+    /// The single-lane write that produced `vec`, if that is how it was made.
+    fn lane_write(&self, vec: Value) -> Option<LaneWrite> {
+        let dfg = &self.builder.func.dfg;
+        let ValueDef::Result(inst, 0) = dfg.value_def(vec) else {
+            return None;
+        };
+        let ty = dfg.value_type(vec);
+        match dfg.insts[inst] {
+            InstructionData::TernaryImm8 {
+                opcode: Opcode::Insertlane,
+                args: [base, value],
+                imm,
+            } => Some(LaneWrite {
+                ty,
+                base: Some(base),
+                lane: imm,
+                value,
+            }),
+            InstructionData::Unary {
+                opcode: Opcode::ScalarToVector,
+                arg,
+            } if dfg.value_type(arg) == ty.lane_type() => Some(LaneWrite {
+                ty,
+                base: None,
+                lane: 0,
+                value: arg,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Lane `lane` of `vec` viewed as `ty`, forwarded from the write that put it there
+    /// when that is visible, so a scalar chain stays out of the vector register.
+    pub fn xmm_lane(&mut self, vec: Value, ty: Type, lane: u8) -> Value {
+        let mut src = self.vec_source(vec);
+        while let Some(write) = self.lane_write(src)
+            && write.ty == ty
+        {
+            if write.lane == lane {
+                return write.value;
+            }
+            match write.base {
+                Some(base) => src = self.vec_source(base),
+                None => break,
+            }
+        }
+        let vec = self.vec_bitcast(vec, ty);
+        self.builder.ins().extractlane(vec, lane)
+    }
+
+    /// `vec` viewed as `ty` with lane `lane` replaced by `value`. A lane that was itself
+    /// just written is replaced in what it was written into, not chained after it.
+    pub fn xmm_with_lane(&mut self, vec: Value, ty: Type, lane: u8, value: Value) -> Value {
+        let src = self.vec_source(vec);
+        if let Some(write) = self.lane_write(src)
+            && write.ty == ty
+            && write.lane == lane
+        {
+            return match write.base {
+                Some(base) => self.builder.ins().insertlane(base, value, lane),
+                // Every other lane of a `scalar_to_vector` is zero, and stays so.
+                None => self.builder.ins().scalar_to_vector(ty, value),
+            };
+        }
+        let vec = self.vec_bitcast(vec, ty);
+        self.builder.ins().insertlane(vec, value, lane)
+    }
+
     /// Return the low 64 bits of XMM register `idx` (0-15).
     pub fn get_xmm_lo(&mut self, idx: u8) -> Value {
         if self.state.use_vector_xmm {
             let var = *self.state.xmms_vec.get(&idx).unwrap();
             let vec = self.builder.use_var(var);
-            self.builder.ins().extractlane(vec, 0)
+            self.xmm_lane(vec, types::I64X2, 0)
         } else {
             let var = *self.state.xmms_lo.get(&idx).unwrap();
             self.builder.use_var(var)
@@ -557,7 +648,7 @@ impl<'a> Lifter<'a> {
         if self.state.use_vector_xmm {
             let var = *self.state.xmms_vec.get(&idx).unwrap();
             let vec = self.builder.use_var(var);
-            self.builder.ins().extractlane(vec, 1)
+            self.xmm_lane(vec, types::I64X2, 1)
         } else {
             let var = *self.state.xmms_hi.get(&idx).unwrap();
             self.builder.use_var(var)
@@ -569,7 +660,7 @@ impl<'a> Lifter<'a> {
         if self.state.use_vector_xmm {
             let var = *self.state.xmms_vec.get(&idx).unwrap();
             let vec = self.builder.use_var(var);
-            let new_vec = self.builder.ins().insertlane(vec, val, 0);
+            let new_vec = self.xmm_with_lane(vec, types::I64X2, 0, val);
             self.builder.def_var(var, new_vec);
         } else {
             let var = *self.state.xmms_lo.get(&idx).unwrap();
@@ -587,7 +678,7 @@ impl<'a> Lifter<'a> {
         if self.state.use_vector_xmm {
             let var = *self.state.xmms_vec.get(&idx).unwrap();
             let vec = self.builder.use_var(var);
-            let new_vec = self.builder.ins().insertlane(vec, val, 1);
+            let new_vec = self.xmm_with_lane(vec, types::I64X2, 1, val);
             self.builder.def_var(var, new_vec);
         } else {
             let var = *self.state.xmms_hi.get(&idx).unwrap();
