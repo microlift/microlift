@@ -84,6 +84,7 @@ pub(crate) fn eliminate(func: &mut Function, flags: &[Value]) {
 
     let mut dead = Vec::new();
     let mut plain = Vec::new();
+    let mut flagged = HashMap::new();
     for block in func.layout.blocks() {
         for inst in func.layout.block_insts(block) {
             if !candidates.contains(inst) {
@@ -93,16 +94,14 @@ pub(crate) fn eliminate(func: &mut Function, flags: &[Value]) {
                 dead.push(inst);
                 continue;
             }
-            // Only the arithmetic result survives: shed the condition output.
-            let opcode = match func.dfg.insts[inst].opcode() {
-                Opcode::UaddOverflow | Opcode::SaddOverflow => Opcode::Iadd,
-                Opcode::UsubOverflow | Opcode::SsubOverflow => Opcode::Isub,
-                Opcode::SmulOverflow => Opcode::Imul,
-                _ => continue,
+            let Some(key) = arithmetic(func, inst) else {
+                continue;
             };
             let results = func.dfg.inst_results(inst);
-            if !live.contains(func.dfg.resolve_aliases(results[1])) {
-                plain.push((inst, opcode, results[0]));
+            if live.contains(func.dfg.resolve_aliases(results[1])) {
+                flagged.entry((block, key)).or_insert(inst);
+            } else {
+                plain.push((inst, block, key));
             }
         }
     }
@@ -110,17 +109,63 @@ pub(crate) fn eliminate(func: &mut Function, flags: &[Value]) {
         func.layout.remove_inst(inst);
         func.dfg.clear_results(inst);
     }
-    for (inst, opcode, result) in plain {
-        let args = func.dfg.inst_args(inst);
-        func.dfg.insts[inst] = InstructionData::Binary {
-            opcode,
-            args: [args[0], args[1]],
-        };
-        let ty = func.dfg.value_type(result);
-        func.dfg
-            .make_inst_results_reusing(inst, ty, [Some(result)].into_iter());
+    for (inst, block, key) in plain {
+        match flagged.get(&(block, key)) {
+            Some(&twin) => reuse_twin_result(func, inst, twin),
+            None => demote(func, inst, key),
+        }
     }
     dce::remove_dead_block_params(func);
+}
+
+/// The arithmetic an overflow op computes; its signed and unsigned forms share it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct Arithmetic {
+    opcode: Opcode,
+    args: [Value; 2],
+}
+
+fn arithmetic(func: &Function, inst: Inst) -> Option<Arithmetic> {
+    let opcode = match func.dfg.insts[inst].opcode() {
+        Opcode::UaddOverflow | Opcode::SaddOverflow => Opcode::Iadd,
+        Opcode::UsubOverflow | Opcode::SsubOverflow => Opcode::Isub,
+        Opcode::SmulOverflow => Opcode::Imul,
+        _ => return None,
+    };
+    let args = func.dfg.inst_args(inst);
+    Some(Arithmetic {
+        opcode,
+        args: [
+            func.dfg.resolve_aliases(args[0]),
+            func.dfg.resolve_aliases(args[1]),
+        ],
+    })
+}
+
+/// Sheds the dead condition output, leaving only the arithmetic.
+fn demote(func: &mut Function, inst: Inst, key: Arithmetic) {
+    let result = func.dfg.inst_results(inst)[0];
+    func.dfg.insts[inst] = InstructionData::Binary {
+        opcode: key.opcode,
+        args: key.args,
+    };
+    let ty = func.dfg.value_type(result);
+    func.dfg
+        .make_inst_results_reusing(inst, ty, [Some(result)].into_iter());
+}
+
+/// Removes `inst`, whose condition is dead, in favour of the same arithmetic in `twin`.
+fn reuse_twin_result(func: &mut Function, inst: Inst, twin: Inst) {
+    // Hoisted so it dominates every use of `inst`'s result; its operands are `inst`'s.
+    if func.layout.pp_cmp(twin, inst).is_gt() {
+        func.layout.remove_inst(twin);
+        func.layout.insert_inst(twin, inst);
+    }
+    let result = func.dfg.inst_results(inst)[0];
+    let twin_result = func.dfg.inst_results(twin)[0];
+    func.layout.remove_inst(inst);
+    func.dfg.clear_results(inst);
+    func.dfg.change_to_alias(result, twin_result);
 }
 
 /// Fails closed; guest loads stay even if only dead flags used them (fault behavior is observable).
@@ -401,6 +446,34 @@ mod tests {
             eliminate(&mut func, &flags);
             check(&func);
             assert_eq!(count(&func, opcode), 0);
+        }
+    }
+
+    #[test]
+    fn a_dead_condition_reuses_its_live_twins_arithmetic() {
+        for unsigned_first in [true, false] {
+            let (mut func, flags) = function(|b| {
+                let x = b.block_params(b.current_block().unwrap())[0];
+                let y = b.ins().iconst(types::I64, 7);
+                let (sum, cf, of) = if unsigned_first {
+                    let (sum, cf) = b.ins().uadd_overflow(x, y);
+                    let (_, of) = b.ins().sadd_overflow(x, y);
+                    (sum, cf, of)
+                } else {
+                    let (_, of) = b.ins().sadd_overflow(x, y);
+                    let (sum, cf) = b.ins().uadd_overflow(x, y);
+                    (sum, cf, of)
+                };
+                let observed = b.ins().uextend(types::I64, of);
+                b.ins().store(MemFlagsData::new(), observed, x, 0);
+                b.ins().return_(&[sum]);
+                vec![cf, of]
+            });
+            eliminate(&mut func, &flags);
+            check(&func);
+            assert_eq!(count(&func, Opcode::SaddOverflow), 1);
+            assert_eq!(count(&func, Opcode::UaddOverflow), 0);
+            assert_eq!(count(&func, Opcode::Iadd), 0);
         }
     }
 

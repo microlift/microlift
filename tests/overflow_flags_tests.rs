@@ -36,7 +36,7 @@ fn overflow_ops(bytes: &[u8], spec: Specialization, lean: bool) -> usize {
 /// Add/sub/mul shapes with CF and OF read (`seto`/`setb`) so the specialization is reached.
 /// `LOCK` forms address `[rsp]`, which the harness maps.
 fn snippets() -> Vec<(&'static str, Vec<u8>)> {
-    // seto dl ; setb bl - the readers that make CF and OF live.
+    // seto dl ; setb bl - read CF and OF inside the region, not only at the exit sync.
     const READ: &[u8] = &[0x0F, 0x90, 0xC2, 0x0F, 0x92, 0xC3];
     let cases: &[(&str, &[u8])] = &[
         ("add r64", &[0x48, 0x01, 0xC8]),
@@ -156,6 +156,105 @@ fn agrees_with_the_portable_paths() {
                     target.name()
                 );
             }
+        }
+    }
+}
+
+/// Sites where a later flag write kills exactly one of CF and OF before the exit sync,
+/// with the overflow ops the whole lift should keep.
+fn single_flag_snippets() -> Vec<(&'static str, Vec<u8>, usize)> {
+    // inc rdx: OF only. cmp rax, rbx: both.
+    const INC: &[u8] = &[0x48, 0xFF, 0xC2];
+    const CMP: &[u8] = &[0x48, 0x39, 0xD8];
+    const ADD: &[u8] = &[0x48, 0x01, 0xC8];
+    const SUB: &[u8] = &[0x48, 0x29, 0xC8];
+    const SETL: &[u8] = &[0x0F, 0x9C, 0xC2];
+    const SETO: &[u8] = &[0x0F, 0x90, 0xC2];
+    let cases: &[(&str, &[&[u8]], usize)] = &[
+        ("add, CF live", &[ADD, INC], 2),
+        ("add, OF live", &[ADD, SETL, CMP], 3),
+        ("sub, CF live", &[SUB, INC], 2),
+        ("sub, OF live", &[SUB, SETO, CMP], 3),
+    ];
+    cases
+        .iter()
+        .map(|(name, parts, ops)| {
+            let mut v = parts.concat();
+            v.push(0xC3); // ret
+            (*name, v, *ops)
+        })
+        .collect()
+}
+
+/// Overflow ops whose arithmetic a plain `iadd`/`isub` on the same operands also computes.
+fn duplicated_arithmetic(bytes: &[u8], spec: Specialization) -> usize {
+    let code = lift_to_code::<X86_64>(bytes, DEFAULT_LIFT_BASE, config(spec, true)).expect("lift");
+    let func = &code.func;
+    let insts: Vec<_> = func
+        .layout
+        .blocks()
+        .flat_map(|b| func.layout.block_insts(b))
+        .collect();
+    let args = |inst| -> Vec<_> {
+        func.dfg
+            .inst_args(inst)
+            .iter()
+            .map(|&v| func.dfg.resolve_aliases(v))
+            .collect()
+    };
+    let plain = |opcode| match opcode {
+        Opcode::UaddOverflow | Opcode::SaddOverflow => Some(Opcode::Iadd),
+        Opcode::UsubOverflow | Opcode::SsubOverflow => Some(Opcode::Isub),
+        _ => None,
+    };
+    insts
+        .iter()
+        .filter(|&&i| {
+            plain(func.dfg.insts[i].opcode()).is_some_and(|opcode| {
+                insts
+                    .iter()
+                    .any(|&j| func.dfg.insts[j].opcode() == opcode && args(j) == args(i))
+            })
+        })
+        .count()
+}
+
+#[test]
+fn a_single_live_flag_agrees_with_the_portable_paths() {
+    for (name, bytes, _) in single_flag_snippets() {
+        for &ops in OPERANDS {
+            let portable = run(&bytes, Specialization::generic(), true, ops);
+            for target in [SpecTarget::X86_64, SpecTarget::Aarch64] {
+                let spec = run(&bytes, Specialization::for_target(target), true, ops);
+                assert_eq!(
+                    portable,
+                    spec,
+                    "{name}: {} diverged from the portable path on {ops:x?}",
+                    target.name()
+                );
+            }
+        }
+    }
+}
+
+/// The dead flag's overflow op gives way to its live twin instead of leaving a second add or sub.
+#[test]
+fn a_single_live_flag_computes_the_arithmetic_once() {
+    for (name, bytes, expected) in single_flag_snippets() {
+        for target in [SpecTarget::X86_64, SpecTarget::Aarch64] {
+            let spec = Specialization::for_target(target);
+            assert_eq!(
+                duplicated_arithmetic(&bytes, spec),
+                0,
+                "{name}: {} computes the arithmetic twice",
+                target.name()
+            );
+            assert_eq!(
+                overflow_ops(&bytes, spec, true),
+                expected,
+                "{name}: {} kept the wrong overflow ops",
+                target.name()
+            );
         }
     }
 }
