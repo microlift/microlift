@@ -862,6 +862,7 @@ fn semantics<'a>(instruction: &Instruction) -> Option<Semantics<'a>> {
         Mnemonic::Fnop | Mnemonic::Wait => |this, i| this.handle_fpu_nop(i),
         Mnemonic::Fnstenv => |this, i| this.handle_fnstenv(i),
         Mnemonic::Fldenv => |this, i| this.handle_fldenv(i),
+        Mnemonic::Fxsave | Mnemonic::Fxsave64 => |this, i| this.handle_fxsave(i),
         Mnemonic::Fnclex => |this, i| this.handle_fnclex(i),
         Mnemonic::Fninit => |this, i| this.handle_fninit(i),
 

@@ -1248,6 +1248,57 @@ impl<'a> Lifter<'a> {
         Ok(())
     }
 
+    /// FXSAVE m512byte - save the legacy x87 and SSE state image.
+    /// Instruction and data pointers are not tracked by the register context, so those fields are zeroed.
+    pub(super) fn handle_fxsave(&mut self, instruction: &Instruction) -> crate::Result<()> {
+        match instruction.memory_size() {
+            MemorySize::Fxsave_512Byte | MemorySize::Fxsave64_512Byte => {}
+            other => return Err(MicroliftError::UnsupportedInstruction {
+                mnemonic: format!("fxsave-{:?}", other),
+            }),
+        }
+        let ptr = self.get_mem_ptr(instruction, 0)?;
+        let ctx = self.fpu_ctx_ptr();
+        let cw = self.ctx_load(types::I16, ctx, std::mem::offset_of!(RegisterContext, fpu_cw) as i32);
+        let sw = self.fpu_status_word();
+        let tag = self.fpu_load_tag();
+        self.builder.ins().store(self.guest_flags, cw, ptr, 0);
+        self.builder.ins().store(self.guest_flags, sw, ptr, 2);
+        self.builder.ins().store(self.guest_flags, tag, ptr, 4);
+        // FOP and the instruction/data pointers/selectors are not represented in RegisterContext.
+        let zero16 = self.builder.ins().iconst(types::I16, 0);
+        let zero32 = self.builder.ins().iconst(types::I32, 0);
+        let zero64 = self.builder.ins().iconst(types::I64, 0);
+        self.builder.ins().store(self.guest_flags, zero16, ptr, 6);
+        self.builder.ins().store(self.guest_flags, zero64, ptr, 8);
+        self.builder.ins().store(self.guest_flags, zero64, ptr, 16);
+        let mxcsr = self.ctx_load(types::I32, ctx, std::mem::offset_of!(RegisterContext, mxcsr) as i32);
+        self.builder.ins().store(self.guest_flags, mxcsr, ptr, 24);
+        self.builder.ins().store(self.guest_flags, zero32, ptr, 28);
+
+        for i in 0..8 {
+            let (mant, se) = self.fpu_read_st_raw(i);
+            let off = 32 + i as i32 * 16;
+            self.builder.ins().store(self.guest_flags, mant, ptr, off);
+            let se = self.builder.ins().ireduce(types::I16, se);
+            self.builder.ins().store(self.guest_flags, se, ptr, off + 8);
+            self.builder.ins().store(self.guest_flags, zero32, ptr, off + 10);
+            self.builder.ins().store(self.guest_flags, zero16, ptr, off + 14);
+        }
+        for i in 0..16 {
+            let off = std::mem::offset_of!(RegisterContext, xmm) as i32 + i * 16;
+            let lo = self.ctx_load(types::I64, ctx, off);
+            let hi = self.ctx_load(types::I64, ctx, off + 8);
+            self.builder.ins().store(self.guest_flags, lo, ptr, 160 + i * 16);
+            self.builder.ins().store(self.guest_flags, hi, ptr, 168 + i * 16);
+        }
+        // Reserved bytes [416, 512) have defined zero contents in this implementation.
+        for off in (416..512).step_by(8) {
+            self.builder.ins().store(self.guest_flags, zero64, ptr, off);
+        }
+        Ok(())
+    }
+
     /// FLDENV m14/m28byte - reload the environment saved by `FNSTENV`.
     /// The control word is verbatim, the tag word collapsed, `TOP` restored from status bits 13-11; pointer/opcode fields are ignored.
     /// Data registers are untouched (`FRSTOR` restores those).

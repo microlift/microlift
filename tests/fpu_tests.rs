@@ -21,6 +21,37 @@ fn set_phys(ctx: &mut RegisterContext, phys: usize, v: f64) {
 }
 
 #[test]
+fn test_fxsave_writes_legacy_state_image() {
+    #[repr(align(16))]
+    struct Aligned([u8; 512]);
+    let mut image = Aligned([0xA5; 512]);
+    let mut ctx = RegisterContext::default();
+    ctx.rsi = image.0.as_mut_ptr() as u64;
+    ctx.fpu_top = 3;
+    ctx.fpu_sw = 0x0500; // C2 | C0; TOP is materialized by FXSAVE.
+    ctx.fpu_tag = 1 << 3;
+    ctx.fpr[3] = [0x8000_0000_0000_0000, 0x3FFF]; // ST0 = 1.0
+    ctx.mxcsr = 0x1F40;
+    ctx.xmm.0[0] = [0x1122_3344_5566_7788, 0x99AA_BBCC_DDEE_FF00];
+
+    // fxsave [rsi]; ret
+    let out = run_test(&[0x0F, 0xAE, 0x06, 0xC3], ctx);
+    let word = |off| u16::from_le_bytes(image.0[off..off + 2].try_into().unwrap());
+    let dword = |off| u32::from_le_bytes(image.0[off..off + 4].try_into().unwrap());
+    let qword = |off| u64::from_le_bytes(image.0[off..off + 8].try_into().unwrap());
+    assert_eq!(word(0), ctx.fpu_cw);
+    assert_eq!(word(2), 0x1D00, "TOP and condition codes are saved");
+    assert_eq!(image.0[4], 1 << 3, "abridged tag word uses physical slots");
+    assert_eq!(dword(24), ctx.mxcsr);
+    assert_eq!(qword(32), 0x8000_0000_0000_0000, "ST0 significand");
+    assert_eq!(word(40), 0x3FFF, "ST0 exponent");
+    assert_eq!(qword(160), 0x1122_3344_5566_7788);
+    assert_eq!(qword(168), 0x99AA_BBCC_DDEE_FF00);
+    assert!(image.0[416..].iter().all(|&b| b == 0), "reserved tail is zeroed");
+    assert_eq!(out.fpu_top, 3, "FXSAVE does not alter the live state");
+}
+
+#[test]
 fn test_fldz_pushes_zero() {
     let bytes = [0xD9, 0xEE, 0xC3];
     let mut ctx = RegisterContext::default();
