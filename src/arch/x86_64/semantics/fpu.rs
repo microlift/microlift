@@ -1292,8 +1292,9 @@ impl<'a> Lifter<'a> {
             self.builder.ins().store(self.guest_flags, lo, ptr, 160 + i * 16);
             self.builder.ins().store(self.guest_flags, hi, ptr, 168 + i * 16);
         }
-        // Reserved bytes [416, 512) have defined zero contents in this implementation.
-        for off in (416..512).step_by(8) {
+        // Bytes [416, 464) are reserved and zeroed. Bytes [464, 512) are software-owned
+        // (Intel SDM: FXSAVE/FXSAVE64 do not modify them) and are preserved.
+        for off in (416..464).step_by(8) {
             self.builder.ins().store(self.guest_flags, zero64, ptr, off);
         }
         Ok(())

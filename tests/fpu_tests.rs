@@ -20,11 +20,12 @@ fn set_phys(ctx: &mut RegisterContext, phys: usize, v: f64) {
     ctx.fpr[phys] = [mant, se as u64];
 }
 
-#[test]
-fn test_fxsave_writes_legacy_state_image() {
+fn check_fxsave_image(bytes: &[u8], seed: u8) {
     #[repr(align(16))]
     struct Aligned([u8; 512]);
-    let mut image = Aligned([0xA5; 512]);
+    let mut image = Aligned([seed; 512]);
+    let tail: [u8; 48] = std::array::from_fn(|i| seed + i as u8);
+    image.0[464..].copy_from_slice(&tail);
     let mut ctx = RegisterContext::default();
     ctx.rsi = image.0.as_mut_ptr() as u64;
     ctx.fpu_top = 3;
@@ -34,8 +35,7 @@ fn test_fxsave_writes_legacy_state_image() {
     ctx.mxcsr = 0x1F40;
     ctx.xmm.0[0] = [0x1122_3344_5566_7788, 0x99AA_BBCC_DDEE_FF00];
 
-    // fxsave [rsi]; ret
-    let out = run_test(&[0x0F, 0xAE, 0x06, 0xC3], ctx);
+    let out = run_test(bytes, ctx);
     let word = |off| u16::from_le_bytes(image.0[off..off + 2].try_into().unwrap());
     let dword = |off| u32::from_le_bytes(image.0[off..off + 4].try_into().unwrap());
     let qword = |off| u64::from_le_bytes(image.0[off..off + 8].try_into().unwrap());
@@ -47,8 +47,24 @@ fn test_fxsave_writes_legacy_state_image() {
     assert_eq!(word(40), 0x3FFF, "ST0 exponent");
     assert_eq!(qword(160), 0x1122_3344_5566_7788);
     assert_eq!(qword(168), 0x99AA_BBCC_DDEE_FF00);
-    assert!(image.0[416..].iter().all(|&b| b == 0), "reserved tail is zeroed");
+    assert!(
+        image.0[416..464].iter().all(|&b| b == 0),
+        "reserved bytes [416, 464) are zeroed"
+    );
+    assert_eq!(image.0[464..], tail, "software-owned bytes must be preserved verbatim");
     assert_eq!(out.fpu_top, 3, "FXSAVE does not alter the live state");
+}
+
+#[test]
+fn test_fxsave_writes_legacy_state_image() {
+    // fxsave [rsi]; ret
+    check_fxsave_image(&[0x0F, 0xAE, 0x06, 0xC3], 0xA5);
+}
+
+#[test]
+fn test_fxsave64_preserves_software_owned_tail() {
+    // fxsave64 [rsi]; ret
+    check_fxsave_image(&[0x48, 0x0F, 0xAE, 0x06, 0xC3], 0xC7);
 }
 
 #[test]
